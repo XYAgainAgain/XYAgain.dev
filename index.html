@@ -2,12 +2,92 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-    <title>Sam's Stuff</title>
-
-    
-<link href="tailwind_theme/tailwind.css" rel="stylesheet" type="text/css"></head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>XYAgain.dev</title>
+    <meta name="description" content="Sam Atwood's creative portfolio, under construction. For now: a moonlit pond. Maybe eels.">
+    <meta name="theme-color" content="#05070c">
+    <meta property="og:title" content="XYAgain.dev">
+    <meta property="og:description" content="A moonlit pond while the museum gets built.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://xyagain.dev/">
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="preload" href="assets/shared/fonts/Providence-Sans-Pro-Regular.woff2" as="font" type="font/woff2" crossorigin>
+    <link href="tailwind_theme/tailwind.css" rel="stylesheet" type="text/css">
+    <link href="assets/shared/css/base.css" rel="stylesheet" type="text/css">
+    <link href="assets/pond/css/pond.css" rel="stylesheet" type="text/css">
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "./assets/shared/vendor/three/three.webgpu.min.js",
+        "three/webgpu": "./assets/shared/vendor/three/three.webgpu.min.js",
+        "three/tsl": "./assets/shared/vendor/three/three.tsl.min.js",
+        "tone": "./assets/shared/vendor/tone/tone.esm.js"
+      }
+    }
+    </script>
+</head>
 <body>
-suh dude
+    <main id="stage">
+        <canvas id="pond" role="img" aria-label="A moonlit pond seen from above, with eels."></canvas>
+
+        <div id="fallback" class="fallback" aria-hidden="true">
+            <video class="fallback-video" autoplay muted loop playsinline preload="metadata" poster="assets/pond/pond-poster.webp">
+                <source src="assets/pond/pond-loop.webm" type="video/webm">
+            </video>
+        </div>
+
+        <dialog id="gate" class="gate" aria-labelledby="gate-title">
+            <p id="gate-title" class="gate-text">Howdy pardner. Welcome to XYAgain.dev, where <br> Sam Atwood will soon display his creative projects.<br>Before we go any further, how do you feel about eels?</p>
+            <div class="gate-actions">
+                <button type="button" class="btn" data-eels="yes">Eels are cool</button>
+                <button type="button" class="btn" data-eels="no">Not a fan</button>
+            </div>
+        </dialog>
+
+        <div class="chrome chrome-top">
+            <div class="sound">
+                <button id="sound" type="button" class="btn btn-icon" aria-pressed="false" aria-label="Turn sound on" title="Sound">
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+                        <path class="spk" d="M4 9v6h4l5 4V5L8 9H4z"/>
+                        <path class="wave wave-1" d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/>
+                        <path class="wave wave-2" d="M17.5 7a7 7 0 0 1 0 10"/>
+                        <path class="mute-x" d="M16 9l5 6M21 9l-5 6"/>
+                    </svg>
+                </button>
+                <label class="volume-wrap">
+                    <span class="visually-hidden">Volume</span>
+                    <input id="volume" type="range" min="0" max="100" value="70" class="volume">
+                </label>
+            </div>
+        </div>
+
+        <nav class="chrome chrome-links" aria-label="Elsewhere">
+            <a class="btn" href="https://github.com/XYAgainAgain" target="_blank" rel="me noopener"><img class="btn-mark" src="assets/shared/svg/GitHub_Invertocat_White.svg" alt="" width="18" height="18">GitHub</a>
+            <a class="btn" href="https://tkb.band/" target="_blank" rel="noopener">TKB.band</a>
+            <a class="btn" href="https://ko-fi.com/xyagain" target="_blank" rel="noopener">Ko-fi</a>
+            <a class="btn" href="mailto:sam@xyagain.dev" target="_blank">sam@xyagain.dev</a>
+        </nav>
+
+        <footer class="chrome chrome-legend">
+            <p class="stats" aria-hidden="true"><span id="fps">-- FPS</span> <span id="backend"></span></p>
+            <p class="legend" aria-label="Pointer controls">
+                <span>click: poke</span>
+                <span>drag: finger through</span>
+                <span>right-click: feed</span>
+                <span>right-drag around eels: corral</span>
+                <span>middle-click: recolor</span>
+                <span>touch: 2 fingers = right, 3 = middle</span>
+                <button id="eel-toggle" type="button" class="btn btn-tiny" aria-pressed="false">eels: off</button>
+            </p>
+        </footer>
+    </main>
+
+    <noscript>
+        <div class="noscript">
+            <p>XYAgain.dev is under construction. The pond needs JavaScript; the links above still work.</p>
+        </div>
+    </noscript>
+
+    <script type="module" src="assets/pond/js/main.js"></script>
 </body>
 </html>

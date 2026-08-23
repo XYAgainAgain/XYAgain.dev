@@ -1,0 +1,77 @@
+/* Shared foundation for every exhibit: typeface, tokens, focus, and the pill button. */
+@font-face {
+  font-family: "Providence Sans Pro";
+  src: url("../fonts/Providence-Sans-Pro-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Providence Sans Pro";
+  src: url("../fonts/Providence-Sans-Pro-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-body: "Providence Sans Pro", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ink: oklch(92% 0.015 260 / 0.62);
+  --ink-strong: oklch(95% 0.012 260 / 0.92);
+  --glass: oklch(12% 0.02 260 / 0.55);
+  --glass-edge: oklch(85% 0.04 260 / 0.18);
+  --accent: oklch(78% 0.11 250);
+  --fade: 900ms;
+}
+
+html {
+  color-scheme: dark;
+  font-family: var(--font-body);
+  font-size: 108%;   /* ~17.3px at default settings; everything below is rem/em off this */
+}
+
+button, input, select, textarea { font: inherit; }
+
+.btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-block: 0.5em;
+  padding-inline: 0.9em;
+  border-radius: 999px;
+  border: 1px solid var(--glass-edge);
+  background: var(--glass);
+  color: var(--ink-strong);
+  font: inherit;
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  transition: background 160ms ease, border-color 160ms ease, translate 160ms ease;
+}
+.btn-mark {
+  inline-size: 1.15em;
+  block-size: 1.15em;
+  margin-inline-start: -0.15em;
+}
+.btn:hover { background: oklch(18% 0.03 260 / 0.7); border-color: oklch(85% 0.04 260 / 0.35); }
+.btn:active { translate: 0 1px; }
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.visually-hidden {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn { transition: none; }
+}

@@ -1,0 +1,7 @@
+{
+  "_comment": "PBR sets for the pond floor. Sources in .dev/assets/textures (normals re-exported from the EXRs). bump scales normal-map strength; height is the fallback when no normal map exists.",
+  "sand":  { "albedo": "sand_albedo.webp",  "normal": "sand_normal.webp",  "height": "sand_displacement.webp",  "roughness": "sand_roughness.webp",  "tiling": 1, "bump": 1.7 },
+  "stone": { "albedo": "stone_albedo.webp", "normal": "stone_normal.webp", "height": "stone_displacement.webp", "roughness": "stone_roughness.webp", "tiling": 1, "bump": 1.0 },
+  "algae": { "albedo": "algae_albedo.webp", "normal": "algae_normal.webp", "height": "algae_displacement.webp", "roughness": "algae_roughness.webp", "tiling": 1, "bump": 1.0 },
+  "wood":  { "albedo": "wood_albedo.webp",  "normal": "wood_normal.webp",  "height": "wood_displacement.webp",  "roughness": "wood_roughness.webp",  "tiling": 1, "bump": 1.0 }
+}

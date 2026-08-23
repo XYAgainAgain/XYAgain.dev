@@ -1,0 +1,78 @@
+import { IDLE_FADE_MS, STORAGE_KEY } from './config.js';
+
+/* The eel gate, idle fade, sound button, and legend toggle. Pure DOM, no rendering. */
+export function readEelChoice() {
+  try { return localStorage.getItem(STORAGE_KEY); } catch { return null; }
+}
+
+export function writeEelChoice(v) {
+  try { localStorage.setItem(STORAGE_KEY, v); } catch {}
+}
+
+export function setupIdleFade(root) {
+  let timer = null, deadline = 0, idle = false;
+  const check = () => {
+    const left = deadline - performance.now();
+    if (left > 0) { timer = setTimeout(check, left); return; }
+    timer = null; idle = true; root.classList.add('is-idle');
+  };
+  const wake = () => {
+    deadline = performance.now() + IDLE_FADE_MS;
+    if (idle) { idle = false; root.classList.remove('is-idle'); }
+    if (timer === null) timer = setTimeout(check, IDLE_FADE_MS);
+  };
+  ['pointermove', 'pointerdown', 'keydown', 'touchstart', 'wheel'].forEach((ev) => window.addEventListener(ev, wake, { passive: true }));
+  wake();
+  return wake;
+}
+
+/* Shows the gate dialog; resolves 'yes' | 'no'. */
+export function askAboutEels(dialog) {
+  return new Promise((resolve) => {
+    const yes = dialog.querySelector('[data-eels="yes"]');
+    const no = dialog.querySelector('[data-eels="no"]');
+    const finish = (v) => { dialog.close(); resolve(v); };
+    yes.addEventListener('click', () => finish('yes'), { once: true });
+    no.addEventListener('click', () => finish('no'), { once: true });
+    dialog.addEventListener('cancel', (e) => e.preventDefault());
+    dialog.showModal();
+    yes.focus();
+  });
+}
+
+export function bindSoundButton(btn, slider, audio) {
+  const render = () => {
+    const off = !audio.unlocked || audio.muted;
+    btn.setAttribute('aria-pressed', String(!off));
+    btn.dataset.state = !audio.unlocked ? 'locked' : audio.muted ? 'muted' : 'on';
+    btn.setAttribute('aria-label', !audio.unlocked ? 'Turn sound on' : audio.muted ? 'Unmute' : 'Mute');
+    slider.value = String(Math.round(audio.volume * 100));
+  };
+  btn.addEventListener('click', async () => {
+    if (!audio.unlocked) { await audio.unlock(); audio.setMuted(false); }
+    else audio.setMuted(!audio.muted);
+    render();
+  });
+  slider.addEventListener('input', () => {
+    audio.setVolume(slider.valueAsNumber / 100);
+    if (audio.muted && slider.valueAsNumber > 0) audio.setMuted(false);
+    render();
+  });
+  audio.onState = render;
+  render();
+}
+
+export function bindEelToggle(btn, onChange) {
+  const render = (v) => {
+    btn.setAttribute('aria-pressed', String(v === 'yes'));
+    btn.textContent = v === 'yes' ? 'eels: on' : 'eels: off';
+  };
+  btn.addEventListener('click', () => {
+    const next = readEelChoice() === 'yes' ? 'no' : 'yes';
+    writeEelChoice(next);
+    render(next);
+    onChange(next);
+  });
+  render(readEelChoice());
+  return render;
+}
