@@ -1,11 +1,14 @@
 import * as THREE from 'three/webgpu';
 import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, smoothstep, varying, dot, TWO_PI, positionWorld } from 'three/tsl';
-import { EEL_COUNT, EEL_POINTS, DEPTH } from './config.js';
+import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2 } from './shading.js';
 
 const RINGS = 48, SIDES = 12;
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
+const tmpPink = new THREE.Color(), tmpFlash = new THREE.Color();
+// Generic smoothstep; handles reversed edges the way GLSL's does not, which blink() relies on.
+const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
 
 /* Tube geometry parameterized by (t along, angle around); the spine comes in as a uniform array. */
 function makeTubeGeometry() {
@@ -187,11 +190,62 @@ export class EelRenderer {
 
   setEnabled(on) {
     this.group.visible = on;
-    if (!on) for (let i = 0; i < EEL_COUNT; i++) { this.U.eelPos.array[i].set(0, -99, 0); this.U.eelCol.array[i].setRGB(0, 0, 0); }
+    // The system stops syncing while disabled, so nothing would overwrite a stale lit capsule.
+    if (!on) for (let i = 0; i < INF_SLOTS; i++) this.clearSlot(i);
+  }
+
+  /* One influence capsule: spine points 2 and 16 of 24, the lit trunk minus snoot and whippy tail. */
+  writeSlot(i, e) {
+    const U = this.U, a = e.show[2], b = e.show[16];
+    U.infA.array[i].set(a.x, a.y, a.z, e.radius);
+    U.infB.array[i].set(b.x, b.y, b.z, 1);
+    // speedBL is body lengths per second, so a long eel pushes harder than a short one at equal gait.
+    const v = e.speedBL * e.length;
+    U.infC.array[i].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
+    const k = 0.7 + e.uExcite.value * 0.6;
+    // Narrow span: a full colA→colB lerp passes through a grey mid-band on complementary palettes.
+    U.eelCol.array[i].copy(e.colA).lerp(e.colB, 0.25).multiplyScalar(k);
+    U.eelColB.array[i].copy(e.colA).lerp(e.colB, 0.55).multiplyScalar(k);
+  }
+
+  clearSlot(i) {
+    const U = this.U;
+    U.infA.array[i].set(0, -99, 0, 0);
+    U.infB.array[i].set(0, -99, 0, 0);
+    U.infC.array[i].set(0, 0, 0, 0);
+    U.eelCol.array[i].setRGB(0, 0, 0);
+    U.eelColB.array[i].setRGB(0, 0, 0);
+  }
+
+  /* Her body is long enough that one chord reads as a static bar, so she gets two chained capsules,
+     the last two INF_SLOTS past the six residents, that actually follow her S-curve. */
+  writeGuestSlots(e) {
+    const U = this.U;
+    const v = e.speedBL * e.length;
+    const k = 0.7 + e.uExcite.value * 0.6;
+    const seg = (slot, a, b) => {
+      U.infA.array[slot].set(a.x, a.y, a.z, e.radius);
+      U.infB.array[slot].set(b.x, b.y, b.z, 1);
+      U.infC.array[slot].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
+    };
+    seg(EEL_COUNT, e.show[2], e.show[10]);
+    seg(EEL_COUNT + 1, e.show[10], e.show[18]);
+    U.eelCol.array[EEL_COUNT].copy(e.colA).multiplyScalar(k);
+    U.eelColB.array[EEL_COUNT].copy(e.colA).lerp(e.colB, 0.6).multiplyScalar(k);
+    U.eelCol.array[EEL_COUNT + 1].copy(U.eelColB.array[EEL_COUNT]);
+    // The tail capsule ends in the photophore's pink, blinking on the sand in the same cycle the
+    // shader runs on the tip: pure formula off the shared clock, so no readback and no drift.
+    const time = U.time.value;
+    const cyc = (time * 0.25 + e.uSeed.value) % 1;
+    const blink = (c) => sstep(0.0, 0.02, cyc - c) * sstep(0.07, 0.05, cyc - c);
+    const flash = (blink(0.05) + blink(0.16)) * 2.6;
+    const tipPulse = Math.sin(time * 0.7 + e.uSeed.value) * 0.18 + 0.82;
+    tmpPink.setRGB(1.0, 0.3, 0.55).multiplyScalar(tipPulse * 0.9);
+    tmpFlash.setRGB(1.0, 0.05, 0.1).multiplyScalar(flash * 0.5);
+    U.eelColB.array[EEL_COUNT + 1].copy(e.colB).lerp(tmpPink, 0.75).add(tmpFlash).multiplyScalar(k);
   }
 
   sync(eels, foods, alpha) {
-    const U = this.U;
     for (const e of eels) {
       for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
       // Eye placement from the head frame.
@@ -203,9 +257,8 @@ export class EelRenderer {
       e.eyes[0].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, r * 0.62);
       e.eyes[1].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, -r * 0.62);
       e.eyes[0].position.y += r * 0.22; e.eyes[1].position.y += r * 0.22;
-      const mid = e.show[Math.floor(EEL_POINTS * 0.3)];
-      U.eelPos.array[e.index].copy(mid);
-      U.eelCol.array[e.index].copy(e.colA).lerp(e.colB, 0.3).multiplyScalar(0.7 + e.uExcite.value * 0.6);
+      // A resident being slurped is hidden but still posed, so its slot goes dark with it.
+      if (e.body.visible) this.writeSlot(e.index, e); else this.clearSlot(e.index);
     }
     for (const f of foods) {
       f.mesh.position.set(f.x, f.y, f.z);
@@ -213,9 +266,12 @@ export class EelRenderer {
     }
   }
 
-  /* Guests sync spine and eyes only; they have no slot in the EEL_COUNT environment-light arrays. */
+  /* The guest owns slots EEL_COUNT and EEL_COUNT + 1. She is parked offstage and hidden between
+     visits, so a dark body must never leave a lit capsule sitting in the pond. */
   syncGuest(e, alpha) {
     for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
+    if (e.body.visible) this.writeGuestSlots(e);
+    else { this.clearSlot(EEL_COUNT); this.clearSlot(EEL_COUNT + 1); }
     const h = e.show[0], n1 = e.show[1];
     tmpA.subVectors(h, n1).normalize();
     tmpB.crossVectors(tmpA, UP).normalize();

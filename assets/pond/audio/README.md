@@ -5,7 +5,7 @@ All files OGG Opus under `assets/pond/audio/`. A file that fails to load warns o
 | File | Slot | Notes |
 | --- | --- | --- |
 | `ambient-pond.ogg` | Ambient bed | Gapless 3-min nighttime loop, fades in over 2 s after the gate |
-| `drippy-pond-rain.ogg` | Rain (reserved) | Perfect-loop light rain for the future randomized shower feature; not loaded yet |
+| `drippy-pond-rain.ogg` | Rain bed | Perfect 3:00 loop on the env bus; gain rides the shower envelope squared, lowpass opens 700 Hz–7 kHz with intensity. The shower chains one loop at a time on a coin toss |
 | `sfx/plip-1..6.ogg` | Poke | Random pick, pitch jitter, ducked under spam |
 | `sfx/swishy-a/b.ogg` | Drag | One looping hand-swish per drag, random variant, 150 ms fade-in |
 | `sfx/plop-big.ogg` | Treat drop | R-click food; each drop rolls a random note on a 2-octave major pentatonic |

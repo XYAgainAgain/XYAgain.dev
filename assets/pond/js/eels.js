@@ -87,6 +87,9 @@ export class Eel {
   get head() { return this.pts[0]; }
 }
 
+// The shim fans out across every type the pond emits; a new event type belongs here too.
+const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble'];
+
 export class EelSystem {
   constructor(scene, U, shading, seed, extent, colliders, sim, motion, view) {
     this.view = view;
@@ -101,12 +104,17 @@ export class EelSystem {
     this.eels = [];
     this.guests = [];              // Eleanor-class residents: own brain, shared physics and renderer
     this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
+    this.rain = null;              // the shower scheduler, one shared reference: behavior reads its envelope
     this.feedRecent = 0;           // decaying feed-spree meter; the residents eat too fast for a stock check
     this.spooks = [];              // { x, z, t, strength }
     this.lures = [];               // curiosity points from drags: { x, z, t }
     this.foods = [];               // { x, z, y, amount, mesh, claims }
     this.vortices = [];            // { x, z, t, strength, radius }
     this.time = 0;
+    // Listeners live before the eels do: anything built below may already emit.
+    this.listeners = new Map();    // type → fn[]
+    this.shim = null;
+    this.shimFn = null;
     this.renderer = new EelRenderer(scene, U, shading);
     this.group = this.renderer.group;
     for (let i = 0; i < EEL_COUNT; i++) {
@@ -121,10 +129,51 @@ export class EelSystem {
       e.flock = this.eels;
     }
     this.enabled = true;
-    this.onEvent = null;           // audio hook: (type, eel) =>
   }
 
   endPrewarm() { this.renderer.endPrewarm(); }
+
+  /* Subscribe/unsubscribe. Many consumers per type: a single assigned callback let the second one win. */
+  on(type, fn) {
+    const list = this.listeners.get(type);
+    if (!list) this.listeners.set(type, [fn]);
+    else if (!list.includes(fn)) list.push(fn);
+  }
+
+  off(type, fn) {
+    const list = this.listeners.get(type);
+    const i = list ? list.indexOf(fn) : -1;
+    if (i >= 0) list.splice(i, 1);
+  }
+
+  /* One payload for every consumer, pan included, so nobody re-derives the world → stereo mapping. */
+  emit(type, eel, extra) {
+    const list = this.listeners.get(type);
+    if (!list || !list.length) return;
+    const h = eel.head;
+    const payload = {
+      type,
+      x: h.x, y: h.y, z: h.z,
+      // 0.8 keeps even edge-huggers a little off the speaker wall.
+      pan: Math.max(-1, Math.min(1, h.x / (this.view.w / 2))) * 0.8,
+      source: this.guests.includes(eel) ? 'eleanor' : 'eel',
+      size: extra?.size,
+      length: eel.length,
+      eel,
+      food: extra ?? null,
+    };
+    for (const fn of list.slice()) fn(payload);
+  }
+
+  /* Compatibility shim: one wrapper across every type, still called as (type, eel, food). */
+  set onEvent(fn) {
+    if (this.shim) for (const t of EVENT_TYPES) this.off(t, this.shim);
+    this.shimFn = fn ?? null;
+    this.shim = fn ? (p) => fn(p.type, p.eel, p.food) : null;
+    if (this.shim) for (const t of EVENT_TYPES) this.on(t, this.shim);
+  }
+
+  get onEvent() { return this.shimFn; }
 
   setView(w, h) { this.view.w = w; this.view.h = h; for (const e of this.eels) { e.view.w = w; e.view.h = h; } }
 

@@ -14,6 +14,7 @@ export const MOON_ORBIT_SECONDS = 30 * 60;
 export const MOON_COLOR = [0.62, 0.74, 1.0];
 export const EEL_COUNT = 6;
 export const EEL_POINTS = 24;
+export const INF_SLOTS = 8;          // creature influence capsules: 6 residents plus Eleanor's two chained capsules
 export const MAX_PIXELS = 2.6e6;     // internal render budget before DPR gets clamped
 export const IDLE_FADE_MS = 6000;
 export const STORAGE_KEY = 'xy.eels';

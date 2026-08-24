@@ -19,13 +19,14 @@ const SETS = {
 };
 // Sounds the eels make ride the eel bus; player-made water and pond environment ride env.
 const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', 'tinyBubs']);
-// drippy-pond-rain.ogg is reserved for the future rain-shower feature (env bus).
+// Rain's lowpass sweep: a shut-in patter at the first drops, wide open in a downpour.
+const RAIN_LP = [700, 7000];
 
 /* Mixed by ear via ?mixer=1; the panel still overrides these per-browser via localStorage. */
 const DEFAULT_MIX = {
   buses: { ambience: 0, eel: 0, env: 0 },
   levels: {
-    ambient: -2.5,
+    ambient: -2.5, rain: -6,
     plip: -5, swish: -1.5, plopBig: -2, plopSmol: -2,
     startle: -10, eleanorStartle: -8,
     crackleLil: -2.5, crackleMed: -2.5, crackleBig: -2.5,
@@ -65,6 +66,9 @@ export class PondAudio {
     this.crackleAt = 0;
     this.eleanorAt = 0;
     this.bubAt = 0;
+    this.rainEnv = 0;              // shower envelope, survives an unlock so a shower already running fades in
+    this.rainOn = false;
+    this.rainStopAt = 0;
     this.volume = this.readNumber(VOLUME_KEY, 0.5);
     this.muted = this.readBool(MUTE_KEY, false);
     // User-facing bus faders (0–1), layered on top of the dev mix's bus dB.
@@ -81,9 +85,14 @@ export class PondAudio {
   readNumber(k, d) { try { const v = parseFloat(localStorage.getItem(k)); return Number.isFinite(v) ? v : d; } catch { return d; } }
   readBool(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v === '1'; } catch { return d; } }
 
-  /* Call from a user gesture. Builds the graph and starts the bed. */
-  async unlock() {
-    if (this.unlocked) return;
+  /* Call from a user gesture. Builds the graph and starts the bed. The promise latch matters: two
+     gestures racing past a boolean while Tone.start() awaits would build two live graphs. */
+  unlock() {
+    this.unlockP ??= this.buildGraph();
+    return this.unlockP;
+  }
+
+  async buildGraph() {
     await Tone.start();
     this.unlocked = true;
     // The limiter caps the summed output so a busy pond can't clip, whatever the mix says.
@@ -106,6 +115,15 @@ export class PondAudio {
       onload: () => { if (this.unlocked) this.players.ambient.start(); },
       onerror: warn('ambient'),
     }).connect(this.buses.ambience);
+    // Rain gets its own gain and filter so the envelope can swell and open up without touching the
+    // mix level, which stays a plain dB slider like every other slot.
+    this.rainGain = new Tone.Gain(0).connect(this.buses.env);
+    this.rainFilter = new Tone.Filter({ type: 'lowpass', frequency: RAIN_LP[0], Q: 0.4 }).connect(this.rainGain);
+    this.players.rain = new Tone.Player({
+      url: `${BASE}drippy-pond-rain.ogg`, loop: true, fadeIn: 1.5, fadeOut: 2, volume: this.mix.levels.rain,
+      onload: () => { if (this.rainEnv > 0) this.setRain(this.rainEnv); },
+      onerror: warn('rain'),
+    }).connect(this.rainFilter);
     // The sets stay unconnected: they only hold decoded buffers for shot() to spawn from.
     for (const [name, files] of Object.entries(SETS)) {
       const urls = {};
@@ -118,6 +136,12 @@ export class PondAudio {
     this.volume = Math.max(0, Math.min(1, v));
     try { localStorage.setItem(VOLUME_KEY, String(this.volume)); } catch {}
     this.apply();
+  }
+
+  /* The rain bed's true loop length, once decoded; the shower chains itself one loop at a time. */
+  rainLoopSeconds() {
+    const b = this.players.rain?.buffer;
+    return b?.loaded ? b.duration : null;
   }
 
   setMuted(m) {
@@ -254,6 +278,37 @@ export class PondAudio {
 
   shortBub({ pan = null } = {}) { this.pick('shortBubs', 'shortBub', { jitter: 0.25, pan }); }
 
+  /* The shower envelope (0–1) from rain.js. Gain is squared so the build feels gradual rather than
+     arriving all at once, and the lowpass opens as the rain gets closer. */
+  setRain(env) {
+    const e = Math.max(0, Math.min(1, env));
+    this.rainEnv = e;
+    if (!this.unlocked || !this.rainGain) return;
+    if (e <= 0) {
+      this.rainGain.gain.rampTo(0, 2);
+      this.stopRain();
+      return;
+    }
+    const p = this.players.rain;
+    if (p?.loaded && !this.rainOn) {
+      this.rainOn = true;
+      clearTimeout(this.rainStopAt);
+      if (p.state !== 'started') p.start();
+    }
+    this.rainGain.gain.rampTo(e * e, 0.4);
+    this.rainFilter.frequency.rampTo(RAIN_LP[0] + (RAIN_LP[1] - RAIN_LP[0]) * e ** 0.7, 0.6);
+  }
+
+  /* Dry means stopped, not silent: a loop left running keeps the graph awake for nothing. The timer
+     outlasts the gain ramp, and a shower that returns first cancels it by flipping rainOn back. */
+  stopRain() {
+    if (!this.rainOn) return;
+    this.rainOn = false;
+    const p = this.players.rain;
+    clearTimeout(this.rainStopAt);
+    this.rainStopAt = setTimeout(() => { if (!this.rainOn && p?.state === 'started') p.stop(); }, 2400);
+  }
+
   stopAll() {
     this.swish(false);
     for (const p of [...this.live]) if (p.state === 'started') p.stop();
@@ -264,6 +319,7 @@ export class PondAudio {
     this.mix.levels[key] = db;
     // The two looping slots track their slider live; one-shots pick the new level up on next play.
     if (key === 'ambient' && this.players.ambient) this.players.ambient.volume.value = db;
+    if (key === 'rain' && this.players.rain) this.players.rain.volume.value = db;
     // swishPl stays non-null through its fade tail (onstop clears it), so this also catches fades.
     if (key === 'swish' && this.swishPl) this.swishPl.volume.value = db;
     this.saveMix();
@@ -295,6 +351,7 @@ export class PondAudio {
     try { localStorage.removeItem(MIX_KEY); } catch {}
     this.mix = structuredClone(DEFAULT_MIX);
     if (this.players.ambient) this.players.ambient.volume.value = this.mix.levels.ambient;
+    if (this.players.rain) this.players.rain.volume.value = this.mix.levels.rain;
     if (this.swishPl) this.swishPl.volume.value = this.mix.levels.swish;
     for (const n of Object.keys(this.buses ?? {})) this.applyBus(n);
   }

@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, texture, uv, vec2, vec3, vec4, float, normalize, refract, reflect, dot, mix, smoothstep, exp, min, length, pow, step } from 'three/tsl';
+import { Fn, If, uniform, texture, uv, vec2, vec3, vec4, float, normalize, refract, reflect, dot, mix, smoothstep, exp, min, length, pow, step } from 'three/tsl';
 import { DEPTH, IOR_WATER } from './config.js';
-import { fbm2, makeSwell } from './shading.js';
+import { fbm2, valueNoise2, makeSwell } from './shading.js';
 
 /* Final compose: refracts the underwater RT through the live surface, adds a soft cloudy sky
    and moon in the reflection, and absorbs color with path length. Straight-down camera. */
@@ -17,6 +17,7 @@ export class SurfacePass {
     this.uSkyGain = uniform(0.03);
     this.uMaxOffset = uniform(0.2);   // world units; keeps steep ripples from flinging pixels around
     this.uReveal = uniform(0.0);     // 0 = dim gate state, 1 = full
+    this.uRainNoise = uniform(0.0);  // shower envelope × 0.35; 0 when dry, and always 0 in reduced motion
     const texel = float(1 / sim.rtA.width);
     const under = texture(underRT.texture);
     const eta = float(1 / IOR_WATER);
@@ -44,7 +45,27 @@ export class SurfacePass {
       const t = U.time;
       const sw = swell(xz, t);
       const scale = this.uTexelW.mul(2);
-      const n = normalize(vec3(slope.x.mul(this.uSlope).sub(sw.y.mul(scale).mul(this.uSlosh)), scale, slope.y.mul(this.uSlope).sub(sw.z.mul(scale).mul(this.uSlosh))));
+      // A shower's 3 cm rings never survive a 512 sim, so its fine texture lives here: three octaves
+      // of animated value noise, decorrelated per axis, folded into the slope exactly like the swell.
+      const rn = this.uRainNoise;
+      const rx = float(0).toVar(), rz = float(0).toVar();
+      // Branching on a uniform is coherent across the whole quad, so a dry pond pays nothing at all.
+      If(rn.greaterThan(0), () => {
+        // Scroll directions are coprime integer pairs (3,-2), (-5,7), (11,-4): no shared factor, so
+        // the octaves never fall into step and streak along one diagonal.
+        const rp = xz.mul(8.0).add(vec2(t.mul(3 * 0.23), t.mul(-2 * 0.23)));
+        const rq = xz.mul(22.0).add(vec2(t.mul(-5 * 0.148), t.mul(7 * 0.148)));
+        const rr = xz.mul(44.0).add(vec2(t.mul(11 * 0.157), t.mul(-4 * 0.157)));
+        const gain = rn.mul(scale).mul(1.1);
+        rx.assign(valueNoise2(rp).sub(0.5).add(valueNoise2(rq).sub(0.5).mul(0.6)).add(valueNoise2(rr).sub(0.5).mul(0.45)).mul(gain));
+        rz.assign(valueNoise2(rp.add(vec2(37.2, 11.7))).sub(0.5).add(valueNoise2(rq.add(vec2(5.9, 23.4))).sub(0.5).mul(0.6)).add(valueNoise2(rr.add(vec2(17.3, 3.1))).sub(0.5).mul(0.45)).mul(gain));
+      });
+      const sx = slope.x.mul(this.uSlope).sub(sw.y.mul(scale).mul(this.uSlosh));
+      const sz = slope.y.mul(this.uSlope).sub(sw.z.mul(scale).mul(this.uSlosh));
+      const n = normalize(vec3(sx.add(rx), scale, sz.add(rz)));
+      // Reflection sees the rain barely: full-noise normals smear the moon's halo into a broad glare
+      // band across the whole pond, and that band moves with the clock, not the seed.
+      const nR = normalize(vec3(sx.add(rx.mul(0.2)), scale, sz.add(rz.mul(0.2))));
 
       const I = vec3(0, -1, 0);
       const R = refract(I, n, eta).toVar();
@@ -64,7 +85,7 @@ export class SurfacePass {
       const absorb = exp(vec3(0.22, 0.11, 0.06).negate().mul(dist));
       const below = sample.rgb.mul(absorb);
 
-      const Rr = reflect(I, n);
+      const Rr = reflect(I, nR);
       const moon = U.moonDir;
       const cosM = dot(Rr, moon).max(0);
       // Straight down, the mirror direction sits ~38 deg off the moon, so the glow must be broad to read at all.
@@ -74,7 +95,7 @@ export class SurfacePass {
       const sky = U.moonColor.mul(disc.add(halo).add(cloud));
       // F0 sits above the physical 0.02 on purpose: from straight above, the reflected sky is how ripples read.
       const F0 = float(0.035);
-      const fresnel = F0.add(F0.oneMinus().mul(dot(n, vec3(0, 1, 0)).max(0).oneMinus().pow(5)));
+      const fresnel = F0.add(F0.oneMinus().mul(dot(nR, vec3(0, 1, 0)).max(0).oneMinus().pow(5)));
       const water = mix(below, sky, fresnel.clamp(0, 0.6)).add(sky.mul(this.uSkyGain));
       // depthFrac 0 means the pixel is above the waterline (a rock top): no refraction, no sky film.
       const color = mix(water, sample.rgb, step(depthFrac0, float(0.001))).toVar();

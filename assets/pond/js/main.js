@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { texture, Fn, vec4, uv } from 'three/tsl';
-import { VIEW_H, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS } from './config.js';
+import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS } from './config.js';
 import { seedFromUrl, deriveSeed } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
@@ -10,6 +10,9 @@ import { EelSystem } from './eels.js';
 import { attachEleanor } from './eleanor.js';
 import { growEel } from './eel-physics.js';
 import { SurfacePass } from './surface.js';
+import { ImpulseInjector, halfToFloat } from './impulse.js';
+import { UnderwaterEffectsPool, KINDS as EFFECT_KINDS } from './effects.js';
+import { RainScheduler } from './rain.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle } from './ui.js';
@@ -53,6 +56,8 @@ async function boot() {
 
   const { w: viewW, h: viewH } = viewSize();
   const extent = POOL_SCALE * Math.max(viewW, viewH);
+  // One live view object, kept current by resize(), shared with everything that needs the frame.
+  const view = { w: viewW, h: viewH };
 
   const camera = new THREE.OrthographicCamera(-viewW / 2, viewW / 2, viewH / 2, -viewH / 2, 0.1, 20);
   camera.position.set(0, 5, 0);
@@ -63,12 +68,19 @@ async function boot() {
   const shading = makeUnderwaterShading(U);
   const sim = new WaterSim(renderer, extent);
   const caustics = new CausticsPass(renderer, sim, U, viewW, viewH);
+  // Nothing may ride the injector until this passes; rain and strider legs are its first customers.
+  const impulse = new ImpulseInjector(renderer, sim);
+  await impulse.probe();
 
   const underScene = new THREE.Scene();
+  // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
+  const overScene = new THREE.Scene();
   const { colliders } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH });
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
-  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, { w: viewW, h: viewH });
+  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view);
   const eleanor = attachEleanor(eels, seed);
+  const effects = new UnderwaterEffectsPool();
+  underScene.add(effects.mesh);
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -126,13 +138,25 @@ async function boot() {
   setupIdleFade(root);
   // World x -> stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
   const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
-  eels.onEvent = (type, eel, food) => {
-    const pan = toPan(eel.head.x);
-    if (type === 'startle') eel === eleanor ? audio.eleanorStartle({ pan }) : audio.startle({ pan, length: eel.length });
-    else if (type === 'eat') audio.eat(food?.size ?? 1, { pan, rate: eel === eleanor ? 0.5 : 1 });
-    else if (type === 'slurp') audio.slurp({ pan });
-    else if (type === 'nibble') audio.tinyBub({ pan });
-  };
+  // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
+  eels.on('startle', (ev) => { ev.source === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
+  eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.source === 'eleanor' ? 0.5 : 1 }));
+  eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
+  eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
+
+  // Showers own their own clock: envelope drives impulses, surface noise, and eel activity; intensity
+  // alone drives the rain bed. ?rain=1 skips the wait and starts one now.
+  const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio });
+  if (params.get('rain') === '1') rain.force();
+  eels.rain = rain;
+
+  // Audio already speaks for a nibble; this is the second subscriber, and it only makes bubbles.
+  eels.on('nibble', (ev) => {
+    const n = Math.random() < 0.5 ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      effects.spawn(ev.x + (Math.random() - 0.5) * 0.1, ev.y + 0.03, ev.z + (Math.random() - 0.5) * 0.1, 'bubbleTiny');
+    }
+  });
 
   // Input
   const toWorld = (cx, cy) => {
@@ -185,6 +209,9 @@ async function boot() {
     applyChoice(choice);
     revealTarget = 1;
     root.classList.add('is-ready');
+    // Return visits skip the gate, so the first tap on the water doubles as the audio unlock.
+    // unlock() honors the stored mute preference, so a deliberately muted pond stays quiet.
+    liveCanvas.addEventListener('pointerdown', () => audio.unlock(), { once: true });
   } else {
     eels.setEnabled(false);
     askAboutEels(dialog).then(async (v) => {
@@ -197,15 +224,32 @@ async function boot() {
     });
   }
 
-  // A stray bubble reaches the surface now and then: quiet bloop, tiny ripple where it broke.
+  // A stray bubble is seen before it is heard: it leaves the mud, rises, and only then bloops and
+  // rings. Rain stirs a few more loose ones out of the bottom, never a fizz of them.
+  const pendingPops = [];
   let nextBubble = 6;
   function strayBubbles(now) {
     if (now < nextBubble) return;
-    nextBubble = now + 7 + Math.random() * 13;
+    nextBubble = now + (7 + Math.random() * 13) / (1 + 0.6 * rain.envelope);
     const { w, h } = viewSize();
     const bx = (Math.random() - 0.5) * w * 0.9;
-    audio.shortBub({ pan: toPan(bx) });
-    if (!motion.reduced) sim.addDrop(bx, (Math.random() - 0.5) * h * 0.9, 0.3, 0.02);
+    const bz = (Math.random() - 0.5) * h * 0.9;
+    // Narrow band on purpose: the pop is scheduled from the rise time, so arrival has to land while
+    // the sprite is still bright rather than after it has faded out.
+    const by = -DEPTH * (0.5 + Math.random() * 0.15);
+    effects.spawn(bx, by, bz, 'bubble');
+    pendingPops.push({ x: bx, z: bz, at: now - by / EFFECT_KINDS.bubble.rise });
+  }
+
+  function popBubbles(now) {
+    for (let i = pendingPops.length - 1; i >= 0; i--) {
+      const p = pendingPops[i];
+      if (now < p.at) continue;
+      pendingPops.splice(i, 1);
+      effects.spawn(p.x, -0.02, p.z, 'pop');
+      audio.shortBub({ pan: toPan(p.x) });
+      if (!motion.reduced) sim.addDrop(p.x, p.z, 0.3, 0.02);
+    }
   }
 
   // Idle ripples arrive from off-screen, so the pond never looks dead.
@@ -221,6 +265,10 @@ async function boot() {
     const z = side >= 2 ? (side === 2 ? -h / 2 - m : h / 2 + m) : (Math.random() - 0.5) * h;
     sim.addDrop(x, z, 0.8 + Math.random() * 0.8, 0.08 + Math.random() * 0.1);
   }
+
+  // ?impulse=test: 40 micro-drops a frame over the middle of the pool, so the injector is visible
+  // under both backends without waiting on a live shower. One reused array, no per-frame allocation.
+  const testDrops = params.get('impulse') === 'test' ? Array.from({ length: 40 }, () => ({ u: 0, v: 0, s: 0.006, r: 2.5 })) : null;
 
   const timer = new THREE.Timer();
   timer.connect(document);
@@ -279,9 +327,18 @@ async function boot() {
       sim.addDrop(feeding.x, feeding.z, 0.14, 0.006);
       audio.plop('smol', toPan(feeding.x));
     }
+    // Ahead of anything that spawns, so this frame's effects are stamped with this frame's clock.
+    effects.setTime(t);
     idleDrops(t, dt);
     strayBubbles(t);
+    popBubbles(t);
     eels.update(dt);
+    // Before sim.update, so this frame's drops are stepped by the water they landed in.
+    rain.update(dt);
+    if (testDrops) {
+      for (const d of testDrops) { d.u = 0.3 + Math.random() * 0.4; d.v = 0.3 + Math.random() * 0.4; }
+      impulse.inject(testDrops);
+    }
     // Caustics follow the water, so they only need redrawing on frames the sim actually stepped.
     if (sim.update(dt) > 0 || t < 0.5) caustics.render();
 
@@ -290,7 +347,16 @@ async function boot() {
     renderer.clear();
     renderer.render(underScene, camera);
     if (debugQuad) { debugQuad.update(); renderer.setRenderTarget(null); debugQuad.render(renderer); }
-    else surface.render();
+    else {
+      surface.render();
+      // Drawn onto the composed canvas with no clear; materials in here own their own depth flags.
+      if (overScene.children.length) {
+        const prevAutoClear = renderer.autoClear;
+        renderer.autoClear = false;
+        try { renderer.render(overScene, camera); }
+        finally { renderer.autoClear = prevAutoClear; }
+      }
+    }
 
     // Long sounds ride each creature's own panner, so they sweep the stereo field as it swims.
     if (audio.unlocked && eels.enabled) {
@@ -320,6 +386,7 @@ async function boot() {
     motion.reduced = reduceMotion.matches && params.get('motion') !== 'full';
     sim.uDamping.value = motion.reduced ? 0.975 : sim.damping;
     surface.uSlosh.value = motion.reduced ? 0.2 : 1.0;
+    rain.motionChanged();
   };
   reduceMotion.addEventListener('change', applyMotion);
   applyMotion();
@@ -332,12 +399,7 @@ async function boot() {
       // Sample the center: the corners of the sim are its sponge ring and always read zero.
       const raw = await renderer.readRenderTargetPixelsAsync(rt, (rt.width - w) >> 1, (rt.height - h) >> 1, w, h);
       // Half-float targets read back as raw uint16; decode so the stats mean something.
-      const px = raw instanceof Uint16Array ? Array.from(raw, (u) => {
-        const sgn = u >> 15 ? -1 : 1, ex = (u >> 10) & 0x1f, m = u & 0x3ff;
-        if (ex === 0) return sgn * m * 2 ** -24;
-        if (ex === 31) return m ? NaN : sgn * Infinity;
-        return sgn * (1 + m / 1024) * 2 ** (ex - 15);
-      }) : raw;
+      const px = raw instanceof Uint16Array ? Array.from(raw, (u) => halfToFloat(u)) : raw;
       let sum = [0, 0, 0, 0], max = [-1e9, -1e9, -1e9, -1e9], nan = 0;
       for (let i = 0; i < px.length; i += 4) for (let c = 0; c < 4; c++) {
         const v = px[i + c];
@@ -348,7 +410,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       stats: fpsStats,
       diag: async () => {

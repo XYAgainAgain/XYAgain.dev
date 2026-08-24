@@ -39,13 +39,17 @@ export function pickTarget(sys, e, now) {
   const rng = e.rng;
   e.coverSpot = null;
   const flock = e.flock || [];
+  // Eels move on wet nights, so a shower thins the appetite for cover. It only ever reweights an
+  // existing roll: no extra targets, no extra rolls, nothing new to simulate.
+  const env = sys?.rain?.envelope ?? 0;
+  const act = 1 + 0.35 * env;
   // Tunnel runs: a good share of the time the next destination is one log mouth, then the other.
   // Crowded cover loses its appeal, and a laired guest closes the log to everyone but her admirer.
   const log = e.colliders.logs[0];
   const lairBlocked = !!(sys?.lairGuest && e.quirks.follows !== sys.lairGuest.name);
   if (log && !lairBlocked && e.tunnel === null && logFits(e, log)) {
     const logClaims = flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'log' ? 1 : 0), 0);
-    if (rng.chance(Math.min(0.85, 0.4 * e.traits.cover) / (1 + logClaims))) {
+    if (rng.chance(Math.min(0.85, 0.4 * e.traits.cover / act) / (1 + logClaims))) {
       const fromA = rng.chance(0.5);
       startTunnel(e, fromA ? log.a : log.b, fromA ? log.b : log.a, now);
       e.coverSpot = { type: 'log', idx: 0 };
@@ -56,7 +60,7 @@ export function pickTarget(sys, e, now) {
   // Half the time head for cover: a spot beside a rock (or under a lily pad, later). Otherwise wander
   // the viewport and a little past it, so they drift in and out but never leave for long.
   const rocks = e.colliders.spheres;
-  if (rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover))) {
+  if (rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover / act))) {
     const claims = rocks.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'rock' && o.coverSpot.idx === i ? 1 : 0), 0));
     const least = Math.min(...claims);
     const idx = rng.pick(rocks.map((_, i) => i).filter((i) => claims[i] === least));
@@ -66,17 +70,22 @@ export function pickTarget(sys, e, now) {
     e.coverSpot = { type: 'rock', idx };
   } else {
     const ex = e.view.w * 0.48, ez = e.view.h * 0.48;
-    e.target.set(rng.range(-ex, ex), 0, rng.range(-ez, ez));
+    // Andy's ripple habit in the rain: now and then the next wander target is a drop that actually
+    // landed, taken from the injector's own published positions rather than any spook.
+    const drop = e.quirks.rippleChase && env > 0 && rng.chance(0.5 * env) ? sys.rain.freshInterest(5) : null;
+    if (drop) e.target.set(drop.x, 0, drop.z);
+    else e.target.set(rng.range(-ex, ex), 0, rng.range(-ez, ez));
   }
   e.retargetAt = now + rng.range(e.traits.attention[0], e.traits.attention[1]);
 }
 
-/* Hold/prowl/cruise cadence: travel in bouts, then settle; anguilliforms stop rather than coast. */
-function updateGait(e, now) {
+/* Hold/prowl/cruise cadence: travel in bouts, then settle; anguilliforms stop rather than coast.
+   act is the rain activity multiplier and only ever bends these odds; bout lengths stay untouched. */
+function updateGait(e, now, act) {
   if (now < e.gaitUntil) return;
   const rng = e.rng, t = e.traits;
-  if (e.gait === 'hold') { e.gait = rng.chance(0.75) ? 'prowl' : 'cruise'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
-  else if (rng.chance(t.holdChance)) { e.gait = 'hold'; e.gaitUntil = now + rng.range(t.holdTime[0], t.holdTime[1]); }
+  if (e.gait === 'hold') { e.gait = rng.chance(0.75 / act) ? 'prowl' : 'cruise'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
+  else if (rng.chance(t.holdChance / act)) { e.gait = 'hold'; e.gaitUntil = now + rng.range(t.holdTime[0], t.holdTime[1]); }
   else { e.gait = rng.chance(0.35) ? 'cruise' : 'prowl'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
 }
 
@@ -217,7 +226,7 @@ export function steer(sys, e, dt) {
     excite = Math.max(excite, k);
     if (k > 0.5 && now > e.fleeUntil) {
       e.fleeUntil = now + 1;
-      sys.onEvent?.('startle', e);
+      sys.emit('startle', e);
       nope(sys, e, s, now);
       if (now < e.nopeUntil) { nopingTick(sys, e, dt); return; }
     }
@@ -286,8 +295,8 @@ export function steer(sys, e, dt) {
         best.amount -= bite;
         growEel(e, bite * (best.growPerAmt || 0));
         excite = Math.max(excite, 0.5);
-        if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + rng.range(0.5, 1.1); sys.onEvent?.('nibble', e); }
-        if (best.amount <= 0) { sys.onEvent?.('eat', e, best); }
+        if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + rng.range(0.5, 1.1); sys.emit('nibble', e); }
+        if (best.amount <= 0) { sys.emit('eat', e, best); }
       }
     }
   } else if (e.food) { e.food = null; }
@@ -368,6 +377,15 @@ export function steer(sys, e, dt) {
   if (Math.abs(head.x) > limX) force.x -= Math.sign(head.x) * 3;
   if (Math.abs(head.z) > limZ) force.z -= Math.sign(head.z) * 3;
 
+  // Andy in a shower: the whole film is ticking, so he fidgets. Omnidirectional and capped at +0.3;
+  // direction comes from the wander target above, never from the drops themselves.
+  const rainEnv = sys.rain?.envelope ?? 0;
+  if (e.quirks.rippleChase && rainEnv > 0) {
+    const restless = 0.3 * rainEnv;
+    speedMul = Math.max(speedMul, 1 + restless);
+    excite = Math.max(excite, restless * 0.6);
+  }
+
   if (sys.motion.reduced) speedMul = Math.min(speedMul, 1) * 0.35;
 
   if (force.x * force.x + force.z * force.z > 1e-6) {
@@ -383,7 +401,7 @@ export function steer(sys, e, dt) {
   e.speedMul += (speedMul - e.speedMul) * Math.min(1, dt * 4);
   e.uExcite.value += (excite - e.uExcite.value) * Math.min(1, dt * 3);
 
-  updateGait(e, now);
+  updateGait(e, now, 1 + 0.35 * rainEnv);
   const gait = hiding ? 'hold' : (e.tunnel || e.food) ? 'cruise' : e.gait;
 
   // Depth wandering: bottom-hugging by default; only a cruise ranges the whole column.

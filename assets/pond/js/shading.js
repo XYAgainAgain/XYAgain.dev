@@ -1,7 +1,7 @@
 import { Fn, vec2, vec3, vec4, float, floor, fract, dot, mix, normalize, hash, Loop, length, uniformArray, uniform, texture, refract, sin, cos, smoothstep, pow, clamp, If } from 'three/tsl';
 import { createRng } from './rng.js';
 import * as THREE from 'three/webgpu';
-import { EEL_COUNT, IOR_WATER, MOON_COLOR } from './config.js';
+import { INF_SLOTS, IOR_WATER, MOON_COLOR } from './config.js';
 
 /* Shared TSL helpers used by the floor, rocks, log, eels, and the compose pass. */
 
@@ -84,9 +84,15 @@ export function makeSwell(U) {
 
 /* Scene-wide uniforms every underwater material reads. Created once, closed over by the shading Fns. */
 export function createSceneUniforms(waveSet) {
-  const eelPos = [];
-  const eelCol = [];
-  for (let i = 0; i < EEL_COUNT; i++) { eelPos.push(new THREE.Vector3(0, -99, 0)); eelCol.push(new THREE.Color(0, 0, 0)); }
+  // The creature influence field: one capsule per slot, parked below the world and strength 0 until claimed.
+  const infA = [], infB = [], infC = [], eelCol = [], eelColB = [];
+  for (let i = 0; i < INF_SLOTS; i++) {
+    infA.push(new THREE.Vector4(0, -99, 0, 0));
+    infB.push(new THREE.Vector4(0, -99, 0, 0));
+    infC.push(new THREE.Vector4(0, 0, 0, 0));
+    eelCol.push(new THREE.Color(0, 0, 0));
+    eelColB.push(new THREE.Color(0, 0, 0));
+  }
   const placeholder = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
   placeholder.needsUpdate = true;
   return {
@@ -97,8 +103,11 @@ export function createSceneUniforms(waveSet) {
     causticTex: texture(placeholder),                   // replaced by the caustics pass before any material builds
     causticCenter: uniform(new THREE.Vector2()),
     causticSize: uniform(new THREE.Vector2(1, 1)),
-    eelPos: uniformArray(eelPos),
-    eelCol: uniformArray(eelCol),
+    infA: uniformArray(infA),                           // (ax, ay, az, radius)
+    infB: uniformArray(infB),                           // (bx, by, bz, strength)
+    infC: uniformArray(infC),                           // (vx, vy, vz, excite), velocity in world units/s
+    eelCol: uniformArray(eelCol),                       // glow color at the capsule's head end
+    eelColB: uniformArray(eelColB),                     // glow color at the tail end; mixed along the axis
     eelGlow: uniform(2.4),
     swell: uniform(1.0),
     waves: uniformArray(waveSet.waves.map((w) => new THREE.Vector4(w.x, w.y, w.z, w.w))),
@@ -106,6 +115,25 @@ export function createSceneUniforms(waveSet) {
     reflCausticTex: texture(placeholder),
   };
 }
+
+/* Closest point on segment ab to p, the same clamp-the-projection math sim.js runs in 2D for its
+   obstacle capsules. The max() keeps a degenerate capsule (a == b) from dividing by zero. */
+export const closestOnSegment = Fn(([p, a, b]) => {
+  const ba = b.sub(a);
+  const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+  return a.add(ba.mul(t));
+});
+
+/* Wake push at p from one influence slot, for anything creatures shove around (lily pads first).
+   Falloff scales the WHOLE push, not just velocity, or the shove reaches the whole pond as a press. */
+export const capsuleInfluence = Fn(([p, a, b, vel]) => {
+  const closest = closestOnSegment(p, a.xyz, b.xyz);
+  const away = p.sub(closest);
+  const d = length(away);
+  const w = smoothstep(a.w.add(0.9), a.w.add(0.05), d);
+  const radial = away.div(d.max(1e-5));   // safe normalize: dead on the axis, d is 0
+  return radial.xz.add(vel.xz.mul(0.6)).mul(w);
+});
 
 /* Builds the underwater shading Fn bound to one set of scene uniforms. */
 export function makeUnderwaterShading(U) {
@@ -116,11 +144,20 @@ export function makeUnderwaterShading(U) {
     return normalize(refr).negate();
   });
 
+  // Neon fill from the influence capsules. Distance is measured to the body's skin rather than its
+  // axis, so a guest three times a resident's girth lights the sand off her whole bulk.
   const eelGlowAt = Fn(([p]) => {
     const glow = vec3(0).toVar();
-    Loop(EEL_COUNT, ({ i }) => {
-      const d = length(p.sub(U.eelPos.element(i)));
-      glow.addAssign(U.eelCol.element(i).mul(U.eelGlow.mul(0.55).div(d.mul(d).mul(3.5).add(1))));
+    Loop(INF_SLOTS, ({ i }) => {
+      const a = U.infA.element(i), b = U.infB.element(i);
+      const ba = b.xyz.sub(a.xyz);
+      const t = p.sub(a.xyz).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+      const d = length(p.sub(a.xyz.add(ba.mul(t)))).sub(a.w.mul(1.5)).max(0);
+      // Color runs head → tail along the axis, and a slow tailward shimmer keeps the pool of light
+      // alive the way the ridge lights already travel on the body itself.
+      const col = mix(U.eelCol.element(i), U.eelColB.element(i), t);
+      const shimmer = sin(t.mul(5).sub(U.time.mul(1.57)).add(float(i).mul(2.7))).mul(0.22).add(1);
+      glow.addAssign(col.mul(shimmer).mul(b.w).mul(U.eelGlow.mul(0.42).div(d.mul(d).mul(3.5).add(1))));
     });
     return glow;
   });
@@ -158,7 +195,27 @@ export function makeUnderwaterShading(U) {
     const H = normalize(L.add(V));
     const specPow = mix(kSpecHi, kSpecLo, roughness);
     const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25);
-    const glow = eelGlowAt(p);
+    // Wrapped Lambert over the normal map so gravel facets face or shade the glow; the roughness-
+    // driven highlight puts a neon glint on wet stones.
+    const glow = vec3(0).toVar();
+    const glowSpec = vec3(0).toVar();
+    Loop(INF_SLOTS, ({ i }) => {
+      const a = U.infA.element(i), b = U.infB.element(i);
+      const ba = b.xyz.sub(a.xyz);
+      const t = p.sub(a.xyz).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+      const away = a.xyz.add(ba.mul(t)).sub(p);
+      const dist = length(away);
+      const d = dist.sub(a.w.mul(1.5)).max(0);
+      const Le = away.div(dist.max(1e-4));
+      // The mid hump refunds the brightness an RGB lerp loses crossing between distant hues.
+      const col = mix(U.eelCol.element(i), U.eelColB.element(i), t).mul(t.mul(t.oneMinus()).mul(0.5).add(1));
+      const shimmer = sin(t.mul(5).sub(U.time.mul(1.57)).add(float(i).mul(2.7))).mul(0.22).add(1);
+      const cNow = col.mul(shimmer).mul(b.w).mul(U.eelGlow.mul(0.42).div(d.mul(d).mul(3.5).add(1)));
+      // The wrap keeps crevices dim rather than black under a soft nearby glow.
+      glow.addAssign(cNow.mul(dot(n, Le).add(0.35).div(1.35).clamp(0, 1)));
+      const He = normalize(Le.add(V));
+      glowSpec.addAssign(cNow.mul(dot(n, He).max(0).pow(specPow)).mul(roughness.oneMinus()).mul(1.2));
+    });
     const dbg = new URLSearchParams(location.search).get('shade');
     if (dbg === 'n') return n.mul(0.5).add(0.5);
     if (dbg === 'l') return L.mul(0.5).add(0.5);
@@ -168,7 +225,8 @@ export function makeUnderwaterShading(U) {
     return albedo.mul(U.moonColor.mul(direct.add(ambient)))
       .add(U.moonColor.mul(spec))
       .add(albedo.mul(glow).mul(0.9))
-      .add(glow.mul(0.05));
+      .add(glow.mul(0.05))
+      .add(glowSpec);
   });
 
   return { shade, lightDir, eelGlowAt };

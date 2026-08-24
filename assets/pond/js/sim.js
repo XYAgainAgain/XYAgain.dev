@@ -31,7 +31,7 @@ export class WaterSim {
     // Obstacle mask (R = 1 where something solid crosses the waterline), baked once from the colliders.
     this.maskRT = new THREE.RenderTarget(SIM_RES, SIM_RES, {
       type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
-      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, generateMipmaps: false,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
     });
     this.mask = texture(this.maskRT.texture);
     this.maskDirty = false;
@@ -85,13 +85,16 @@ export class WaterSim {
     for (let i = 0; i < MAXC; i++) { const o = capsules[i]; cp.push(new THREE.Vector4(o?.ax ?? 0, o?.az ?? 0, o?.bx ?? 0, o?.bz ?? 0)); cp.push(new THREE.Vector4(o?.r ?? 0, 0, 0, 0)); }
     const uDiscs = uniformArray(d), uCaps = uniformArray(cp);
     const uExtent = uniform(this.extent);
+    // A hard step bakes stair-steps into the wall, and every wave that bounces off it shows them;
+    // a 1.5-texel smoothstep skirt plus linear filtering gives the sim an antialiased shoreline.
+    const uEdge = uniform(this.texelWorld * 1.5);
     const mat = new THREE.NodeMaterial();
     mat.fragmentNode = Fn(() => {
       const p = uv().sub(0.5).mul(uExtent);
       const solid = float(0).toVar();
       Loop(MAXD, ({ i }) => {
         const o = uDiscs.element(i);
-        solid.addAssign(step(length(p.sub(o.xy)), o.z));
+        solid.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), length(p.sub(o.xy))));
       });
       Loop(MAXC, ({ i }) => {
         const ab = uCaps.element(i.mul(2));
@@ -99,7 +102,7 @@ export class WaterSim {
         const a = ab.xy, b = ab.zw;
         const ba = b.sub(a);
         const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
-        solid.addAssign(step(length(p.sub(a.add(ba.mul(t)))), r));
+        solid.addAssign(smoothstep(r.add(uEdge), r.sub(uEdge), length(p.sub(a.add(ba.mul(t))))));
       });
       return vec4(solid.min(1), 0, 0, 1);
     })();
