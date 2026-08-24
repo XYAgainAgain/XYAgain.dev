@@ -146,7 +146,9 @@ export class EelSystem {
     const mesh = this.renderer.createFoodMesh();
     mesh.position.set(x, -0.05, z);
     this.group.add(mesh);
-    this.foods.push({ x, z, y: -0.05, amount, mesh, claims: 0, vy: 0, growPerAmt: 0.02 });
+    // Size bucket picks the eel-eat-* variant when the crumb finishes: 1 big, 2 crumb, 3 tiny.
+    const size = amount >= 0.75 ? 1 : amount >= 0.3 ? 2 : 3;
+    this.foods.push({ x, z, y: -0.05, amount, size, mesh, claims: 0, vy: 0, growPerAmt: 0.02 });
     this.feedRecent += amount;
     if (this.foods.length > 24) { const f = this.foods.shift(); this.group.remove(f.mesh); }
   }

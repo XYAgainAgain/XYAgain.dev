@@ -110,17 +110,42 @@ html.is-idle .chrome:focus-within {
 }
 .btn-tiny[aria-pressed="true"] { border-color: rgb(140 255 220 / 0.5); opacity: 1; }
 
-.sound { display: flex; align-items: center; gap: 6px; }
+.sound { position: relative; display: flex; align-items: center; gap: 6px; }
+/* Dropdown mixer under the sound button. The wrap itself is a transparent hover bridge so the
+   pointer can cross from button to panel without the :hover chain breaking. */
 .volume-wrap {
-  display: flex;
-  align-items: center;
-  width: 0;
-  overflow: hidden;
-  transition: width 200ms ease, opacity 200ms ease;
+  position: absolute;
+  inset-block-start: 100%;
+  inset-inline-end: 0;
+  padding-block-start: 8px;
   opacity: 0;
+  visibility: hidden;
+  translate: 0 -4px;
+  transition: opacity 200ms ease, translate 200ms ease, visibility 200ms;
 }
 .sound:hover .volume-wrap,
-.sound:focus-within .volume-wrap { width: 110px; opacity: 1; }
+.sound:focus-within .volume-wrap { opacity: 1; visibility: visible; translate: 0 0; }
+.volume-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-block: 10px;
+  padding-inline: 12px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 12px;
+  background: var(--glass);
+  backdrop-filter: blur(10px);
+}
+.volume-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.75rem;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.volume-row:first-child { color: var(--ink-strong); }
 .volume {
   width: 100px;
   accent-color: var(--accent);
@@ -195,5 +220,5 @@ html.is-idle .chrome:focus-within {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chrome, .fallback, .volume-wrap { transition: none; }
+  .chrome, .fallback, .volume-wrap { transition: none; translate: none; }
 }

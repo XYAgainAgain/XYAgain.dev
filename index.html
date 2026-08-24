@@ -54,10 +54,18 @@
                         <path class="mute-x" d="M16 9l5 6M21 9l-5 6"/>
                     </svg>
                 </button>
-                <label class="volume-wrap">
-                    <span class="visually-hidden">Volume</span>
-                    <input id="volume" type="range" min="0" max="100" value="70" class="volume">
-                </label>
+                <div class="volume-wrap" id="volume-panel">
+                    <div class="volume-rows">
+                        <label class="volume-row"><span>Master</span>
+                            <input id="volume" type="range" min="0" max="100" value="50" class="volume"></label>
+                        <label class="volume-row"><span>Ambience</span>
+                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="ambience"></label>
+                        <label class="volume-row"><span>Eel Sounds</span>
+                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="eel"></label>
+                        <label class="volume-row"><span>Environmental SFX</span>
+                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="env"></label>
+                    </div>
+                </div>
             </div>
         </div>
 

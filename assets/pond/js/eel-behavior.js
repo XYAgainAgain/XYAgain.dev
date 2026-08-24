@@ -286,7 +286,8 @@ export function steer(sys, e, dt) {
         best.amount -= bite;
         growEel(e, bite * (best.growPerAmt || 0));
         excite = Math.max(excite, 0.5);
-        if (best.amount <= 0) { sys.onEvent?.('eat', e); }
+        if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + rng.range(0.5, 1.1); sys.onEvent?.('nibble', e); }
+        if (best.amount <= 0) { sys.onEvent?.('eat', e, best); }
       }
     }
   } else if (e.food) { e.food = null; }

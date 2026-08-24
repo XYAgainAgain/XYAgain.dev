@@ -119,42 +119,61 @@ async function boot() {
   // Audio + UI
   const audio = new PondAudio();
   const soundBtn = document.getElementById('sound');
-  const volume = document.getElementById('volume');
-  bindSoundButton(soundBtn, volume, audio);
+  bindSoundButton(soundBtn, document.getElementById('volume-panel'), audio);
+  // Dev-only mix console; the module never loads without the flag.
+  if (params.get('mixer') === '1') import('./mixer.js').then((m) => m.attachMixer(audio)).catch((err) => console.warn('Pond: mixer failed to load', err));
   const eelToggleRender = bindEelToggle(document.getElementById('eel-toggle'), (v) => eels.setEnabled(v === 'yes'));
   setupIdleFade(root);
-  eels.onEvent = (type) => { if (type === 'startle') audio.startle(); else if (type === 'eat') audio.eat(); };
+  // World x -> stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
+  const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
+  eels.onEvent = (type, eel, food) => {
+    const pan = toPan(eel.head.x);
+    if (type === 'startle') eel === eleanor ? audio.eleanorStartle({ pan }) : audio.startle({ pan, length: eel.length });
+    else if (type === 'eat') audio.eat(food?.size ?? 1, { pan, rate: eel === eleanor ? 0.5 : 1 });
+    else if (type === 'slurp') audio.slurp({ pan });
+    else if (type === 'nibble') audio.tinyBub({ pan });
+  };
 
   // Input
   const toWorld = (cx, cy) => {
     const { w, h } = viewSize();
     return [(cx / innerWidth - 0.5) * w, (cy / innerHeight - 0.5) * h];
   };
-  let trickleUntil = 0;
+  let swishUntil = 0;
   let lastCrackle = 0;
+  // R-hold crumbs drop on a fixed 250 BPM clock (Tetris-ish tempo), moving or not.
+  const CRUMB_MS = 60000 / 250;
+  let feeding = null;
+  let nextCrumbAt = 0;
   new PondInput(liveCanvas, toWorld, {
     poke: (x, z) => {
       sim.addDrop(x, z, 0.5, motion.reduced ? 0.08 : 0.2);
       eels.spook(x, z, 1);
-      audio.plip(1);
+      audio.plip(1, toPan(x));
     },
     dragStart: () => {},
     dragMove: (x, z, moved, path) => {
       sim.addDrop(x, z, 0.55, Math.min(0.07, 0.01 + moved * 0.07));
       if (path.length < 8) eels.spook(x, z, 0.5); else eels.lure(x, z);
-      trickleUntil = performance.now() + 180;
-      audio.trickle(true);
+      swishUntil = performance.now() + 180;
+      audio.swish(true);
+      audio.swishPan(toPan(x));
     },
     dragEnd: (path) => { for (const p of path.slice(-6)) eels.lure(p.x, p.z); },
-    feed: (x, z) => { eels.feed(x, z, 1); sim.addDrop(x, z, 0.18, 0.012); audio.plop(); },
-    feedDragMove: (x, z, moved, path) => {
-      if (path.length % 3 === 0) { eels.feed(x, z, 0.35); sim.addDrop(x, z, 0.14, 0.006); }
+    feed: (x, z) => {
+      eels.feed(x, z, 1);
+      sim.addDrop(x, z, 0.18, 0.012);
+      audio.plop('big', toPan(x));
+      feeding = { x, z };
+      nextCrumbAt = performance.now() + CRUMB_MS;
     },
+    feedDragMove: (x, z) => { if (feeding) { feeding.x = x; feeding.z = z; } },
     feedDragEnd: (path) => {
+      feeding = null;
       const loop = detectLoop(path);
-      if (loop) { eels.vortex(loop.x, loop.z, loop.radius); audio.crackle(); }
+      if (loop) { eels.vortex(loop.x, loop.z, loop.radius); audio.crackle('med', { pan: toPan(loop.x) }); }
     },
-    recolor: () => { eels.recolor(); audio.crackle(); },
+    recolor: () => { feeding = null; eels.recolor(); audio.crackle('lil'); },
   });
 
   // Gate
@@ -176,6 +195,17 @@ async function boot() {
       await audio.unlock();
       audio.setMuted(false);
     });
+  }
+
+  // A stray bubble reaches the surface now and then: quiet bloop, tiny ripple where it broke.
+  let nextBubble = 6;
+  function strayBubbles(now) {
+    if (now < nextBubble) return;
+    nextBubble = now + 7 + Math.random() * 13;
+    const { w, h } = viewSize();
+    const bx = (Math.random() - 0.5) * w * 0.9;
+    audio.shortBub({ pan: toPan(bx) });
+    if (!motion.reduced) sim.addDrop(bx, (Math.random() - 0.5) * h * 0.9, 0.3, 0.02);
   }
 
   // Idle ripples arrive from off-screen, so the pond never looks dead.
@@ -242,8 +272,15 @@ async function boot() {
     moonDir.set(Math.cos(MOON_ELEVATION) * Math.cos(az), Math.sin(MOON_ELEVATION), Math.cos(MOON_ELEVATION) * Math.sin(az));
     U.moonDir.value.copy(moonDir);
 
-    if (performance.now() > trickleUntil) audio.trickle(false);
+    if (performance.now() > swishUntil) audio.swish(false);
+    if (feeding && performance.now() >= nextCrumbAt) {
+      nextCrumbAt = performance.now() + CRUMB_MS;
+      eels.feed(feeding.x, feeding.z, 0.35);
+      sim.addDrop(feeding.x, feeding.z, 0.14, 0.006);
+      audio.plop('smol', toPan(feeding.x));
+    }
     idleDrops(t, dt);
+    strayBubbles(t);
     eels.update(dt);
     // Caustics follow the water, so they only need redrawing on frames the sim actually stepped.
     if (sim.update(dt) > 0 || t < 0.5) caustics.render();
@@ -255,7 +292,16 @@ async function boot() {
     if (debugQuad) { debugQuad.update(); renderer.setRenderTarget(null); debugQuad.render(renderer); }
     else surface.render();
 
-    if (eels.enabled && t - lastCrackle > 4 && Math.random() < dt * 0.08) { lastCrackle = t; audio.crackle(); }
+    // Long sounds ride each creature's own panner, so they sweep the stereo field as it swims.
+    if (audio.unlocked && eels.enabled) {
+      for (const e of eels.eels) audio.setTrackPan(e.index, toPan(e.head.x));
+      if (eleanor.body?.visible) audio.setTrackPan(eleanor.index, toPan(eleanor.head.x));
+    }
+    if (eels.enabled && t - lastCrackle > 4 && Math.random() < dt * 0.08) {
+      lastCrackle = t;
+      const e = eels.eels[Math.floor(Math.random() * eels.eels.length)];
+      audio.crackle('auto', { length: e.length, track: e.index });
+    }
     if (t > 1) eels.endPrewarm();
   }
 

@@ -1,6 +1,6 @@
 import { IDLE_FADE_MS, STORAGE_KEY } from './config.js';
 
-/* The eel gate, idle fade, sound button, and legend toggle. Pure DOM, no rendering. */
+/* The eel gate, idle fade, sound button + volume dropdown, and legend toggle. Pure DOM, no rendering. */
 export function readEelChoice() {
   try { return localStorage.getItem(STORAGE_KEY); } catch { return null; }
 }
@@ -40,24 +40,28 @@ export function askAboutEels(dialog) {
   });
 }
 
-export function bindSoundButton(btn, slider, audio) {
+export function bindSoundButton(btn, panel, audio) {
+  const master = panel.querySelector('#volume');
+  const busSliders = [...panel.querySelectorAll('[data-bus]')];
   const render = () => {
     const off = !audio.unlocked || audio.muted;
     btn.setAttribute('aria-pressed', String(!off));
     btn.dataset.state = !audio.unlocked ? 'locked' : audio.muted ? 'muted' : 'on';
     btn.setAttribute('aria-label', !audio.unlocked ? 'Turn sound on' : audio.muted ? 'Unmute' : 'Mute');
-    slider.value = String(Math.round(audio.volume * 100));
+    master.value = String(Math.round(audio.volume * 100));
+    for (const s of busSliders) s.value = String(Math.round(audio.busVolume(s.dataset.bus) * 100));
   };
   btn.addEventListener('click', async () => {
     if (!audio.unlocked) { await audio.unlock(); audio.setMuted(false); }
     else audio.setMuted(!audio.muted);
     render();
   });
-  slider.addEventListener('input', () => {
-    audio.setVolume(slider.valueAsNumber / 100);
-    if (audio.muted && slider.valueAsNumber > 0) audio.setMuted(false);
+  master.addEventListener('input', () => {
+    audio.setVolume(master.valueAsNumber / 100);
+    if (audio.muted && master.valueAsNumber > 0) audio.setMuted(false);
     render();
   });
+  for (const s of busSliders) s.addEventListener('input', () => audio.setBusVolume(s.dataset.bus, s.valueAsNumber / 100));
   audio.onState = render;
   render();
 }

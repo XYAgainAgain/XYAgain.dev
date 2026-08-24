@@ -80,7 +80,9 @@ function teleport(e, x, z, ang, y = -DEPTH + e.radius + 0.1) {
   e.targetY = y;
 }
 
-function pickExit(e) {
+/* Only ever called when she leaves the log, so the gravelly startle rides along here. */
+function pickExit(sys, e) {
+  sys.onEvent?.('startle', e);
   return e.rng.chance(0.4) ? 'turn' : e.rng.chance(0.58) ? 'reverse' : 'ahead';
 }
 
@@ -112,21 +114,21 @@ function brain(sys, e, dt) {
       e.checkAt = now + 1;
       const fromLair = e.state === 'lair';
       // A hot pond empties even the lair; otherwise: repossessions first, then dinner, then a lap.
-      if (fromLair && sys.perfHot) { begin(e, 'depart', now); e.exiting = pickExit(e); return; }
+      if (fromLair && sys.perfHot) { begin(e, 'depart', now); e.exiting = pickExit(sys, e); return; }
       if (!sys.perfHot) {
         const gnarly = sys.eels.filter((r) => r.length > SLURP_AT && !r.slurpedBy);
         if (gnarly.length) {
           gnarly.sort((a, b) => b.length - a.length);
           e.prey = gnarly[0];
           begin(e, 'hunt', now);
-          e.exiting = fromLair ? pickExit(e) : null;
+          e.exiting = fromLair ? pickExit(sys, e) : null;
         } else if (sys.feedRecent >= FEED_WORTH) {
           sys.feedRecent = 0;
           begin(e, 'graze', now);
-          e.exiting = fromLair ? pickExit(e) : null;
+          e.exiting = fromLair ? pickExit(sys, e) : null;
         } else if (now > e.nextSwimBy) {
           begin(e, 'swimby', now);
-          e.exiting = fromLair ? pickExit(e) : null;
+          e.exiting = fromLair ? pickExit(sys, e) : null;
           e.swimbyX = e.rng.range(-sys.view.w * 0.35, sys.view.w * 0.35);
           e.swimbyZ = e.rng.range(-sys.view.h * 0.35, sys.view.h * 0.35);
         } else if (e.state === 'offstage' && e.lair && now > e.coolAt) {
@@ -140,7 +142,7 @@ function brain(sys, e, dt) {
 
   // Stuck rescue ladder: nope backward down her own path first; the hard park is the last resort.
   if (now - e.stateAt > VISIT_CAP + 20) {
-    if (!e.rescued) { e.rescued = true; e.stateAt = now - VISIT_CAP - 10; e.nopePulse = now + 1.4; }
+    if (!e.rescued) { e.rescued = true; e.stateAt = now - VISIT_CAP - 10; e.nopePulse = now + 1.4; sys.onEvent?.('startle', e); }
     else {
       // Never park with someone in her jaws: any abandoned meal gets spat before she vanishes.
       if (e.prey && e.prey.slurpedBy === e) spit(sys, e, now);
@@ -228,6 +230,7 @@ function brain(sys, e, dt) {
       p.slurpedBy = e;
       e.slurpT = 0;
       begin(e, 'slurp', now);
+      sys.onEvent?.('slurp', e);
       return;
     }
   } else {
@@ -244,7 +247,8 @@ function brain(sys, e, dt) {
       wantBL = e.prowlBL;
       best.amount -= dt * 3;
       e.uExcite.value += (0.7 - e.uExcite.value) * Math.min(1, dt * 2);
-      if (best.amount <= 0) sys.onEvent?.('eat', e);
+      if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(0.4, 0.9); sys.onEvent?.('nibble', e); }
+      if (best.amount <= 0) sys.onEvent?.('eat', e, best);
     }
   }
 
@@ -296,6 +300,7 @@ function brain(sys, e, dt) {
   if (head.y > -e.radius * 1.2 && now > e.rippleAt && !sys.motion.reduced) {
     e.rippleAt = now + 0.22;
     sys.sim.addDrop(head.x, head.z, 0.7 + e.radius, 0.014 * speed);
+    if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(1.2, 2.4); sys.onEvent?.('nibble', e); }
   }
 
   // Stuck: commanded speed with no progress. Nope backward early; two strikes abandons the outing.
@@ -307,7 +312,7 @@ function brain(sys, e, dt) {
       e.stuckFor = 0;
       e.stuckStrikes++;
       if (e.stuckStrikes >= 2) { e.stuckStrikes = 0; goHome(sys, e, now); }
-      else e.nopePulse = now + 1.3;
+      else { e.nopePulse = now + 1.3; sys.onEvent?.('startle', e); }
     }
   }
   e.lastX = head.x; e.lastZ = head.z;
@@ -346,7 +351,6 @@ function spit(sys, e, now) {
   p.speedBL = p.cruiseBL;
   p.fleeUntil = now + 1;
   setVisible(p, true);
-  sys.onEvent?.('eat', e);
-  // The queen stays winning.
+  // The queen stays winning. (No eat sound here: the slurp already covered the meal.)
   growEel(e, 0.5);
 }
