@@ -7,6 +7,8 @@ import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet } from './shading.js';
 import { buildFloor } from './floor.js';
 import { EelSystem } from './eels.js';
+import { attachEleanor } from './eleanor.js';
+import { growEel } from './eel-physics.js';
 import { SurfacePass } from './surface.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
@@ -66,6 +68,7 @@ async function boot() {
   const { colliders } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH });
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, { w: viewW, h: viewH });
+  const eleanor = attachEleanor(eels, seed);
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -192,6 +195,8 @@ async function boot() {
   const timer = new THREE.Timer();
   timer.connect(document);
   let t = 0;
+  // Diegetic performance watcher: a sustained hot pond gates Eleanor's visits (and future quality tiers).
+  let perfEma = 8, perfHotFor = 0;
   let running = false;
   const moonDir = new THREE.Vector3();
   const epoch = (Date.now() / 1000) % MOON_ORBIT_SECONDS;
@@ -227,6 +232,9 @@ async function boot() {
     if (debug && rawDt > 0.05 && t > 3) console.warn(`Pond: slow frame ${(rawDt * 1000).toFixed(0)} ms (drops ${sim.pending.length}, foods ${eels.foods.length}, eels ${eels.enabled})`);
     const dt = Math.min(rawDt, 0.05);
     t += dt;
+    perfEma += (rawDt * 1000 - perfEma) * 0.05;
+    perfHotFor = perfEma > 14 ? perfHotFor + dt : 0;
+    eels.perfHot = perfHotFor > 4;
     U.time.value = t % 4096;
     surface.uReveal.value += (revealTarget - surface.uReveal.value) * Math.min(1, dt * 1.2);
 
@@ -294,7 +302,8 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, U, surface, seed,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed,
+      grow: (i, d = 1) => growEel(eels.eels[i], d),
       stats: fpsStats,
       diag: async () => {
         console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '));

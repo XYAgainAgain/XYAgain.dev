@@ -97,7 +97,28 @@ export class EelRenderer {
       return world;
     })();
 
-    const emission = Fn(() => {
+    // Eleanor's glow is its own animal: dim wavy ridge lines running the length of the body plus a
+    // pink tail photophore with a rare red flash (the pelican eel's real trick), not the pattern mix.
+    const emission = e.identity?.dorsalGlow ? Fn(() => {
+      const t = vUV.x, ang = vUV.y;
+      const time = U.time;
+      const wander = sin(t.mul(7).sub(time.mul(0.2)).add(e.uSeed)).mul(0.5);
+      const ridge = (mu, w, gain) => smoothstep(w, 0.0, abs(sin(ang.sub(mu).sub(wander).mul(0.5)))).mul(gain);
+      const lines = ridge(0, 0.18, 1.0).add(ridge(2.4, 0.12, 0.35)).add(ridge(-2.4, 0.12, 0.35));
+      const drift = sin(time.mul(0.11).add(t.mul(3)).add(e.uSeed)).mul(0.2).add(0.8);
+      const tip = smoothstep(0.9, 1.0, t);
+      const tipPulse = sin(time.mul(0.7).add(e.uSeed)).mul(0.18).add(0.82);
+      // Double warning blink every ~4 s, the way real photophore flashes come in bursts; a charging
+      // pulse rides the strips tailward each cycle so the tip's blink reads as its arrival.
+      const cyc = time.mul(0.25).add(e.uSeed).fract();
+      const travel = smoothstep(0.16, 0.0, abs(t.sub(cyc))).mul(1.4);
+      const blink = (c) => smoothstep(0.0, 0.02, cyc.sub(c)).mul(smoothstep(0.07, 0.05, cyc.sub(c)));
+      const flash = blink(0.05).add(blink(0.16)).mul(2.6);
+      const body = mix(e.uColA, e.uColB, sin(t.mul(2).add(time.mul(0.05))).mul(0.5).add(0.5)).mul(lines).mul(drift.mul(0.5).add(travel));
+      const tail = vec3(1.0, 0.3, 0.55).mul(tip).mul(tipPulse.mul(1.25)).add(vec3(1.0, 0.05, 0.1).mul(tip).mul(flash));
+      const eyeT = smoothstep(0.0, 0.05, t).oneMinus();
+      return body.add(tail).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.25));
+    }) : Fn(() => {
       const t = vUV.x, ang = vUV.y;
       const time = U.time;
       const stripes = smoothstep(0.35, 0.65, sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5));
@@ -190,6 +211,18 @@ export class EelRenderer {
       f.mesh.position.set(f.x, f.y, f.z);
       f.mesh.scale.setScalar(Math.max(0.2, Math.min(1, f.amount)));
     }
+  }
+
+  /* Guests sync spine and eyes only; they have no slot in the EEL_COUNT environment-light arrays. */
+  syncGuest(e, alpha) {
+    for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
+    const h = e.show[0], n1 = e.show[1];
+    tmpA.subVectors(h, n1).normalize();
+    tmpB.crossVectors(tmpA, UP).normalize();
+    const r = e.radius * 0.95;
+    e.eyes[0].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, r * 0.62);
+    e.eyes[1].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, -r * 0.62);
+    e.eyes[0].position.y += r * 0.22; e.eyes[1].position.y += r * 0.22;
   }
 
   dispose(eels) {

@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { DEPTH, EEL_POINTS } from './config.js';
-import { segDist, retreatAlongTrail } from './eel-physics.js';
+import { segDist, retreatAlongTrail, growEel } from './eel-physics.js';
 
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 const axis = new THREE.Vector3(), rel = new THREE.Vector3(), nearest = new THREE.Vector3();
@@ -35,14 +35,15 @@ export function startTunnel(e, entry, exit, now) {
   e.retargetAt = now + 30;
 }
 
-export function pickTarget(e, now) {
+export function pickTarget(sys, e, now) {
   const rng = e.rng;
   e.coverSpot = null;
   const flock = e.flock || [];
   // Tunnel runs: a good share of the time the next destination is one log mouth, then the other.
-  // Crowded cover loses its appeal: every current claimant halves the draw toward that spot.
+  // Crowded cover loses its appeal, and a laired guest closes the log to everyone but her admirer.
   const log = e.colliders.logs[0];
-  if (log && e.tunnel === null && logFits(e, log)) {
+  const lairBlocked = !!(sys?.lairGuest && e.quirks.follows !== sys.lairGuest.name);
+  if (log && !lairBlocked && e.tunnel === null && logFits(e, log)) {
     const logClaims = flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'log' ? 1 : 0), 0);
     if (rng.chance(Math.min(0.85, 0.4 * e.traits.cover) / (1 + logClaims))) {
       const fromA = rng.chance(0.5);
@@ -79,12 +80,26 @@ function updateGait(e, now) {
   else { e.gait = rng.chance(0.35) ? 'cruise' : 'prowl'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
 }
 
+/* Tail beat is an output of speed; wavelength comes from measured slip, clamped to 0.58–0.85 L.
+   Shared by steer() and guest brains (Eleanor) so every swimmer waves honestly. */
+export function paceWave(e, dt, resting) {
+  const f = F_IDLE + F_K * e.speedBL;
+  e.wavePhase += Math.PI * 2 * f * dt;
+  if (e.wavePhase > WRAP) e.wavePhase -= WRAP;
+  const lambda = Math.min(0.85, Math.max(0.58, e.speedBL / (slipFor(e.speedBL) * f)));
+  e.waveK = (Math.PI * 2) / ((EEL_POINTS - 1) * lambda);
+  e.ampMul += ((resting ? 0.15 : 1) - e.ampMul) * Math.min(1, dt * 3);
+  e.anterior += ((0.2 + 0.8 * Math.min(1, e.speedBL / 1.6)) - e.anterior) * Math.min(1, dt * 3);
+  return f;
+}
+
 /* The nope: hold tight if already denned, back straight up when threatened head-on with trail
    to spare, bolt for the log when it fits and is close; otherwise the plain flee burst handles it. */
 function nope(sys, e, s, now) {
   const head = e.head;
   const log = sys.colliders.logs[0];
-  if (log && segDist(head.x, head.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rInner) {
+  const lairBlocked = !!(sys.lairGuest && e.quirks.follows !== sys.lairGuest.name);
+  if (log && !lairBlocked && segDist(head.x, head.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rInner) {
     if (!e.tunnel) {
       const da = Math.hypot(log.a.x - s.x, log.a.z - s.z), db = Math.hypot(log.b.x - s.x, log.b.z - s.z);
       const exit = da > db ? log.a : log.b;   // continue toward the mouth farther from the threat
@@ -98,12 +113,12 @@ function nope(sys, e, s, now) {
     return;
   }
   tmpB.set(s.x - head.x, 0, s.z - head.z);
-  if (tmpB.length() < e.length && tmpB.normalize().dot(e.heading) > 0.4 && e.trailCount > EEL_POINTS * 3) {
+  if (tmpB.length() < e.length && tmpB.normalize().dot(e.heading) > 0.4 && e.trailCount > 8) {
     e.tunnel = null;
     e.nopeUntil = now + 1.1;
     return;
   }
-  if (log && logFits(e, log)) {
+  if (log && !lairBlocked && logFits(e, log)) {
     const da = Math.hypot(log.a.x - head.x, log.a.z - head.z), db = Math.hypot(log.b.x - head.x, log.b.z - head.z);
     if (Math.min(da, db) < e.length * 2.5) {
       const nearA = da < db;
@@ -135,6 +150,24 @@ export function steer(sys, e, dt) {
   const head = e.head;
 
   if (now < e.nopeUntil) { nopingTick(sys, e, dt); return; }
+  if (e.nopeZig > 0) {
+    // Second half of the zig-zag: flick the heading and back up again on the new line.
+    e.nopeZig--;
+    const zf = e.rng.chance(0.5) ? 0.6 : -0.6;
+    const zc = Math.cos(zf), zs = Math.sin(zf);
+    e.heading.set(e.heading.x * zc - e.heading.z * zs, 0, e.heading.x * zs + e.heading.z * zc);
+    e.nopeUntil = now + 0.5;
+    nopingTick(sys, e, dt);
+    return;
+  }
+  if (e.attnReset) {
+    // Unstuck by forgetting, not teleporting: drop the claim, the run, and the plan, then re-decide.
+    e.attnReset = false;
+    if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
+    e.tunnel = null;
+    e.gaitUntil = 0;
+    pickTarget(sys, e, now);
+  }
   e.reverse = false;
 
   const force = tmpA.set(0, 0, 0);
@@ -142,6 +175,7 @@ export function steer(sys, e, dt) {
   let excite = 0;
 
   // Hiding freezes the run mid-bore; the timer clears and the run resumes on its own.
+  const berthed = !!(sys.lairGuest && e.quirks.follows !== sys.lairGuest.name);
   const hiding = !!(e.tunnel && e.tunnel.hideUntil && now > e.tunnel.hideFrom && now < e.tunnel.hideUntil);
   if (e.tunnel && e.tunnel.hideUntil && now >= e.tunnel.hideUntil) e.tunnel.hideUntil = 0;
 
@@ -153,11 +187,11 @@ export function steer(sys, e, dt) {
       if (e.tunnel.wantHide) { e.tunnel.wantHide = false; e.tunnel.hideFrom = now + 0.6; e.tunnel.hideUntil = now + 0.6 + rng.range(3, 8); }
     }
     else if (e.tunnel.stage === 1 && dxz < 0.4) { e.tunnel.stage = 2; e.target.copy(e.tunnel.runout); }
-    else if (e.tunnel.stage === 2 && dxz < 0.5) { e.tunnel = null; pickTarget(e, now); }
+    else if (e.tunnel.stage === 2 && dxz < 0.5) { e.tunnel = null; pickTarget(sys, e, now); }
     if (e.tunnel) { e.targetY = e.tunnel.entry.y; e.retargetYAt = now + 2; }
   }
   // Never abandon a run mid-bore: turning around inside the log drags the body through its wall.
-  if ((now > e.retargetAt && e.tunnel?.stage !== 1) || (!e.tunnel && head.distanceTo(e.target) < 0.6)) pickTarget(e, now);
+  if ((now > e.retargetAt && e.tunnel?.stage !== 1) || (!e.tunnel && head.distanceTo(e.target) < 0.6)) pickTarget(sys, e, now);
   tmpB.subVectors(e.target, head); tmpB.y = 0; tmpB.normalize();
   force.addScaledVector(tmpB, hiding ? 0 : e.tunnel ? 1.4 : 0.6);
 
@@ -217,8 +251,8 @@ export function steer(sys, e, dt) {
     let best = null, bestScore = Infinity;
     for (const f of sys.foods) {
       if (f.amount <= 0) continue;
-      // Bore food is invisible to an eel that cannot fit through the mouth.
-      if (!fits && log && segDist(f.x, f.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rInner) continue;
+      // Bore food is invisible to an eel that cannot fit through the mouth, or dares not enter.
+      if ((!fits || berthed) && log && segDist(f.x, f.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rInner) continue;
       const d = Math.hypot(f.x - head.x, f.z - head.z);
       const score = d + f.claims * 2.2 * (1 + e.traits.yield * 2) - (e.food === f ? e.traits.persistence : 0);
       if (score < bestScore) { bestScore = score; best = f; }
@@ -233,17 +267,24 @@ export function steer(sys, e, dt) {
       // bore do the steering until the head is actually inside.
       let pull = 4.0 * e.traits.hunger;
       if (log && segDist(best.x, best.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rOuter) {
-        if (!e.tunnel && fits) {
+        if (!e.tunnel && fits && !berthed) {
           const nearA = Math.hypot(log.a.x - head.x, log.a.z - head.z) < Math.hypot(log.b.x - head.x, log.b.z - head.z);
           startTunnel(e, nearA ? log.a : log.b, nearA ? log.b : log.a, now);
         }
         if (segDist(head.x, head.z, log.a.x, log.a.z, log.b.x, log.b.z) > log.rInner) pull = 0;
       }
-      force.x += (dx / (d + 0.01)) * pull; force.z += (dz / (d + 0.01)) * pull;
-      speedMul = Math.max(speedMul, 1 + 0.5 * e.traits.hunger);
+      // Dinner-circle approach: each eel aims at its own side of the crumb until it is close enough to bite.
+      const ringA = e.index * (Math.PI / 3);
+      const ringR = Math.min(0.35, d * 0.4);
+      const ax = best.x + Math.cos(ringA) * ringR - head.x, az = best.z + Math.sin(ringA) * ringR - head.z;
+      force.x += (ax / (d + 0.01)) * pull; force.z += (az / (d + 0.01)) * pull;
+      // Brake on approach: a full-speed turning circle is wider than the crumb, which reads as orbiting.
+      speedMul = Math.max(speedMul, 1 + 0.5 * e.traits.hunger * Math.min(1, d / 1.5));
       e.targetY = Math.max(e.targetY, -0.25);
       if (d < 0.35) {
-        best.amount -= dt * 0.6;
+        const bite = Math.min(best.amount, dt * 0.6);
+        best.amount -= bite;
+        growEel(e, bite * (best.growPerAmt || 0));
         excite = Math.max(excite, 0.5);
         if (best.amount <= 0) { sys.onEvent?.('eat', e); }
       }
@@ -266,20 +307,24 @@ export function steer(sys, e, dt) {
   }
 
   // Idle spacing: resting eels spread out instead of dogpiling; bonded partners may cuddle.
+  // Guests (Eleanor) count too, and her sheer length buys her a wide berth from the same math.
   let crowd = 0;
   if (!e.tunnel) {
-    for (const o of sys.eels) {
-      if (o === e || o === e.partner) continue;
+    const sep = (o) => {
+      if (o === e || o === e.partner || o.slurpedBy) return;
       const dx = head.x - o.head.x, dz = head.z - o.head.z;
       const d = Math.hypot(dx, dz);
       const want = (e.length + o.length) * 0.25;
       if (d < want && d > 1e-4) {
-        const calmness = 1 - Math.min(1, e.speedBL / e.cruiseBL);
+        // Floor keeps a little personal space even mid-scramble, so feeding is a circle, not a pile.
+        const calmness = Math.max(0.25, 1 - Math.min(1, e.speedBL / e.cruiseBL));
         const k = (1 - d / want) * 1.2 * calmness;
         force.x += (dx / d) * k; force.z += (dz / d) * k;
         crowd = Math.max(crowd, k);
       }
-    }
+    };
+    for (const o of sys.eels) sep(o);
+    for (const o of sys.guests) sep(o);
   }
 
   // Steer around rocks and the log wall before the head touches them (a shoved head kinks the trail).
@@ -298,16 +343,18 @@ export function steer(sys, e, dt) {
     }
   }
   if (!e.tunnel) {
+    // A laired guest widens the keep-out ring around her log for everyone except her admirer.
+    const berth = berthed ? 4 : 1;
     for (const l of sys.colliders.logs) {
       // force aliases tmpA, so this block keeps to its own temporaries.
       axis.subVectors(l.b, l.a); rel.subVectors(head, l.a);
       const t = Math.max(0, Math.min(1, rel.dot(axis) / axis.lengthSq()));
       nearest.copy(l.a).addScaledVector(axis, t);
       const dx = head.x - nearest.x, dz = head.z - nearest.z;
-      const d = Math.hypot(dx, dz), reach = l.rOuter + lookahead;
+      const d = Math.hypot(dx, dz), reach = l.rOuter * berth + lookahead;
       if (d < reach && d > 1e-4) {
         const top = l.a.y + l.rOuter;
-        const canClear = top < -e.radius * 2.5;
+        const canClear = berth === 1 && top < -e.radius * 2.5;
         const k = (1 - d / reach) * (canClear ? 0.7 : 2.5);
         force.x += (dx / d) * k; force.z += (dz / d) * k;
         if (canClear && d < l.rOuter + 0.6) e.targetY = Math.max(e.targetY, top + e.radius * 1.5);
@@ -325,7 +372,8 @@ export function steer(sys, e, dt) {
   if (force.x * force.x + force.z * force.z > 1e-6) {
     let diff = Math.atan2(force.z, force.x) - Math.atan2(e.heading.z, e.heading.x);
     diff = Math.atan2(Math.sin(diff), Math.cos(diff));
-    const maxTurn = e.turnRate * (1 + 0.6 * (e.speedMul - 1)) * dt;
+    // Slow eels corner harder: max yaw grows as speed drops, so close-quarters turns stay tight.
+    const maxTurn = e.turnRate * (1 + 0.6 * (e.speedMul - 1)) * (1.6 - 0.6 * Math.min(1, e.speedBL / e.cruiseBL)) * dt;
     const yaw = Math.max(-maxTurn, Math.min(maxTurn, diff * Math.min(1, dt * 7)));
     const c = Math.cos(yaw), sn = Math.sin(yaw);
     const hx = e.heading.x * c - e.heading.z * sn, hz = e.heading.x * sn + e.heading.z * c;
@@ -354,14 +402,7 @@ export function steer(sys, e, dt) {
   e.speedBL += Math.max(-rate * dt, Math.min(rate * dt, wantBL - e.speedBL));
   const speed = e.speedBL * e.length;
 
-  // Tail beat is an output of speed; wavelength comes from measured slip, clamped to 0.58–0.85 L.
-  const f = F_IDLE + F_K * e.speedBL;
-  e.wavePhase += Math.PI * 2 * f * dt;
-  if (e.wavePhase > WRAP) e.wavePhase -= WRAP;
-  const lambda = Math.min(0.85, Math.max(0.58, e.speedBL / (slipFor(e.speedBL) * f)));
-  e.waveK = (Math.PI * 2) / ((EEL_POINTS - 1) * lambda);
-  e.ampMul += ((gait === 'hold' ? 0.15 : 1) - e.ampMul) * Math.min(1, dt * 3);
-  e.anterior += ((0.2 + 0.8 * Math.min(1, e.speedBL / 1.6)) - e.anterior) * Math.min(1, dt * 3);
+  const f = paceWave(e, dt, gait === 'hold');
 
   const side = tmpC.set(-e.heading.z, 0, e.heading.x);
   head.addScaledVector(e.heading, speed * dt);
@@ -377,4 +418,19 @@ export function steer(sys, e, dt) {
     e.rippleAt = now + 0.3;
     sys.sim.addDrop(head.x, head.z, 0.45 + e.radius, 0.008 * speed);
   }
+
+  // Stuck check: commanded speed but no progress → two zig-zag nopes, then fresh interests.
+  const cmd = e.speedBL * e.length;
+  if (e.lastX !== undefined && cmd > 0.35) {
+    const moved = Math.hypot(head.x - e.lastX, head.z - e.lastZ);
+    if (moved < cmd * dt * 0.3) e.stuckFor += dt; else e.stuckFor = Math.max(0, e.stuckFor - dt * 2);
+    if (e.stuckFor > 1.5 && e.trailCount > 8) {
+      e.stuckFor = 0;
+      e.nopeZig = 1;
+      e.attnReset = true;
+      e.tunnel = null;
+      e.nopeUntil = now + 0.7;
+    }
+  }
+  e.lastX = head.x; e.lastZ = head.z;
 }

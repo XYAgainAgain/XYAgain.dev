@@ -65,12 +65,13 @@ export const IDENTITIES = [
     quirks: { rippleChase: true },
   },
   {
-    name: 'Eleanor',   // the mega-eel; inactive until the off-screen entry system exists
+    name: 'Eleanor',   // the mega-eel; not in the active rotation, attached as a guest with her own brain
     active: false,
-    build: { length: [5.5, 7.0], radius: [0.24, 0.28] },   // barely fits under the surface; drifting up breaches
+    dorsalGlow: true,   // dim wavy ridge lights + tail photophore instead of the standard pattern glow
+    build: { length: [7.5, 8.5], radius: [0.24, 0.28] },   // barely fits under the surface; drifting up breaches
     colorsA: [PURPLE], colorsB: [TEAL],
     pattern: { stripe: [0.4, 0.3, 0.6], spot: [0.9, 0.6, 1], flank: [0.9, 0.6, 1], wavy: [1, 2.5] },
-    traits: { spookMul: 0.3, cover: 0.4 },
+    traits: { spookMul: 0.3, cover: 0.4, turn: [1.2, 1.8], cruise: [0.3, 0.42], prowl: [0.15, 0.25] },
   },
 ];
 

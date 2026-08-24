@@ -1,12 +1,12 @@
 import * as THREE from 'three/webgpu';
 import { EEL_COUNT, EEL_POINTS, DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
-import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, rememberPushes } from './eel-physics.js';
+import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, rememberPushes, tailAmp } from './eel-physics.js';
 import { expire, pickTarget, steer } from './eel-behavior.js';
 import { EelRenderer } from './eel-render.js';
 import { identityFor, applyIdentity, rollIdentityColors, rollIdentityPattern } from './eel-identity.js';
 
-class Eel {
+export class Eel {
   constructor(index, seed, extent, colliders, view, identity) {
     this.view = view;
     this.index = index;
@@ -16,7 +16,9 @@ class Eel {
     // Identity sets name, build, speeds (in body lengths/s), and traits; the rolls below stay universal.
     applyIdentity(this, identity, rng);
     this.spacing = this.length / (EEL_POINTS - 1);
-    this.ampTail = this.length * rng.range(0.08, 0.11);   // half-amplitude at the tail tip
+    this.baseLength = this.length;   // snake growth resets here after a SLURP
+    this.ampRatio = rng.range(0.05, 0.07);   // tail-tip half-amplitude fraction; real eels run ~0.10 L but that thrashes at our scale
+    this.ampTail = tailAmp(this);
     this.wavePhase = rng.range(0, Math.PI * 2);
     this.extent = extent;
     this.colliders = colliders;
@@ -70,6 +72,10 @@ class Eel {
     this.nopeUntil = 0;
     this.coverSpot = null;
     this.flock = null;
+    this.stuckFor = 0;
+    this.nopeZig = 0;
+    this.attnReset = false;
+    this.slurpedBy = null;
     this.rollColors(rng);
     this.rollPattern(rng);
   }
@@ -93,6 +99,9 @@ export class EelSystem {
     this.colliders = colliders;
     this.rng = createRng(deriveSeed(seed, 5));
     this.eels = [];
+    this.guests = [];              // Eleanor-class residents: own brain, shared physics and renderer
+    this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
+    this.feedRecent = 0;           // decaying feed-spree meter; the residents eat too fast for a stock check
     this.spooks = [];              // { x, z, t, strength }
     this.lures = [];               // curiosity points from drags: { x, z, t }
     this.foods = [];               // { x, z, y, amount, mesh, claims }
@@ -102,7 +111,7 @@ export class EelSystem {
     this.group = this.renderer.group;
     for (let i = 0; i < EEL_COUNT; i++) {
       const e = new Eel(i, seed, extent, colliders, view, identityFor(i));
-      pickTarget(e, 0);
+      pickTarget(this, e, 0);
       this.eels.push(e);
       this.renderer.buildMesh(e);
     }
@@ -137,7 +146,8 @@ export class EelSystem {
     const mesh = this.renderer.createFoodMesh();
     mesh.position.set(x, -0.05, z);
     this.group.add(mesh);
-    this.foods.push({ x, z, y: -0.05, amount, mesh, claims: 0, vy: 0 });
+    this.foods.push({ x, z, y: -0.05, amount, mesh, claims: 0, vy: 0, growPerAmt: 0.02 });
+    this.feedRecent += amount;
     if (this.foods.length > 24) { const f = this.foods.shift(); this.group.remove(f.mesh); }
   }
   vortex(x, z, radius) {
@@ -160,27 +170,30 @@ export class EelSystem {
       this.tick(TICK);
     }
     this.renderer.sync(this.eels, this.foods, this.acc / TICK);
+    for (const g of this.guests) this.renderer.syncGuest(g, this.acc / TICK);
   }
 
   tick(dt) {
     this.time += dt;
-    for (const e of this.eels) for (let i = 0; i < EEL_POINTS; i++) e.pose0[i].copy(e.pts[i]);
-    for (const e of this.eels) steer(this, e, dt);
-    for (const e of this.eels) followBody(e);
-    for (const e of this.eels) for (let i = 0; i < EEL_POINTS; i++) e.prev[i].copy(e.pts[i]);
-    collide(this.eels, this.colliders);
-    for (const e of this.eels) constrain(e);
-    for (const e of this.eels) rememberPushes(e);
+    const all = this.guests.length ? this.eels.concat(this.guests) : this.eels;
+    for (const e of all) for (let i = 0; i < EEL_POINTS; i++) e.pose0[i].copy(e.pts[i]);
+    for (const e of all) if (!e.slurpedBy) (e.brain || steer)(this, e, dt);
+    for (const e of all) if (!e.slurpedBy) followBody(e);
+    for (const e of all) for (let i = 0; i < EEL_POINTS; i++) e.prev[i].copy(e.pts[i]);
+    collide(all, this.colliders);
+    for (const e of all) if (!e.slurpedBy) constrain(e);
+    for (const e of all) if (!e.slurpedBy) rememberPushes(e);
     // Food sinks slowly, then rests on the sand; spent crumbs disappear.
     for (let i = this.foods.length - 1; i >= 0; i--) {
       const f = this.foods[i];
       f.y = Math.max(-DEPTH + 0.05, f.y - dt * 0.12);
       if (f.amount <= 0) { this.group.remove(f.mesh); this.foods.splice(i, 1); }
     }
+    this.feedRecent *= Math.exp(-dt / 6);
     expire(this.spooks, this.time, 1.6);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
   }
 
-  dispose() { this.renderer.dispose(this.eels); }
+  dispose() { this.renderer.dispose(this.eels.concat(this.guests)); }
 }

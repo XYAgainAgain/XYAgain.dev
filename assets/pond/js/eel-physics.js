@@ -2,7 +2,7 @@ import * as THREE from 'three/webgpu';
 import { EEL_POINTS, DEPTH } from './config.js';
 
 export const TICK = 1 / 90;
-export const TRAIL_LEN = 240;
+export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
 const OFF_DECAY = Math.exp(-2.5 * TICK);
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 
@@ -13,11 +13,32 @@ export function segDist(px, pz, ax, az, bx, bz) {
 }
 
 export function pushTrail(e, p) {
-  e.trailHead = (e.trailHead + 1) % TRAIL_LEN;
+  const n = e.trail.length;
+  e.trailHead = (e.trailHead + 1) % n;
   e.trail[e.trailHead].copy(p);
-  e.trailCount = Math.min(e.trailCount + 1, TRAIL_LEN);
+  e.trailCount = Math.min(e.trailCount + 1, n);
 }
-export function trailAt(e, k) { return e.trail[(e.trailHead - k + TRAIL_LEN) % TRAIL_LEN]; }
+export function trailAt(e, k) { const n = e.trail.length; return e.trail[(e.trailHead - k + n) % n]; }
+
+/* Tail half-amplitude with length damping past ~3.6 units: giant tails read as thrash, not propulsion. */
+export function tailAmp(e) {
+  return e.length * e.ampRatio * Math.min(1, Math.sqrt(3.6 / e.length));
+}
+
+/* Growth support: longer bodies need longer path memory (capacity is the trail array itself). */
+export function growEel(e, d) {
+  e.length += d;
+  e.spacing = e.length / (e.pts.length - 1);
+  e.ampTail = tailAmp(e);
+  if (e.length * 1.5 > e.trail.length * 0.03) growTrail(e);
+}
+
+function growTrail(e) {
+  const fresh = Array.from({ length: Math.ceil(e.trail.length * 1.5) }, () => new THREE.Vector3());
+  for (let k = e.trailCount - 1; k >= 0; k--) fresh[e.trailCount - 1 - k].copy(trailAt(e, k));
+  e.trail = fresh;
+  e.trailHead = Math.max(0, e.trailCount - 1);
+}
 
 /* The body slides along the path the head took (snake-style), so turns flow down the length
    instead of the tail being dragged sideways. Collision pushes live in a decaying offset layer. */
@@ -56,8 +77,9 @@ export function followBody(e) {
     if (e.reverse) env = 1;
     else if (i <= node) env = -0.2 * (1 - i / node);   // slight counter-phase snout yaw, node not at the head
     else {
+      // Concave growth keeps the mid-body calm so the tail reads as propulsion, not thrashing.
       const t = (i - node) / (EEL_POINTS - 1 - node);
-      env = t * (e.anterior + (1 - e.anterior) * Math.min(1, t * 2));
+      env = Math.pow(t, 1.3) * (e.anterior + (1 - e.anterior) * Math.min(1, t * 2));
     }
     const amt = Math.sin(phase) * e.ampTail * env * e.ampMul;
     const q = pts[i - 1];
@@ -75,13 +97,13 @@ export function followBody(e) {
 export function retreatAlongTrail(e, dist) {
   const head = e.pts[0];
   let remaining = dist;
-  while (remaining > 1e-5 && e.trailCount > EEL_POINTS * 3) {
+  while (remaining > 1e-5 && e.trailCount > 4) {
     const back = trailAt(e, 0);
     const step = head.distanceTo(back);
     if (step > remaining) { head.lerp(back, remaining / step); return; }
     head.copy(back);
     remaining -= step;
-    e.trailHead = (e.trailHead - 1 + TRAIL_LEN) % TRAIL_LEN;
+    e.trailHead = (e.trailHead - 1 + e.trail.length) % e.trail.length;
     e.trailCount--;
   }
 }
@@ -105,6 +127,7 @@ export function collide(eels, colliders) {
   for (let pass = 0; pass < 1; pass++) {
     for (let a = 0; a < eels.length; a++) {
       const ea = eels[a];
+      if (ea.slurpedBy) continue;
       const ca = ea.pts[EEL_POINTS >> 1];
       for (let i = 0; i < EEL_POINTS; i++) {
         const p = ea.pts[i];
@@ -137,6 +160,7 @@ export function collide(eels, colliders) {
         }
         for (let b = a + 1; b < eels.length; b++) {
           const eb = eels[b];
+          if (eb.slurpedBy) continue;
           if (i === 0) eb.skip = ca.distanceTo(eb.pts[EEL_POINTS >> 1]) > ea.boundR + eb.boundR;
           if (eb.skip) continue;
           const min = r + eb.radius;
