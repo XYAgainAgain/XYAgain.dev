@@ -267,10 +267,15 @@ export async function buildFloor(scene, shading, extent, seed, view) {
   }
 
   // Hollow log: an open cylinder rendered from both sides, lying on the sand near the view.
-  // It is fat enough to break the surface; the bore stays roomy for eels.
-  const logR = 0.52, logLen = 4.6;
+  // Seeded size variance: mostly ordinary, sometimes snug, rarely grand (a future Eleanor-sized bore).
+  const sizeRng = createRng(deriveSeed(seed, 4243));
+  const grand = sizeRng.chance(0.15);
+  const sizeMul = grand ? sizeRng.range(1.25, 1.5) : sizeRng.chance(0.3) ? sizeRng.range(0.72, 0.9) : sizeRng.range(0.9, 1.15);
+  // The bore rolls independently of girth so a tight bore makes the eels' fit check a real sorting rule.
+  const boreT = grand ? sizeRng.range(0.7, 0.8) : sizeRng.chance(0.25) ? sizeRng.range(0.24, 0.4) : sizeRng.range(0.6, 0.78);
+  const logR = 0.52 * sizeMul, logLen = 4.6 * sizeRng.range(0.85, 1.25);
   const outer = new THREE.CylinderGeometry(logR, logR * 0.92, logLen, 64, 48, true);
-  const inner = new THREE.CylinderGeometry(logR * 0.8, logR * 0.76, logLen, 64, 48, true);
+  const inner = new THREE.CylinderGeometry(logR * (boreT + 0.06), logR * (boreT + 0.02), logLen, 64, 48, true);
   const logNoise = createRng(deriveSeed(seed, 4242));
   const lf = [logNoise.range(2, 4), logNoise.range(2, 4), logNoise.range(2, 4)];
   const lph = [logNoise.range(0, 6), logNoise.range(0, 6), logNoise.range(0, 6)];
@@ -310,7 +315,7 @@ export async function buildFloor(scene, shading, extent, seed, view) {
   log.add(new THREE.Mesh(inner, woodInner));
   // End lips follow the shaped radius so the wall reads as solid wood.
   for (const end of [1, -1]) {
-    const lip = new THREE.RingGeometry(logR * 0.78, logR, 64, 1);
+    const lip = new THREE.RingGeometry(logR * (boreT + 0.04), logR, 64, 1);
     const lp = lip.attributes.position;
     for (let v = 0; v < lp.count; v++) {
       const px = lp.getX(v), py = lp.getY(v);
@@ -328,7 +333,7 @@ export async function buildFloor(scene, shading, extent, seed, view) {
   colliders.logs.push({
     a: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, -logLen / 2),
     b: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, logLen / 2),
-    rInner: logR * 0.74, rOuter: logR * 1.08,
+    rInner: logR * boreT, rOuter: logR * 1.08,
   });
   if (logY + logR > 0) {
     const half = Math.sqrt(logR * logR - logY * logY);
