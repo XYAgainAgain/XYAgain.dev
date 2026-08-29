@@ -1,11 +1,13 @@
 import * as THREE from 'three/webgpu';
-import { texture, Fn, vec4, uv } from 'three/tsl';
+import { texture, Fn, vec4, uv, uniform } from 'three/tsl';
 import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS } from './config.js';
 import { seedFromUrl, deriveSeed } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
-import { createSceneUniforms, makeUnderwaterShading, createWaveSet } from './shading.js';
+import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
 import { buildFloor } from './floor.js';
+import { WakeBuffer } from './wake.js';
+import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
 import { attachEleanor } from './eleanor.js';
 import { growEel } from './eel-physics.js';
@@ -64,18 +66,22 @@ async function boot() {
   camera.up.set(0, 0, -1);
   camera.lookAt(0, 0, 0);
 
-  const U = createSceneUniforms(createWaveSet(deriveSeed(seed, 31)));
+  const waveSet = createWaveSet(deriveSeed(seed, 31));
+  const U = createSceneUniforms(waveSet, createCurrentSet(deriveSeed(seed, 1900)));
   const shading = makeUnderwaterShading(U);
   const sim = new WaterSim(renderer, extent);
   const caustics = new CausticsPass(renderer, sim, U, viewW, viewH);
   // Nothing may ride the injector until this passes; rain and strider legs are its first customers.
   const impulse = new ImpulseInjector(renderer, sim);
   await impulse.probe();
+  // Wake memory for the flora layers; runs from boot so the field is warm before anything reads it.
+  const wake = new WakeBuffer(renderer, U, extent, seed);
+  const habitat = new Habitat();
 
   const underScene = new THREE.Scene();
   // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
   const overScene = new THREE.Scene();
-  const { colliders } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH });
+  const { colliders } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat);
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view);
   const eleanor = attachEleanor(eels, seed);
@@ -89,20 +95,32 @@ async function boot() {
   });
   const surface = new SurfacePass(renderer, sim, U, underRT, viewW, viewH);
 
-  // ?view=caustics|under|sim blits one intermediate target straight to the canvas.
+  // ?view=caustics|under|sim|wake blits one intermediate target straight to the canvas.
   const debugView = params.get('view');
   let debugQuad = null;
   if (debugView) {
-    const src = debugView === 'caustics' ? caustics.rt.texture : debugView === 'sim' ? sim.rtA.texture : underRT.texture;
+    const src = debugView === 'caustics' ? caustics.rt.texture : debugView === 'sim' ? sim.rtA.texture : debugView === 'wake' ? wake.rtA.texture : underRT.texture;
     const tex = texture(src);
     const m = new THREE.NodeMaterial();
     const gain = debugView === 'sim' ? 20 : debugView === 'caustics' ? 0.5 : 1;
+    const uExtentDbg = uniform(sim.extent);
     m.fragmentNode = Fn(() => {
+      // The wake view is cropped to the viewport so what you draw lands where you drew it; the other
+      // views still show the whole pool. Signed fields sit on 0.5 grey; the algae channel stays raw blue.
+      if (debugView === 'wake') {
+        const xz = uv().sub(0.5).mul(surface.uView);
+        const c = tex.sample(xz.div(uExtentDbg).add(0.5));
+        return vec4(c.r.mul(0.5).add(0.5), c.g.mul(0.5).add(0.5), c.b, 1);
+      }
       const c = tex.sample(uv());
-      return debugView === 'sim' ? vec4(c.r.mul(gain).add(0.5), c.g.mul(gain).add(0.5), 0.5, 1) : vec4(c.rgb.mul(gain), 1);
+      if (debugView === 'sim') return vec4(c.r.mul(gain).add(0.5), c.g.mul(gain).add(0.5), 0.5, 1);
+      return vec4(c.rgb.mul(gain), 1);
     })();
     debugQuad = new THREE.QuadMesh(m);
-    debugQuad.update = () => { if (debugView === 'sim') tex.value = sim.rtA.texture; };
+    debugQuad.update = () => {
+      if (debugView === 'sim') tex.value = sim.rtA.texture;
+      if (debugView === 'wake') tex.value = wake.rtA.texture;
+    };
   }
 
   function resize() {
@@ -136,7 +154,7 @@ async function boot() {
   if (params.get('mixer') === '1') import('./mixer.js').then((m) => m.attachMixer(audio)).catch((err) => console.warn('Pond: mixer failed to load', err));
   const eelToggleRender = bindEelToggle(document.getElementById('eel-toggle'), (v) => eels.setEnabled(v === 'yes'));
   setupIdleFade(root);
-  // World x -> stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
+  // World x → stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
   const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
   // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
   eels.on('startle', (ev) => { ev.source === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
@@ -146,7 +164,7 @@ async function boot() {
 
   // Showers own their own clock: envelope drives impulses, surface noise, and eel activity; intensity
   // alone drives the rain bed. ?rain=1 skips the wait and starts one now.
-  const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio });
+  const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio, bearing: waveSet.mainDir });
   if (params.get('rain') === '1') rain.force();
   eels.rain = rain;
 
@@ -165,6 +183,8 @@ async function boot() {
   };
   let swishUntil = 0;
   let lastCrackle = 0;
+  // A finger through the water leaves a wake too; the frame loop hands the drag segment to the wake buffer.
+  const finger = { x: 0, z: 0, px: 0, pz: 0, at: -1 };
   // R-hold crumbs drop on a fixed 250 BPM clock (Tetris-ish tempo), moving or not.
   const CRUMB_MS = 60000 / 250;
   let feeding = null;
@@ -182,8 +202,10 @@ async function boot() {
       swishUntil = performance.now() + 180;
       audio.swish(true);
       audio.swishPan(toPan(x));
+      if (finger.at < 0) { finger.px = x; finger.pz = z; }
+      finger.x = x; finger.z = z; finger.at = performance.now();
     },
-    dragEnd: (path) => { for (const p of path.slice(-6)) eels.lure(p.x, p.z); },
+    dragEnd: (path) => { finger.at = -1; for (const p of path.slice(-6)) eels.lure(p.x, p.z); },
     feed: (x, z) => {
       eels.feed(x, z, 1);
       sim.addDrop(x, z, 0.18, 0.012);
@@ -278,6 +300,8 @@ async function boot() {
   let running = false;
   const moonDir = new THREE.Vector3();
   const epoch = (Date.now() / 1000) % MOON_ORBIT_SECONDS;
+  // The pond's night clock: one orbit is one night. Lilies, mat growth, and later larvae read it.
+  const moon = { az: 0, phase01: 0, cycles: 0 };
 
   // Frame-rate HUD; in debug mode every frame time is kept so pond.stats() can report averages and lows.
   const debug = params.get('debug') === '1';
@@ -316,7 +340,10 @@ async function boot() {
     U.time.value = t % 4096;
     surface.uReveal.value += (revealTarget - surface.uReveal.value) * Math.min(1, dt * 1.2);
 
-    const az = ((epoch + t) / MOON_ORBIT_SECONDS) * Math.PI * 2;
+    const orbit = (epoch + t) / MOON_ORBIT_SECONDS;
+    const az = orbit * Math.PI * 2;
+    moon.az = az; moon.phase01 = orbit % 1; moon.cycles = Math.floor(t / MOON_ORBIT_SECONDS);
+    U.moonPhase.value = moon.phase01;
     moonDir.set(Math.cos(MOON_ELEVATION) * Math.cos(az), Math.sin(MOON_ELEVATION), Math.cos(MOON_ELEVATION) * Math.sin(az));
     U.moonDir.value.copy(moonDir);
 
@@ -335,12 +362,23 @@ async function boot() {
     eels.update(dt);
     // Before sim.update, so this frame's drops are stepped by the water they landed in.
     rain.update(dt);
+    U.wind.value.set(rain.wind.x, rain.wind.z, rain.wind.gust, rain.wind.gustLag);
     if (testDrops) {
       for (const d of testDrops) { d.u = 0.3 + Math.random() * 0.4; d.v = 0.3 + Math.random() * 0.4; }
       impulse.inject(testDrops);
     }
     // Caustics follow the water, so they only need redrawing on frames the sim actually stepped.
     if (sim.update(dt) > 0 || t < 0.5) caustics.render();
+    // The drag segment since the last frame becomes a pointer capsule; a flick is capped so it shoves, not teleports.
+    if (finger.at >= 0 && performance.now() - finger.at < 120) {
+      let vx = (finger.x - finger.px) / Math.max(dt, 1e-3), vz = (finger.z - finger.pz) / Math.max(dt, 1e-3);
+      const sp = Math.hypot(vx, vz);
+      if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
+      wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
+      finger.px = finger.x; finger.pz = finger.z;
+    }
+    // After eels.update wrote this frame's influence slots, before anything samples the field.
+    wake.update(dt);
 
     renderer.setRenderTarget(underRT);
     renderer.setClearColor(0x000000, 1);
@@ -386,6 +424,8 @@ async function boot() {
     motion.reduced = reduceMotion.matches && params.get('motion') !== 'full';
     sim.uDamping.value = motion.reduced ? 0.975 : sim.damping;
     surface.uSlosh.value = motion.reduced ? 0.2 : 1.0;
+    // Plant-owned idle motion (breeze, drift, stir) runs at a tenth; event responses keep full gain.
+    U.motionScale.value = motion.reduced ? 0.1 : 1;
     rain.motionChanged();
   };
   reduceMotion.addEventListener('change', applyMotion);
@@ -410,14 +450,15 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       stats: fpsStats,
       diag: async () => {
-        console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '));
+        console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '), 'moonPhase', moon.phase01.toFixed(3), 'wind', U.wind.value.toArray().map((v) => v.toFixed(2)).join(' '));
         await stats(sim.rtA, 'sim');
         await stats(caustics.rt, 'caustics');
         await stats(underRT, 'under');
+        await stats(wake.rtA, 'wake');
       },
     };
     console.log('pond seed', seed, 'backend', root.dataset.backend, '- pond.diag() for target stats, pond.stats() for frame times');

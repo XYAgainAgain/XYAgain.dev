@@ -192,7 +192,7 @@ const placeholders = {
   },
 };
 
-export async function buildFloor(scene, shading, extent, seed, view) {
+export async function buildFloor(scene, shading, extent, seed, view, habitat = null) {
   const rng = createRng(deriveSeed(seed, 77));
   const loader = new THREE.TextureLoader();
   const manifest = await loadManifest();
@@ -257,12 +257,14 @@ export async function buildFloor(scene, shading, extent, seed, view) {
     m.rotation.y = rng.range(0, Math.PI * 2);
     group.add(m);
     const rc = r * Math.min(sq[0], sq[2]) * 0.95;
-    colliders.spheres.push({ x: m.position.x, y: m.position.y, z: m.position.z, r: rc });
-    // Chord of the rock at y = 0 is what the water sim treats as a wall.
     const ry = r * sq[1];
-    if (m.position.y + ry > 0) {
+    const top = m.position.y + ry;
+    colliders.spheres.push({ x: m.position.x, y: m.position.y, z: m.position.z, r: rc, top });
+    // Chord of the rock at y = 0 is what the water sim treats as a wall; a dry top is a perch.
+    if (top > 0) {
       const frac = Math.sqrt(Math.max(0, 1 - (m.position.y / ry) ** 2));
       colliders.waterline.discs.push({ x: m.position.x, z: m.position.z, r: rc * frac });
+      habitat?.addPerch({ x: m.position.x, y: top, z: m.position.z, type: 'rock', radius: rc * 0.5 });
     }
   }
 
@@ -338,6 +340,10 @@ export async function buildFloor(scene, shading, extent, seed, view) {
   if (logY + logR > 0) {
     const half = Math.sqrt(logR * logR - logY * logY);
     colliders.waterline.capsules.push({ ax: lx - dir.x * logLen / 2, az: lz - dir.z * logLen / 2, bx: lx + dir.x * logLen / 2, bz: lz + dir.z * logLen / 2, r: half });
+    // Three perches along the dry ridge of the trunk, ends pulled in so nothing sits on the lip.
+    for (const s of [-0.35, 0, 0.35]) {
+      habitat?.addPerch({ x: lx + dir.x * logLen * s, y: logY + logR, z: lz + dir.z * logLen * s, type: 'log', radius: logR * 0.4 });
+    }
   }
 
   scene.add(group);

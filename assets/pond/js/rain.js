@@ -42,8 +42,10 @@ const FORCE_BUILD = 4, FORCE_STEADY = 240;
 const roll = ([lo, hi]) => lo + Math.random() * (hi - lo);
 const smooth = (p) => p * p * (3 - 2 * p);
 
+const WIND_LAG = 1.5;                 // seconds for a gust to reach the reeds after it crosses the water
+
 export class RainScheduler {
-  constructor({ sim, injector, motion, view, surface = null, audio = null }) {
+  constructor({ sim, injector, motion, view, surface = null, audio = null, bearing = 0 }) {
     this.sim = sim;
     this.injector = injector;
     this.motion = motion;
@@ -57,9 +59,10 @@ export class RainScheduler {
     this.stateT = 0;
     this.stateLen = 1;
     this.peak = 0;
-    this.gustPhase = 0;
-    // Bearing and swing of the gust, for anything that has to draw the shower rather than land it.
-    this.wind = { x: 1, z: 0, gust: 0 };
+    this.gustPhase = Math.random() * Math.PI * 2;
+    // The pond's one wind: bearing from the swell so they agree, a light breeze when dry, real gusts
+    // in a shower. gustLag is the copy the reeds read, so a gust visibly crosses the water first.
+    this.wind = { x: Math.cos(bearing), z: Math.sin(bearing), gust: 0, gustLag: 0 };
     this.t = 0;
     this.pending = 0;          // fractional impulses owed to the injector
     this.forceSteady = false;
@@ -87,10 +90,6 @@ export class RainScheduler {
     if (state === 'build') {
       this.stateLen = roll(T.build);
       this.peak = roll(PEAK);
-      this.gustPhase = Math.random() * Math.PI * 2;
-      // One phase serves as the shower's bearing too, so the gust swings along the way it blows.
-      this.wind.x = Math.cos(this.gustPhase);
-      this.wind.z = Math.sin(this.gustPhase);
     } else if (state === 'steady') {
       // One audio loop per link of the chain, so the continue toss lands on the seam of the bed.
       this.stateLen = this.forceSteady ? FORCE_STEADY : (this.audio?.rainLoopSeconds?.() ?? LOOP_FALLBACK);
@@ -129,6 +128,7 @@ export class RainScheduler {
   update(dt) {
     this.t += dt;
     this.advance(dt);
+    this.blow(dt);
     this.pushAudio();
     // Exactly zero when dry, and always zero under reduced motion.
     const noise = this.motion.reduced ? 0 : this.envelope * NOISE_GAIN;
@@ -143,11 +143,17 @@ export class RainScheduler {
     if (this.state === 'dry') { this.intensity = 0; this.envelope = 0; return; }
     const p = Math.min(1, this.stateT / this.stateLen);
     const shape = this.state === 'build' ? smooth(p) : this.state === 'tail' ? smooth(1 - p) : 1;
-    const gust = 0.5 + 0.5 * Math.sin(this.t * 0.23 + this.gustPhase);
-    this.wind.gust = gust;
-    this.intensity = this.peak * shape * (0.88 + 0.12 * gust);
+    this.intensity = this.peak * shape * (0.88 + 0.12 * this.gustRaw());
     // Clamped every frame, not per shower, so toggling the preference mid-downpour takes effect now.
     this.envelope = this.motion.reduced ? Math.min(this.intensity, CALM_CEIL) : this.intensity;
+  }
+
+  gustRaw() { return 0.5 + 0.5 * Math.sin(this.t * 0.23 + this.gustPhase); }
+
+  /* Wind runs dry or wet: a quarter-strength breeze at rest, swelling with the shower. */
+  blow(dt) {
+    this.wind.gust = this.gustRaw() * (0.25 + 0.75 * this.envelope);
+    this.wind.gustLag += (this.wind.gust - this.wind.gustLag) * Math.min(1, dt / WIND_LAG);
   }
 
   /* Tone's own ramps do the smoothing, so pushing every frame would only queue automation events. */
@@ -163,7 +169,7 @@ export class RainScheduler {
     this.audio.setRain(level);
   }
 
-  /* Drops per rendered frame = density x envelope x the sim steps that frame is worth; the remainder
+  /* Drops per rendered frame = density × envelope × the sim steps that frame is worth; the remainder
      carries so a light shower still lands drops. A failed blend probe means audible rain and no rings. */
   emit(dt) {
     const inj = this.injector;

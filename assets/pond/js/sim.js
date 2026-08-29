@@ -1,6 +1,8 @@
 import * as THREE from 'three/webgpu';
 import { Fn, uniform, texture, uv, vec2, vec3, vec4, float, max, min, cos, length, smoothstep, mix, PI, Loop, uniformArray, step } from 'three/tsl';
-import { SIM_RES, SIM_STEPS_HZ, SIM_DAMPING, SIM_WAVE } from './config.js';
+import { SIM_RES, SIM_STEPS_HZ, SIM_DAMPING, SIM_WAVE, COVER_DISCS, COVER_CAPS } from './config.js';
+
+const MAXD = 24, MAXC = 4;   // waterline walls the obstacle mask can hold
 
 /* Heightfield wave sim after Evan Wallace's MIT webgl-water: R = height, G = velocity.
    Ping-pong render targets so the same TSL runs on WebGPU and WebGL2. */
@@ -34,7 +36,9 @@ export class WaterSim {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
     });
     this.mask = texture(this.maskRT.texture);
-    this.maskDirty = false;
+    this.obstacles = { discs: [], capsules: [] };
+    this.cover = { discs: [], capsules: [] };
+    this.bake = null;
 
     const stepMat = new THREE.NodeMaterial();
     stepMat.fragmentNode = Fn(() => {
@@ -77,40 +81,82 @@ export class WaterSim {
     this.pending = [];
   }
 
-  /* Bakes waterline footprints (xz + radius, or capsule a→b + radius) into the obstacle mask. */
+  /* Waterline walls (xz + radius, or capsule a→b + radius): mask R, which the wave step bounces off. */
   setObstacles(discs, capsules) {
-    const MAXD = 24, MAXC = 4;
-    const d = [], cp = [];
-    for (let i = 0; i < MAXD; i++) { const o = discs[i]; d.push(new THREE.Vector4(o?.x ?? 0, o?.z ?? 0, o?.r ?? 0, 0)); }
-    for (let i = 0; i < MAXC; i++) { const o = capsules[i]; cp.push(new THREE.Vector4(o?.ax ?? 0, o?.az ?? 0, o?.bx ?? 0, o?.bz ?? 0)); cp.push(new THREE.Vector4(o?.r ?? 0, 0, 0, 0)); }
-    const uDiscs = uniformArray(d), uCaps = uniformArray(cp);
-    const uExtent = uniform(this.extent);
-    // A hard step bakes stair-steps into the wall, and every wave that bounces off it shows them;
-    // a 1.5-texel smoothstep skirt plus linear filtering gives the sim an antialiased shoreline.
-    const uEdge = uniform(this.texelWorld * 1.5);
-    const mat = new THREE.NodeMaterial();
-    mat.fragmentNode = Fn(() => {
-      const p = uv().sub(0.5).mul(uExtent);
-      const solid = float(0).toVar();
-      Loop(MAXD, ({ i }) => {
-        const o = uDiscs.element(i);
-        solid.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), length(p.sub(o.xy))));
-      });
-      Loop(MAXC, ({ i }) => {
-        const ab = uCaps.element(i.mul(2));
-        const r = uCaps.element(i.mul(2).add(1)).x;
-        const a = ab.xy, b = ab.zw;
-        const ba = b.sub(a);
-        const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
-        solid.addAssign(smoothstep(r.add(uEdge), r.sub(uEdge), length(p.sub(a.add(ba.mul(t))))));
-      });
-      return vec4(solid.min(1), 0, 0, 1);
-    })();
-    const quad = new THREE.QuadMesh(mat);
+    this.obstacles = { discs, capsules };
+    this.bakeMask();
+  }
+
+  /* Surface cover: mask G, read by the floor as moon shadow. Discs {x, z, r, strength} for pads and
+     mats, capsules {ax, az, bx, bz, r, strength} for reed stems. Never a wall: R is untouched. */
+  setCover(discs, capsules) {
+    this.cover = { discs, capsules };
+    this.bakeMask();
+  }
+
+  /* One persistent material bakes both channels from stored inputs: a rebake never reallocates. */
+  bakeMask() {
+    if (!this.bake) {
+      const v4 = (n) => Array.from({ length: n }, () => new THREE.Vector4());
+      const uDiscs = uniformArray(v4(MAXD)), uCaps = uniformArray(v4(MAXC * 2));
+      const uCovD = uniformArray(v4(COVER_DISCS)), uCovC = uniformArray(v4(COVER_CAPS * 2));
+      const uExtent = uniform(this.extent);
+      // A hard step bakes stair-steps into the wall, and every wave that bounces off it shows them;
+      // a 1.5-texel smoothstep skirt plus linear filtering gives the sim an antialiased shoreline.
+      const uEdge = uniform(this.texelWorld * 1.5);
+      const mat = new THREE.NodeMaterial();
+      mat.fragmentNode = Fn(() => {
+        const p = uv().sub(0.5).mul(uExtent);
+        const solid = float(0).toVar();
+        const cover = float(0).toVar();
+        Loop(MAXD, ({ i }) => {
+          const o = uDiscs.element(i);
+          solid.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), length(p.sub(o.xy))));
+        });
+        Loop(MAXC, ({ i }) => {
+          const ab = uCaps.element(i.mul(2));
+          const r = uCaps.element(i.mul(2).add(1)).x;
+          const a = ab.xy, b = ab.zw;
+          const ba = b.sub(a);
+          const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+          solid.addAssign(smoothstep(r.add(uEdge), r.sub(uEdge), length(p.sub(a.add(ba.mul(t))))));
+        });
+        Loop(COVER_DISCS, ({ i }) => {
+          const o = uCovD.element(i);
+          cover.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), length(p.sub(o.xy))).mul(o.w));
+        });
+        Loop(COVER_CAPS, ({ i }) => {
+          const ab = uCovC.element(i.mul(2));
+          const rs = uCovC.element(i.mul(2).add(1));
+          const a = ab.xy, b = ab.zw;
+          const ba = b.sub(a);
+          const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+          cover.addAssign(smoothstep(rs.x.add(uEdge), rs.x.sub(uEdge), length(p.sub(a.add(ba.mul(t))))).mul(rs.y));
+        });
+        return vec4(solid.min(1), cover.min(1), 0, 1);
+      })();
+      this.bake = { quad: new THREE.QuadMesh(mat), uDiscs, uCaps, uCovD, uCovC };
+    }
+    const { quad, uDiscs, uCaps, uCovD, uCovC } = this.bake;
+    const { discs, capsules } = this.obstacles;
+    // Empty wall slots get a negative radius: a zero radius still baked a skirt-sized wall at the pool center.
+    for (let i = 0; i < MAXD; i++) { const o = discs[i]; uDiscs.array[i].set(o?.x ?? 0, o?.z ?? 0, o?.r ?? -1, 0); }
+    for (let i = 0; i < MAXC; i++) {
+      const o = capsules[i];
+      uCaps.array[i * 2].set(o?.ax ?? 0, o?.az ?? 0, o?.bx ?? 0, o?.bz ?? 0);
+      uCaps.array[i * 2 + 1].set(o?.r ?? -1, 0, 0, 0);
+    }
+    const cd = this.cover.discs, cc = this.cover.capsules;
+    for (let i = 0; i < COVER_DISCS; i++) { const o = cd[i]; uCovD.array[i].set(o?.x ?? 0, o?.z ?? 0, o?.r ?? 0, o?.strength ?? 0); }
+    for (let i = 0; i < COVER_CAPS; i++) {
+      const o = cc[i];
+      uCovC.array[i * 2].set(o?.ax ?? 0, o?.az ?? 0, o?.bx ?? 0, o?.bz ?? 0);
+      uCovC.array[i * 2 + 1].set(o?.r ?? 0, o?.strength ?? 0, 0, 0);
+    }
+    const prev = this.renderer.getRenderTarget();
     this.renderer.setRenderTarget(this.maskRT);
     quad.render(this.renderer);
-    this.renderer.setRenderTarget(null);
-    mat.dispose();
+    this.renderer.setRenderTarget(prev);
   }
 
   /* World xz → sim uv. */
@@ -167,5 +213,6 @@ export class WaterSim {
   dispose() {
     this.rtA.dispose(); this.rtB.dispose(); this.maskRT.dispose();
     this.stepQuad.material.dispose(); this.dropQuad.material.dispose();
+    this.bake?.quad.material.dispose();
   }
 }

@@ -33,6 +33,7 @@ export const fbm2 = Fn(([p]) => {
 });
 
 export const WAVE_COUNT = 12;
+export const CURRENT_TERMS = 4;
 
 /* A small directional spectrum in the spirit of a JONSWAP sea, scaled to a pond: a dominant swell
    direction with spread, energy falling off toward short wavelengths. Each wave: (dir.x, dir.z, k, amp). */
@@ -57,7 +58,44 @@ export function createWaveSet(seed) {
     // z, w: a slow breathing rate and phase per wave, so the idle pattern never loops visibly.
     phases.push({ x: rng.range(0, Math.PI * 2), y: Math.sqrt(9.81 * k) * tempo, z: rng.range(0.04, 0.16), w: rng.range(0, Math.PI * 2) });
   }
-  return { waves, phases };
+  // mainDir doubles as the pond's wind bearing, so the swell and everything the wind pushes agree.
+  return { waves, phases, mainDir };
+}
+
+/* Surface current as a sinusoidal potential: its curl is divergence-free (nothing bunches into sinks)
+   and normalized to max|curl| 1. Each term is (dir.x, dir.z, k, amp) plus (phase, omega). */
+export function createCurrentSet(seed) {
+  const rng = createRng(seed);
+  const terms = [], phases = [];
+  let sumAK = 0;
+  for (let i = 0; i < CURRENT_TERMS; i++) {
+    const dir = rng.range(0, Math.PI * 2);
+    const k = (2 * Math.PI) / rng.range(3, 9);
+    const amp = rng.range(0.6, 1.0);
+    terms.push({ x: Math.cos(dir), y: Math.sin(dir), z: k, w: amp });
+    sumAK += amp * k;
+    // Slowest term drifts a full cycle in 50–60 s; the rest a little quicker so the path never closes visibly.
+    phases.push({ x: rng.range(0, Math.PI * 2), y: i === 0 ? rng.range(0.10, 0.125) : rng.range(0.13, 0.3), z: 0, w: 0 });
+  }
+  for (const t of terms) t.w /= sumAK;
+  return { terms, phases };
+}
+
+/* Surface current at xz: the 2D curl of the potential above, |v| <= 1. Shared by every floater. */
+export function makeCurrent(U) {
+  return Fn(([xz, t]) => {
+    const dpdx = float(0).toVar();
+    const dpdz = float(0).toVar();
+    Loop(CURRENT_TERMS, ({ i }) => {
+      const c = U.current.element(i);
+      const q = U.currentPhase.element(i);
+      const arg = dot(xz, c.xy).mul(c.z).add(q.x).add(t.mul(q.y));
+      const g = cos(arg).mul(c.w).mul(c.z);
+      dpdx.addAssign(g.mul(c.x));
+      dpdz.addAssign(g.mul(c.y));
+    });
+    return vec2(dpdz, dpdx.negate());
+  });
 }
 
 /* Height and slope of the swell at xz: returns (h, dh/dx, dh/dz). Shared by caustics and the surface. */
@@ -83,7 +121,7 @@ export function makeSwell(U) {
 }
 
 /* Scene-wide uniforms every underwater material reads. Created once, closed over by the shading Fns. */
-export function createSceneUniforms(waveSet) {
+export function createSceneUniforms(waveSet, currentSet) {
   // The creature influence field: one capsule per slot, parked below the world and strength 0 until claimed.
   const infA = [], infB = [], infC = [], eelCol = [], eelColB = [];
   for (let i = 0; i < INF_SLOTS; i++) {
@@ -113,6 +151,11 @@ export function createSceneUniforms(waveSet) {
     waves: uniformArray(waveSet.waves.map((w) => new THREE.Vector4(w.x, w.y, w.z, w.w))),
     wavePhase: uniformArray(waveSet.phases.map((p) => new THREE.Vector4(p.x, p.y, p.z, p.w))),
     reflCausticTex: texture(placeholder),
+    current: uniformArray(currentSet.terms.map((c) => new THREE.Vector4(c.x, c.y, c.z, c.w))),
+    currentPhase: uniformArray(currentSet.phases.map((p) => new THREE.Vector4(p.x, p.y, p.z, p.w))),
+    wind: uniform(new THREE.Vector4(1, 0, 0, 0)),         // (bearing.x, bearing.z, gust, gust lagged for the reeds)
+    moonPhase: uniform(0),                                // 0–1 around the orbit; the pond's night clock
+    motionScale: uniform(1),                              // 1, or 0.1 under reduced motion: scales plant-owned idle motion
   };
 }
 
@@ -124,16 +167,38 @@ export const closestOnSegment = Fn(([p, a, b]) => {
   return a.add(ba.mul(t));
 });
 
+/* The scalar half of the wake falloff: full inside the body's skin, zero 0.9 units out. Lift, push,
+   and the CPU twin below all read this one curve so they can never drift apart. */
+export const capsuleWeight = Fn(([p, a, b]) => {
+  const d = length(p.sub(closestOnSegment(p, a.xyz, b.xyz)));
+  return smoothstep(a.w.add(0.9), a.w.add(0.05), d);
+});
+
 /* Wake push at p from one influence slot, for anything creatures shove around (lily pads first).
    Falloff scales the WHOLE push, not just velocity, or the shove reaches the whole pond as a press. */
 export const capsuleInfluence = Fn(([p, a, b, vel]) => {
   const closest = closestOnSegment(p, a.xyz, b.xyz);
   const away = p.sub(closest);
   const d = length(away);
-  const w = smoothstep(a.w.add(0.9), a.w.add(0.05), d);
+  const w = capsuleWeight(p, a, b);
   const radial = away.div(d.max(1e-5));   // safe normalize: dead on the axis, d is 0
   return radial.xz.add(vel.xz.mul(0.6)).mul(w);
 });
+
+/* CPU twin of capsuleWeight for the few things the CPU decides (pad drips, settle plops): the CPU may
+   never read the GPU, so it re-runs the same curve against the same uniform arrays. */
+export function capsuleWeightCPU(U, px, py, pz, slot) {
+  const a = U.infA.array[slot], b = U.infB.array[slot];
+  if (b.w <= 0) return 0;
+  const bax = b.x - a.x, bay = b.y - a.y, baz = b.z - a.z;
+  const len2 = Math.max(1e-6, bax * bax + bay * bay + baz * baz);
+  const t = Math.max(0, Math.min(1, ((px - a.x) * bax + (py - a.y) * bay + (pz - a.z) * baz) / len2));
+  const dx = px - (a.x + bax * t), dy = py - (a.y + bay * t), dz = pz - (a.z + baz * t);
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const e0 = a.w + 0.9, e1 = a.w + 0.05;
+  const s = Math.max(0, Math.min(1, (d - e0) / (e1 - e0)));
+  return s * s * (3 - 2 * s);
+}
 
 /* Builds the underwater shading Fn bound to one set of scene uniforms. */
 export function makeUnderwaterShading(U) {
@@ -144,21 +209,22 @@ export function makeUnderwaterShading(U) {
     return normalize(refr).negate();
   });
 
-  // Neon fill from the influence capsules. Distance is measured to the body's skin rather than its
-  // axis, so a guest three times a resident's girth lights the sand off her whole bulk.
+  // One slot's neon at p, measured to the skin, not the axis; the sand and the pads both read this
+  // one formula so they can never disagree. The mid hump refunds what an RGB lerp loses between hues.
+  const eelSlotGlow = Fn(([p, i]) => {
+    const a = U.infA.element(i), b = U.infB.element(i);
+    const ba = b.xyz.sub(a.xyz);
+    const t = p.sub(a.xyz).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
+    const d = length(p.sub(a.xyz.add(ba.mul(t)))).sub(a.w.mul(1.5)).max(0);
+    const col = mix(U.eelCol.element(i), U.eelColB.element(i), t).mul(t.mul(t.oneMinus()).mul(0.5).add(1));
+    const shimmer = sin(t.mul(5).sub(U.time.mul(1.57)).add(float(i).mul(2.7))).mul(0.22).add(1);
+    return col.mul(shimmer).mul(b.w).mul(U.eelGlow.mul(0.42).div(d.mul(d).mul(3.5).add(1)));
+  });
+
+  // Unwrapped neon fill summed over every slot: what a pad's underside or a fish's flank receives.
   const eelGlowAt = Fn(([p]) => {
     const glow = vec3(0).toVar();
-    Loop(INF_SLOTS, ({ i }) => {
-      const a = U.infA.element(i), b = U.infB.element(i);
-      const ba = b.xyz.sub(a.xyz);
-      const t = p.sub(a.xyz).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
-      const d = length(p.sub(a.xyz.add(ba.mul(t)))).sub(a.w.mul(1.5)).max(0);
-      // Color runs head → tail along the axis, and a slow tailward shimmer keeps the pool of light
-      // alive the way the ridge lights already travel on the body itself.
-      const col = mix(U.eelCol.element(i), U.eelColB.element(i), t);
-      const shimmer = sin(t.mul(5).sub(U.time.mul(1.57)).add(float(i).mul(2.7))).mul(0.22).add(1);
-      glow.addAssign(col.mul(shimmer).mul(b.w).mul(U.eelGlow.mul(0.42).div(d.mul(d).mul(3.5).add(1))));
-    });
+    Loop(INF_SLOTS, ({ i }) => { glow.addAssign(eelSlotGlow(p, i)); });
     return glow;
   });
 
@@ -204,13 +270,8 @@ export function makeUnderwaterShading(U) {
       const ba = b.xyz.sub(a.xyz);
       const t = p.sub(a.xyz).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
       const away = a.xyz.add(ba.mul(t)).sub(p);
-      const dist = length(away);
-      const d = dist.sub(a.w.mul(1.5)).max(0);
-      const Le = away.div(dist.max(1e-4));
-      // The mid hump refunds the brightness an RGB lerp loses crossing between distant hues.
-      const col = mix(U.eelCol.element(i), U.eelColB.element(i), t).mul(t.mul(t.oneMinus()).mul(0.5).add(1));
-      const shimmer = sin(t.mul(5).sub(U.time.mul(1.57)).add(float(i).mul(2.7))).mul(0.22).add(1);
-      const cNow = col.mul(shimmer).mul(b.w).mul(U.eelGlow.mul(0.42).div(d.mul(d).mul(3.5).add(1)));
+      const Le = away.div(length(away).max(1e-4));
+      const cNow = eelSlotGlow(p, i);
       // The wrap keeps crevices dim rather than black under a soft nearby glow.
       glow.addAssign(cNow.mul(dot(n, Le).add(0.35).div(1.35).clamp(0, 1)));
       const He = normalize(Le.add(V));
