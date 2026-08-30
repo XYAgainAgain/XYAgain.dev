@@ -22,6 +22,10 @@ const BEAD_FLOW = 0.12, BEAD_LIFT_ROLL = 0.8, BEAD_SWING_ROLL = 0.6, BEAD_RUN = 
 // Beads shed off a disturbed pad as a short burst of small drops, biased to the side they roll toward.
 const SHED_TIME = 0.7, SHED_RATE = 9, SHED_STRENGTH = 0.012, SHED_RADIUS = 2.5, SHED_THRESHOLD = 0.35;
 const MASS_RADIUS = 0.1;   // a resident's radius: a stalk shove scales by body radius over this, capped at 4×
+// Grazing: a small pad goes whole over EAT_FALL and comes back through the emerging class over one
+// orbit; a big one just loses a mouthful of rim. The fragment's bite mask only opens past age 0.8.
+const EAT_FALL = 2.0, BITE_FALL = 0.4, GRAZE_REGROW = MOON_ORBIT_SECONDS, GRAZE_UPLOAD = 0.5;
+const BITE_AGE = 0.9, BITE_NOTCH_ADD = 12 * Math.PI / 180, BITE_NOTCH_MAX = 45 * Math.PI / 180;
 
 function makePadGeometry() {
   const geo = new THREE.InstancedBufferGeometry();
@@ -102,6 +106,8 @@ export class PadSystem {
     this.plopAt = 0;
     this.dripTmp = { x: 0, z: 0 };
     this.drops = [];
+    this.grazed = [];      // pads mid-bite or mid-regrow; empty means stepGrazed costs nothing
+    this.grazeAcc = 0;
     this.bloomDebug = null;   // 'cycle' runs the whole open/close every 40 s; a number pins the bloom
     this.layout(seed, view, colliders);
     this.buildPads(U, shading, sim, leaf);
@@ -109,9 +115,12 @@ export class PadSystem {
     this.buildLilies(U, sim);
     overScene.add(this.padMesh, this.lilyMesh);
     underScene.add(this.stalkMesh);
+    // The registry entries are kept, not just their ids: a grazed pad has to shrink its cover and
+    // its perch with it, and the cover source below reads p.r live on every bake.
     for (const p of this.pads) {
-      p.habitatId = habitat.addPad({ x: p.x, z: p.z, r: p.r }).id;
-      habitat.addPerch({ x: p.x, y: 0.01, z: p.z, type: 'pad', radius: p.r * 0.7 });
+      p.habitatPad = habitat.addPad({ x: p.x, z: p.z, r: p.r });
+      p.habitatId = p.habitatPad.id;
+      p.perch = habitat.addPerch({ x: p.x, y: 0.01, z: p.z, type: 'pad', radius: p.r * 0.7 });
     }
     habitat.addCoverSource((discs) => { for (const p of this.pads) discs.push({ x: p.x, z: p.z, r: p.r, strength: 1 }); });
     U.coverStrength.value = 0.85;
@@ -155,6 +164,7 @@ export class PadSystem {
         biteSeed: cls === 'old' ? rng.range(1, 100) : 0, restY: 0, liftGain: 1, raised: false,
         wet: 0, swingX: 0, swingZ: 0, swingVX: 0, swingVZ: 0, lastLift: 0, lastPlop: 0, lastPush: 0, cooldownAt: 0, flower: null,
         shedUntil: 0, shedDir: 0, disturbed: 0, rollX: 0, rollZ: 0, rollS: 0,
+        idx: this.pads.length, graze: null,
       };
       // A pad whose center falls under an earlier pad rides on top: raised, stiff, and deaf to the eels.
       if (this.pads.some((q) => Math.hypot(q.x - x, q.z - z) < q.r)) { p.raised = true; p.restY = 0.02; p.liftGain = 0; }
@@ -252,7 +262,8 @@ export class PadSystem {
       if (dynamic) a.setUsage(THREE.DynamicDrawUsage);
       return a;
     };
-    this.aPadA = mk(this.padA); this.aPadB = mk(this.padB); this.aPadC = mk(this.padC); this.aPadD = mk(this.padD, true);
+    // A, B, and C are static until something grazes; they carry the dynamic hint for when it does.
+    this.aPadA = mk(this.padA, true); this.aPadB = mk(this.padB, true); this.aPadC = mk(this.padC, true); this.aPadD = mk(this.padD, true);
     this.aPadE = mk(this.padE, true);
     geo.setAttribute('aPadA', this.aPadA); geo.setAttribute('aPadB', this.aPadB);
     geo.setAttribute('aPadC', this.aPadC); geo.setAttribute('aPadD', this.aPadD); geo.setAttribute('aPadE', this.aPadE);
@@ -674,9 +685,88 @@ export class PadSystem {
     if (p) p.wet = Math.max(0, Math.min(1, p.wet + amount));
   }
 
+  /* Grazing, public: a pad already mid-bite, mid-regrow, or carrying a flower is off the menu. */
+  canEat(i) { const p = this.pads[i]; return !!p && !p.graze && !p.flower && p.r > 0.01; }
+
+  canBite(i) { const p = this.pads[i]; return !!p && !p.graze && !p.flower && p.r > 0.01 && p.notchHalf < BITE_NOTCH_MAX; }
+
+  /* Eaten whole: the disc shrinks away, then a new leaf unrolls from the same petiole over an orbit. */
+  eatPad(i) {
+    if (!this.canEat(i)) return false;
+    const p = this.pads[i];
+    p.graze = { mode: 'eat', t: 0, r0: p.r, age0: p.age, curl0: p.curl, cls0: p.cls };
+    this.grazed.push(p);
+    return true;
+  }
+
+  /* One mouthful out of a pad too big to swallow: a fresh hash seed re-rolls the fragment's holes,
+     the notch opens a little, and the age ramp is what lets that mask show at all. */
+  bitePad(i, seed = null) {
+    if (!this.canBite(i)) return false;
+    const p = this.pads[i];
+    p.graze = {
+      mode: 'bite', t: 0,
+      age0: p.age, ageTo: Math.max(p.age, BITE_AGE),
+      notch0: p.notchHalf, notchTo: Math.min(BITE_NOTCH_MAX, p.notchHalf + BITE_NOTCH_ADD),
+    };
+    p.biteSeed = seed ?? (p.biteSeed * 1.618 + 7.31) % 100;
+    this.grazed.push(p);
+    return true;
+  }
+
+  writePad(p) {
+    const o = p.idx * 4;
+    this.padA[o + 2] = p.r;
+    this.padB[o] = p.notchHalf; this.padB[o + 2] = p.curl;
+    this.padC[o] = p.age; this.padC[o + 1] = p.biteSeed;
+    // The registry is the CPU's view of the same leaf: cover, perches, and pad queries follow it down.
+    if (p.habitatPad) p.habitatPad.r = p.r;
+    if (p.perch) p.perch.radius = p.r * 0.7;
+  }
+
+  stepGrazed(dt) {
+    if (!this.grazed.length) return;
+    this.grazeAcc += dt;
+    let fast = false;
+    for (const p of this.grazed) if (p.graze.t < EAT_FALL) { fast = true; break; }
+    if (!fast && this.grazeAcc < GRAZE_UPLOAD) return;
+    // Advance by everything the throttle swallowed, or a regrow would run at a fraction of real time.
+    const el = this.grazeAcc;
+    this.grazeAcc = 0;
+    let w = 0;
+    for (let k = 0; k < this.grazed.length; k++) {
+      const p = this.grazed[k], g = p.graze;
+      g.t += el;
+      let live = true;
+      if (g.mode === 'bite') {
+        const u = Math.min(1, g.t / BITE_FALL);
+        p.age = g.age0 + (g.ageTo - g.age0) * u;
+        p.notchHalf = g.notch0 + (g.notchTo - g.notch0) * u;
+        live = u < 1;
+      } else if (g.t < EAT_FALL) {
+        p.r = g.r0 * (1 - g.t / EAT_FALL);
+      } else {
+        const u = Math.min(1, (g.t - EAT_FALL) / GRAZE_REGROW);
+        p.cls = u < 1 ? 'emerging' : g.cls0;
+        p.r = g.r0 * u;
+        p.age = AGE.emerging + (g.age0 - AGE.emerging) * u;
+        p.curl = 0.9 + (g.curl0 - 0.9) * u;
+        live = u < 1;
+      }
+      this.writePad(p);
+      if (live) this.grazed[w++] = p;
+      else p.graze = null;
+    }
+    this.grazed.length = w;
+    this.aPadA.needsUpdate = true;
+    this.aPadB.needsUpdate = true;
+    this.aPadC.needsUpdate = true;
+  }
+
   /* After eels.update and before sim.update: this frame's pose feeds the drips, plops, and swings,
      and the drips land in the water the sim is about to step. */
   update(dt, now, rain, injector) {
+    this.stepGrazed(dt);
     const U = this.U, env = rain.envelope, gust = rain.wind.gust;
     const reduced = this.motion.reduced;
     this.dripBudget = Math.min(4, this.dripBudget + 4 * dt);

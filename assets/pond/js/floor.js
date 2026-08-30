@@ -332,7 +332,10 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     const rc = r * Math.min(sq[0], sq[2]) * 0.95;
     const ry = r * sq[1];
     const top = m.position.y + ry;
-    colliders.spheres.push({ x: m.position.x, y: m.position.y, z: m.position.z, r: rc, top });
+    // r is the inscribed radius the flora and the mask lean on; the eels collide against the envelope
+    // instead (widest axis plus the lump noise), or a body reads as passing through the stone's bulges.
+    const rHit = r * Math.max(sq[0], sq[2]) * 1.12, ryHit = ry * 1.12;
+    colliders.spheres.push({ x: m.position.x, y: m.position.y, z: m.position.z, r: rc, rHit, ryHit, top });
     // Chord of the rock at y = 0 is what the water sim treats as a wall; a dry top is a perch.
     if (top > 0) {
       const frac = Math.sqrt(Math.max(0, 1 - (m.position.y / ry) ** 2));
@@ -533,7 +536,10 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     if (logY + logOuter > 0) {
       // The bark crest, not the nominal radius, is what stands dry; the mask must keep duckweed off all of it.
       const chord = Math.sqrt(logOuter * logOuter - logY * logY);
-      colliders.waterline.capsules.push({ ax: lx - dir.x * halfLen, az: lz - dir.z * halfLen, bx: lx + dir.x * halfLen, bz: lz + dir.z * halfLen, r: chord });
+      // The mask capsule is drawn in by its own radius, so its round caps end at the mouths instead of
+      // reaching a whole chord past them; the CPU obstacle model in floaters.js reads the bark itself.
+      const inset = Math.max(0, halfLen - chord);
+      colliders.waterline.capsules.push({ ax: lx - dir.x * inset, az: lz - dir.z * inset, bx: lx + dir.x * inset, bz: lz + dir.z * inset, r: chord });
       // Three perches along the dry ridge, read off the shaped trunk so they sit on the bark, not above it.
       for (const s of [-0.35, 0, 0.35]) {
         const ys = s * logLen;

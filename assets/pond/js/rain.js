@@ -9,6 +9,7 @@ import { MAX_IMPULSES, MICRO_RADIUS } from './impulse.js';
 // completed audio loop tosses again and the rain chains until it loses. Losing resets the timer.
 const TOSS_INTERVAL = 900;
 const TOSS_P = 0.5;
+const BOOT_P = 0.2;   // one load-in in five opens already wet; the chain toss decides how long it lasts
 const LOOP_FALLBACK = 180;            // the bed is a 3:00 loop; used until the decoder confirms it
 const BUILD = [10, 22], TAIL = [18, 40], PEAK = [0.55, 1.0];
 // Reduced motion: rarer starts, shorter chains, and capped low. The shower still sounds like a
@@ -79,7 +80,7 @@ export class RainScheduler {
     this.pushedEnv = 0;
     this.pushedNoise = -1;     // forces the first write, so a stale uniform can never linger
 
-    this.enter('dry');
+    this.enter(Math.random() < BOOT_P ? 'build' : 'dry');
   }
 
   get raining() { return this.state !== 'dry'; }

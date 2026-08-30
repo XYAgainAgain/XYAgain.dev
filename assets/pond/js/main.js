@@ -10,6 +10,7 @@ import { WakeBuffer } from './wake.js';
 import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
 import { attachEleanor } from './eleanor.js';
+import { Grazing } from './eel-graze.js';
 import { IDENTITIES } from './eel-identity.js';
 import { growEel } from './eel-physics.js';
 import { SurfacePass } from './surface.js';
@@ -182,6 +183,10 @@ async function boot() {
   eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.source === 'eleanor' ? 0.5 : 1 }));
   eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
   eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
+  eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
+  eels.on('headbutt', (ev) => audio.headbutt({ pan: ev.pan, length: ev.length }));
+  eels.on('rescue', (ev) => audio.rescue({ pan: ev.pan }));
+  eels.on('graze', (ev) => audio.graze({ pan: ev.pan, muffled: ev.food?.kind === 'algae' }));   // a tuft is eaten under water
 
   // Showers own their own clock: envelope drives impulses, surface noise, and eel activity; intensity
   // alone drives the rain bed. ?rain=1 skips the wait and starts one now.
@@ -206,6 +211,7 @@ async function boot() {
   });
   // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
+  eels.graze = new Grazing({ floaters, algae, pads, habitat });
   habitat.composeCover(sim);
   // Reseeds the algae field with the rocks, logs, and this first cover bake all known.
   wake.setSubstrate(colliders);
@@ -216,6 +222,15 @@ async function boot() {
     const n = Math.random() < 0.5 ? 2 : 1;
     for (let i = 0; i < n; i++) {
       effects.spawn(ev.x + (Math.random() - 0.5) * 0.1, ev.y + 0.03, ev.z + (Math.random() - 0.5) * 0.1, 'bubbleTiny');
+    }
+  });
+  // One bubble per sung note, staggered over the phrase. The pool stamps spawn time at the call, so
+  // the queue holds them and the frame loop drains it on effects.time, which is in scope here (t is not yet).
+  const singBubs = [];
+  eels.on('sing', (ev) => {
+    const n = Math.max(1, Math.min(8, ev.food?.notes ?? 3));
+    for (let i = 0; i < n; i++) {
+      singBubs.push({ at: effects.time + (i * 0.6) / n, x: ev.x + (Math.random() - 0.5) * 0.1, y: ev.y + 0.03, z: ev.z + (Math.random() - 0.5) * 0.1 });
     }
   });
 
@@ -415,6 +430,12 @@ async function boot() {
     }
     // Ahead of anything that spawns, so this frame's effects are stamped with this frame's clock.
     effects.setTime(t);
+    for (let i = singBubs.length - 1; i >= 0; i--) {
+      if (t < singBubs[i].at) continue;
+      const q = singBubs[i];
+      effects.spawn(q.x, q.y, q.z, 'bubbleTiny');
+      singBubs.splice(i, 1);
+    }
     idleDrops(t, dt);
     strayBubbles(t);
     popBubbles(t);

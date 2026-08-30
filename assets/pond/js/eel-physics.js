@@ -4,6 +4,7 @@ import { EEL_POINTS, DEPTH } from './config.js';
 export const TICK = 1 / 90;
 export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
 const OFF_DECAY = Math.exp(-2.5 * TICK);
+const SLIP_POINTS = 4;   // how far back the head's slip reaches; behind it the body takes full pushes
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 
 export function segDist(px, pz, ax, az, bx, bz) {
@@ -129,17 +130,26 @@ export function collide(eels, colliders) {
       const ea = eels[a];
       if (ea.slurpedBy) continue;
       const ca = ea.pts[EEL_POINTS >> 1];
+      // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
+      // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
+      const slip = ea.slip ?? 1;
       for (let i = 0; i < EEL_POINTS; i++) {
         const p = ea.pts[i];
         const r = ea.radius;
         const soft = i === 0 ? 0.35 : 1;   // the head eases out of contact; a full shove kinks the trail
+        const glance = i < SLIP_POINTS ? slip : 1;
+        // Rock and log colliders both sit proud of what they draw (the log's is a crest-plus-bend
+        // envelope), so a slippery snout may take a small bite out of one before the push counts.
+        const sink = (1 - glance) * r * 0.35;
         if (p.y < floorY + r + 0.08) p.y = floorY + r + 0.08;   // floor has bumps up to ~0.08
         if (p.y > -r * 0.5) p.y = -r * 0.5;
         for (const s of spheres) {
           // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
-          const dx = p.x - s.x, dy = s.y + s.r > -r * 2 ? 0 : p.y - s.y, dz = p.z - s.z;
-          const d = Math.hypot(dx, dy, dz), min = s.r + r;
-          if (d < min && d > 1e-5) { const k = (min - d) / d * soft; p.x += dx * k; p.y += dy * k; p.z += dz * k; }
+          // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
+          const sr = s.rHit ?? s.r, ky = sr / (s.ryHit ?? sr);
+          const dx = p.x - s.x, dy = s.y + sr > -r * 2 ? 0 : (p.y - s.y) * ky, dz = p.z - s.z;
+          const d = Math.hypot(dx, dy, dz), min = sr + r - sink;
+          if (d < min && d > 1e-5) { const k = (min - d) / d * soft * glance; p.x += dx * k; p.y += dy * k / ky; p.z += dz * k; }
         }
         for (const l of logs) {
           // Distance to the log's axis segment; inside the bore is fine, the wall is not.
@@ -152,10 +162,10 @@ export function collide(eels, colliders) {
           // Hollow logs have open mouths; a solid stub (rInner 0) keeps its tip as a sphere cap.
           const endCap = t <= 0 || t >= 1;
           if (endCap && l.rInner > 0) continue;
-          const inner = l.rInner - r, outer = l.rOuter + r;
+          const inner = l.rInner - r + sink, outer = l.rOuter + r - sink;
           if (d > inner && d < outer && d > 1e-5) {
             const toInner = d - inner, toOuter = outer - d;
-            const k = (l.rInner > 0 && toInner < toOuter ? -toInner : toOuter) / d * soft;
+            const k = (l.rInner > 0 && toInner < toOuter ? -toInner : toOuter) / d * soft * glance;
             p.x += dx * k; p.y += dy * k; p.z += dz * k;
           }
         }

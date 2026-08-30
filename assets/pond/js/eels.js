@@ -57,6 +57,7 @@ export class Eel {
     this.speedMul = 1;
     this.fleeUntil = 0;
     this.squash = 1;
+    this.slip = 1;   // collision glance factor on the snout; Eleanor runs 0.5 so she skids off scenery
     this.rippleAt = 0;
     this.food = null;
     this.tunnel = null;
@@ -92,7 +93,7 @@ export class Eel {
 }
 
 // The shim fans out across every type the pond emits; a new event type belongs here too.
-const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble', 'swap'];
+const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble', 'swap', 'sing', 'headbutt', 'rescue', 'graze'];
 
 export class EelSystem {
   constructor(scene, U, shading, seed, extent, colliders, sim, motion, view, opts = {}) {
@@ -112,6 +113,7 @@ export class EelSystem {
     this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
     this.rain = null;              // the shower scheduler, one shared reference: behavior reads its envelope
     this.habitat = null;           // the cover registry; pads become loiter targets once it is set
+    this.graze = null;             // the herbivore menu (eel-graze.js); behavior calls it only for grazers
     this.feedRecent = 0;           // decaying feed-spree meter; the residents eat too fast for a stock check
     this.spooks = [];              // { x, z, t, strength }
     this.lures = [];               // curiosity points from drags: { x, z, t }
@@ -203,6 +205,14 @@ export class EelSystem {
     if (this.lures.length > 40) this.lures.shift();
   }
   feed(x, z, amount = 1) {
+    // A crumb inside a rock is scored but unreachable, and six eels orbit the stone forever: slide it
+    // to the rim. Logs are hollow and the bore is a legitimate dinner spot, so they keep theirs.
+    for (const o of this.colliders.spheres) {
+      const dx = x - o.x, dz = z - o.z, d = Math.hypot(dx, dz), want = o.r + 0.2;
+      if (d >= want) continue;
+      const nx = d > 1e-4 ? dx / d : 1, nz = d > 1e-4 ? dz / d : 0;
+      x = o.x + nx * want; z = o.z + nz * want;
+    }
     const mesh = this.renderer.createFoodMesh();
     mesh.position.set(x, -0.05, z);
     this.group.add(mesh);
@@ -235,6 +245,8 @@ export class EelSystem {
     const to = id ?? pickAbsent(this.rng, names);
     if (!to) return false;
     const from = e.name, oldLen = e.length;
+    // A braid does not survive one of its strands turning into someone else.
+    if (e.twine) { for (const m of e.twine.members) if (m.twine === e.twine) m.twine = null; }
     e.identity = to;
     applyIdentity(e, to, e.rng);
     // applyIdentity rolls the new length straight onto the eel; growEel is the only path that carries
@@ -261,7 +273,13 @@ export class EelSystem {
       o.partner = o.quirks.follows
         ? this.eels.find((p) => p.name === o.quirks.follows) ?? this.guests.find((g) => g.name === o.quirks.follows) ?? null
         : null;
+      // A grudge, a rescue, or a crush aimed at the eel who left does not transfer to the newcomer.
+      if (o.buttTo === e) o.buttTo = null;
+      if (o.rescueTo === e) o.rescueTo = null;
+      if (o.cuddle?.with === e) o.cuddle.until = 0;
+      if (o.snuggle?.with === e) o.snuggle.with = null;
     }
+    for (const g of this.guests) if (g.prey === e) g.prey = null;
     this.emit('swap', e, { from, to: e.name });
     return true;
   }

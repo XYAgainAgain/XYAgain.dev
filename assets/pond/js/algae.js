@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, attribute, uniform, varying, positionGeometry, vec2, vec3, vec4, float, sin, cos, dot, cross, length, normalize, mix, smoothstep, pow, select, frontFacing, PI } from 'three/tsl';
-import { DEPTH, INF_SLOTS } from './config.js';
+import { DEPTH, INF_SLOTS, MOON_ORBIT_SECONDS } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { makeCurrent, capsuleInfluenceCPU, valueNoise2 } from './shading.js';
 
@@ -12,18 +12,33 @@ const STRAND_MAX = 16;
 const STRAND_POOL = TUFT_POOL * STRAND_MAX;
 const TUFT_SALT = 1700;
 const TUFT_TARGET = [40, 64];
-const STRANDS = [10, STRAND_MAX];
+const STRANDS = [8, 13], STRANDS_BIG = [13, STRAND_MAX];
 const STRAND_SEGS = 5;                     // 6 rows × 2 = 12 vertices, 10 triangles
 const MIN_SEP = 0.25;                      // holdfast spacing for the scatter, 3D
 const VIEW_MARGIN = 0.6;
 
-// Long for a real tuft (up to 0.78 units), because the diffuse cloud in the reference needs the reach.
+// 13 cm of real Cladophora is 0.78 units and the ordinary band sits under it. One in six is a monster
+// well past that, half an eel long, paid out of the same strand pool, so the rest run leaner.
 const TUFT_LEN = [0.30, 0.70];
+const TUFT_LEN_BIG = [0.90, 1.30];
+const BIG_CHANCE = 1 / 6;
+const STRAND_LEN_SPREAD = [0.55, 1.0];     // each strand's share of its tuft's length
 const TUFT_LEN_MIN = 0.10;
+// A monster flops rather than standing: without cutting its rise toward up, the headroom cap in 0.8
+// units of water would shave every big tuft straight back to an ordinary one.
+const BIG_UP_BLEND = 0.35;
 const W_BASE = [0.018, 0.026], W_TIP = 0.004;
-const FAN_SPREAD = 35 * Math.PI / 180;
-const REST_LEAN = [0.55, 1.05];            // rad; without a resting arch a strand is edge-on to the top-down camera
+const FAN_SPREAD = 35 * Math.PI / 180, FAN_SPREAD_BIG = 58 * Math.PI / 180;
+const REST_LEAN = [0.40, 1.25];            // rad, per tuft; without a resting arch a strand is edge-on to the top-down camera
+const LEAN_JITTER = [0.8, 1.25];           // per strand, around its tuft's lean
+const LEAN_MAX = 1.3;                      // uTuftBendMax; past it the shader clamps anyway
+const LEAN_STRIP = 0.22, LEAN_DEEP = 0.18, LEAN_DEEP_AT = 0.35;
+// Yaw is a full circle around the holdfast normal, tilt is how far off it the whole tuft leans. Without
+// the yaw every tuft on a log leans the same way off the bark and the row reads as a comb.
+const TILT = [0.10, 0.80], TILT_BIG = [0.55, 1.30];
+const STRAND_SCATTER = 0.16;               // per-strand tilt off the tuft axis, so no two strands share a plane
 const CURL = 0.25, OMEGA = [1.0, 2.0];
+const MEANDER_GAIN = 0.03;                 // shared with uTuftMeander: the CPU bows against this exact number
 const MEANDER_AMP = [0.6, 1.4], MEANDER_F = [0.85, 1.25];
 const STRAND_ALPHA = [0.35, 0.8];
 
@@ -31,12 +46,18 @@ const STRAND_ALPHA = [0.35, 0.8];
 const EMERGENT_TOP = -0.04;
 const STRIP_STEP = [0.30, 0.40];           // arc between holdfasts along a strip
 const STRIP_Y = [-0.16, -0.06];            // the band of substrate the water actually laps
-const STRIP_RING = [3, 18];
+const STRIP_RING = [3, 24];
 const STRIP_SHARE = 0.7;                   // of the budget claimed by strips before the scatter fills in
-// Strips grow as colonies, not fences: a few dense runs per flank, bare stretches between, a bare side now and then.
-const COLONIES = [1, 3], COLONY_W = [0.04, 0.22], COLONY_STRAY = 0.08, SIDE_BARE = 0.25;
-const RING_ARCS = [1, 2], RING_ARC_W = [0.5, 2.2];
-const STRIP_DOWN = 0.35;
+// Strips grow as colonies, not fences: a couple of tight runs per flank, long bare stretches between,
+// a bare side now and then, and the odd loner. Narrow colonies over a finer walk is what packs them.
+const COLONIES = [1, 2], COLONY_W = [0.03, 0.14], COLONY_STRAY = 0.06, SIDE_BARE = 0.35;
+const RING_ARCS = [1, 2], RING_ARC_W = [0.4, 1.6];
+const FLANK_STEP = 0.5, RING_STEP = 0.65;  // of STRIP_STEP, so a colony has holdfasts to spend
+// A slice of the budget buys second holdfasts beside chosen ones rather than new sites: two fans
+// growing through each other is what a clump looks like from above.
+const STACK_SHARE = 0.18, STACK_CHANCE = 0.35, STACK_OFF = [0.02, 0.07], STACK_RISE = 0.02;
+const STRIP_DOWN = [0.15, 0.55];
+const STRIP_YAW = 1.2;                     // how far a streamer swings off the outward normal before it is inside the stone
 const BISECT_STEPS = 10;                   // π/2^10 is under a millimeter of bark
 const FLANK_Y = [-0.30, -0.10];
 const ROCK_FLANK = [1, 3], EMERGENT_FLANK = [2, 3];
@@ -45,12 +66,13 @@ const CROWN_BAND = [0.05, 0.25];           // how far below a submerged crown it
 const FLOOR_MARGIN = 0.08, SURFACE_MARGIN = 0.06;
 const LOG_TUFTS = [3, 5], LOG_T = [0.12, 0.88], LOG_TOP_Y = -0.08, LOG_PHI_SIN = 0.78;
 
-// Rise direction: normalize(mix(N, up, blend)). The blend shrinks in the shallows so a strand on a
+// Rise direction: normalize(mix(axis, up, blend)). The blend shrinks in the shallows so a strand on a
 // near-surface flank leans out instead of standing up through the waterline.
 const UP_BLEND = 0.6, UP_BLEND_DEPTH = 0.40, UP_BLEND_FLOOR = 0.2;
-const LAT_TIP = 0.5;                       // worst-case lateral rise of a bent tip, as a fraction of length
 
 const CLOUD_R = [0.30, 0.55];
+const CLOUD_LEN_REF = 0.50, CLOUD_SCALE = [0.8, 1.7];
+const CLOUD_FOLLOW = 0.5;                  // the haze centers over the middle of the fan, not over the tips
 const CLOUD_HZ = [0.05, 0.10];
 const CLOUD_LIFT = 0.10;                   // the haze sits camera-side of its rock or the stone halves it
 
@@ -58,6 +80,23 @@ const CLOUD_LIFT = 0.10;                   // the haze sits camera-side of its r
 const ATTACK_TAU = 0.25, RECOVER_TAU = 3.5;
 const BEND_GAIN = 0.9, REDUCED_BEND = 0.5, MASS_SOFT = 0.6;
 const DT_MAX = 0.1;
+
+// Grazing: the strands collapse fast, then creep back over a whole orbit. A re-upload every half
+// second is finer than a filament growing 0.0004 units a second could ever show.
+const BITE_FALL = 0.3, BITE_REGROW = MOON_ORBIT_SECONDS, BITE_UPLOAD = 0.5;
+
+/* How far a resting strand of unit length ever gets above and below its holdfast. A tip-only bound
+   misses the interior maximum, which is where a down-leaning strand actually reaches the waterline. */
+const reach = { up: 0, down: 0 };
+function arcReach(riseY, latY, bend) {
+  const m = Math.hypot(riseY, latY), lo = -Math.atan2(latY, riseY), hi = bend + lo;
+  const sl = Math.sin(lo), sh = Math.sin(hi);
+  // bend is at most LEAN_MAX and lo lands in [−π, π], so ±π/2 are the only turning points in the sweep.
+  const mx = lo <= Math.PI / 2 && hi >= Math.PI / 2 ? 1 : Math.max(sl, sh);
+  const mn = lo <= -Math.PI / 2 && hi >= -Math.PI / 2 ? -1 : Math.min(sl, sh);
+  reach.up = (latY + m * mx) / bend;
+  reach.down = (latY + m * mn) / bend;
+}
 
 function makeStrandGeometry() {
   const geo = new THREE.InstancedBufferGeometry();
@@ -110,6 +149,8 @@ export class AlgaeTufts {
     this.tufts = [];
     this.strandCount = 0;
     this.pushTmp = { x: 0, z: 0 };
+    this.bitten = 0;      // grazed tufts still collapsing or regrowing; 0 means stepBites costs nothing
+    this.biteAcc = 0;
     this.layout(seed, view, colliders);
     const current = makeCurrent(U);
     this.build(U, shading, wake, current);
@@ -191,18 +232,36 @@ export class AlgaeTufts {
     };
     shuffle(strips); shuffle(scatter);
     const cap = Math.min(rng.int(TUFT_TARGET[0], TUFT_TARGET[1]), TUFT_POOL);
-    const share = Math.round(cap * STRIP_SHARE);
+    const sites = Math.max(1, Math.round(cap * (1 - STACK_SHARE)));
+    const share = Math.round(sites * STRIP_SHARE);
     const kept = [];
     let si = 0;
     for (; si < strips.length && kept.length < share; si++) kept.push(strips[si]);
     for (const s of scatter) {
-      if (kept.length >= cap) break;
+      if (kept.length >= sites) break;
       // Strips space themselves by STRIP_STEP, so only the scattered holdfasts police each other.
       if (kept.some((k) => !k.strip && (k.x - s.x) ** 2 + (k.y - s.y) ** 2 + (k.z - s.z) ** 2 < MIN_SEP * MIN_SEP)) continue;
       kept.push(s);
     }
-    for (; si < strips.length && kept.length < cap; si++) kept.push(strips[si]);
+    for (; si < strips.length && kept.length < sites; si++) kept.push(strips[si]);
+    // Twins land after the separation pass on purpose: MIN_SEP exists to stop accidental doubles, and
+    // these are the deliberate ones.
+    const order = kept.map((_, i) => i);
+    shuffle(order);
+    for (const i of order) {
+      if (kept.length >= cap) break;
+      if (rng.chance(STACK_CHANCE)) kept.push(this.stackTwin(rng, kept[i]));
+    }
     for (const h of kept) this.growTuft(rng, h);
+  }
+
+  /* A second holdfast a fan's width from the first, on the same substrate. */
+  stackTwin(rng, h) {
+    let tx = -h.nz, tz = h.nx;
+    const m = Math.hypot(tx, tz);
+    if (m < 1e-4) { tx = 1; tz = 0; } else { tx /= m; tz /= m; }
+    const d = rng.range(STACK_OFF[0], STACK_OFF[1]) * (rng.chance(0.5) ? 1 : -1);
+    return { ...h, x: h.x + tx * d, y: h.y + rng.range(-STACK_RISE, STACK_RISE), z: h.z + tz * d };
   }
 
   /* The rock's ring at the waterline, walked at a fixed arc step and dropped to just under the surface.
@@ -212,7 +271,7 @@ export class AlgaeTufts {
     const k = 1 - dy0 * dy0;
     if (k < 0.04) return;
     const r0 = s.r * Math.sqrt(k);
-    const step = rng.range(STRIP_STEP[0], STRIP_STEP[1]);
+    const step = rng.range(STRIP_STEP[0], STRIP_STEP[1]) * RING_STEP;
     const n = Math.max(STRIP_RING[0], Math.min(STRIP_RING[1], Math.round((2 * Math.PI * r0) / step)));
     const th0 = rng.range(0, Math.PI * 2);
     const dth = (Math.PI * 2) / n;
@@ -236,7 +295,7 @@ export class AlgaeTufts {
   /* Both flanks of a half-drowned trunk. The bark radius varies along the log, so the angle that sits
      just under the surface is solved per station and per side rather than assumed. Returns the count. */
   waterlineFlanks(rng, l, alen, inView, out) {
-    const step = rng.range(STRIP_STEP[0], STRIP_STEP[1]) * 0.7;
+    const step = rng.range(STRIP_STEP[0], STRIP_STEP[1]) * FLANK_STEP;
     const span = LOG_T[1] - LOG_T[0];
     const n = Math.max(2, Math.min(32, Math.round((alen * span) / step)));
     let placed = 0;
@@ -297,24 +356,44 @@ export class AlgaeTufts {
     return best;
   }
 
-  /* 10–16 strands fanned about the holdfast's rise axis. Every strand's length is capped by the water
-     over it, using the worst tip a full bend can reach, so nothing pokes through the surface. */
+  /* A tuft: an axis yawed and tilted off the holdfast normal, strands fanned about it each on their
+     own small tilt, every length capped by the water above and the sand below. */
   growTuft(rng, h) {
     if (this.tufts.length >= TUFT_POOL || this.strandCount + STRAND_MAX > STRAND_POOL) return;
     const depth = -h.y;
+    const big = rng.chance(BIG_CHANCE);
+    const lenBand = big ? TUFT_LEN_BIG : TUFT_LEN;
+    const lenBase = rng.range(lenBand[0], lenBand[1]);
     let rx, ryy, rz;
     if (h.strip) {
       // Right under the surface an upward rise would push every tip through it and the headroom cap
       // would shave the tuft away, so a strip streams outward off the substrate and droops.
       const hh = Math.hypot(h.nx, h.nz) || 1;
-      rx = (h.nx / hh) * (1 - STRIP_DOWN); rz = (h.nz / hh) * (1 - STRIP_DOWN); ryy = -STRIP_DOWN;
+      const yaw = rng.range(-STRIP_YAW, STRIP_YAW), cy = Math.cos(yaw), sy = Math.sin(yaw);
+      const ox = h.nx / hh, oz = h.nz / hh;
+      const down = rng.range(STRIP_DOWN[0], STRIP_DOWN[1]);
+      const flat = 1 - down;
+      rx = (ox * cy - oz * sy) * flat; rz = (ox * sy + oz * cy) * flat; ryy = -down;
     } else {
-      const blend = UP_BLEND * Math.min(1, Math.max(UP_BLEND_FLOOR, depth / UP_BLEND_DEPTH));
-      rx = h.nx * (1 - blend); ryy = h.ny * (1 - blend) + blend; rz = h.nz * (1 - blend);
+      // Perpendicular pair around the normal, p1 the up-most of them, so yaw 0 is the old straight-out lean.
+      let p1x = -h.nx * h.ny, p1y = 1 - h.ny * h.ny, p1z = -h.nz * h.ny;
+      let m1 = Math.hypot(p1x, p1y, p1z);
+      if (m1 < 1e-4) { p1x = 1; p1y = 0; p1z = 0; m1 = 1; }
+      p1x /= m1; p1y /= m1; p1z /= m1;
+      const p2x = h.ny * p1z - h.nz * p1y, p2y = h.nz * p1x - h.nx * p1z, p2z = h.nx * p1y - h.ny * p1x;
+      const tiltBand = big ? TILT_BIG : TILT;
+      const yaw = rng.range(0, Math.PI * 2), tilt = rng.range(tiltBand[0], tiltBand[1]);
+      const st = Math.sin(tilt), cy = Math.cos(yaw) * st, sy = Math.sin(yaw) * st, ct = Math.cos(tilt);
+      const axX = h.nx * ct + p1x * cy + p2x * sy;
+      const axY = h.ny * ct + p1y * cy + p2y * sy;
+      const axZ = h.nz * ct + p1z * cy + p2z * sy;
+      const blend = UP_BLEND * Math.min(1, Math.max(UP_BLEND_FLOOR, depth / UP_BLEND_DEPTH)) * (big ? BIG_UP_BLEND : 1);
+      rx = axX * (1 - blend); ryy = axY * (1 - blend) + blend; rz = axZ * (1 - blend);
     }
     const rm = Math.hypot(rx, ryy, rz) || 1;
     rx /= rm; ryy /= rm; rz /= rm;
     const headroom = Math.max(0, depth - SURFACE_MARGIN);
+    const floorRoom = Math.max(0, h.y + DEPTH - FLOOR_MARGIN);
     // Best case over the fan is a strand aimed level or below; if even that cannot reach the minimum
     // length under the water above, drop the tuft rather than squash it onto the ceiling.
     if (ryy > 1e-3 && headroom / ryy < TUFT_LEN_MIN) return;
@@ -325,18 +404,34 @@ export class AlgaeTufts {
     if (ah < 1e-4) { ax = 1; ay = 0; az = 0; } else { ax /= ah; az /= ah; }
     const bx = ryy * az - rz * ay, by = rz * ax - rx * az, bz = rx * ay - ryy * ax;
 
-    const count = rng.int(STRANDS[0], STRANDS[1]);
+    const strandBand = big ? STRANDS_BIG : STRANDS;
+    const count = rng.int(strandBand[0], strandBand[1]);
+    const fan = big ? FAN_SPREAD_BIG : FAN_SPREAD;
+    // Waterline tufts stream over with the current and deep flanks droop, so the tuft's resting arch
+    // is biased by where it sits rather than rolled the same way everywhere.
+    const leanC = rng.range(REST_LEAN[0], REST_LEAN[1])
+      + (h.strip ? LEAN_STRIP : 0) + (!h.strip && depth > LEAN_DEEP_AT ? LEAN_DEEP : 0);
     const azimuth = rng.range(0, Math.PI * 2);
     const strands = [];
     for (let i = 0; i < count; i++) {
-      const a = azimuth + rng.range(-FAN_SPREAD, FAN_SPREAD);
+      const a = azimuth + rng.range(-fan, fan);
       const ca = Math.cos(a), sa = Math.sin(a);
-      const lx = ax * ca + bx * sa, ly = ay * ca + by * sa, lz = az * ca + bz * sa;
+      let lx = ax * ca + bx * sa, ly = ay * ca + by * sa, lz = az * ca + bz * sa;
+      const sd = rng.range(0, Math.PI * 2), sj = rng.range(0, STRAND_SCATTER);
+      const cs = Math.cos(sd), ss = Math.sin(sd), cj = Math.cos(sj), sjs = Math.sin(sj);
+      const jx = ax * cs + bx * ss, jy = ay * cs + by * ss, jz = az * cs + bz * ss;
+      const srx = rx * cj + jx * sjs, sry = ryy * cj + jy * sjs, srz = rz * cj + jz * sjs;
+      // The ribbon plane is cross(rise, lat) with no normalize in the shader, so this strand's own axis
+      // and its fan direction have to stay perpendicular and unit after the scatter.
+      const d = srx * lx + sry * ly + srz * lz;
+      lx -= srx * d; ly -= sry * d; lz -= srz * d;
+      const lm = Math.hypot(lx, ly, lz) || 1;
+      lx /= lm; ly /= lm; lz /= lm;
       // Rolled before the cap test so a rejected strand never shifts the stream for the ones after it.
       const s = {
-        rx, ry: ryy, rz, lx, ly, lz,
+        rx: srx, ry: sry, rz: srz, lx, ly, lz,
         len: 0,
-        lean: rng.range(REST_LEAN[0], REST_LEAN[1]),
+        lean: Math.min(LEAN_MAX, leanC * rng.range(LEAN_JITTER[0], LEAN_JITTER[1])),
         width: rng.range(W_BASE[0], W_BASE[1]),
         phase: rng.range(0, Math.PI * 2),
         omega: rng.range(OMEGA[0], OMEGA[1]),
@@ -347,21 +442,48 @@ export class AlgaeTufts {
         alpha: rng.range(STRAND_ALPHA[0], STRAND_ALPHA[1]),
         waveF: rng.range(MEANDER_F[0], MEANDER_F[1]),
       };
-      const roll = rng.range(TUFT_LEN[0], TUFT_LEN[1]);
-      const rise = ryy + LAT_TIP * Math.max(0, ly);
-      const cap = rise > 1e-3 ? headroom / rise : TUFT_LEN[1];
+      const roll = lenBase * rng.range(STRAND_LEN_SPREAD[0], STRAND_LEN_SPREAD[1]);
+      arcReach(sry, ly, Math.max(1e-3, s.lean));
+      const cap = reach.up > 1e-3 ? headroom / reach.up : lenBand[1];
       if (cap < TUFT_LEN_MIN) continue;
-      s.len = Math.max(TUFT_LEN_MIN, Math.min(roll, cap));
+      // A nub is honest where the sand is close; the alternative is a meter of filament buried in it.
+      const capDown = reach.down < -1e-3 ? floorRoom / -reach.down : lenBand[1];
+      s.len = Math.max(TUFT_LEN_MIN, Math.min(roll, cap, capDown));
+      // The bow's budget is whatever room is left to the water or sand above the arc. A clean bow only
+      // swings one way, so its sign picks the margin; the meander spends both, and a maxed strand straightens rather than flattens.
+      const wys = srz * lx - srx * lz;
+      const mAmp = s.waveAmp * MEANDER_GAIN * Math.abs(wys), halfW = W_BASE[1] * 0.5;
+      const bowUp = Math.max(0, wys * s.curl) + mAmp, bowDown = Math.max(0, -wys * s.curl) + mAmp;
+      let k = 1;
+      if (bowUp > 1e-4) k = Math.min(k, Math.max(0, headroom - s.len * reach.up - halfW) / (s.len * bowUp));
+      if (bowDown > 1e-4) k = Math.min(k, Math.max(0, floorRoom + s.len * reach.down - halfW) / (s.len * bowDown));
+      if (k < 1) { s.curl *= k; s.waveAmp *= k; }
       strands.push(s);
     }
     const cloud = {
-      r: rng.range(CLOUD_R[0], CLOUD_R[1]),
+      r: rng.range(CLOUD_R[0], CLOUD_R[1])
+        * Math.min(CLOUD_SCALE[1], Math.max(CLOUD_SCALE[0], lenBase / CLOUD_LEN_REF)),
       phase: rng.range(0, Math.PI * 2),
       rate: rng.range(CLOUD_HZ[0], CLOUD_HZ[1]) * Math.PI * 2,
       nx: rng.range(0, 50), nz: rng.range(0, 50),
     };
     if (!strands.length) return;
-    this.tufts.push({ x: h.x, y: h.y, z: h.z, cloudY: h.y + CLOUD_LIFT, start: this.strandCount, count: strands.length, strands, cloud });
+    // The haze follows the fan's mean lean, so a tuft laid right over drags its cloud along instead
+    // of glowing over its own holdfast. Horizontal only: the camera looks straight down.
+    let mx = 0, mz = 0;
+    for (const s of strands) {
+      const t = Math.min(LEAN_MAX, Math.max(1e-3, s.lean)), R = s.len / t;
+      const sn = Math.sin(t) * R, cs = (1 - Math.cos(t)) * R;
+      mx += s.rx * sn + s.lx * cs;
+      mz += s.rz * sn + s.lz * cs;
+    }
+    const k = CLOUD_FOLLOW / strands.length;
+    this.tufts.push({
+      x: h.x, y: h.y, z: h.z,
+      cloudX: h.x + mx * k, cloudY: h.y + CLOUD_LIFT, cloudZ: h.z + mz * k,
+      start: this.strandCount, count: strands.length, strands, cloud,
+      biting: false, biteT: 0,
+    });
     this.strandCount += strands.length;
   }
 
@@ -384,7 +506,11 @@ export class AlgaeTufts {
     }
     this.aBend = new THREE.InstancedBufferAttribute(this.bendArr, 4);
     this.aBend.setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('aTuftA', new THREE.InstancedBufferAttribute(A, 4));
+    // Strand length is the one static field grazing rewrites, so it carries the dynamic hint too.
+    this.tuftA = A;
+    this.aTuftA = new THREE.InstancedBufferAttribute(A, 4);
+    this.aTuftA.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aTuftA', this.aTuftA);
     geo.setAttribute('aTuftB', new THREE.InstancedBufferAttribute(B, 4));
     geo.setAttribute('aTuftC', new THREE.InstancedBufferAttribute(C, 4));
     geo.setAttribute('aTuftD', new THREE.InstancedBufferAttribute(D, 4));
@@ -408,7 +534,7 @@ export class AlgaeTufts {
     const uTuftSway = uniform(0.12), uTuftOsc = uniform(0.03);
     const uTuftWakeK = uniform(2.4), uTuftWakeGain = uniform(0.35);
     const uTuftCurl = uniform(1.0), uTuftBendMax = uniform(1.3);
-    const uTuftMeander = uniform(0.03), uTuftMeanderK = uniform(2 * Math.PI * 1.7);
+    const uTuftMeander = uniform(MEANDER_GAIN), uTuftMeanderK = uniform(2 * Math.PI * 1.7);
     const uTuftCeil = uniform(-0.02);                // hard backstop: no strand ever crosses the waterline
 
     const vTuftP = varying(vec3(0), 'vTuftP');
@@ -501,12 +627,15 @@ export class AlgaeTufts {
     this.cloudBendArr = new Float32Array(TUFT_POOL * 4);
     this.tufts.forEach((tf, i) => {
       const c = tf.cloud, o = i * 4;
-      A.set([tf.x, tf.cloudY, tf.z, c.r], o);
+      A.set([tf.cloudX, tf.cloudY, tf.cloudZ, c.r], o);
       B.set([c.phase, c.rate, c.nx, c.nz], o);
     });
     this.aCloudBend = new THREE.InstancedBufferAttribute(this.cloudBendArr, 4);
     this.aCloudBend.setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('aCloudA', new THREE.InstancedBufferAttribute(A, 4));
+    this.cloudA = A;
+    this.aCloudA = new THREE.InstancedBufferAttribute(A, 4);
+    this.aCloudA.setUsage(THREE.DynamicDrawUsage);   // w is the haze radius, which fades with a bitten tuft
+    geo.setAttribute('aCloudA', this.aCloudA);
     geo.setAttribute('aCloudB', new THREE.InstancedBufferAttribute(B, 4));
     geo.setAttribute('aCloudBend', this.aCloudBend);
     geo.instanceCount = this.tufts.length;
@@ -565,17 +694,61 @@ export class AlgaeTufts {
 
   /* Asymmetric one-pole per tuft: quick to lay over, slow to rise. A stateless GPU read of the wake
      would spring back on the wake's own 1.2 s, which reads as a reed, not as water-damped algae. */
+  /* A tuft the quality ladder has hidden, or one already torn off, is not on anybody's menu. */
+  canBite(i) {
+    const tf = this.tufts[i];
+    if (!tf || tf.biting) return false;
+    return tf.start + tf.count <= this.mesh.geometry.instanceCount && i < this.cloudMesh.geometry.instanceCount;
+  }
+
+  /* Torn off the stone: the strands fall to a stubble over BITE_FALL and creep back over one orbit.
+     The width attribute is untouched, so what is left is the holdfast nub a grazer actually leaves. */
+  biteTuft(i) {
+    if (!this.canBite(i)) return false;
+    const tf = this.tufts[i];
+    tf.biting = true;
+    tf.biteT = 0;
+    this.bitten++;
+    return true;
+  }
+
+  stepBites(dt) {
+    if (!this.bitten) return;
+    this.biteAcc += dt;
+    let falling = false;
+    for (const tf of this.tufts) if (tf.biting && tf.biteT < BITE_FALL) { falling = true; break; }
+    if (!falling && this.biteAcc < BITE_UPLOAD) return;
+    // Advance by everything the throttle swallowed, or a regrow would run at a fraction of real time.
+    const el = this.biteAcc;
+    this.biteAcc = 0;
+    for (let i = 0; i < this.tufts.length; i++) {
+      const tf = this.tufts[i];
+      if (!tf.biting) continue;
+      tf.biteT += el;
+      let gone = tf.biteT < BITE_FALL ? Math.min(1, tf.biteT / BITE_FALL) : 1 - (tf.biteT - BITE_FALL) / BITE_REGROW;
+      if (gone <= 0) { gone = 0; tf.biting = false; this.bitten--; }
+      const keep = 1 - gone;
+      for (let j = 0; j < tf.count; j++) this.tuftA[(tf.start + j) * 4 + 3] = tf.strands[j].len * keep;
+      this.cloudA[i * 4 + 3] = tf.cloud.r * keep;
+    }
+    this.aTuftA.needsUpdate = true;
+    this.aCloudA.needsUpdate = true;
+  }
+
   update(dt) {
     if (!this.tufts.length) return;
     // A NaN dt would poison the lag state for the rest of the session; the comparison rejects it.
     const step = dt > 0 ? Math.min(dt, DT_MAX) : 0;
+    this.stepBites(step);
     const U = this.U, out = this.pushTmp;
     const gain = BEND_GAIN * (this.motion && this.motion.reduced ? REDUCED_BEND : 1);
     for (let i = 0; i < this.tufts.length; i++) {
       const tf = this.tufts[i];
       let px = 0, pz = 0;
       for (let s = 0; s < INF_SLOTS; s++) {
-        if (!capsuleInfluenceCPU(U, tf.x, tf.y, tf.z, s, out)) continue;
+        // Sampled at the mass, not the holdfast: a tuft leaning a body-length downstream would
+        // otherwise ignore an eel swimming straight through the part of it you can see.
+        if (!capsuleInfluenceCPU(U, tf.cloudX, tf.y, tf.cloudZ, s, out)) continue;
         const a = U.infA.array[s], b = U.infB.array[s];
         // A body's shove scales with its girth, exactly as the petiole bump does.
         const k = b.w * (a.w / (a.w + MASS_SOFT));

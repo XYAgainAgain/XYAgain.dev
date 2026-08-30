@@ -12,6 +12,12 @@ import { pushTrail, retreatAlongTrail, growEel } from './eel-physics.js';
 const FEED_WORTH = 4;   // recent feed-spree total that makes the trip worthwhile
 const VISIT_CAP = 30;   // seconds before she loses interest in an outing
 const SLURP_AT = 7;     // residents longer than this get repossessed segment by segment
+const ZOOM_EVERY = 0.7; // seconds between evasive re-aims for a zoomies prey
+const ZOOM_JITTER = 40 * Math.PI / 180;
+const SLIP = 0.5;         // rock and log pushes on her snout, halved: she is far too strong to be held by bark
+const REV_JAM = 1;        // seconds of motionless head before a backing-out fold gets help
+const REV_TRAIL = 6;      // retreatAlongTrail starves at 4; below this the path can no longer feed a reverse
+const PROG_WINDOW = 0.5;  // stuck is judged over this window, never tick to tick
 
 export function attachEleanor(sys, seed) {
   const id = IDENTITIES.find((i) => i.name === 'Eleanor');
@@ -24,6 +30,10 @@ export function attachEleanor(sys, seed) {
   e.rescued = false;
   e.stuckStrikes = 0;
   e.prey = null;
+  e.zoomAt = 0;
+  e.slip = SLIP;
+  setExit(e, null);
+  resetProgress(e);
   const log = sys.colliders.logs[0];
   // Lair test is stricter than the passage fit: she wants a den, not a squeeze.
   e.lair = log && log.rInner >= e.radius * 1.6 ? log : null;
@@ -55,9 +65,23 @@ function setVisible(e, v) {
   e.eyes.forEach((m) => { m.visible = v; });
 }
 
+/* Every exit change clears the reverse-jam watch with it, so a fresh fold never inherits the last one's strikes. */
+function setExit(e, mode) {
+  e.exiting = mode;
+  e.revJam = 0;
+  e.revNudged = false;
+  e.revX = e.head.x; e.revZ = e.head.z;
+}
+
+function resetProgress(e) {
+  e.stuckFor = 0;
+  e.progT = 0;
+  e.progX = e.head.x; e.progZ = e.head.z;
+}
+
 function park(sys, e) {
   e.parkAng = e.rng.range(0, Math.PI * 2);
-  e.exiting = null;
+  setExit(e, null);
   e.nopePulse = 0;
   const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
   teleport(e, Math.cos(e.parkAng) * d, Math.sin(e.parkAng) * d, e.parkAng + Math.PI);
@@ -91,6 +115,7 @@ function begin(e, state, now) {
   e.stateAt = now;
   e.rescued = false;
   e.stuckStrikes = 0;
+  resetProgress(e);
   setVisible(e, true);
 }
 
@@ -98,8 +123,22 @@ function goHome(sys, e, now) {
   e.stateAt = now;
   e.rescued = false;
   e.stuckStrikes = 0;
+  resetProgress(e);
   if (e.lair && !sys.perfHot) { e.state = 'return'; e.returnLeg = 0; }
   else e.state = 'depart';
+}
+
+/* Obstacle push, written into the module scratch so the steering loops allocate nothing. Squared
+   falloff keeps the far field a hint; the tangent is what saves a head-on, where radial alone cancels. */
+let avoidX = 0, avoidZ = 0;
+function avoid(e, dx, dz, d, reach) {
+  const f = 1 - d / reach, k = f * f * 2.2;
+  avoidX = (dx / d) * k; avoidZ = (dz / d) * k;
+  const ahead = (-dx * e.heading.x - dz * e.heading.z) / d;
+  if (ahead <= 0) return;
+  const sx = -e.heading.z, sz = e.heading.x;
+  const kt = k * ahead * 1.4 * (dx * sx + dz * sz >= 0 ? 1 : -1);   // slide toward the flank it is not on
+  avoidX += sx * kt; avoidZ += sz * kt;
 }
 
 function brain(sys, e, dt) {
@@ -114,21 +153,21 @@ function brain(sys, e, dt) {
       e.checkAt = now + 1;
       const fromLair = e.state === 'lair';
       // A hot pond empties even the lair; otherwise: repossessions first, then dinner, then a lap.
-      if (fromLair && sys.perfHot) { begin(e, 'depart', now); e.exiting = pickExit(sys, e); return; }
+      if (fromLair && sys.perfHot) { begin(e, 'depart', now); setExit(e, pickExit(sys, e)); return; }
       if (!sys.perfHot) {
         const gnarly = sys.eels.filter((r) => r.length > SLURP_AT && !r.slurpedBy);
         if (gnarly.length) {
           gnarly.sort((a, b) => b.length - a.length);
           e.prey = gnarly[0];
           begin(e, 'hunt', now);
-          e.exiting = fromLair ? pickExit(sys, e) : null;
+          setExit(e, fromLair ? pickExit(sys, e) : null);
         } else if (sys.feedRecent >= FEED_WORTH) {
           sys.feedRecent = 0;
           begin(e, 'graze', now);
-          e.exiting = fromLair ? pickExit(sys, e) : null;
+          setExit(e, fromLair ? pickExit(sys, e) : null);
         } else if (now > e.nextSwimBy) {
           begin(e, 'swimby', now);
-          e.exiting = fromLair ? pickExit(sys, e) : null;
+          setExit(e, fromLair ? pickExit(sys, e) : null);
           e.swimbyX = e.rng.range(-sys.view.w * 0.35, sys.view.w * 0.35);
           e.swimbyZ = e.rng.range(-sys.view.h * 0.35, sys.view.h * 0.35);
         } else if (e.state === 'offstage' && e.lair && now > e.coolAt) {
@@ -159,7 +198,7 @@ function brain(sys, e, dt) {
     e.reverse = true;
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
     paceWave(e, dt, false);
-    retreatAlongTrail(e, 0.5 * e.length * dt);
+    retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
     return;
   }
   // A meal in progress finishes before any performance retreat; slurp plus wriggle caps under 4 s.
@@ -184,15 +223,25 @@ function brain(sys, e, dt) {
     e.reverse = true;
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
     paceWave(e, dt, false);
-    retreatAlongTrail(e, 0.5 * e.length * dt);
+    retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
     const behind = (e.head.x - e.lair.a.x) * e.lairDir.x + (e.head.z - e.lair.a.z) * e.lairDir.z;
-    if (behind < -0.8) e.exiting = null;
+    if (behind < -0.8) { setExit(e, null); return; }
+    // A reverse eats the path it walks, so it can jam on the bore or simply run out of history. One
+    // shove deeper buys fresh trail to back down; after that the fold is the only way out.
+    if (e.trailCount <= REV_TRAIL) { setExit(e, 'turn'); return; }
+    if (Math.hypot(e.head.x - e.revX, e.head.z - e.revZ) > e.radius * 0.5) {
+      e.revJam = 0; e.revX = e.head.x; e.revZ = e.head.z;
+    } else if ((e.revJam += dt) > REV_JAM) {
+      if (e.revNudged) { setExit(e, 'turn'); return; }
+      e.head.addScaledVector(e.heading, e.length * 0.1);
+      e.revJam = 0; e.revNudged = true; e.revX = e.head.x; e.revZ = e.head.z;
+    }
     return;
   }
   if (e.exiting) {
     const p = e.exiting === 'turn' ? e.lairApproach : e.lairExit;
     tx = p.x; tz = p.z; ty = e.lairPoint.y; wantBL = e.prowlBL;
-    if (Math.hypot(tx - e.head.x, tz - e.head.z) < 0.8) e.exiting = null;
+    if (Math.hypot(tx - e.head.x, tz - e.head.z) < 0.8) setExit(e, null);
   } else if (e.state === 'depart') {
     const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
     tx = Math.cos(e.parkAng) * d; tz = Math.sin(e.parkAng) * d;
@@ -226,7 +275,9 @@ function brain(sys, e, dt) {
     ty = Math.max(-DEPTH + e.radius, p.head.y);
     wantBL = e.cruiseBL * 1.3;
     const tail = p.pts[p.pts.length - 1];
-    if (Math.min(Math.hypot(e.head.x - tail.x, e.head.z - tail.z), Math.hypot(e.head.x - p.head.x, e.head.z - p.head.z)) < 0.9) {
+    // A zoomies prey is never actually caught: the run itself burns her back under SLURP_AT.
+    if (p.quirks?.zoomies) zoomTick(sys, e, p, dt, now);
+    else if (Math.min(Math.hypot(e.head.x - tail.x, e.head.z - tail.z), Math.hypot(e.head.x - p.head.x, e.head.z - p.head.z)) < 0.9) {
       p.slurpedBy = e;
       e.slurpT = 0;
       begin(e, 'slurp', now);
@@ -259,20 +310,26 @@ function brain(sys, e, dt) {
   const al = Math.hypot(ax, az) || 1e-4;
   ax /= al; az /= al;
   const inBore = !!e.exiting || (e.state === 'return' && e.returnLeg === 1);
+  // Homing aims at a point two units off her own log's mouth, so that log must stop shoving her away
+  // from it or she orbits her own front door until the visit times out.
+  const homing = e.state === 'return';
   if (!inBore) {
-    const look = 0.9 + e.radius * 2;
+    // Reach is her turning radius at this speed, not a fixed collar: eight units of eel has to start
+    // the sweep long before the snout arrives, or the turn finishes somewhere inside the rock.
+    const look = 0.9 + e.radius * 2 + Math.min(2.4, e.speedBL * e.length / Math.max(0.8, e.turnRate));
     for (const o of sys.colliders.spheres) {
       const dx = head.x - o.x, dz = head.z - o.z;
-      const d = Math.hypot(dx, dz), reach = o.r + look;
-      if (d < reach && d > 1e-4) { const k = (1 - d / reach) * 2.2; ax += (dx / d) * k; az += (dz / d) * k; }
+      const d = Math.hypot(dx, dz), reach = (o.rHit ?? o.r) + look;
+      if (d < reach && d > 1e-4) { avoid(e, dx, dz, d, reach); ax += avoidX; az += avoidZ; }
     }
     for (const l of sys.colliders.logs) {
+      if (homing && l === e.lair) continue;
       const abx = l.b.x - l.a.x, abz = l.b.z - l.a.z;
       const tp = Math.max(0, Math.min(1, ((head.x - l.a.x) * abx + (head.z - l.a.z) * abz) / (abx * abx + abz * abz)));
       const nx = l.a.x + abx * tp, nz = l.a.z + abz * tp;
       const dx = head.x - nx, dz = head.z - nz;
       const d = Math.hypot(dx, dz), reach = l.rOuter + look;
-      if (d < reach && d > 1e-4) { const k = (1 - d / reach) * 2.2; ax += (dx / d) * k; az += (dz / d) * k; }
+      if (d < reach && d > 1e-4) { avoid(e, dx, dz, d, reach); ax += avoidX; az += avoidZ; }
     }
   }
 
@@ -303,19 +360,49 @@ function brain(sys, e, dt) {
     if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(1.2, 2.4); sys.emit('nibble', e); }
   }
 
-  // Stuck: commanded speed with no progress. Nope backward early; two strikes abandons the outing.
+  // Stuck: commanded speed and no ground covered over a window. Per tick, a body her size reads every
+  // scrape along a log as a jam; three bad windows is a real one, and 1.5 s is still early enough.
   const cmd = e.speedBL * e.length;
-  if (e.lastX !== undefined && cmd > 0.5 && !e.exiting) {
-    const moved = Math.hypot(head.x - e.lastX, head.z - e.lastZ);
-    if (moved < cmd * dt * 0.3) e.stuckFor += dt; else e.stuckFor = Math.max(0, e.stuckFor - dt * 2);
-    if (e.stuckFor > 1.5) {
-      e.stuckFor = 0;
-      e.stuckStrikes++;
-      if (e.stuckStrikes >= 2) { e.stuckStrikes = 0; goHome(sys, e, now); }
-      else { e.nopePulse = now + 1.3; sys.emit('startle', e); }
+  if (cmd > 0.5 && !e.exiting) {
+    e.progT += dt;
+    if (e.progT >= PROG_WINDOW) {
+      const moved = Math.hypot(head.x - e.progX, head.z - e.progZ);
+      if (moved < cmd * e.progT * 0.3) e.stuckFor += e.progT; else e.stuckFor = 0;
+      e.progT = 0; e.progX = head.x; e.progZ = head.z;
+      if (e.stuckFor > PROG_WINDOW * 2) {
+        e.stuckFor = 0;
+        e.stuckStrikes++;
+        if (e.stuckStrikes >= 2) { e.stuckStrikes = 0; goHome(sys, e, now); }
+        else { e.nopePulse = now + 1.3; sys.emit('startle', e); }
+      }
     }
+  } else {
+    e.progT = 0; e.progX = head.x; e.progZ = head.z;
+    e.stuckFor = Math.max(0, e.stuckFor - dt * 2);
   }
-  e.lastX = head.x; e.lastZ = head.z;
+}
+
+/* Chandler outruns the queen. Speed comes from the residents' own steer: a speedMul spike set after
+   her steer ran this tick becomes next tick's burst, capped at cruise × 1.5 like every other stim. */
+function zoomTick(sys, e, p, dt, now) {
+  if (p.slurpedBy) return;
+  p.uExcite.value += (1 - p.uExcite.value) * Math.min(1, dt * 4);
+  if (p.length > p.baseLength) growEel(p, -Math.min(0.5 * dt, p.length - p.baseLength));
+  // Mid-bore the run's own target must stand, or she aims at the wall from inside the log.
+  if (p.tunnel || now < e.zoomAt) return;
+  e.zoomAt = now + ZOOM_EVERY;
+  const ax = p.head.x - e.head.x, az = p.head.z - e.head.z;
+  const away = Math.hypot(ax, az) > 1e-4 ? Math.atan2(az, ax) : e.rng.range(0, Math.PI * 2);
+  const ang = away + e.rng.range(-ZOOM_JITTER, ZOOM_JITTER);
+  const d = p.length * e.rng.range(2, 3);
+  const hw = sys.view.w * 0.45, hh = sys.view.h * 0.45;
+  p.target.set(
+    Math.max(-hw, Math.min(hw, p.head.x + Math.cos(ang) * d)),
+    0,
+    Math.max(-hh, Math.min(hh, p.head.z + Math.sin(ang) * d)),
+  );
+  p.retargetAt = now + ZOOM_EVERY;
+  p.speedMul = 2.2;
 }
 
 function slurpTick(sys, e, dt, now) {

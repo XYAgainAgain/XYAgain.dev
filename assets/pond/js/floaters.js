@@ -47,6 +47,17 @@ const NOISE_RES = 1024;
 // the ragged frond-scale rim.
 const NOISE_OCTAVES = [[8, 0.28], [16, 0.22], [32, 0.17], [64, 0.13], [128, 0.12], [256, 0.08]];
 
+// Carving lives in its own world-space field, never in the noise: the noise is read in each clump's
+// drifted frame, so a scar stamped there rides a wandering mat and reappears a pond-width away.
+const SCAR_RES = 512;                      // 0.04 units a texel: a fingertip furrow is still four wide
+const SCAR_K = MEM_NOISE;                  // scar bytes carry the units the noise subtraction used
+// Deepest a furrow goes: the mat is long gone by NOISE_MID × MEM_NOISE, and anything past it only
+// buys a longer heal.
+const SCAR_MAX = NOISE_MID * 255;
+
+// Trunk waterline half-widths, sampled along the axis at boot so the per-speck test stays a lookup.
+const LOG_PROFILE_N = 32, LOG_BISECT = 10;
+
 // Speck particle sim. Settle ~5 s: critically damped, ω = 5.8 / settle for a 2% tail.
 const SPECK_OMEGA = 1.16;
 const SPECK_DT_MAX = 1 / 20;
@@ -65,10 +76,11 @@ const CLUMP_STICK = 0.25;                  // a mat that reaches a rock or the l
 // Eleanor is the only body wide enough to plow the mat apart; the residents only warp it. She is
 // identified by capsule radius (0.24–0.28 against a resident's 0.065–0.12), never by slot index.
 const CARVE_MIN_R = 0.18, CARVE_WIDE = 0.34, CARVE_DEPTH = 0.6, CARVE_RATE = 1.2;
-const CARVE_TICK = 0.25, CARVE_HEAL_TAU = 85;   // the furrow is ~95% closed in a little under four minutes
+export const CARVE_TICK = 0.25;
+const CARVE_HEAL_TAU = 85;   // the furrow is ~95% closed in a little under four minutes
 // A finger slices the same field she does, thinner and to a fixed depth: passing twice cannot dig
-// deeper than parted, where dwelling in her path can.
-const FINGER_CARVE_R = 0.085, FINGER_CARVE = 0.46;
+// deeper than parted, where dwelling in her path can. A grazer eats on the same terms.
+export const FINGER_CARVE_R = 0.085, FINGER_CARVE = 0.46;
 const POKE_MAX = 16;                       // sub-frame pointer samples honored per frame
 
 function smoothstep01(e0, e1, x) {
@@ -131,8 +143,20 @@ function buildNoiseField(seed, extent) {
   tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
-  // base is the pristine field a carve heals back toward; work carries the sub-byte relaxation.
-  return { bytes, base: bytes.slice(), work: Float32Array.from(bytes), tex, res: N, extent };
+  return { bytes, tex, res: N, extent };
+}
+
+/* The scar layer: what has been plowed, in world coordinates, zero everywhere until something carves.
+   work carries the sub-byte relaxation the heal runs on. */
+function buildScarField(extent) {
+  const N = SCAR_RES;
+  const bytes = new Uint8Array(N * N);
+  const tex = new THREE.DataTexture(bytes, N, N, THREE.RedFormat);
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return { bytes, work: new Float32Array(N * N), tex, res: N, extent };
 }
 
 /* Unit disc, 6 rings × 32 segments = 193 vertices. aRR is the radial fraction the membership is cut
@@ -188,6 +212,7 @@ export class FloaterSystem {
     this.lastCycle = 0;
     this.windCalm = 1;   // eased 0.7 while a shower loosens the packing
     this.noise = buildNoiseField(seed, sim.extent);
+    this.scar = buildScarField(sim.extent);
     this.pokeSegs = new Float32Array(POKE_MAX * 4);
     this.poke0 = { n: 0, vx: 0, vz: 0, x0: 0, x1: 0, z0: 0, z1: 0 };
     this.forceOut = { x: 0, z: 0 };
@@ -195,7 +220,7 @@ export class FloaterSystem {
     this.slotBox = new Float32Array(INF_SLOTS * 5);
     this.memClump = null;
     this.carveAcc = 0;
-    this.carveBox = null;   // texel AABB of everything Eleanor has plowed and not yet healed
+    this.carveBox = null;   // scar-texel AABB of everything plowed and not yet healed
     this.rect = { ex: view.w / 2 + CLUMP_MARGIN, ez: view.h / 2 + CLUMP_MARGIN };
     this.flattenColliders(colliders);
 
@@ -225,6 +250,56 @@ export class FloaterSystem {
     d.forEach((o, i) => this.obsDisc.set([o.x, o.z, o.r], i * 3));
     this.obsCap = new Float32Array(c.length * 5);
     c.forEach((o, i) => this.obsCap.set([o.ax, o.az, o.bx, o.bz, o.r], i * 5));
+    // A trunk is not a pill: its ends are open mouths and its flanks are shaped bark, so the capsule's
+    // crest-plus-bend radius is only the fallback the branch stubs (no bark sampler) still want.
+    const trunks = (colliders.logs || []).filter((l) => typeof l.bark === 'function');
+    this.obsProfile = c.map((o) => {
+      // The mask capsule is inset from the mouths by its own radius, so match on the axis, not the ends.
+      const l = trunks.find((t) => segDist(o.ax, o.az, t.a.x, t.a.z, t.b.x, t.b.z) < 1e-3 && segDist(o.bx, o.bz, t.a.x, t.a.z, t.b.x, t.b.z) < 1e-3);
+      return l ? this.buildLogProfile(l) : null;
+    });
+  }
+
+  /* Half-widths of the chord where a trunk's bark crosses y = 0, per station and per flank, in the axis
+     frame. The two sides differ: bark is lumpy and the trunk bends. */
+  buildLogProfile(l) {
+    const ax = l.a.x, az = l.a.z;
+    const len = Math.hypot(l.b.x - ax, l.b.z - az) || 1e-6;
+    const ux = (l.b.x - ax) / len, uz = (l.b.z - az) / len;
+    const w = new Float32Array((LOG_PROFILE_N + 1) * 2);
+    for (let i = 0; i <= LOG_PROFILE_N; i++) {
+      const t = i / LOG_PROFILE_N;
+      const p = this.barkWaterlinePerp(l, t, 1, ax, az, ux, uz);
+      const m = this.barkWaterlinePerp(l, t, -1, ax, az, ux, uz);
+      const wp = p >= 0 ? p : (m >= 0 ? m : 0), wn = m < 0 ? -m : (p < 0 ? -p : 0);
+      // Filed by the sign the bark lands on, and a flank whose sample crossed over borrows its twin:
+      // better a symmetric trunk than one side of it reading as zero-width water.
+      w[i * 2] = wp || wn;
+      w[i * 2 + 1] = wn || wp;
+    }
+    return { ax, az, ux, uz, len, w };
+  }
+
+  /* Signed offset from the axis of the point where one flank meets the water, the same bracket algae.js
+     solves on: bark height falls monotonically from the ridge (ang 0) to the belly (ang ±PI). */
+  barkWaterlinePerp(l, t, sgn, ax, az, ux, uz) {
+    const perpOf = (ang) => { const p = l.bark(t, ang * sgn); return (p.x - ax) * -uz + (p.z - az) * ux; };
+    if (l.bark(t, 0).y <= 0) return 0;                                   // ridge drowned: nothing dry here
+    if (l.bark(t, Math.PI * sgn).y >= 0) return perpOf(Math.PI / 2);     // belly dry: the widest chord
+    let lo = 0, hi = Math.PI;
+    for (let i = 0; i < LOG_BISECT; i++) {
+      const mid = (lo + hi) * 0.5;
+      if (l.bark(t, mid * sgn).y > 0) lo = mid; else hi = mid;
+    }
+    return perpOf((lo + hi) * 0.5);
+  }
+
+  logHalfWidth(pr, t, side) {
+    const f = t * LOG_PROFILE_N;
+    let i0 = Math.floor(f);
+    if (i0 < 0) i0 = 0; else if (i0 > LOG_PROFILE_N - 1) i0 = LOG_PROFILE_N - 1;
+    const o = i0 * 2 + side;
+    return pr.w[o] + (pr.w[o + 2] - pr.w[o]) * (f - i0);
   }
 
   insideObstacle(x, z, margin = 0) {
@@ -234,15 +309,26 @@ export class FloaterSystem {
       if (dx * dx + dz * dz < r * r) return true;
     }
     const c = this.obsCap;
-    for (let i = 0; i < c.length; i += 5) if (segDist(x, z, c[i], c[i + 1], c[i + 2], c[i + 3]) < c[i + 4] + margin) return true;
+    for (let i = 0, k = 0; i < c.length; i += 5, k++) {
+      const pr = this.obsProfile[k];
+      if (!pr) {
+        if (segDist(x, z, c[i], c[i + 1], c[i + 2], c[i + 3]) < c[i + 4] + margin) return true;
+        continue;
+      }
+      const rx = x - pr.ax, rz = z - pr.az;
+      const s = rx * pr.ux + rz * pr.uz;
+      if (s < 0 || s > pr.len) continue;   // both mouths are open annuli, so nothing juts past an end
+      const perp = rx * -pr.uz + rz * pr.ux;
+      if (Math.abs(perp) < this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + margin) return true;
+    }
     return false;
   }
 
-  /* Bilinear over the quantized bytes, matching the sampler the shader uses on the same texture. */
-  noiseAt(x, z) {
-    const N = this.noise.res, b = this.noise.bytes;
-    let fx = (x / this.noise.extent + 0.5) * N - 0.5;
-    let fz = (z / this.noise.extent + 0.5) * N - 0.5;
+  /* Bilinear over a field's quantized bytes, matching the sampler the shader uses on the same texture. */
+  fieldAt(f, x, z) {
+    const N = f.res, b = f.bytes;
+    let fx = (x / f.extent + 0.5) * N - 0.5;
+    let fz = (z / f.extent + 0.5) * N - 0.5;
     fx = fx < 0 ? 0 : fx > N - 1 ? N - 1 : fx;
     fz = fz < 0 ? 0 : fz > N - 1 ? N - 1 : fz;
     const x0 = Math.floor(fx), z0 = Math.floor(fz);
@@ -254,12 +340,17 @@ export class FloaterSystem {
     return (lo + (hi - lo) * tz) / 255;
   }
 
+  noiseAt(x, z) { return this.fieldAt(this.noise, x, z); }
+  scarAt(x, z) { return this.fieldAt(this.scar, x, z); }
+
   /* CPU twin of the mat's alpha test, positive inside the fronds; noise is read in the clump's own frame so a
      drifting mat carries its shape. Side effects: this.memClump (the winning clump) and this.memBand. */
   memAt(x, z) {
     let best = -99;
     this.memClump = null;
     this.memBand = 1;
+    // One lookup for every clump in reach: a scar belongs to the pond, not to whichever mat drifts over it.
+    const scar = this.scarAt(x, z) * SCAR_K;
     for (const c of this.clumps) {
       const lx = x - c.dx, lz = z - c.dz;
       const dx = lx - c.x, dz = lz - c.z;
@@ -267,7 +358,7 @@ export class FloaterSystem {
       const d2 = dx * dx + dz * dz;
       if (d2 > reach * reach) continue;
       const rn = Math.sqrt(d2) / (c.r * c.growth * warpFactor(Math.atan2(dz, dx), c.phases));
-      const m = (MEM_EDGE - rn) * MEM_SLOPE + (this.noiseAt(lx, lz) - NOISE_MID) * MEM_NOISE;
+      const m = (MEM_EDGE - rn) * MEM_SLOPE + (this.noiseAt(lx, lz) - NOISE_MID) * MEM_NOISE - scar;
       if (m > best) { best = m; this.memClump = c; this.memBand = SPECK_BAND * MEM_SLOPE / Math.max(0.3, c.r * c.warpMean); }
     }
     return best;
@@ -287,11 +378,17 @@ export class FloaterSystem {
         const dx = x - o.x, dz = z - o.z, d = Math.hypot(dx, dz);
         if (d - o.r <= LEE_REACH && d > 1e-4 && (dx * wind.x + dz * wind.z) / d > 0.3) return true;
       }
-      for (const l of colliders.waterline.capsules) {
-        const d = segDist(x, z, l.ax, l.az, l.bx, l.bz);
-        if (d - l.r > LEE_REACH) continue;
-        const t = Math.max(0, Math.min(1, ((x - l.ax) * (l.bx - l.ax) + (z - l.az) * (l.bz - l.az)) / (Math.hypot(l.bx - l.ax, l.bz - l.az) ** 2 || 1e-9)));
-        const dx = x - (l.ax + (l.bx - l.ax) * t), dz = z - (l.az + (l.bz - l.az) * t), m = Math.hypot(dx, dz);
+      const cA = this.obsCap;
+      for (let i = 0, k = 0; i < cA.length; i += 5, k++) {
+        const pr = this.obsProfile[k];
+        const lax = cA[i], laz = cA[i + 1], ex = cA[i + 2] - lax, ez = cA[i + 3] - laz;
+        const t = Math.max(0, Math.min(1, ((x - lax) * ex + (z - laz) * ez) / (ex * ex + ez * ez || 1e-9)));
+        const dx = x - (lax + ex * t), dz = z - (laz + ez * t), m = Math.hypot(dx, dz);
+        // A trunk shelters behind its own bark, not behind the capsule's worst-case envelope. The profile
+        // runs the whole trunk while the mask capsule is inset, so its station comes from the trunk axis.
+        const tp = pr ? Math.max(0, Math.min(1, ((x - pr.ax) * pr.ux + (z - pr.az) * pr.uz) / pr.len)) : 0;
+        const r = pr ? this.logHalfWidth(pr, tp, (dx * -pr.uz + dz * pr.ux) >= 0 ? 0 : 1) : cA[i + 4];
+        if (m - r > LEE_REACH) continue;
         if (m > 1e-4 && (dx * wind.x + dz * wind.z) / m > 0.3) return true;
       }
       return false;
@@ -392,6 +489,7 @@ export class FloaterSystem {
     this.current = makeCurrent(U);
     this.swell = makeSwell(U);
     this.noiseTex = texture(this.noise.tex);
+    this.scarTex = texture(this.scar.tex);
     this.uWeedExtent = uniform(sim.extent);
     // Both layers wander on the one current: a mat and the specks over it must never slide apart.
     this.uWeedDrift = uniform(0.14);
@@ -459,6 +557,7 @@ export class FloaterSystem {
     const uCarpetSpan = uniform(MEM_SPAN), uCarpetMemEdge = uniform(MEM_EDGE);
     const uCarpetMemSlope = uniform(MEM_SLOPE), uCarpetMemNoise = uniform(MEM_NOISE);
     const uCarpetMemMid = uniform(NOISE_MID);
+    const uCarpetScarK = uniform(SCAR_K);
     // Push-aside: the fronds slide off the finger's line instead of only vanishing along it.
     const uCarpetPart = uniform(0.09), uCarpetPartStep = uniform(this.sim.extent * 1.2 / WAKE_RES);
     const uCarpetPartLo = uniform(0.02), uCarpetPartHi = uniform(0.30);
@@ -554,7 +653,10 @@ export class FloaterSystem {
       const nz = this.noiseTex.sample(src.div(this.uWeedExtent).add(0.5)).r;
       const tear = smoothstep(uCarpetTearLo, uCarpetTearHi, fa).mul(uCarpetTearAmt);
       const solid = this.sim.mask.sample(c).r;
-      const edge = dens.add(nz.sub(uCarpetMemMid).mul(uCarpetMemNoise)).sub(tear).sub(solid.mul(4));
+      // The scar reads at the fragment's world position while the noise reads in the clump's frame: a
+      // furrow stays where it was plowed instead of riding a drifting mat across the pond.
+      const scar = this.scarTex.sample(c).r;
+      const edge = dens.add(nz.sub(uCarpetMemMid).mul(uCarpetMemNoise)).sub(scar.mul(uCarpetScarK)).sub(tear).sub(solid.mul(4));
       const aa = fwidth(edge).max(1e-4);
       const gate = smoothstep(aa.negate(), aa, edge);
       // Re-sharpen the lace: minification softens the near-binary opacity toward its 0.78 mean, and a
@@ -575,7 +677,7 @@ export class FloaterSystem {
     this.knobs = {
       tile: uCarpetTile, ripple: uCarpetRipple, wakeWarp: uCarpetWakeWarp, wakeTilt: uCarpetWakeTilt,
       tearLo: uCarpetTearLo, tearHi: uCarpetTearHi, tearAmt: uCarpetTearAmt,
-      memEdge: uCarpetMemEdge, memSlope: uCarpetMemSlope, memNoise: uCarpetMemNoise,
+      memEdge: uCarpetMemEdge, memSlope: uCarpetMemSlope, memNoise: uCarpetMemNoise, scarK: uCarpetScarK,
       frondLo: uCarpetFrondLo, frondHi: uCarpetFrondHi, transGain: uCarpetTransGain,
     };
   }
@@ -710,36 +812,37 @@ export class FloaterSystem {
     p.vx = vx; p.vz = vz; p.n++;
   }
 
-  /* One capsule bitten out of the noise, stamped in each reached clump's own frame so a drifting mat keeps its
-     scar. floorMode (the finger) caps the depth however many passes; Eleanor accumulates, so dwelling digs deeper. */
+  /* One capsule bitten out of the world-space scar layer, once, whatever mats are over it. floorMode (the
+     finger, a grazer) caps the depth however many passes; Eleanor accumulates, so dwelling digs deeper. */
   carveCapsule(ax, az, bx, bz, r, amount, floorMode) {
-    const N = this.noise.res, ext = this.noise.extent, work = this.noise.work, base = this.noise.base;
-    const step = ext / N, half = ext * 0.5, inner = r * 0.45, amt = amount * 255;
+    let near = false;
     for (const c of this.clumps) {
-      const lax = ax - c.dx, laz = az - c.dz, lbx = bx - c.dx, lbz = bz - c.dz;
       const reach = c.r * c.growth * (WARP_BASE + WARP_SPAN) * MEM_SPAN + r;
-      if (segDist(c.x, c.z, lax, laz, lbx, lbz) > reach) continue;
-      const ix0 = Math.max(0, Math.floor((Math.min(lax, lbx) - r + half) / step - 0.5));
-      const ix1 = Math.min(N - 1, Math.ceil((Math.max(lax, lbx) + r + half) / step - 0.5));
-      const iz0 = Math.max(0, Math.floor((Math.min(laz, lbz) - r + half) / step - 0.5));
-      const iz1 = Math.min(N - 1, Math.ceil((Math.max(laz, lbz) + r + half) / step - 0.5));
-      if (ix1 < ix0 || iz1 < iz0) continue;
-      for (let iz = iz0; iz <= iz1; iz++) {
-        const wz = (iz + 0.5) * step - half, row = iz * N;
-        for (let ix = ix0; ix <= ix1; ix++) {
-          const w = smoothstep01(r, inner, segDist((ix + 0.5) * step - half, wz, lax, laz, lbx, lbz));
-          if (w <= 0) continue;
-          const i = row + ix;
-          const cut = floorMode ? Math.min(work[i], base[i] - amt * w) : work[i] - amt * w;
-          work[i] = cut < 0 ? 0 : cut;
-        }
+      if (segDist(c.x + c.dx, c.z + c.dz, ax, az, bx, bz) <= reach) { near = true; break; }
+    }
+    if (!near) return;   // a furrow through open water would only cost the heal sweep
+    const N = this.scar.res, ext = this.scar.extent, work = this.scar.work;
+    const step = ext / N, half = ext * 0.5, inner = r * 0.45, amt = amount * 255;
+    const ix0 = Math.max(0, Math.floor((Math.min(ax, bx) - r + half) / step - 0.5));
+    const ix1 = Math.min(N - 1, Math.ceil((Math.max(ax, bx) + r + half) / step - 0.5));
+    const iz0 = Math.max(0, Math.floor((Math.min(az, bz) - r + half) / step - 0.5));
+    const iz1 = Math.min(N - 1, Math.ceil((Math.max(az, bz) + r + half) / step - 0.5));
+    if (ix1 < ix0 || iz1 < iz0) return;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      const wz = (iz + 0.5) * step - half, row = iz * N;
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const w = smoothstep01(r, inner, segDist((ix + 0.5) * step - half, wz, ax, az, bx, bz));
+        if (w <= 0) continue;
+        const i = row + ix, cut = amt * w;
+        const v = floorMode ? Math.max(work[i], cut) : work[i] + cut;
+        work[i] = v > SCAR_MAX ? SCAR_MAX : v;
       }
-      const box = this.carveBox;
-      if (!box) this.carveBox = { x0: ix0, x1: ix1, z0: iz0, z1: iz1 };
-      else {
-        if (ix0 < box.x0) box.x0 = ix0; if (ix1 > box.x1) box.x1 = ix1;
-        if (iz0 < box.z0) box.z0 = iz0; if (iz1 > box.z1) box.z1 = iz1;
-      }
+    }
+    const box = this.carveBox;
+    if (!box) this.carveBox = { x0: ix0, x1: ix1, z0: iz0, z1: iz1 };
+    else {
+      if (ix0 < box.x0) box.x0 = ix0; if (ix1 > box.x1) box.x1 = ix1;
+      if (iz0 < box.z0) box.z0 = iz0; if (iz1 > box.z1) box.z1 = iz1;
     }
   }
 
@@ -753,7 +856,8 @@ export class FloaterSystem {
     }
   }
 
-  /* Relax the carved region back toward pristine and re-upload, four times a second at most. */
+  /* Relax the carved region back toward clean water and re-upload, four times a second at most. The scar
+     does not drift with the mat over it, which CARVE_HEAL_TAU makes moot inside a few minutes. */
   healCarve(dt) {
     this.carveAcc += dt;
     if (this.carveAcc < CARVE_TICK) return;
@@ -763,20 +867,20 @@ export class FloaterSystem {
     this.carveAcc = 0;
     if (!this.carveBox) return;
     const { x0, x1, z0, z1 } = this.carveBox;
-    const N = this.noise.res, work = this.noise.work, base = this.noise.base, bytes = this.noise.bytes;
-    const rate = 1 - Math.exp(-el / CARVE_HEAL_TAU);
+    const N = this.scar.res, work = this.scar.work, bytes = this.scar.bytes;
+    const keep = Math.exp(-el / CARVE_HEAL_TAU);
     let live = false;
     for (let iz = z0; iz <= z1; iz++) {
       const row = iz * N;
       for (let ix = x0; ix <= x1; ix++) {
-        const i = row + ix, d = base[i] - work[i];
-        if (d > 0.4) { work[i] += d * rate; live = true; }
-        else if (d !== 0) work[i] = base[i];
+        const i = row + ix, v = work[i];
+        if (v > 0.4) { work[i] = v * keep; live = true; }
+        else if (v !== 0) work[i] = 0;
         bytes[i] = work[i] + 0.5;
       }
     }
     if (!live) this.carveBox = null;
-    this.noise.tex.needsUpdate = true;
+    this.scar.tex.needsUpdate = true;
   }
 
   /* The shared current, CPU side: the same curl-of-a-potential the shader evaluates, for the handful
@@ -872,7 +976,7 @@ export class FloaterSystem {
     const off = this.off, vel = this.vel, home = this.home, drift = this.driftF;
     const act = this.sActive, frac = this.sFrac, cl = this.sClump, grow = this.growF, out = this.forceOut;
     const loose = this.sLoose;
-    const dA = this.obsDisc, cA = this.obsCap;
+    const dA = this.obsDisc, cA = this.obsCap, prof = this.obsProfile;
     const px0 = pk.x0 - POKE_OUTER, px1 = pk.x1 + POKE_OUTER, pz0 = pk.z0 - POKE_OUTER, pz1 = pk.z1 + POKE_OUTER;
     for (let i = 0; i < n; i++) {
       const ci = cl[i];
@@ -928,7 +1032,27 @@ export class FloaterSystem {
         const vn = vx * nx + vz * nz;
         if (vn < 0) { vx -= vn * nx; vz -= vn * nz; }
       }
-      for (let j = 0; j < cA.length; j += 5) {
+      for (let j = 0, k = 0; j < cA.length; j += 5, k++) {
+        const pr = prof[k];
+        if (pr) {
+          const rx = px - pr.ax, rz = pz - pr.az;
+          const s = rx * pr.ux + rz * pr.uz;
+          if (s < 0 || s > pr.len) continue;   // the mouths are open annuli: no cap juts past either end
+          const perp = rx * -pr.uz + rz * pr.ux;
+          const ap = perp < 0 ? -perp : perp;
+          const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + OBS_SKIN;
+          if (ap >= rw) continue;
+          // Out through whichever face is nearer, so a speck that drifted in past a mouth leaves by the
+          // mouth instead of being shouldered the whole width of the trunk.
+          const near0 = s * 2 <= pr.len, endGap = near0 ? s : pr.len - s;
+          let nlx, nlz, push;
+          if (endGap < rw - ap) { const g = near0 ? -1 : 1; nlx = pr.ux * g; nlz = pr.uz * g; push = endGap + 1e-3; }
+          else { const g = perp >= 0 ? 1 : -1; nlx = -pr.uz * g; nlz = pr.ux * g; push = rw - ap; }
+          px += nlx * push; pz += nlz * push;
+          const vnl = vx * nlx + vz * nlz;
+          if (vnl < 0) { vx -= vnl * nlx; vz -= vnl * nlz; }
+          continue;
+        }
         // Squared compare in the hot path: segDist's hypot would run 20,000 times a frame for nothing.
         const rr = cA[j + 4] + OBS_SKIN;
         const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
@@ -952,5 +1076,6 @@ export class FloaterSystem {
   dispose() {
     for (const m of [this.carpetMesh, this.speckMesh]) { m.geometry.dispose(); m.material.dispose(); }
     this.noise.tex.dispose();
+    this.scar.tex.dispose();
   }
 }

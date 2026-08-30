@@ -178,8 +178,15 @@ html.is-idle .chrome:focus-within {
   /* Bright duckweed and a lit eel are both plausible backdrops, so the tag carries its own dark halo. */
   text-shadow: 0 1px 3px oklch(8% 0.02 260 / 0.9), 0 0 8px oklch(8% 0.02 260 / 0.7);
   white-space: nowrap;
+  text-align: center;
   will-change: transform;
 }
+.eel-name small {
+  display: block;
+  font-size: 0.72em;
+  opacity: 0.8;
+}
+.eel-name small:empty { display: none; }
 
 .gate {
   /* Tailwind's preflight zeroes dialog margins, which kills the UA centering. */

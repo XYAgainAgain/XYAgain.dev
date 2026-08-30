@@ -165,7 +165,8 @@ export class EelRenderer {
       const ridgeAt = (mu, w, gain) => smoothstep(w, w * 0.3, abs(dorsal.sub(mu).sub(wander))).mul(gain);
       const cyc = time.mul(0.25).add(e.uSeed).fract();
       const travel = smoothstep(0.16, 0.0, abs(t.sub(cyc))).mul(1.2);
-      const ridge = ridgeAt(0, 0.45, 1.0).add(ridgeAt(1.2, 0.3, 0.45)).mul(travel.add(0.7));
+      // Side lines at 0.75 rad: at 1.2 they sat on a resident's silhouette and read as a blurry edge.
+      const ridge = ridgeAt(0, 0.4, 1.0).add(ridgeAt(0.75, 0.25, 0.5)).mul(travel.add(0.7));
       // Plaid: straight bands along the body crossed with bands around it; the crossings glow hardest.
       const bandT = smoothstep(0.35, 0.65, sin(t.mul(e.uPattern.x).mul(TWO_PI)).mul(0.5).add(0.5));
       const bandA = smoothstep(0.35, 0.65, sin(ang.mul(e.uPlaid.y)).mul(0.5).add(0.5));

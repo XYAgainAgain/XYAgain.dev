@@ -171,10 +171,10 @@ export class PondAudio {
 
   swishPan(pan) { if (this.swishPanner) this.swishPanner.pan.value = Math.max(-1, Math.min(1, pan)); }
 
-  /* Spawn one throwaway Player over the set's shared buffer. opts: db (level offset),
-     jitter (pitch spread), rate (pitch multiplier), pan (static), track (creature panner id),
-     trim (random start/length, for small sample pools like Eleanor's). */
-  shot(set, key, levelKey, { db = 0, jitter = 0.15, rate = 1, pan = null, track = null, trim = false } = {}) {
+  /* Spawn one throwaway Player over the set's shared buffer. opts: db (level offset), jitter (pitch
+     spread), rate (pitch multiplier), pan (static), track (creature panner id), trim (random start
+     and length, for small pools like Eleanor's), delay (seconds ahead, for phrases), bus (routing override). */
+  shot(set, key, levelKey, { db = 0, jitter = 0.15, rate = 1, pan = null, track = null, trim = false, delay = 0, bus = null, lp = 0 } = {}) {
     if (!this.unlocked) return null;
     const src = this.players[set]?.player(String(key));
     if (!src?.loaded) return null;
@@ -184,16 +184,18 @@ export class PondAudio {
     p.volume.value = this.mix.levels[levelKey] + db;
     p.fadeIn = trim ? 0.03 : 0;
     p.fadeOut = trim ? 0.15 : 0.05;
-    let panner = null;
-    const bus = EEL_SETS.has(set) ? this.buses.eel : this.buses.env;
+    let panner = null, filt = null;
+    let out = this.buses[bus] ?? (EEL_SETS.has(set) ? this.buses.eel : this.buses.env);
+    // lp is a lowpass in Hz for sounds made under water; the filter sits last so the panner is unchanged.
+    if (lp > 0) { filt = new Tone.Filter({ type: 'lowpass', frequency: lp, Q: 0.5 }).connect(out); out = filt; }
     if (track != null) p.connect(this.trackPanner(track));
-    else if (pan != null) { panner = new Tone.Panner(Math.max(-1, Math.min(1, pan))).connect(bus); p.connect(panner); }
-    else p.connect(bus);
+    else if (pan != null) { panner = new Tone.Panner(Math.max(-1, Math.min(1, pan))).connect(out); p.connect(panner); }
+    else p.connect(out);
     this.live.add(p);
-    p.onstop = () => { this.live.delete(p); setTimeout(() => { panner?.dispose(); p.dispose(); }, 250); };
+    p.onstop = () => { this.live.delete(p); setTimeout(() => { panner?.dispose(); filt?.dispose(); p.dispose(); }, 250); };
     let offset = 0, dur;
     if (trim) { offset = Math.random() * 0.1 * buf.duration; dur = (0.7 + Math.random() * 0.3) * (buf.duration - offset); }
-    p.start(Tone.now(), offset, dur);
+    p.start(Tone.now() + Math.max(0, delay), offset, dur);
     return p;
   }
 
@@ -263,11 +265,43 @@ export class PondAudio {
   }
 
   /* size 1 = big treat, 2 = crumb, 3 = tiny; rate 0.5 drops Eleanor's an octave. */
-  eat(size = 2, { pan = null, rate = 1 } = {}) {
-    this.shot('eats', Math.min(3, Math.max(1, size)) - 1, 'eat', { jitter: 0.3, rate, pan });
+  eat(size = 2, { pan = null, rate = 1, db = 0 } = {}) {
+    this.shot('eats', Math.min(3, Math.max(1, size)) - 1, 'eat', { jitter: 0.3, rate, pan, db });
+  }
+
+  /* Morgan's mouthfuls: the crumb eat, pitched up and pulled back, since she takes many small bites.
+     (The tiny eat sample peaks 4 dB under it and averages -50 dB, so with a cut it vanishes.) */
+  graze({ pan = null, muffled = false } = {}) {
+    this.shot('eats', 1, 'eat', { jitter: 0.3, rate: 1.35, db: -3, pan, lp: muffled ? 900 : 0 });
   }
 
   slurp({ pan = null } = {}) { this.pick('slurps', 'slurp', { jitter: 0.2, trim: true, pan }); }
+
+  /* Chandler's song: pentatonic big-plops walking up then back down, forced onto the eel bus because
+     it is a creature making it, not the water. Scheduled ahead so the phrase survives a busy frame. */
+  sing({ pan = null, notes = 3 } = {}) {
+    const n = Math.max(1, Math.min(8, Math.round(notes)));
+    const peak = Math.ceil(n / 2);
+    let idx = 2 + Math.floor(Math.random() * 3);
+    let at = 0;
+    for (let i = 0; i < n; i++) {
+      const semi = PENTA[Math.max(0, Math.min(PENTA.length - 1, idx))];
+      this.shot('plops', 0, 'plopBig', { db: -6, rate: st(semi), jitter: 0.02, pan, delay: at, bus: 'eel' });
+      at += 0.16 + Math.random() * 0.08;
+      idx += (i < peak - 1 ? 1 : -1) * (1 + Math.floor(Math.random() * 2));
+    }
+  }
+
+  /* Vi's headbutt: a crackle dropped a couple of semitones so it lands as a thud, not a rustle. */
+  headbutt({ pan = null, length } = {}) {
+    this.shot('crackles', 0, 'crackleLil', { jitter: 0.08, rate: 0.85 * this.rateForLength(length), pan });
+  }
+
+  /* Morgan pulling someone loose: two bubbles, close enough to read as one gesture. */
+  rescue({ pan = null } = {}) {
+    this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan });
+    this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan, delay: 0.12 });
+  }
 
   /* Nibble/surface bubbles; lightly throttled so a dinner circle stays bubbly, not fizzy. */
   tinyBub({ pan = null } = {}) {

@@ -29,6 +29,7 @@ export class NameLabels {
     if (!el) {
       el = document.createElement('span');
       el.className = 'eel-name';
+      el.append(document.createElement('span'), document.createElement('small'));
       this.container.appendChild(el);
       this.labels.set(e, el);
     }
@@ -40,8 +41,9 @@ export class NameLabels {
     const mx = innerWidth * 0.1, my = innerHeight * 0.1;
     if (x < -mx || x > innerWidth + mx || y < -my || y > innerHeight + my) { el.hidden = true; return; }
     // A nickname wins when one has been rolled; comparing each frame catches rerolls and hot-swaps alike.
-    const label = e.nick ?? e.name;
-    if (el.textContent !== label) el.textContent = label;
+    const label = e.nick ?? e.name, pro = e.pronouns ?? '';
+    if (el.firstChild.textContent !== label) el.firstChild.textContent = label;
+    if (el.lastChild.textContent !== pro) el.lastChild.textContent = pro;
     if (e.nameStyle && el.dataset.tint !== e.nameStyle) { el.dataset.tint = e.nameStyle; el.style.color = e.nameStyle; }
     el.style.transform = `translate(-50%, -100%) translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
     el.hidden = false;
