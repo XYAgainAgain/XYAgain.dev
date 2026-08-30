@@ -101,6 +101,8 @@ export class EelSystem {
     this.extent = extent;
     this.colliders = colliders;
     this.rng = createRng(deriveSeed(seed, 5));
+    // Live appearance layers, reachable as pond.eels.knobs; skin 0 is the pre-ramp look for an A/B.
+    this.knobs = { skin: 0.3, glow: 1.0 };
     this.eels = [];
     this.guests = [];              // Eleanor-class residents: own brain, shared physics and renderer
     this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
@@ -116,7 +118,7 @@ export class EelSystem {
     this.listeners = new Map();    // type → fn[]
     this.shim = null;
     this.shimFn = null;
-    this.renderer = new EelRenderer(scene, U, shading);
+    this.renderer = new EelRenderer(scene, U, shading, this.knobs);
     this.group = this.renderer.group;
     for (let i = 0; i < EEL_COUNT; i++) {
       const e = new Eel(i, seed, extent, colliders, view, identityFor(i));
@@ -212,6 +214,14 @@ export class EelSystem {
       e.rollPattern(this.rng);
       this.renderer.applyAppearance(e);
     }
+    this.applyKnobs();
+  }
+
+  /* Push the live skin/glow layers at everyone, guests included, after tweaking pond.eels.knobs. */
+  applyKnobs() {
+    const { skin, glow } = this.knobs;
+    for (const e of this.eels) e.uLayers.value.set(skin * e.skinMul, glow);
+    for (const g of this.guests) g.uLayers.value.set(skin * g.skinMul, glow);
   }
 
   /* Fixed-rate solve: the chain and its collision memory behave the same at 60 and 240 Hz. */

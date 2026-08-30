@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, smoothstep, varying, dot, TWO_PI, positionWorld } from 'three/tsl';
+import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, smoothstep, varying, dot, texture, TWO_PI, positionWorld } from 'three/tsl';
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2 } from './shading.js';
+import { makeRampTexture, bakeRamp } from './eel-palette.js';
 
 const RINGS = 48, SIDES = 12;
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
@@ -38,9 +39,10 @@ function makeTubeGeometry() {
 }
 
 export class EelRenderer {
-  constructor(scene, U, shading) {
+  constructor(scene, U, shading, knobs) {
     this.U = U;
     this.shading = shading;
+    this.knobs = knobs ?? { skin: 0.3, glow: 1.0 };   // the system owns them; pond.eels.knobs tunes live
     this.group = new THREE.Group();
     scene.add(this.group);
     this.geometry = makeTubeGeometry();
@@ -69,6 +71,17 @@ export class EelRenderer {
     e.uWeights = uniform(new THREE.Vector3(e.wStripe, e.wSpot, e.wFlank));
     e.uSeed = uniform(e.index * 17.3 + 3.1);
     e.uExcite = uniform(0);
+    // One 256 × 1 ramp per eel, allocated here and rebaked in place forever after; every mask reads
+    // its color from it, so a reroll is a texture upload and some uniforms, never a new pipeline.
+    e.rampTex = makeRampTexture();
+    const baked = bakeRamp(e.rampTex, e.rampStops, e.rampOpts, e.rng);
+    e.rampHead = baked.head; e.rampTail = baked.tail;
+    e.uLayers = uniform(new THREE.Vector2(this.knobs.skin * e.skinMul, this.knobs.glow));
+    e.uSkinTint = uniform(new THREE.Color(1, 1, 1));
+    e.uGlowTint = uniform(new THREE.Color(1, 1, 1));
+    e.uBand = uniform(new THREE.Vector2(e.wBand, e.repeats));
+    e.uGlowMode = uniform(e.glowMode.clone());
+    const rampNode = texture(e.rampTex);
     const U = this.U;
 
     const vNormal = varying(vec3(0), 'vEelN');
@@ -124,15 +137,37 @@ export class EelRenderer {
     }) : Fn(() => {
       const t = vUV.x, ang = vUV.y;
       const time = U.time;
-      const stripes = smoothstep(0.35, 0.65, sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5));
+      const wave = sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5);
+      const stripes = smoothstep(0.35, 0.65, wave);
       const spotsN = valueNoise2(vec2(t.mul(e.uPattern.y), ang.mul(1.2).add(e.uSeed)));
       const spots = smoothstep(0.62, 0.8, spotsN);
       const flank = smoothstep(0.05, 0.35, abs(cos(ang))).oneMinus();
+
+      // The field indexes the ramp: crests and flank read the main half, spots and between-stripe skin the
+      // accent half, bands walk the whole ramp; a flank-only eel borrows the spot field so it is not split at mid-body.
+      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x)).oneMinus();
+      const wSpotF = e.uWeights.y.add(bare);
+      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).max(1e-3);
+      const field = wave.oneMinus().mul(e.uWeights.x.div(wSum))
+        .add(spots.mul(wSpotF.div(wSum)))
+        .add(t.mul(e.uBand.y).mul(e.uBand.x.div(wSum)));
+
+      // The bake puts a band-edge mask in alpha, so each stripe boundary lights up from the one sample.
+      const samp = rampNode.sample(vec2(field, 0.5));
+      const ramp = samp.rgb;
+      const mask = stripes.mul(e.uWeights.x).add(spots.mul(e.uWeights.y)).add(flank.mul(e.uWeights.z)).add(samp.a.mul(e.uBand.x));
+
+      const breathe = sin(time.mul(TWO_PI).mul(0.25).add(e.uSeed)).mul(0.25).add(0.75);
       const pulse = sin(time.mul(e.uPattern.w).sub(t.mul(7)).add(e.uSeed)).mul(0.25).add(0.85);
-      const glowA = e.uColA.mul(stripes.mul(e.uWeights.x).add(flank.mul(e.uWeights.z)));
-      const glowB = e.uColB.mul(spots.mul(e.uWeights.y));
+      const flicker = valueNoise2(vec2(time.mul(6), e.uSeed)).mul(0.4).add(0.6);
+      const g = e.uGlowMode;
+      const envelope = g.x.add(g.y.mul(breathe)).add(g.z.mul(pulse)).add(g.w.mul(flicker))
+        .div(g.x.add(g.y).add(g.z).add(g.w).max(1e-3));
+
+      const skin = ramp.mul(e.uLayers.x).mul(e.uSkinTint);
+      const glow = ramp.mul(mask).mul(e.uLayers.y).mul(e.uGlowTint).mul(envelope);
       const eyeT = smoothstep(0.0, 0.05, t).oneMinus();
-      return glowA.add(glowB).mul(pulse).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.3));
+      return skin.add(glow).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.3));
     });
 
     const bodyMat = new THREE.NodeMaterial();
@@ -180,10 +215,17 @@ export class EelRenderer {
     this.group.add(e.body, e.halo);
   }
 
+  /* A reroll rebakes the ramp texture and moves uniforms; the node graph and the materials are the
+     ones built at boot, which is what keeps a middle click free of a pipeline compile. */
   applyAppearance(e) {
+    const baked = bakeRamp(e.rampTex, e.rampStops, e.rampOpts, e.rng);
+    e.rampHead = baked.head; e.rampTail = baked.tail;
     e.uColA.value.copy(e.colA); e.uColB.value.copy(e.colB);
     e.uPattern.value.set(e.stripeFreq, e.spotFreq, e.wavy, e.pulseRate);
     e.uWeights.value.set(e.wStripe, e.wSpot, e.wFlank);
+    e.uBand.value.set(e.wBand, e.repeats);
+    e.uGlowMode.value.copy(e.glowMode);
+    e.uLayers.value.set(this.knobs.skin * e.skinMul, this.knobs.glow);
   }
 
   createFoodMesh() { return new THREE.Mesh(this.foodGeo, this.foodMat); }
@@ -203,9 +245,10 @@ export class EelRenderer {
     const v = e.speedBL * e.length;
     U.infC.array[i].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
     const k = 0.7 + e.uExcite.value * 0.6;
-    // Narrow span: a full colA→colB lerp passes through a grey mid-band on complementary palettes.
-    U.eelCol.array[i].copy(e.colA).lerp(e.colB, 0.25).multiplyScalar(k);
-    U.eelColB.array[i].copy(e.colA).lerp(e.colB, 0.55).multiplyScalar(k);
+    // Ramp half means (a whole-ramp mean of 26 tablecloth bands is beige), kept to the same narrow
+    // span as before: a full head→tail lerp passes through grey on complementary palettes.
+    U.eelCol.array[i].copy(e.rampHead).lerp(e.rampTail, 0.25).multiplyScalar(k);
+    U.eelColB.array[i].copy(e.rampHead).lerp(e.rampTail, 0.55).multiplyScalar(k);
   }
 
   clearSlot(i) {
@@ -283,7 +326,7 @@ export class EelRenderer {
 
   dispose(eels) {
     this.geometry.dispose();
-    for (const e of eels) { e.body.material.dispose(); e.halo.material.dispose(); }
+    for (const e of eels) { e.body.material.dispose(); e.halo.material.dispose(); e.rampTex.dispose(); }
     this.foodGeo.dispose(); this.foodMat.dispose();
   }
 }
