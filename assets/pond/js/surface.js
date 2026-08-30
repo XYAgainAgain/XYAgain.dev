@@ -72,7 +72,8 @@ export class SurfacePass {
       R.y = min(R.y, float(-0.2));
       // One depth tap under the pixel decides the path length; refining at the hit point made eels
       // shimmer wherever the ripple pushed the sample across their edge every frame.
-      const depthFrac0 = under.sample(suv).a;
+      const straight = under.sample(suv);
+      const depthFrac0 = straight.a;
       const dist0 = depthFrac0.mul(uDepth).add(h).add(sw.x).max(0.02);
       const offset = R.xz.mul(dist0.div(R.y.negate())).toVar();
       const offLen = length(offset);
@@ -83,7 +84,10 @@ export class SurfacePass {
       const dist = dist0;
       // Water is crystal clear, so absorption is faint, but red still dies first.
       const absorb = exp(vec3(0.22, 0.11, 0.06).negate().mul(dist));
-      const below = sample.rgb.mul(absorb);
+      // A refracted ray that lands on something above the waterline (the log's back, a rock top) would smear
+      // that dry surface around it as a dark halo; water next to it shows what is straight below instead.
+      const dry = step(sample.a, float(0.001)).mul(step(float(0.001), depthFrac0));
+      const below = mix(sample.rgb, straight.rgb, dry).mul(absorb);
 
       const Rr = reflect(I, nR);
       const moon = U.moonDir;

@@ -52,6 +52,7 @@ export class RainScheduler {
     this.view = view;
     this.surface = surface;
     this.audio = audio;
+    this.habitat = null;       // set by main once the flora exists; feature drops dodge the pads
 
     this.envelope = 0;         // what the pond sees: intensity, capped under reduced motion
     this.intensity = 0;        // what the shower actually is; the audio bed rides this
@@ -186,9 +187,16 @@ export class RainScheduler {
         const d = drops[i];
         if (this.pendingBig >= 1) {
           this.pendingBig -= 1;
-          d.u = 0.5 + (Math.random() - 0.5) * bu;
-          d.v = 0.5 + (Math.random() - 0.5) * bv;
-          d.s = roll(BIG_STRENGTH); d.r = roll(BIG_RADIUS);
+          // A splash under a pad would ring where nothing landed: re-roll a few times, then let the
+          // drop fall as an invisible micro one rather than fake a ring.
+          let open = false;
+          for (let k = 0; k < 4 && !open; k++) {
+            d.u = 0.5 + (Math.random() - 0.5) * bu;
+            d.v = 0.5 + (Math.random() - 0.5) * bv;
+            open = !this.habitat?.padAt((d.u - 0.5) * this.sim.extent, (d.v - 0.5) * this.sim.extent, 0);
+          }
+          if (open) { d.s = roll(BIG_STRENGTH); d.r = roll(BIG_RADIUS); }
+          else { d.s = roll(STRENGTH); d.r = MICRO_RADIUS; }
         } else {
           d.u = Math.random();
           d.v = Math.random();

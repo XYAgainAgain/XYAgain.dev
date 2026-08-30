@@ -15,6 +15,8 @@ import { SurfacePass } from './surface.js';
 import { ImpulseInjector, halfToFloat } from './impulse.js';
 import { UnderwaterEffectsPool, KINDS as EFFECT_KINDS } from './effects.js';
 import { RainScheduler } from './rain.js';
+import { PadSystem } from './pads.js';
+import { FloaterSystem } from './floaters.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle } from './ui.js';
@@ -46,7 +48,10 @@ async function boot() {
   const seed = seedFromUrl();
   let renderer;
   try {
-    renderer = await createRenderer(params.get('gl') === '1');
+    // Firefox's WebGPU runs this scene at roughly half its WebGL2 rate with no visible difference, so it
+    // starts on WebGL2; ?gl=0 forces WebGPU there, ?gl=1 forces WebGL2 anywhere.
+    const firefox = /firefox/i.test(navigator.userAgent);
+    renderer = await createRenderer(params.get('gl') === '1' || (firefox && params.get('gl') !== '0'));
   } catch (err) {
     console.warn('Pond: WebGPU init failed, retrying on WebGL2.', err);
     try { renderer = await createRenderer(true); }
@@ -70,6 +75,11 @@ async function boot() {
   const U = createSceneUniforms(waveSet, createCurrentSet(deriveSeed(seed, 1900)));
   const shading = makeUnderwaterShading(U);
   const sim = new WaterSim(renderer, extent);
+  // The floor's cover shadow reads the mask and the live sim through the scene uniforms; swapped in
+  // before any material builds, the same way the caustics pass replaces its placeholder.
+  U.simTex = sim.read;
+  U.coverTex = sim.mask;
+  U.maskExtent.value = sim.extent;
   const caustics = new CausticsPass(renderer, sim, U, viewW, viewH);
   // Nothing may ride the injector until this passes; rain and strider legs are its first customers.
   const impulse = new ImpulseInjector(renderer, sim);
@@ -81,7 +91,7 @@ async function boot() {
   const underScene = new THREE.Scene();
   // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
   const overScene = new THREE.Scene();
-  const { colliders } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat);
+  const { colliders, textures } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat);
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view);
   const eleanor = attachEleanor(eels, seed);
@@ -167,6 +177,24 @@ async function boot() {
   const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio, bearing: waveSet.mainDir });
   if (params.get('rain') === '1') rain.force();
   eels.rain = rain;
+  rain.habitat = habitat;
+  eels.habitat = habitat;
+
+  // Flora: the pads publish their cover and perches to the habitat; the cover composer bakes the
+  // shadow mask now and every 2 s after (the stems and mats of later phases move on that clock).
+  const pads = new PadSystem({
+    underScene, overScene, U, shading, sim, wake, seed, view: { w: viewW, h: viewH }, colliders, habitat, leaf: textures.leaf, motion,
+    events: { drip: (x) => audio.drip({ pan: toPan(x) }), settle: (x) => audio.padSettle({ pan: toPan(x) }) },
+  });
+  // ?bloom=cycle runs the lilies through a whole night every 40 s; ?bloom=0.7 pins them.
+  if (params.get('bloom') !== null) pads.bloomDebug = params.get('bloom');
+  // Duckweed after the pads, so its speck seeding can exclude the pad discs already in the registry.
+  const floaters = new FloaterSystem({
+    overScene, U, sim, wake, shading, seed, view: { w: viewW, h: viewH }, colliders, habitat,
+    carpet: textures.duckweed, rain, motion,
+  });
+  habitat.composeCover(sim);
+  let coverBakeAt = 2;
 
   // Audio already speaks for a nibble; this is the second subscriber, and it only makes bubbles.
   eels.on('nibble', (ev) => {
@@ -184,7 +212,7 @@ async function boot() {
   let swishUntil = 0;
   let lastCrackle = 0;
   // A finger through the water leaves a wake too; the frame loop hands the drag segment to the wake buffer.
-  const finger = { x: 0, z: 0, px: 0, pz: 0, at: -1 };
+  const finger = { x: 0, z: 0, px: 0, pz: 0, at: -1, path: null, idx: 0 };
   // R-hold crumbs drop on a fixed 250 BPM clock (Tetris-ish tempo), moving or not.
   const CRUMB_MS = 60000 / 250;
   let feeding = null;
@@ -202,10 +230,26 @@ async function boot() {
       swishUntil = performance.now() + 180;
       audio.swish(true);
       audio.swishPan(toPan(x));
-      if (finger.at < 0) { finger.px = x; finger.pz = z; }
+      // The frame loop walks path from finger.idx, so every coalesced sub-sample reaches the specks.
+      if (finger.at < 0) { finger.px = x; finger.pz = z; finger.idx = path.length - 1; }
+      finger.path = path;
       finger.x = x; finger.z = z; finger.at = performance.now();
     },
-    dragEnd: (path) => { finger.at = -1; for (const p of path.slice(-6)) eels.lure(p.x, p.z); },
+    dragEnd: (path) => {
+      // A release inside a frame would drop the last coalesced samples; walk them here on the path's own clock.
+      const n = path.length;
+      if (finger.at >= 0 && n > 1 && finger.idx < n - 1) {
+        const a = path[Math.max(0, finger.idx)], b = path[n - 1];
+        const dtp = Math.max(1e-3, (b.t - a.t) / 1000);
+        let vx = (b.x - a.x) / dtp, vz = (b.z - a.z) / dtp;
+        const sp = Math.hypot(vx, vz);
+        if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
+        for (let k = Math.max(finger.idx, n - 1 - 16); k < n - 1; k++) floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+        wake.poke(a.x, a.z, b.x, b.z, vx, vz, 0.35, 16);
+      }
+      finger.at = -1;
+      for (const p of path.slice(-6)) eels.lure(p.x, p.z);
+    },
     feed: (x, z) => {
       eels.feed(x, z, 1);
       sim.addDrop(x, z, 0.18, 0.012);
@@ -360,6 +404,10 @@ async function boot() {
     strayBubbles(t);
     popBubbles(t);
     eels.update(dt);
+    // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
+    pads.update(dt, t, rain, impulse);
+    floaters.update(dt, t);
+    if (t > coverBakeAt) { coverBakeAt = t + 2; habitat.composeCover(sim); }
     // Before sim.update, so this frame's drops are stepped by the water they landed in.
     rain.update(dt);
     U.wind.value.set(rain.wind.x, rain.wind.z, rain.wind.gust, rain.wind.gustLag);
@@ -374,7 +422,16 @@ async function boot() {
       let vx = (finger.x - finger.px) / Math.max(dt, 1e-3), vz = (finger.z - finger.pz) / Math.max(dt, 1e-3);
       const sp = Math.hypot(vx, vz);
       if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
-      wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
+      // A finger crosses a texel in one frame where a body lingers for many, so it pushes 16× as hard.
+      wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz, 0.35, 16);
+      // The 128² wake gains nothing from sub-frame precision; the CPU speck sim and the noise carve do,
+      // so they get every coalesced sample since the last frame, newest 16 at most.
+      const path = finger.path;
+      if (path && path.length > 1) {
+        let k = Math.max(finger.idx, path.length - 1 - 16);
+        for (; k < path.length - 1; k++) floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+        finger.idx = path.length - 1;
+      } else floaters.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
       finger.px = finger.x; finger.pz = finger.z;
     }
     // After eels.update wrote this frame's influence slots, before anything samples the field.
@@ -450,7 +507,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, textures,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       stats: fpsStats,
       diag: async () => {

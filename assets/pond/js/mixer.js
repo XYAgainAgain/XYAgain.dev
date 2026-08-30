@@ -22,6 +22,8 @@ const ROWS = [
   { key: 'slurp', label: 'slurp', fire: (a) => a.slurp() },
   { key: 'tinyBub', label: 'tiny bubs', fire: (a) => a.tinyBub() },
   { key: 'shortBub', label: 'short bubs', fire: (a) => a.shortBub() },
+  { key: 'drip', label: 'pad drip', fire: (a) => a.drip() },
+  { key: 'padSettle', label: 'pad settle', fire: (a) => a.padSettle() },
 ];
 
 const CSS = `

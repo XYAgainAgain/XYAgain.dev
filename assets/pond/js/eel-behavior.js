@@ -57,10 +57,18 @@ export function pickTarget(sys, e, now) {
     }
   }
   e.tunnel = null;
-  // Half the time head for cover: a spot beside a rock (or under a lily pad, later). Otherwise wander
-  // the viewport and a little past it, so they drift in and out but never leave for long.
+  // Half the time head for cover: under a lily pad or beside a rock. Otherwise wander the viewport
+  // and a little past it, so they drift in and out but never leave for long.
+  const pads = sys?.habitat?.pads ?? [];
   const rocks = e.colliders.spheres;
-  if (rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover / act))) {
+  if (pads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act))) {
+    const claims = pads.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'pad' && o.coverSpot.idx === i ? 1 : 0), 0));
+    const least = Math.min(...claims);
+    const idx = rng.pick(pads.map((_, i) => i).filter((i) => claims[i] === least));
+    e.target.set(pads[idx].x, 0, pads[idx].z);
+    // holdUntil 0 means "on the way"; arrival in steer() sets the loiter and its end.
+    e.coverSpot = { type: 'pad', idx, holdUntil: 0 };
+  } else if (rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover / act))) {
     const claims = rocks.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'rock' && o.coverSpot.idx === i ? 1 : 0), 0));
     const least = Math.min(...claims);
     const idx = rng.pick(rocks.map((_, i) => i).filter((i) => claims[i] === least));
@@ -199,8 +207,19 @@ export function steer(sys, e, dt) {
     else if (e.tunnel.stage === 2 && dxz < 0.5) { e.tunnel = null; pickTarget(sys, e, now); }
     if (e.tunnel) { e.targetY = e.tunnel.entry.y; e.retargetYAt = now + 2; }
   }
+  // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
+  // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
+  const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
+  const padHolding = !!(padSpot && now < padSpot.holdUntil);
+  if (padSpot && !e.tunnel && padSpot.holdUntil === 0 && Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6) {
+    const until = now + rng.range(6, 18);
+    padSpot.holdUntil = until;
+    e.gait = 'hold'; e.gaitUntil = until;
+    e.targetY = Math.max(-0.35, -DEPTH + e.radius * 2.2);
+    e.retargetYAt = until; e.retargetAt = until;
+  }
   // Never abandon a run mid-bore: turning around inside the log drags the body through its wall.
-  if ((now > e.retargetAt && e.tunnel?.stage !== 1) || (!e.tunnel && head.distanceTo(e.target) < 0.6)) pickTarget(sys, e, now);
+  else if (!padHolding && ((now > e.retargetAt && e.tunnel?.stage !== 1) || (!e.tunnel && head.distanceTo(e.target) < 0.6))) pickTarget(sys, e, now);
   tmpB.subVectors(e.target, head); tmpB.y = 0; tmpB.normalize();
   force.addScaledVector(tmpB, hiding ? 0 : e.tunnel ? 1.4 : 0.6);
 
@@ -226,6 +245,7 @@ export function steer(sys, e, dt) {
     excite = Math.max(excite, k);
     if (k > 0.5 && now > e.fleeUntil) {
       e.fleeUntil = now + 1;
+      if (e.coverSpot?.type === 'pad') e.coverSpot = null;
       sys.emit('startle', e);
       nope(sys, e, s, now);
       if (now < e.nopeUntil) { nopingTick(sys, e, dt); return; }
@@ -269,6 +289,7 @@ export function steer(sys, e, dt) {
     if (e.food && e.food !== best) e.food.claims = Math.max(0, e.food.claims - 1);
     if (best && e.food !== best) best.claims++;
     e.food = best;
+    if (best && e.coverSpot?.type === 'pad') e.coverSpot = null;
     if (best) {
       const dx = best.x - head.x, dz = best.z - head.z;
       const d = Math.hypot(dx, dz);
@@ -402,7 +423,7 @@ export function steer(sys, e, dt) {
   e.uExcite.value += (excite - e.uExcite.value) * Math.min(1, dt * 3);
 
   updateGait(e, now, 1 + 0.35 * rainEnv);
-  const gait = hiding ? 'hold' : (e.tunnel || e.food) ? 'cruise' : e.gait;
+  const gait = hiding ? 'hold' : (e.tunnel || e.food) ? 'cruise' : (padSpot && now < padSpot.holdUntil) ? 'hold' : e.gait;
 
   // Depth wandering: bottom-hugging by default; only a cruise ranges the whole column.
   if (now > e.retargetYAt) {

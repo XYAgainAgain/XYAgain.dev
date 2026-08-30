@@ -1,7 +1,7 @@
 import { Fn, vec2, vec3, vec4, float, floor, fract, dot, mix, normalize, hash, Loop, length, uniformArray, uniform, texture, refract, sin, cos, smoothstep, pow, clamp, If } from 'three/tsl';
 import { createRng } from './rng.js';
 import * as THREE from 'three/webgpu';
-import { INF_SLOTS, IOR_WATER, MOON_COLOR } from './config.js';
+import { INF_SLOTS, IOR_WATER, MOON_COLOR, SIM_RES } from './config.js';
 
 /* Shared TSL helpers used by the floor, rocks, log, eels, and the compose pass. */
 
@@ -156,6 +156,12 @@ export function createSceneUniforms(waveSet, currentSet) {
     wind: uniform(new THREE.Vector4(1, 0, 0, 0)),         // (bearing.x, bearing.z, gust, gust lagged for the reeds)
     moonPhase: uniform(0),                                // 0–1 around the orbit; the pond's night clock
     motionScale: uniform(1),                              // 1, or 0.1 under reduced motion: scales plant-owned idle motion
+    // Surface cover (mask G) and the live sim, swapped in by main.js before any material builds.
+    coverTex: texture(placeholder),
+    simTex: texture(placeholder),
+    maskExtent: uniform(1),
+    coverStrength: uniform(0),                            // 0 until something floats: the floor's shadow fetches are gated on it
+    coverWobble: uniform(0.08),                           // ripple nudge on the shadow's entry point; a rung-4 switch
   };
 }
 
@@ -200,6 +206,27 @@ export function capsuleWeightCPU(U, px, py, pz, slot) {
   return s * s * (3 - 2 * s);
 }
 
+/* CPU twin of capsuleInfluence: the horizontal push at a point from one slot, written into out {x, z}.
+   Returns the weight so callers get both from one closest-point solve (stalk bumps, drips). */
+export function capsuleInfluenceCPU(U, px, py, pz, slot, out) {
+  out.x = 0; out.z = 0;
+  const a = U.infA.array[slot], b = U.infB.array[slot];
+  if (b.w <= 0) return 0;
+  const bax = b.x - a.x, bay = b.y - a.y, baz = b.z - a.z;
+  const len2 = Math.max(1e-6, bax * bax + bay * bay + baz * baz);
+  const t = Math.max(0, Math.min(1, ((px - a.x) * bax + (py - a.y) * bay + (pz - a.z) * baz) / len2));
+  const dx = px - (a.x + bax * t), dy = py - (a.y + bay * t), dz = pz - (a.z + baz * t);
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const e0 = a.w + 0.9, e1 = a.w + 0.05;
+  const s = Math.max(0, Math.min(1, (d - e0) / (e1 - e0)));
+  const w = s * s * (3 - 2 * s);
+  if (w <= 0) return 0;
+  const v = U.infC.array[slot], inv = 1 / Math.max(1e-5, d);
+  out.x = (dx * inv + v.x * 0.6) * w;
+  out.z = (dz * inv + v.z * 0.6) * w;
+  return w;
+}
+
 /* Builds the underwater shading Fn bound to one set of scene uniforms. */
 export function makeUnderwaterShading(U) {
   // Moon direction as seen from under the surface: refracted, pointing up toward the light.
@@ -232,6 +259,9 @@ export function makeUnderwaterShading(U) {
   // Constants live in uniforms: an all-literal WGSL expression is an abstract type, and Firefox's Naga
   // rejects the whole module when one reaches runtime math (Chrome silently materializes f32).
   const kSpecLo = uniform(24), kSpecHi = uniform(140), kAmbient = uniform(0.004);
+  // Shadow wobble stencil: two sim texels either side of the entry point, in mask uv; sim heights are
+  // a few hundredths of a unit, so the gain turns them into a visible fraction-of-a-unit crawl.
+  const kMaskTexel2 = uniform(2 / SIM_RES), kWobbleGain = uniform(40);
   const shade = Fn(([albedo, n, p, roughnessIn]) => {
     const roughness = float(roughnessIn).toVar();
     const L = lightDir();
@@ -255,12 +285,29 @@ export function makeUnderwaterShading(U) {
       const faceWater = n.y.negate().add(1).clamp(0, 1).mul(0.6).add(0.2);
       direct.assign(ndlAir.mul(2.2).add(reflCaustic.mul(faceWater).mul(2.5)).add(0.2));
     });
+    // Surface cover shadow (pads, later mats and stems): the floor point is lit by a ray that crossed
+    // the surface up-moon of it, so the mask is read at that entry point, not overhead. Two height
+    // taps along the azimuth make the shadow crawl with the ripples. Nothing floating can shade a
+    // point above the water, and the eel glow below is never attenuated: the eels are under the pad.
+    const cover = float(0).toVar();
+    // Branch on the uniform alone: sampling inside per-fragment control flow is a WGSL uniformity error.
+    If(U.coverStrength.greaterThan(0), () => {
+      const entry = p.xz.add(L.xz.mul(p.y.negate().div(L.y.max(1e-3)))).toVar();
+      const azim = L.xz.div(length(L.xz).max(1e-4));
+      const c = entry.div(U.maskExtent).add(0.5);
+      const step2 = azim.mul(kMaskTexel2);
+      const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
+      entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
+      const g = U.coverTex.sample(entry.div(U.maskExtent).add(0.5)).g;
+      cover.assign(g.mul(U.coverStrength).mul(smoothstep(0.02, -0.02, p.y)));
+    });
+    direct.mulAssign(cover.oneMinus());
     direct.mulAssign(U.moonStrength);
     const ambient = kAmbient;
     const V = vec3(0, 1, 0);
     const H = normalize(L.add(V));
     const specPow = mix(kSpecHi, kSpecLo, roughness);
-    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25);
+    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25).mul(cover.oneMinus());
     // Wrapped Lambert over the normal map so gravel facets face or shade the glow; the roughness-
     // driven highlight puts a neon glint on wet stones.
     const glow = vec3(0).toVar();
@@ -283,6 +330,7 @@ export function makeUnderwaterShading(U) {
     if (dbg === 'ndl') return vec3(ndl);
     if (dbg === 'caustic') return vec3(caustic.mul(0.5));
     if (dbg === 'albedo') return albedo;
+    if (dbg === 'cover') return vec3(cover);
     return albedo.mul(U.moonColor.mul(direct.add(ambient)))
       .add(U.moonColor.mul(spec))
       .add(albedo.mul(glow).mul(0.9))

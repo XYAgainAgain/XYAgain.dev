@@ -31,6 +31,7 @@ const DEFAULT_MIX = {
     startle: -10, eleanorStartle: -8,
     crackleLil: -2.5, crackleMed: -2.5, crackleBig: -2.5,
     eat: -3, slurp: -3, tinyBub: -18, shortBub: -15,
+    drip: -17, padSettle: -8,
   },
 };
 
@@ -277,6 +278,17 @@ export class PondAudio {
   }
 
   shortBub({ pan = null } = {}) { this.pick('shortBubs', 'shortBub', { jitter: 0.25, pan }); }
+
+  /* Water running off a tipped lily pad: a small high plip, at most two a second pond-wide. */
+  drip({ pan = null } = {}) {
+    const now = Tone.now();
+    if (now - (this.dripAt ?? 0) < 0.5) return;
+    this.dripAt = now;
+    this.pick('plips', 'drip', { jitter: 0.3, rate: 1.2, pan });
+  }
+
+  /* A pad or leaf settling back after a body shoved it: a low plip. */
+  padSettle({ pan = null } = {}) { this.pick('plips', 'padSettle', { jitter: 0.2, rate: 0.7, pan }); }
 
   /* The shower envelope (0–1) from rain.js. Gain is squared so the build feels gradual rather than
      arriving all at once, and the lowpass opens as the rain gets closer. */

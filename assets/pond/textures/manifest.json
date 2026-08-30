@@ -5,5 +5,5 @@
   "algae": { "albedo": "algae_albedo.webp", "normal": "algae_normal.webp", "height": "algae_displacement.webp", "roughness": "algae_roughness.webp", "tiling": 1, "bump": 1.0 },
   "wood":  { "albedo": "wood_albedo.webp",  "normal": "wood_normal.webp",  "height": "wood_displacement.webp",  "roughness": "wood_roughness.webp",  "tiling": 1, "bump": 1.0 },
   "leaf":   { "albedo": "leaf_albedo.webp",   "normal": "leaf_normal.webp",   "arm": "leaf_arm.webp",   "tiling": 1, "bump": 1.3 },
-  "carpet": { "albedo": "carpet_albedo.webp", "normal": "carpet_normal.webp", "arm": "carpet_arm.webp", "tiling": 1, "bump": 0.9 }
+  "duckweed": { "albedo": "duckweed_albedo.webp", "normal": "duckweed_normal.webp", "arm": "duckweed_arm.webp", "opacity": "duckweed_opacity.webp", "tiling": 0.65, "bump": 0.9 }
 }

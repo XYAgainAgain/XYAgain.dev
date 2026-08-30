@@ -149,12 +149,13 @@ export function collide(eels, colliders) {
           tmpC.copy(l.a).addScaledVector(tmpA, t);
           const dx = p.x - tmpC.x, dy = p.y - tmpC.y, dz = p.z - tmpC.z;
           const d = Math.hypot(dx, dy, dz);
+          // Hollow logs have open mouths; a solid stub (rInner 0) keeps its tip as a sphere cap.
           const endCap = t <= 0 || t >= 1;
-          if (endCap) continue;
+          if (endCap && l.rInner > 0) continue;
           const inner = l.rInner - r, outer = l.rOuter + r;
           if (d > inner && d < outer && d > 1e-5) {
             const toInner = d - inner, toOuter = outer - d;
-            const k = (toInner < toOuter ? -toInner : toOuter) / d * soft;
+            const k = (l.rInner > 0 && toInner < toOuter ? -toInner : toOuter) / d * soft;
             p.x += dx * k; p.y += dy * k; p.z += dz * k;
           }
         }

@@ -33,14 +33,15 @@ function loadTex(loader, url, srgb) {
 async function loadSet(loader, manifest, name) {
   const entry = manifest?.[name] || {};
   const base = 'assets/pond/textures/';
-  const [albedo, normal, roughness, arm, height] = await Promise.all([
+  const [albedo, normal, roughness, arm, height, opacity] = await Promise.all([
     loadTex(loader, entry.albedo && base + entry.albedo, true),
     loadTex(loader, entry.normal && base + entry.normal, false),
     loadTex(loader, entry.roughness && base + entry.roughness, false),
     loadTex(loader, entry.arm && base + entry.arm, false),
     loadTex(loader, !entry.normal && entry.height && base + entry.height, false),   // height only feeds normals when no normal map
+    loadTex(loader, entry.opacity && base + entry.opacity, false),
   ]);
-  return { albedo, normal, roughness, arm, height, tiling: entry.tiling ?? 1, bump: entry.bump ?? 1 };
+  return { albedo, normal, roughness, arm, height, opacity, tiling: entry.tiling ?? 1, bump: entry.bump ?? 1 };
 }
 
 /* Builds a NodeMaterial that writes (lit color, depthFrac) for the underwater RT.
@@ -152,6 +153,40 @@ function weldGeometry(geo, precision = 1e-4) {
   return out;
 }
 
+/* A cylinder's seam column is a duplicate vertex pair per row, so each half only sees its own faces.
+   Averaging the two after computeVertexNormals hides the lighting crack that leaves down the side. */
+function weldSeamNormals(geo, radial, hseg) {
+  const n = geo.attributes.normal;
+  for (let row = 0; row <= hseg; row++) {
+    const i0 = row * (radial + 1), i1 = i0 + radial;
+    const x = n.getX(i0) + n.getX(i1), y = n.getY(i0) + n.getY(i1), z = n.getZ(i0) + n.getZ(i1);
+    const l = Math.hypot(x, y, z) || 1;
+    n.setXYZ(i0, x / l, y / l, z / l);
+    n.setXYZ(i1, x / l, y / l, z / l);
+  }
+}
+
+/* Shortest distance from a point to a segment, used to keep the log off the rocks it cannot lie over. */
+/* Closest approach of two segments in the plane: zero when they cross, else an endpoint is nearest. */
+function segSegDist(ax, az, bx, bz, cx, cz, dx, dz) {
+  const cross = (ox, oz, px, pz, qx, qz) => (px - ox) * (qz - oz) - (pz - oz) * (qx - ox);
+  const d1 = cross(cx, cz, dx, dz, ax, az), d2 = cross(cx, cz, dx, dz, bx, bz);
+  const d3 = cross(ax, az, bx, bz, cx, cz), d4 = cross(ax, az, bx, bz, dx, dz);
+  if (d1 * d2 < 0 && d3 * d4 < 0) return 0;
+  return Math.min(
+    segPointDist(ax, 0, az, cx, 0, cz, dx, 0, dz), segPointDist(bx, 0, bz, cx, 0, cz, dx, 0, dz),
+    segPointDist(cx, 0, cz, ax, 0, az, bx, 0, bz), segPointDist(dx, 0, dz, ax, 0, az, bx, 0, bz),
+  );
+}
+
+function segPointDist(px, py, pz, ax, ay, az, bx, by, bz) {
+  const ux = bx - ax, uy = by - ay, uz = bz - az;
+  const len2 = ux * ux + uy * uy + uz * uz;
+  let t = len2 > 1e-9 ? ((px - ax) * ux + (py - ay) * uy + (pz - az) * uz) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + ux * t), py - (ay + uy * t), pz - (az + uz * t));
+}
+
 /* Cheap smooth 3D noise: a few hashed sines, enough for lumpy rocks without a library. */
 function lumpNoise(x, y, z, f, ph) {
   return Math.sin(x * f[0] + ph[0]) * Math.sin(y * f[1] + ph[1]) * 0.5
@@ -196,9 +231,11 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const rng = createRng(deriveSeed(seed, 77));
   const loader = new THREE.TextureLoader();
   const manifest = await loadManifest();
-  const [sand, stone, algae, wood] = await Promise.all([
-    loadSet(loader, manifest, 'sand'), loadSet(loader, manifest, 'stone'), loadSet(loader, manifest, 'algae'), loadSet(loader, manifest, 'wood'),
-  ]);
+  // Every manifest set loads here, once; the flora takes leaf and duckweed from the returned library.
+  const names = ['sand', 'stone', 'algae', 'wood', 'leaf', 'duckweed'];
+  const sets = await Promise.all(names.map((n) => loadSet(loader, manifest, n)));
+  const textures = Object.fromEntries(names.map((n, i) => [n, sets[i]]));
+  const { sand, stone, algae, wood } = textures;
 
   const group = new THREE.Group();
   const colliders = { spheres: [], logs: [], waterline: { discs: [], capsules: [] } };
@@ -268,84 +305,270 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     }
   }
 
-  // Hollow log: an open cylinder rendered from both sides, lying on the sand near the view.
-  // Seeded size variance: mostly ordinary, sometimes snug, rarely grand (a future Eleanor-sized bore).
-  const sizeRng = createRng(deriveSeed(seed, 4243));
-  const grand = sizeRng.chance(0.15);
-  const sizeMul = grand ? sizeRng.range(1.25, 1.5) : sizeRng.chance(0.3) ? sizeRng.range(0.72, 0.9) : sizeRng.range(0.9, 1.15);
-  // The bore rolls independently of girth so a tight bore makes the eels' fit check a real sorting rule.
-  const boreT = grand ? sizeRng.range(0.7, 0.8) : sizeRng.chance(0.25) ? sizeRng.range(0.24, 0.4) : sizeRng.range(0.6, 0.78);
-  const logR = 0.52 * sizeMul, logLen = 4.6 * sizeRng.range(0.85, 1.25);
-  const outer = new THREE.CylinderGeometry(logR, logR * 0.92, logLen, 64, 48, true);
-  const inner = new THREE.CylinderGeometry(logR * (boreT + 0.06), logR * (boreT + 0.02), logLen, 64, 48, true);
-  const logNoise = createRng(deriveSeed(seed, 4242));
-  const lf = [logNoise.range(2, 4), logNoise.range(2, 4), logNoise.range(2, 4)];
-  const lph = [logNoise.range(0, 6), logNoise.range(0, 6), logNoise.range(0, 6)];
-  const bendPh = logNoise.range(0, 6), knotY = logNoise.range(-1.2, 1.2), knotA = logNoise.range(0, 6);
-  // Shape the trunk: radius swells and pinches along its length, a gentle bend, a knot bulge, fine bark lumps.
-  const shapeLog = (x, y, z, rScale) => {
-    const ang = Math.atan2(z, x);
-    const along = y / (logLen / 2);
-    const swell = 1 + 0.10 * Math.sin(along * 2.3 + lph[0]) + 0.06 * Math.sin(along * 4.1 + lph[1]);
-    const knot = 0.22 * Math.exp(-((y - knotY) ** 2) * 3.5) * Math.max(0, Math.cos(ang - knotA)) ** 3;
-    const fine = 0.05 * lumpNoise(Math.cos(ang) * 2, y * 0.8, Math.sin(ang) * 2, lf, lph);
-    const k = (swell + knot + fine) * rScale;
-    const bend = Math.sin(along * 1.4 + bendPh) * 0.09;
-    return [x * k + bend, y, z * k];
+  // Two logs at most; the second rolls in about half the seeds. Stub waterline capsules are deferred so
+  // both trunks claim their MAXC slots first.
+  const buildLog = (li, prev) => {
+    const stubCaps = [];
+    // Hollow log: an open cylinder rendered from both sides, lying on the sand near the view.
+    // Seeded size variance: mostly ordinary, sometimes snug, rarely grand (a future Eleanor-sized bore).
+    const sizeRng = createRng(deriveSeed(seed, 4243 + li * 20));
+    const grand = sizeRng.chance(0.15);
+    let sizeMul = grand ? sizeRng.range(1.25, 1.5) : sizeRng.chance(0.3) ? sizeRng.range(0.72, 0.9) : sizeRng.range(0.9, 1.15);
+    // A second log has to read as a different tree: girth and length both land well away from the first.
+    if (prev && Math.abs(sizeMul - prev.sizeMul) < 0.2) sizeMul = prev.sizeMul > 1.05 ? Math.min(sizeMul, prev.sizeMul - 0.25) : prev.sizeMul + 0.25;
+    // The bore rolls independently of girth so a tight bore makes the eels' fit check a real sorting rule.
+    const boreT = grand ? sizeRng.range(0.7, 0.8) : sizeRng.chance(0.25) ? sizeRng.range(0.24, 0.4) : sizeRng.range(0.6, 0.78);
+    const logR = 0.52 * sizeMul;
+    // Snapped logs come in lengths; this spread is wide enough that two seeds rarely read as the same log.
+    let logLen = 4.6 * sizeRng.range(0.68, 1.45);
+    if (prev && Math.abs(logLen / prev.logLen - 1) < 0.2) logLen *= prev.logLen > 4.6 ? 0.75 : 1.3;
+    const halfLen = logLen / 2;
+    const logY = -DEPTH + logR * 0.9;
+
+    const logNoise = createRng(deriveSeed(seed, 4242 + li * 20));
+    const lf = [logNoise.range(2, 4), logNoise.range(2, 4), logNoise.range(2, 4)];
+    const lph = [logNoise.range(0, 6), logNoise.range(0, 6), logNoise.range(0, 6)];
+    const swellA = [logNoise.range(0.04, 0.09), logNoise.range(0.02, 0.045)];
+    const swellW = [logNoise.range(1.5, 3.1), logNoise.range(3.3, 6.2)];
+    const swellP = [logNoise.range(0, 6.28), logNoise.range(0, 6.28)];
+    const taperK = logNoise.range(0.015, 0.055) * (logNoise.chance(0.5) ? 1 : -1);
+    const knots = [];
+    for (let i = 0, n = logNoise.int(2, 4); i < n; i++) {
+      knots.push({
+        y: logNoise.range(-0.8, 0.8) * halfLen, a: logNoise.range(0, 6.28),
+        amp: logNoise.range(0.09, 0.26), w: logNoise.range(2.5, 8), s: logNoise.range(1.5, 4),
+      });
+    }
+
+    // One radial profile for bark, bore, and lips, so the three shells can never disagree about the wall.
+    // Knots only ever add, so the bore's worst case comes from the swell, the taper, and the bark noise.
+    const KFLOOR = 0.88;
+    const radialK = (ang, y) => {
+      const t = y / halfLen;
+      let k = 1 + swellA[0] * Math.sin(t * swellW[0] + swellP[0]) + swellA[1] * Math.sin(t * swellW[1] + swellP[1]) - taperK * t;
+      for (const kn of knots) k += kn.amp * Math.exp(-((y - kn.y) ** 2) * kn.w) * Math.max(0, Math.cos(ang - kn.a)) ** kn.s;
+      k += 0.030 * lumpNoise(Math.cos(ang) * 2, y * 0.9, Math.sin(ang) * 2, lf, lph)
+        + 0.015 * lumpNoise(Math.cos(ang) * 6.3, y * 3.1, Math.sin(ang) * 6.3, lf, lph);
+      // Exponential floor rather than a clamp: a hard max() leaves a flat band around the deepest pinch.
+      return k > KFLOOR + 0.12 ? k : KFLOOR + 0.12 * Math.exp((k - KFLOOR - 0.12) / 0.12);
+    };
+    let kMin = Infinity, kMax = 0;
+    for (let a = 0; a < 48; a++) for (let b = 0; b <= 48; b++) {
+      const k = radialK((a / 48) * 6.283, (b / 24 - 1) * halfLen);
+      kMin = Math.min(kMin, k); kMax = Math.max(kMax, k);
+    }
+
+    // Eels tunnel along a straight collider axis, so the modeled bore swallows the pinch and the bend and
+    // still leaves rInner of clear air. The leftover is the bend budget: thick wall banana, thin shell straight.
+    const boreBase = Math.min(logR * 0.90, Math.max(logR * Math.min(boreT + 0.18, 0.87), (logR * boreT + 0.01) / kMin));
+    const bendMag = Math.min(logR * logNoise.range(0.12, 0.32), Math.max(0, boreBase * kMin - logR * boreT - 0.01));
+    const bendDir = (logNoise.chance(0.5) ? 1 : -1) * (Math.PI / 2) + logNoise.range(-0.35, 0.35);
+    const bendX = (y) => Math.cos(bendDir) * bendMag * (1 - (y / halfLen) ** 2);
+    const bendZ = (y) => Math.sin(bendDir) * bendMag * (1 - (y / halfLen) ** 2);
+
+    // Snapped ends: each end tears along its own seeded rim, so neither mouth is a saw cut and the
+    // two ends break at different places. Splinters ride out along the axis; the bore stays open.
+    const tearRng = createRng(deriveSeed(seed, 4244 + li * 20));
+    const TEAR_W = 0.25;
+    const tearMax = 0.55 * TEAR_W * halfLen;   // past this the last rings fold back through each other
+    const ends = [1, -1].map(() => {
+      const spikes = [];
+      for (let i = 0, n = tearRng.int(1, 3); i < n; i++) {
+        spikes.push({ a: tearRng.range(0, 6.28), w: tearRng.range(4, 12), h: tearRng.range(0.10, 0.40) * logR });
+      }
+      return {
+        base: tearRng.range(-0.10, 0.05) * logR, rag: tearRng.range(0.04, 0.10) * logR,
+        ph: [tearRng.range(0, 6), tearRng.range(0, 6), tearRng.range(0, 6)], spikes,
+      };
+    });
+    const endOff = (end, ang) => {
+      const e = ends[end > 0 ? 0 : 1];
+      let o = e.base + e.rag * lumpNoise(Math.cos(ang) * 2.4, 0, Math.sin(ang) * 2.4, lf, e.ph);
+      for (const s of e.spikes) o += s.h * Math.max(0, Math.cos(ang - s.a)) ** s.w;
+      return end * Math.max(-tearMax, Math.min(tearMax, o));
+    };
+    const tearWin = (y) => {
+      const u = Math.abs(y) / halfLen;
+      if (u <= 1 - TEAR_W) return 0;
+      const s = (u - (1 - TEAR_W)) / TEAR_W;
+      return s * s * (3 - 2 * s);
+    };
+
+    // Placement: rocks are already down, so the log picks a heading and a spot that keeps its capsule
+    // clear of anything bigger than itself. Lying across a smaller stone is fine; it reads as resting on it.
+    const placeRng = createRng(deriveSeed(seed, 4245 + li * 20));
+    // The collider is a straight capsule, so its outer wall must reach the bark crest plus the bend.
+    const logOuter = logR * kMax + bendMag;
+    let place = null;
+    for (let tries = 0; tries < 48; tries++) {
+      const head = placeRng.range(0, Math.PI * 2);
+      const azim = placeRng.range(0, Math.PI * 2);
+      const rad = placeRng.range(0.16, prev ? 0.36 : 0.30);
+      const cx = Math.cos(azim) * view.w * rad, cz = Math.sin(azim) * view.h * rad;
+      const dx = Math.cos(head) * halfLen, dz = -Math.sin(head) * halfLen;
+      let pen = 0;
+      for (const s of colliders.spheres) {
+        if (s.r <= logOuter) continue;
+        pen += Math.max(0, s.r + logOuter + 0.15 - segPointDist(s.x, s.y, s.z, cx - dx, logY, cz - dz, cx + dx, logY, cz + dz));
+      }
+      if (prev) {
+        pen += Math.max(0, prev.rOuter + logOuter + 0.35 - segSegDist(prev.ax, prev.az, prev.bx, prev.bz, cx - dx, cz - dz, cx + dx, cz + dz));
+        // Near-parallel logs read as one broken trunk, so the second one crosses the first's heading.
+        const dh = ((head - prev.head) % Math.PI + Math.PI) % Math.PI;
+        if (Math.min(dh, Math.PI - dh) < 0.5) pen += 0.5;
+      }
+      // Rock clearance outweighs framing ten to one; framing only settles ties between clean spots.
+      const score = pen * 10 + Math.max(0, Math.abs(cx) + Math.abs(dx) - view.w * 0.42)
+        + Math.max(0, Math.abs(cz) + Math.abs(dz) - view.h * 0.42);
+      if (!place || score < place.score) place = { head, cx, cz, score };
+      if (score === 0) break;
+    }
+    const logAng = place.head, lx = place.cx, lz = place.cz;
+
+    const log = new THREE.Group();
+    log.rotation.z = Math.PI / 2;
+    log.rotation.y = logAng;
+    log.position.set(lx, logY, lz);
+    log.updateMatrixWorld(true);
+    const logInv = new THREE.Matrix4().copy(log.matrixWorld).invert();
+    const logRot = new THREE.Matrix3().setFromMatrix4(log.matrixWorld);
+    const woodMat = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
+    const woodInner = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
+    woodInner.side = THREE.BackSide;
+
+    const RADIAL = 64, HSEG = 96;
+    const shapeShell = (geo, baseR) => {
+      const pos = geo.attributes.position;
+      for (let v = 0; v < pos.count; v++) {
+        const x = pos.getX(v), y = pos.getY(v), z = pos.getZ(v);
+        const ang = Math.atan2(z, x);
+        const r = baseR * radialK(ang, y);
+        pos.setXYZ(v, Math.cos(ang) * r + bendX(y), y + endOff(y >= 0 ? 1 : -1, ang) * tearWin(y), Math.sin(ang) * r + bendZ(y));
+      }
+      geo.computeVertexNormals();
+      weldSeamNormals(geo, RADIAL, HSEG);
+      return geo;
+    };
+    const outer = shapeShell(new THREE.CylinderGeometry(1, 1, logLen, RADIAL, HSEG, true), logR);
+    const inner = shapeShell(new THREE.CylinderGeometry(1, 1, logLen, RADIAL, HSEG, true), boreBase);
+    log.add(new THREE.Mesh(outer, woodMat));
+    log.add(new THREE.Mesh(inner, woodInner));
+
+    // End lips: an annulus, never a disc, so both mouths stay enterable. Its rim rides the same tear
+    // as the two shells, which is what welds the torn edge together instead of leaving a clean rim.
+    for (const end of [1, -1]) {
+      const verts = [], idx = [], ye = end * halfLen, bx = bendX(ye), bz = bendZ(ye);
+      for (let i = 0; i < RADIAL; i++) {
+        const ang = (i / RADIAL) * Math.PI * 2, k = radialK(ang, ye), y = ye + endOff(end, ang);
+        const ri = boreBase * k * 0.985, ro = logR * k * 1.005;
+        verts.push(Math.cos(ang) * ri + bx, y, Math.sin(ang) * ri + bz);
+        verts.push(Math.cos(ang) * ro + bx, y, Math.sin(ang) * ro + bz);
+      }
+      for (let i = 0; i < RADIAL; i++) {
+        const j = (i + 1) % RADIAL, ai = i * 2, ao = ai + 1, bi = j * 2, bo = bi + 1;
+        if (end > 0) idx.push(ai, bo, ao, ai, bi, bo);
+        else idx.push(ai, ao, bo, ai, bo, bi);
+      }
+      const lip = new THREE.BufferGeometry();
+      lip.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+      // shade() carries texture nodes whose default uv resolves at build; WebGL2 warns when it is missing.
+      lip.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(verts.length / 3 * 2), 2));
+      lip.setIndex(idx);
+      lip.computeVertexNormals();
+      log.add(new THREE.Mesh(lip, woodMat));
+    }
+    group.add(log);
+
+    const dir = new THREE.Vector3(Math.cos(logAng), 0, -Math.sin(logAng));
+    colliders.logs.push({
+      a: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, -halfLen),
+      b: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, halfLen),
+      rInner: logR * boreT, rOuter: logOuter,
+    });
+    if (logY + logOuter > 0) {
+      // The bark crest, not the nominal radius, is what stands dry; the mask must keep duckweed off all of it.
+      const chord = Math.sqrt(logOuter * logOuter - logY * logY);
+      colliders.waterline.capsules.push({ ax: lx - dir.x * halfLen, az: lz - dir.z * halfLen, bx: lx + dir.x * halfLen, bz: lz + dir.z * halfLen, r: chord });
+      // Three perches along the dry ridge, read off the shaped trunk so they sit on the bark, not above it.
+      for (const s of [-0.35, 0, 0.35]) {
+        const ys = s * logLen;
+        const p = log.localToWorld(new THREE.Vector3(logR * radialK(0, ys) + bendX(ys), ys, bendZ(ys)));
+        habitat?.addPerch({ x: p.x, y: p.y, z: p.z, type: 'log', radius: logR * 0.4 });
+      }
+    }
+
+    // Branch stubs: children of the log group, same material, so bark and transform carry over. Each base
+    // disc hides inside the wall (never through it into the bore) and each is a solid capsule to the eels.
+    const stubRng = createRng(deriveSeed(seed, 4246 + li * 20));
+    const AXIS_Y = new THREE.Vector3(0, 1, 0);
+    for (let i = 0, want = stubRng.int(0, 5); i < want; i++) {
+      const y0 = stubRng.range(-0.55, 0.55) * halfLen;
+      const psi = (stubRng.chance(0.5) ? 1 : -1) * stubRng.range(0.35, 1.85);   // 0 is the ridge; never the underside
+      const phi = stubRng.range(0.35, 1.22);                                    // 20 to 70 degrees off the trunk axis
+      const lean = stubRng.chance(0.5) ? 1 : -1;
+      const cs = Math.cos(psi), sn = Math.sin(psi), sp = Math.sin(phi), cp = Math.cos(phi);
+      const kk = radialK(psi, y0);
+      // Measured against whichever bore is wider, the modeled one or the collider's, so a stub can
+      // never end up as wood inside the air the eels are promised.
+      const rSurf = logR * kk, rBore = Math.max(boreBase * kk, logR * boreT + bendMag);
+      const wall = rSurf - rBore;
+      const R = Math.min(stubRng.range(0.10, 0.30) * logR, 0.45 * wall / Math.max(0.25, cp));
+      if (R < 0.06 * logR) continue;
+      const rb = rBore + wall * 0.5;
+      // Length is whatever survives four limits: neither mouth, not out of the water, not into the sand,
+      // and long enough that what clears the bark is a branch rather than a pimple.
+      const sink = wall * 0.5 / sp;
+      let len = Math.min(stubRng.range(0.5, 2.2) * logR, (0.78 * halfLen - lean * y0) / cp);
+      const room = cs > 0 ? 0.10 - logY - R : -DEPTH + 0.06 + R - logY;
+      if (Math.abs(cs) > 1e-3) len = Math.min(len, (room / cs - rb) / sp);
+      if (len < sink + 0.28 * logR) continue;
+
+      const SR = 14, SH = 10, tipR = R * stubRng.range(0.45, 0.8);
+      const geo = new THREE.CylinderGeometry(tipR, R, len, SR, SH, false);
+      const sBias = stubRng.range(-0.05, 0.02) * len, sRag = stubRng.range(0.02, 0.06) * len;
+      const sPh = [stubRng.range(0, 6), stubRng.range(0, 6), stubRng.range(0, 6)];
+      const sSpk = [];
+      for (let k = 0, n = stubRng.int(1, 2); k < n; k++) sSpk.push({ a: stubRng.range(0, 6.28), w: stubRng.range(4, 10), h: stubRng.range(0.04, 0.10) * len });
+      const pos = geo.attributes.position;
+      for (let v = 0; v < pos.count; v++) {
+        const x = pos.getX(v), y = pos.getY(v), z = pos.getZ(v);
+        const u = (y + len / 2) / len;
+        if (u <= 0.55) continue;
+        const s = (u - 0.55) / 0.45;
+        // Scaling by radius pins the cap center, so the snapped tip splinters around it instead of tilting.
+        const win = s * s * (3 - 2 * s) * Math.min(1, Math.hypot(x, z) / Math.max(tipR, 1e-4));
+        const ang = Math.atan2(z, x);
+        let o = sBias + sRag * lumpNoise(Math.cos(ang) * 2.6, 0, Math.sin(ang) * 2.6, lf, sPh);
+        for (const s2 of sSpk) o += s2.h * Math.max(0, Math.cos(ang - s2.a)) ** s2.w;
+        pos.setY(v, y + Math.max(-0.18 * len, Math.min(0.18 * len, o)) * win);
+      }
+      geo.computeVertexNormals();
+      weldSeamNormals(geo, SR, SH);
+
+      const d3 = new THREE.Vector3(sp * cs, cp * lean, sp * sn);
+      const base = new THREE.Vector3(cs * rb + bendX(y0), y0, sn * rb + bendZ(y0));
+      const stub = new THREE.Mesh(geo, woodMat);
+      stub.quaternion.setFromUnitVectors(AXIS_Y, d3);
+      stub.position.copy(base).addScaledVector(d3, len / 2);
+      log.add(stub);
+
+      // Solid capsule: eel-physics walls the band between rInner and rOuter, so rInner 0 is a filled limb.
+      // It starts where the stub leaves the bark, keeping the collider out of the trunk's own wall band.
+      const a = log.localToWorld(base.clone().addScaledVector(d3, Math.min(len * 0.9, sink)));
+      const b = log.localToWorld(base.clone().addScaledVector(d3, len));
+      colliders.logs.push({ a, b, rInner: 0, rOuter: R });
+      const yTop = Math.max(a.y, b.y);
+      if (yTop + R > 0) {
+        const chord = yTop >= R ? R : Math.sqrt(Math.max(0, R * R - yTop * yTop));
+        if (chord > 0.03) stubCaps.push({ ax: a.x, az: a.z, bx: b.x, bz: b.z, r: chord });
+      }
+    }
+    return { head: logAng, ax: lx - dir.x * halfLen, az: lz - dir.z * halfLen, bx: lx + dir.x * halfLen, bz: lz + dir.z * halfLen, rOuter: logOuter, sizeMul, logLen, stubCaps };
   };
-  for (const [g, rs] of [[outer, 1], [inner, 1]]) {
-    const pos = g.attributes.position;
-    for (let v = 0; v < pos.count; v++) {
-      const [x, y, z] = shapeLog(pos.getX(v), pos.getY(v), pos.getZ(v), rs);
-      pos.setXYZ(v, x, y, z);
-    }
-    g.computeVertexNormals();
-  }
-  const logAng = rng.range(0, Math.PI * 2);
-  const log = new THREE.Group();
-  log.rotation.z = Math.PI / 2;
-  log.rotation.y = logAng;
-  const lx = Math.cos(logAng + 1.3) * view.w * 0.22, lz = Math.sin(logAng + 1.3) * view.h * 0.22;
-  log.position.set(lx, -DEPTH + logR * 0.9, lz);
-  log.updateMatrixWorld(true);
-  const logInv = new THREE.Matrix4().copy(log.matrixWorld).invert();
-  const logRot = new THREE.Matrix3().setFromMatrix4(log.matrixWorld);
-  const woodMat = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
-  const woodInner = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
-  woodInner.side = THREE.BackSide;
-  log.add(new THREE.Mesh(outer, woodMat));
-  log.add(new THREE.Mesh(inner, woodInner));
-  // End lips follow the shaped radius so the wall reads as solid wood.
-  for (const end of [1, -1]) {
-    const lip = new THREE.RingGeometry(logR * (boreT + 0.04), logR, 64, 1);
-    const lp = lip.attributes.position;
-    for (let v = 0; v < lp.count; v++) {
-      const px = lp.getX(v), py = lp.getY(v);
-      const [sx, , sz] = shapeLog(px, end * logLen / 2, py, 1);
-      lp.setXYZ(v, sx, sz, 0);
-    }
-    const m = new THREE.Mesh(lip, woodMat);
-    m.rotation.x = end > 0 ? -Math.PI / 2 : Math.PI / 2;
-    m.position.y = end * logLen / 2;
-    log.add(m);
-  }
-  group.add(log);
-  const dir = new THREE.Vector3(Math.cos(logAng), 0, -Math.sin(logAng));
-  const logY = -DEPTH + logR * 0.9;
-  colliders.logs.push({
-    a: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, -logLen / 2),
-    b: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, logLen / 2),
-    rInner: logR * boreT, rOuter: logR * 1.08,
-  });
-  if (logY + logR > 0) {
-    const half = Math.sqrt(logR * logR - logY * logY);
-    colliders.waterline.capsules.push({ ax: lx - dir.x * logLen / 2, az: lz - dir.z * logLen / 2, bx: lx + dir.x * logLen / 2, bz: lz + dir.z * logLen / 2, r: half });
-    // Three perches along the dry ridge of the trunk, ends pulled in so nothing sits on the lip.
-    for (const s of [-0.35, 0, 0.35]) {
-      habitat?.addPerch({ x: lx + dir.x * logLen * s, y: logY + logR, z: lz + dir.z * logLen * s, type: 'log', radius: logR * 0.4 });
-    }
-  }
+  const firstLog = buildLog(0, null);
+  const secondLog = createRng(deriveSeed(seed, 4260)).chance(0.5) ? buildLog(1, firstLog) : null;
+  for (const c of [...firstLog.stubCaps, ...(secondLog ? secondLog.stubCaps : [])]) if (colliders.waterline.capsules.length < 4) colliders.waterline.capsules.push(c);
 
   scene.add(group);
-  return { group, colliders };
+  return { group, colliders, textures };
 }

@@ -9,6 +9,7 @@ export class PondInput {
     this.mode = null;               // 'left' | 'right' | null
     this.path = [];
     this.lastMoveAt = 0;
+    this.movedAcc = 0;
     this.touchTimer = null;
     this.touchStart = null;
     this.bind();
@@ -56,6 +57,7 @@ export class PondInput {
     this.mode = mode;
     this.path = [{ x, z, t: performance.now() }];
     this.lastMoveAt = performance.now();
+    this.movedAcc = 0;
     if (mode === 'left') { this.h.poke?.(x, z); this.h.dragStart?.(x, z); }
     else { this.h.feed?.(x, z); }
   }
@@ -72,15 +74,36 @@ export class PondInput {
       cx = (pts[0].x + pts[1].x) / 2; cy = (pts[0].y + pts[1].y) / 2;
     }
     const now = performance.now();
-    if (now - this.lastMoveAt < 40) return;
+    // Every sub-frame sample the browser coalesced goes into the path, so a fast swish is a polyline
+    // and not one chord; the handler stays throttled, because it drives audio and sim drops.
+    const raw = (this.mode === 'left' && e.getCoalescedEvents?.().length) ? e.getCoalescedEvents() : null;
+    let added = 0;
+    if (raw) {
+      for (const s of raw) {
+        const [x, z] = this.toWorld(s.clientX, s.clientY);
+        const last = this.path[this.path.length - 1];
+        const d = Math.hypot(x - last.x, z - last.z);
+        if (d < 0.04) continue;
+        this.path.push({ x, z, t: now });
+        this.movedAcc += d;
+        added++;
+      }
+    } else {
+      const [x, z] = this.toWorld(cx, cy);
+      const last = this.path[this.path.length - 1];
+      const d = Math.hypot(x - last.x, z - last.z);
+      if (d < 0.04) return;
+      this.path.push({ x, z, t: now });
+      this.movedAcc += d;
+      added = 1;
+    }
+    if (!added || now - this.lastMoveAt < 40) return;
     this.lastMoveAt = now;
-    const [x, z] = this.toWorld(cx, cy);
-    const last = this.path[this.path.length - 1];
-    const moved = Math.hypot(x - last.x, z - last.z);
-    if (moved < 0.04) return;
-    this.path.push({ x, z, t: now });
-    if (this.mode === 'left') this.h.dragMove?.(x, z, moved, this.path);
-    else this.h.feedDragMove?.(x, z, moved, this.path);
+    const tip = this.path[this.path.length - 1];
+    const moved = this.movedAcc;
+    this.movedAcc = 0;
+    if (this.mode === 'left') this.h.dragMove?.(tip.x, tip.z, moved, this.path);
+    else this.h.feedDragMove?.(tip.x, tip.z, moved, this.path);
   }
 
   onUp(e) {

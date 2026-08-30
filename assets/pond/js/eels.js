@@ -105,6 +105,7 @@ export class EelSystem {
     this.guests = [];              // Eleanor-class residents: own brain, shared physics and renderer
     this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
     this.rain = null;              // the shower scheduler, one shared reference: behavior reads its envelope
+    this.habitat = null;           // the cover registry; pads become loiter targets once it is set
     this.feedRecent = 0;           // decaying feed-spree meter; the residents eat too fast for a stock check
     this.spooks = [];              // { x, z, t, strength }
     this.lures = [];               // curiosity points from drags: { x, z, t }
@@ -180,6 +181,7 @@ export class EelSystem {
   setEnabled(on) {
     this.enabled = on;
     this.renderer.setEnabled(on);
+    if (!on) for (const e of this.eels) if (e.coverSpot?.type === 'pad') e.coverSpot = null;
   }
 
   /* Interaction entry points (world xz). */
@@ -228,6 +230,8 @@ export class EelSystem {
     this.time += dt;
     const all = this.guests.length ? this.eels.concat(this.guests) : this.eels;
     for (const e of all) for (let i = 0; i < EEL_POINTS; i++) e.pose0[i].copy(e.pts[i]);
+    // A slurped eel forgets its pad; nothing else clears a loiter it can no longer hold.
+    for (const e of all) if (e.slurpedBy && e.coverSpot?.type === 'pad') e.coverSpot = null;
     for (const e of all) if (!e.slurpedBy) (e.brain || steer)(this, e, dt);
     for (const e of all) if (!e.slurpedBy) followBody(e);
     for (const e of all) for (let i = 0; i < EEL_POINTS; i++) e.prev[i].copy(e.pts[i]);
