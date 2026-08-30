@@ -22,4 +22,6 @@ export const COVER_DISCS = 48;       // surface-cover bake (mask G): up to 26 pa
 export const COVER_CAPS = 48;        // surface-cover bake (mask G): rush stems as shadow capsules
 export const MAX_PIXELS = 2.6e6;     // internal render budget before DPR gets clamped
 export const IDLE_FADE_MS = 6000;
+export const NAME_LIFT = 0.2;          // world units a name tag floats above its eel's head, toward screen-up
 export const STORAGE_KEY = 'xy.eels';
+export const NAMES_KEY = 'xy.names';

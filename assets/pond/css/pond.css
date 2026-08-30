@@ -160,7 +160,26 @@ html.is-idle .chrome:focus-within {
 }
 .legend span { white-space: nowrap; }
 .legend span + span::before { content: " · "; opacity: 0.5; }
-.legend .btn-tiny { margin-left: 8px; vertical-align: middle; }
+
+/* Name tags ride between the canvas and the chrome, and never eat a click: the pond takes them everywhere. */
+#eel-names {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+.eel-name {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  font-size: 0.85rem;
+  color: var(--ink-strong);
+  /* Bright duckweed and a lit eel are both plausible backdrops, so the tag carries its own dark halo. */
+  text-shadow: 0 1px 3px oklch(8% 0.02 260 / 0.9), 0 0 8px oklch(8% 0.02 260 / 0.7);
+  white-space: nowrap;
+  will-change: transform;
+}
 
 .gate {
   /* Tailwind's preflight zeroes dialog margins, which kills the UA centering. */

@@ -1,10 +1,10 @@
 import * as THREE from 'three/webgpu';
-import { EEL_COUNT, EEL_POINTS, DEPTH } from './config.js';
+import { EEL_POINTS, DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
-import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, rememberPushes, tailAmp } from './eel-physics.js';
+import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, rememberPushes, tailAmp, growEel } from './eel-physics.js';
 import { expire, pickTarget, steer } from './eel-behavior.js';
 import { EelRenderer } from './eel-render.js';
-import { identityFor, applyIdentity, rollIdentityColors, rollIdentityPattern } from './eel-identity.js';
+import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPattern, rollNickname } from './eel-identity.js';
 
 export class Eel {
   constructor(index, seed, extent, colliders, view, identity) {
@@ -76,22 +76,26 @@ export class Eel {
     this.nopeZig = 0;
     this.attnReset = false;
     this.slurpedBy = null;
+    this.offscreenFor = 0;   // seconds the whole body has been out of view; 5 buys an identity swap
     this.rollColors(rng);
     this.rollPattern(rng);
+    this.rollNick(rng);   // last, so the draw never shifts the color and pattern streams above it
   }
 
   rollColors(rng) { rollIdentityColors(this, this.identity, rng); }
 
   rollPattern(rng) { rollIdentityPattern(this, this.identity, rng); }
 
+  rollNick(rng) { rollNickname(this, this.identity, rng); }
+
   get head() { return this.pts[0]; }
 }
 
 // The shim fans out across every type the pond emits; a new event type belongs here too.
-const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble'];
+const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble', 'swap'];
 
 export class EelSystem {
-  constructor(scene, U, shading, seed, extent, colliders, sim, motion, view) {
+  constructor(scene, U, shading, seed, extent, colliders, sim, motion, view, opts = {}) {
     this.view = view;
     this.scene = scene;
     this.U = U;
@@ -120,8 +124,11 @@ export class EelSystem {
     this.shimFn = null;
     this.renderer = new EelRenderer(scene, U, shading, this.knobs);
     this.group = this.renderer.group;
-    for (let i = 0; i < EEL_COUNT; i++) {
-      const e = new Eel(i, seed, extent, colliders, view, identityFor(i));
+    // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.
+    this.hotSwap = !opts.cast;   // null means no ?cast= at all; [] is a bare ?cast= that pins the seeded draw
+    const cast = drawCast(seed, opts.cast ?? []);
+    for (let i = 0; i < cast.length; i++) {
+      const e = new Eel(i, seed, extent, colliders, view, cast[i]);
       pickTarget(this, e, 0);
       this.eels.push(e);
       this.renderer.buildMesh(e);
@@ -212,9 +219,51 @@ export class EelSystem {
     for (const e of this.eels) {
       e.rollColors(this.rng);
       e.rollPattern(this.rng);
+      e.rollNick(this.rng);
       this.renderer.applyAppearance(e);
     }
     this.applyKnobs();
+  }
+
+  /* Trade one resident for an identity nobody is wearing. Only ever called off-screen, so a whole new
+     build, palette, and length can land in a single frame without anything popping in view. */
+  swapIdentity(e, id = null) {
+    if (!e || e.slurpedBy) return false;
+    const names = this.eels.map((o) => o.name);
+    // A named swap (console) still has to obey the pool: active, and not already on screen.
+    if (id && (id.active === false || names.includes(id.name))) return false;
+    const to = id ?? pickAbsent(this.rng, names);
+    if (!to) return false;
+    const from = e.name, oldLen = e.length;
+    e.identity = to;
+    applyIdentity(e, to, e.rng);
+    // applyIdentity rolls the new length straight onto the eel; growEel is the only path that carries
+    // spacing, ampTail, and the trail buffer with it, so hand the delta back through it.
+    const want = e.length;
+    e.length = oldLen;
+    growEel(e, want - oldLen);
+    e.baseLength = e.length;
+    e.uRadius.value = e.radius;
+    for (const m of e.eyes) m.scale.setScalar(e.radius * 0.2);
+    e.rollColors(e.rng);
+    e.rollPattern(e.rng);
+    e.rollNick(e.rng);
+    this.renderer.applyAppearance(e);
+    // The plan belonged to the eel who left: drop the crumb claim, the perch, and the run.
+    if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
+    e.coverSpot = null;
+    e.tunnel = null;
+    e.gaitUntil = 0;
+    e.retargetAt = 0;
+    e.speedBL = e.prowlBL;
+    // Whole flock, not just the swapped eel: someone's partner may have just walked out of the pond.
+    for (const o of this.eels) {
+      o.partner = o.quirks.follows
+        ? this.eels.find((p) => p.name === o.quirks.follows) ?? this.guests.find((g) => g.name === o.quirks.follows) ?? null
+        : null;
+    }
+    this.emit('swap', e, { from, to: e.name });
+    return true;
   }
 
   /* Push the live skin/glow layers at everyone, guests included, after tweaking pond.eels.knobs. */
@@ -243,6 +292,16 @@ export class EelSystem {
     // A slurped eel forgets its pad; nothing else clears a loiter it can no longer hold.
     for (const e of all) if (e.slurpedBy && e.coverSpot?.type === 'pad') e.coverSpot = null;
     for (const e of all) if (!e.slurpedBy) (e.brain || steer)(this, e, dt);
+    // The cast rotates where nobody is looking: every spine point (halo included) past the view rectangle.
+    // A head-only test with a body-length margin sat beyond the 0.7-view turn-back line on the short axis.
+    const hw = this.view.w * 0.5, hh = this.view.h * 0.5;
+    for (const e of this.eels) {
+      if (e.slurpedBy || e.tunnel) continue;
+      const r = e.radius * 2.5;
+      const off = e.pts.every((p) => Math.abs(p.x) > hw + r || Math.abs(p.z) > hh + r);
+      e.offscreenFor = off ? e.offscreenFor + dt : 0;
+      if (this.hotSwap && e.offscreenFor >= 5) { this.swapIdentity(e); e.offscreenFor = 0; }
+    }
     for (const e of all) if (!e.slurpedBy) followBody(e);
     for (const e of all) for (let i = 0; i < EEL_POINTS; i++) e.prev[i].copy(e.pts[i]);
     collide(all, this.colliders);

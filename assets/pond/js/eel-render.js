@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, smoothstep, varying, dot, texture, TWO_PI, positionWorld } from 'three/tsl';
+import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld } from 'three/tsl';
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2 } from './shading.js';
 import { makeRampTexture, bakeRamp } from './eel-palette.js';
@@ -80,6 +80,8 @@ export class EelRenderer {
     e.uSkinTint = uniform(new THREE.Color(1, 1, 1));
     e.uGlowTint = uniform(new THREE.Color(1, 1, 1));
     e.uBand = uniform(new THREE.Vector2(e.wBand, e.repeats));
+    e.uRace = uniform(new THREE.Vector2(e.wRace, e.raceOff));
+    e.uPlaid = uniform(new THREE.Vector3(e.wPlaid, e.plaidFreq, e.wRidge));
     e.uGlowMode = uniform(e.glowMode.clone());
     const rampNode = texture(e.rampTex);
     const U = this.U;
@@ -142,20 +144,51 @@ export class EelRenderer {
       const spotsN = valueNoise2(vec2(t.mul(e.uPattern.y), ang.mul(1.2).add(e.uSeed)));
       const spots = smoothstep(0.62, 0.8, spotsN);
       const flank = smoothstep(0.05, 0.35, abs(cos(ang))).oneMinus();
+      // Racing stripes, car-decal style: two lines straddling the dorsal ridge, split into segments of
+      // solid bar, hash marks, or pinlines. Widths are in radians on a skinny tube, so keep them generous.
+      // Distance from the ridge without acos: cos() can round past 1 on the seam, and acos of that is
+      // NaN, which the compose pass then smears across the body.
+      const dorsal = abs(ang.sub(Math.PI)).sub(Math.PI).negate();
+      const dd = dorsal.sub(e.uRace.y.add(sin(t.mul(9).add(e.uSeed)).mul(0.06)));
+      const rseed = e.uSeed.add(e.uRace.y.mul(40));   // rolls with raceOff, so a reroll re-lays the segments
+      const zoneF = t.mul(3).add(rseed.mul(0.37).fract());
+      const style = fract(sin(floor(zoneF).mul(12.9898).add(rseed)).mul(43758.5453));
+      const solid = smoothstep(0.36, 0.22, abs(dd));
+      const hatch = smoothstep(0.44, 0.3, abs(dd)).mul(step(0.5, fract(t.mul(16).add(dd.mul(3)))));
+      const pins = smoothstep(0.1, 0.04, abs(abs(dd).sub(0.24)));
+      const segGap = smoothstep(0.0, 0.08, fract(zoneF)).mul(smoothstep(1.0, 0.92, fract(zoneF)));
+      const race = mix(mix(solid, hatch, smoothstep(0.3, 0.45, style)), pins, smoothstep(0.65, 0.8, style))
+        .mul(segGap).mul(smoothstep(0.03, 0.12, t));
+      // Ridge lights, Eleanor's trick at resident scale: a wandering dorsal line with two side lines low
+      // enough to still show from above, and a charge pulse riding tailward every four seconds.
+      const wander = sin(t.mul(7).sub(time.mul(0.2)).add(e.uSeed)).mul(0.35);
+      const ridgeAt = (mu, w, gain) => smoothstep(w, w * 0.3, abs(dorsal.sub(mu).sub(wander))).mul(gain);
+      const cyc = time.mul(0.25).add(e.uSeed).fract();
+      const travel = smoothstep(0.16, 0.0, abs(t.sub(cyc))).mul(1.2);
+      const ridge = ridgeAt(0, 0.45, 1.0).add(ridgeAt(1.2, 0.3, 0.45)).mul(travel.add(0.7));
+      // Plaid: straight bands along the body crossed with bands around it; the crossings glow hardest.
+      const bandT = smoothstep(0.35, 0.65, sin(t.mul(e.uPattern.x).mul(TWO_PI)).mul(0.5).add(0.5));
+      const bandA = smoothstep(0.35, 0.65, sin(ang.mul(e.uPlaid.y)).mul(0.5).add(0.5));
+      const plaid = bandT.add(bandA).mul(0.35).add(bandT.mul(bandA).mul(0.5));
 
       // The field indexes the ramp: crests and flank read the main half, spots and between-stripe skin the
       // accent half, bands walk the whole ramp; a flank-only eel borrows the spot field so it is not split at mid-body.
-      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x)).oneMinus();
+      const wRace = e.uRace.x, wPlaid = e.uPlaid.x, wRidge = e.uPlaid.z;
+      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge)).oneMinus();
       const wSpotF = e.uWeights.y.add(bare);
-      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).max(1e-3);
+      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).max(1e-3);
       const field = wave.oneMinus().mul(e.uWeights.x.div(wSum))
         .add(spots.mul(wSpotF.div(wSum)))
-        .add(t.mul(e.uBand.y).mul(e.uBand.x.div(wSum)));
+        .add(t.mul(e.uBand.y).mul(e.uBand.x.div(wSum)))
+        .add(race.oneMinus().mul(wRace.div(wSum)))
+        .add(bandT.add(bandA).mul(0.5).mul(wPlaid.div(wSum)))
+        .add(ridge.clamp(0, 1).oneMinus().mul(wRidge.div(wSum)));
 
       // The bake puts a band-edge mask in alpha, so each stripe boundary lights up from the one sample.
       const samp = rampNode.sample(vec2(field, 0.5));
       const ramp = samp.rgb;
-      const mask = stripes.mul(e.uWeights.x).add(spots.mul(e.uWeights.y)).add(flank.mul(e.uWeights.z)).add(samp.a.mul(e.uBand.x));
+      const mask = stripes.mul(e.uWeights.x).add(spots.mul(e.uWeights.y)).add(flank.mul(e.uWeights.z)).add(samp.a.mul(e.uBand.x))
+        .add(race.mul(wRace)).add(plaid.mul(wPlaid)).add(ridge.mul(wRidge));
 
       const breathe = sin(time.mul(TWO_PI).mul(0.25).add(e.uSeed)).mul(0.25).add(0.75);
       const pulse = sin(time.mul(e.uPattern.w).sub(t.mul(7)).add(e.uSeed)).mul(0.25).add(0.85);
@@ -224,6 +257,8 @@ export class EelRenderer {
     e.uPattern.value.set(e.stripeFreq, e.spotFreq, e.wavy, e.pulseRate);
     e.uWeights.value.set(e.wStripe, e.wSpot, e.wFlank);
     e.uBand.value.set(e.wBand, e.repeats);
+    e.uRace.value.set(e.wRace, e.raceOff);
+    e.uPlaid.value.set(e.wPlaid, e.plaidFreq, e.wRidge);
     e.uGlowMode.value.copy(e.glowMode);
     e.uLayers.value.set(this.knobs.skin * e.skinMul, this.knobs.glow);
   }

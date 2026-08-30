@@ -10,6 +10,7 @@ import { WakeBuffer } from './wake.js';
 import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
 import { attachEleanor } from './eleanor.js';
+import { IDENTITIES } from './eel-identity.js';
 import { growEel } from './eel-physics.js';
 import { SurfacePass } from './surface.js';
 import { ImpulseInjector, halfToFloat } from './impulse.js';
@@ -20,7 +21,8 @@ import { FloaterSystem } from './floaters.js';
 import { AlgaeTufts } from './algae.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
-import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle } from './ui.js';
+import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle } from './ui.js';
+import { NameLabels } from './names.js';
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -97,7 +99,10 @@ async function boot() {
   const overScene = new THREE.Scene();
   const { colliders, textures } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat);
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
-  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view);
+  // ?cast=jim,shelley pins those residents in first and freezes the off-screen rotation for testing;
+  // a bare ?cast= freezes the seeded draw as-is.
+  const cast = params.has('cast') ? (params.get('cast') ?? '').split(',').map((s) => s.trim()).filter(Boolean) : null;
+  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view, { cast });
   const eleanor = attachEleanor(eels, seed);
   const effects = new UnderwaterEffectsPool();
   underScene.add(effects.mesh);
@@ -167,6 +172,8 @@ async function boot() {
   // Dev-only mix console; the module never loads without the flag.
   if (params.get('mixer') === '1') import('./mixer.js').then((m) => m.attachMixer(audio)).catch((err) => console.warn('Pond: mixer failed to load', err));
   const eelToggleRender = bindEelToggle(document.getElementById('eel-toggle'), (v) => eels.setEnabled(v === 'yes'));
+  const names = new NameLabels(document.getElementById('eel-names'), view);
+  bindNamesToggle(document.getElementById('names-toggle'), (on) => names.setEnabled(on));
   setupIdleFade(root);
   // World x → stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
   const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
@@ -412,6 +419,7 @@ async function boot() {
     strayBubbles(t);
     popBubbles(t);
     eels.update(dt);
+    names.update(eels);
     // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
     pads.update(dt, t, rain, impulse);
     floaters.update(dt, t);
@@ -522,6 +530,7 @@ async function boot() {
     window.pond = {
       renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, algae, textures,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
+      swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,
       diag: async () => {
         console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '), 'moonPhase', moon.phase01.toFixed(3), 'wind', U.wind.value.toArray().map((v) => v.toFixed(2)).join(' '));
@@ -531,6 +540,7 @@ async function boot() {
         await stats(wake.rtA, 'wake');
       },
     };
+    eels.on('swap', (p) => console.log('pond: ' + p.food.from + ' swam off, ' + p.food.to + ' swam in'));
     console.log('pond seed', seed, 'backend', root.dataset.backend, '- pond.diag() for target stats, pond.stats() for frame times');
   }
 }

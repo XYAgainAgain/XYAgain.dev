@@ -1,12 +1,20 @@
-import { IDLE_FADE_MS, STORAGE_KEY } from './config.js';
+import { IDLE_FADE_MS, NAMES_KEY, STORAGE_KEY } from './config.js';
 
-/* The eel gate, idle fade, sound button + volume dropdown, and legend toggle. Pure DOM, no rendering. */
+/* The eel gate, idle fade, sound button + volume dropdown, and the chrome toggles. Pure DOM, no rendering. */
 export function readEelChoice() {
   try { return localStorage.getItem(STORAGE_KEY); } catch { return null; }
 }
 
 export function writeEelChoice(v) {
   try { localStorage.setItem(STORAGE_KEY, v); } catch {}
+}
+
+function readNamesChoice() {
+  try { return localStorage.getItem(NAMES_KEY); } catch { return null; }
+}
+
+function writeNamesChoice(v) {
+  try { localStorage.setItem(NAMES_KEY, v); } catch {}
 }
 
 export function setupIdleFade(root) {
@@ -78,5 +86,23 @@ export function bindEelToggle(btn, onChange) {
     onChange(next);
   });
   render(readEelChoice());
+  return render;
+}
+
+/* Names default off, and nothing else drives them, so the stored choice is pushed out at bind time. */
+export function bindNamesToggle(btn, onChange) {
+  const render = (v) => {
+    btn.setAttribute('aria-pressed', String(v === 'on'));
+    btn.textContent = v === 'on' ? 'names: on' : 'names: off';
+  };
+  btn.addEventListener('click', () => {
+    const next = readNamesChoice() === 'on' ? 'off' : 'on';
+    writeNamesChoice(next);
+    render(next);
+    onChange(next === 'on');
+  });
+  const initial = readNamesChoice() === 'on' ? 'on' : 'off';
+  render(initial);
+  onChange(initial === 'on');
   return render;
 }
