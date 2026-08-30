@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, attribute, uniform, varying, vec2, vec3, vec4, float, Loop, sin, cos, atan, mod, length, normalize, dot, smoothstep, mix, pow, abs, fract, floor, step, hash, fwidth, texture, sign, uv, positionGeometry, PI, TWO_PI } from 'three/tsl';
+import { Fn, attribute, uniform, varying, vec2, vec3, vec4, float, Loop, sin, cos, atan, mod, length, normalize, dot, smoothstep, mix, pow, abs, fract, floor, step, hash, fwidth, texture, sign, uv, positionGeometry, PI, TWO_PI, select } from 'three/tsl';
 import { DEPTH, INF_SLOTS, MOON_ORBIT_SECONDS } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { capsuleWeight, capsuleInfluence, capsuleWeightCPU, capsuleInfluenceCPU, makeSwell, makeCurrent, fbm2 } from './shading.js';
@@ -14,8 +14,13 @@ export const LILY_POOL = 8;
 const RINGS = [0, 0.16, 0.32, 0.5, 0.68, 0.82, 0.92, 1.0], SEG = 48;
 const AGE = { emerging: 0, young: 1 / 3, mature: 2 / 3, old: 1 };
 const RIM_TAPS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const TWO_PI_CPU = Math.PI * 2;
 const STALK_V = [0.3, 0.6, 0.85];
 const DRIP_STRENGTH = 0.02, DRIP_RADIUS = 3;
+// Beads roll: a steady creep toward the notch, faster downhill when a body lifts a rim or the stalk swings.
+const BEAD_FLOW = 0.12, BEAD_LIFT_ROLL = 0.8, BEAD_SWING_ROLL = 0.6, BEAD_RUN = 1.1, ROLL_CAP = 6;
+// Beads shed off a disturbed pad as a short burst of small drops, biased to the side they roll toward.
+const SHED_TIME = 0.7, SHED_RATE = 9, SHED_STRENGTH = 0.012, SHED_RADIUS = 2.5, SHED_THRESHOLD = 0.35;
 const MASS_RADIUS = 0.1;   // a resident's radius: a stalk shove scales by body radius over this, capped at 4×
 
 function makePadGeometry() {
@@ -39,8 +44,10 @@ function makePadGeometry() {
   geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
   // A texture node's default uv is still resolved even when every sample passes its own; WebGL2 warns without it.
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(count * 2), 2));
-  geo.setAttribute('aRR', new THREE.Float32BufferAttribute(aRR, 1));
-  geo.setAttribute('aTh', new THREE.Float32BufferAttribute(aTh, 1));
+  // One vec2 for (rr, th): WebGPU binds 8 vertex buffers at most and the pad carries five instanced ones.
+  const aFan = [];
+  for (let i = 0; i < aRR.length; i++) aFan.push(aRR[i], aTh[i]);
+  geo.setAttribute('aFan', new THREE.Float32BufferAttribute(aFan, 2));
   geo.setIndex(idx);
   return geo;
 }
@@ -147,6 +154,7 @@ export class PadSystem {
         notchHalf, notchDepth: rng.range(0.35, 0.5), curl, seed: rng.range(0, 100),
         biteSeed: cls === 'old' ? rng.range(1, 100) : 0, restY: 0, liftGain: 1, raised: false,
         wet: 0, swingX: 0, swingZ: 0, swingVX: 0, swingVZ: 0, lastLift: 0, lastPlop: 0, lastPush: 0, cooldownAt: 0, flower: null,
+        shedUntil: 0, shedDir: 0, disturbed: 0, rollX: 0, rollZ: 0, rollS: 0,
       };
       // A pad whose center falls under an earlier pad rides on top: raised, stiff, and deaf to the eels.
       if (this.pads.some((q) => Math.hypot(q.x - x, q.z - z) < q.r)) { p.raised = true; p.restY = 0.02; p.liftGain = 0; }
@@ -232,7 +240,7 @@ export class PadSystem {
     const geo = makePadGeometry();
     const n = PAD_POOL;
     this.padA = new Float32Array(n * 4); this.padB = new Float32Array(n * 4);
-    this.padC = new Float32Array(n * 4); this.padD = new Float32Array(n * 4);
+    this.padC = new Float32Array(n * 4); this.padD = new Float32Array(n * 4); this.padE = new Float32Array(n * 4);
     this.pads.forEach((p, i) => {
       const o = i * 4;
       this.padA.set([p.x, p.z, p.r, p.rot], o);
@@ -245,8 +253,9 @@ export class PadSystem {
       return a;
     };
     this.aPadA = mk(this.padA); this.aPadB = mk(this.padB); this.aPadC = mk(this.padC); this.aPadD = mk(this.padD, true);
+    this.aPadE = mk(this.padE, true);
     geo.setAttribute('aPadA', this.aPadA); geo.setAttribute('aPadB', this.aPadB);
-    geo.setAttribute('aPadC', this.aPadC); geo.setAttribute('aPadD', this.aPadD);
+    geo.setAttribute('aPadC', this.aPadC); geo.setAttribute('aPadD', this.aPadD); geo.setAttribute('aPadE', this.aPadE);
     geo.instanceCount = this.pads.length;
 
     this.ride = this.makeRide(U, sim);
@@ -275,11 +284,17 @@ export class PadSystem {
     const vPadPolar = varying(vec4(0), 'vPadPolar');   // rr, thRel, radius, tilt
     const vPadInfo = varying(vec4(0), 'vPadInfo');     // seed, age, biteSeed, wet
     const vPadLily = varying(float(0), 'vPadLily');
+    const vPadRot = varying(float(0), 'vPadRot');
+    const vPadRoll = varying(vec4(0), 'vPadRoll');   // in pad radii: downhill roll (xy), creep toward the sink (z), notch apex (w)
+    const uBeadPool = uniform(0.15);                   // beads slow and pool this close to a sink instead of vanishing into it
+    const uBeadRun = uniform(BEAD_RUN);                // pad radii one bead layer travels before it drains and the other takes over
+    const uLilyShadowLen = uniform(0.16);   // world units the lily's shadow travels at 52°: its 0.2 height over tan(52°)
 
     const mat = new THREE.NodeMaterial();
     mat.positionNode = Fn(() => {
       const A = attribute('aPadA', 'vec4'), B = attribute('aPadB', 'vec4'), C = attribute('aPadC', 'vec4'), D = attribute('aPadD', 'vec4');
-      const rr = attribute('aRR', 'float'), th0 = attribute('aTh', 'float');
+      const E = attribute('aPadE', 'vec4'), fan = attribute('aFan', 'vec2');
+      const rr = fan.x, th0 = fan.y;
       const radius = A.z;
       // Angle relative to the notch, warped toward it so the rim spends half its vertices there.
       const d0 = th0.sub(PI);
@@ -343,6 +358,9 @@ export class PadSystem {
       vPadPolar.assign(vec4(rr.mul(cos(thRel)), rr.mul(sin(thRel)), radius, length(g)));
       vPadInfo.assign(vec4(B.w, C.x, C.y, D.z));
       vPadLily.assign(D.w);
+      vPadRot.assign(A.w);
+      const cr0 = cos(A.w), sr0 = sin(A.w);
+      vPadRoll.assign(vec4(E.x.mul(cr0).add(E.y.mul(sr0)), E.x.negate().mul(sr0).add(E.y.mul(cr0)), E.z, 0).div(radius).add(vec4(0, 0, 0, B.y.mul(-0.9).add(1))));
       return vec3(xz.x.sub(scrunch.x), y, xz.y.sub(scrunch.y));
     })();
 
@@ -375,21 +393,56 @@ export class PadSystem {
       const tn = vec3(tnRaw.x.mul(st.negate()).add(tnRaw.y.mul(ct)), tnRaw.x.mul(ct).add(tnRaw.y.mul(st)), tnRaw.z);
       const n = normalize(vPadTan.mul(tn.x.mul(uPadBump)).add(vPadRad.mul(tn.y.mul(uPadBump))).add(n0.mul(tn.z))).toVar();
       // Beads: hashed spherical caps that run off past a modest tilt; free when dry.
-      const cell = padUV.mul(uPadBeadFreq);
-      const cid = floor(cell);
-      const f = fract(cell).sub(0.5);
-      const jit = vec2(hash(dot(cid, vec2(19.1, 47.3))), hash(dot(cid, vec2(71.7, 13.9)))).sub(0.5).mul(0.7);
-      const bd = length(f.sub(jit)).div(hash(dot(cid, vec2(5.3, 91.1))).mul(0.30).add(0.14));
-      const cap = bd.mul(bd).oneMinus().max(0).sqrt();
-      const beadMask = smoothstep(1.0, 0.82, bd).mul(wet).mul(smoothstep(0.35, 0.10, tilt));
-      const beadN = normalize(vec3(f.sub(jit).x, cap.mul(0.6), f.sub(jit).y));
-      n.assign(normalize(mix(n, vPadTan.mul(beadN.x).add(n0.mul(beadN.y)).add(vPadRad.mul(beadN.z)), beadMask)));
+      // Bite-outs on old pads only: up to four hashed holes. Each one is also a sink the beads run to.
+      const hole = float(0).toVar();
+      const sink = vec2(vPadRoll.w, 0).toVar();
+      const sinkD = length(local.sub(sink)).toVar();
+      Loop(4, ({ i }) => {
+        const k = float(i);
+        // The first hole is certain on an old pad; each further one is a coin toss.
+        const on = smoothstep(0.8, 1.0, age).mul(step(k.min(1).mul(0.5), hash(bite.mul(1.7).add(k.mul(3.1)))));
+        const hr = hash(bite.add(k.mul(7.3))).mul(0.5).add(0.3);
+        const ha = hash(bite.add(k.mul(11.9))).mul(TWO_PI);
+        const hs = hash(bite.add(k.mul(5.1))).mul(0.09).add(0.03).div(radius);
+        const hc = vec2(hr.mul(cos(ha)), hr.mul(sin(ha)));
+        const dh = length(local.sub(hc)).div(hs);
+        hole.addAssign(smoothstep(1.0, 0.75, dh).mul(on));
+        const dk = length(local.sub(hc)).add(on.oneMinus().mul(10));
+        sink.assign(select(dk.lessThan(sinkD), hc, sink));
+        sinkD.assign(dk.min(sinkD));
+      });
+      // The lattice is read s radii farther from the sink than the fragment, so every bead runs the
+      // straight line to it; the softened divide pools them at the lip instead of a vanishing point.
+      // Two bead layers, each bounded to uBeadRun then fading out and handing off: unbounded travel
+      // through a converging field squeezes the lattice near the sink without limit, which shrank beads over time.
+      const toSink = sink.sub(local);
+      const flowDir = toSink.div(length(toSink).add(uBeadPool));
+      const phase = vPadRoll.z.div(uBeadRun);
+      const beadMask = float(0).toVar();
+      const beadLayer = (shift, salt) => {
+        const ph = fract(phase.add(shift));
+        const creep = flowDir.mul(ph.mul(uBeadRun));
+        const beadUV = local.sub(vPadRoll.xy).sub(creep).mul(uPadTileC).add(seed.mul(0.37)).add(salt);
+        const cell = beadUV.mul(uPadBeadFreq);
+        const cid = floor(cell).add(4096);   // hash() takes a uint; the pad's own half-plane of negative cells would all read alike
+        const f = fract(cell).sub(0.5);
+        const jit = vec2(hash(dot(cid, vec2(19.1, 47.3))), hash(dot(cid, vec2(71.7, 13.9)))).sub(0.5).mul(0.7);
+        const bd = length(f.sub(jit)).div(hash(dot(cid, vec2(5.3, 91.1))).mul(0.30).add(0.14));
+        const cap = bd.mul(bd).oneMinus().max(0).sqrt();
+        const life = ph.mul(2).sub(1).abs().oneMinus();   // triangle: 0 at the wrap, 1 mid-run
+        const m = smoothstep(1.0, 0.82, bd).mul(wet).mul(smoothstep(0.35, 0.10, tilt)).mul(smoothstep(0.0, 0.35, life));
+        const bn = normalize(vec3(f.sub(jit).x, cap.mul(0.6), f.sub(jit).y));
+        n.assign(normalize(mix(n, vPadTan.mul(bn.x).add(n0.mul(bn.y)).add(vPadRad.mul(bn.z)), m)));
+        beadMask.assign(beadMask.max(m));
+      };
+      beadLayer(float(0), vec2(0, 0));
+      beadLayer(float(0.5), vec2(3.7, 1.9));
       // Red-purple underside where the curl turns the rim away from the moon.
       const under = smoothstep(0.86, 1.0, rr).mul(smoothstep(0.93, 0.6, n0.y));
       albedo.assign(mix(albedo, uPadUnder, under));
       // Direct moon, above the water: the same air-side lobe shade() gives rock tops.
       const ndl = dot(n, U.moonDir).max(0);
-      const col = albedo.mul(U.moonColor).mul(ndl.mul(2.2).add(0.25)).mul(U.moonStrength).mul(uPadGain).toVar();
+      const col = albedo.mul(U.moonColor).mul(ndl.mul(2.9).add(0.25)).mul(U.moonStrength).mul(uPadGain).toVar();
       const H = normalize(U.moonDir.add(vec3(0, 1, 0)));
       const cosH = dot(n, H).max(0);
       const gloss = mix(0.25, 1.0, wet).mul(rough.oneMinus().add(0.15));
@@ -399,22 +452,19 @@ export class PadSystem {
       col.addAssign(U.moonColor.mul(pow(cosH, 400).mul(beadMask).mul(0.4)));
       // Meniscus, the lily's contact shadow, and the eels' light from beneath.
       col.mulAssign(smoothstep(0.95, 1.0, rr).mul(0.35).oneMinus());
+      // The lily's shadow falls away from the moon: its azimuth is brought into pad space, where local
+      // is the pad's own frame rotated by A.w, so the blob slides around the flower as the moon orbits.
+      const cr = cos(vPadRot), sr = sin(vPadRot);
+      const mw = normalize(vec2(U.moonDir.x, U.moonDir.z));
+      const ml = vec2(mw.x.mul(cr).add(mw.y.mul(sr)), mw.x.negate().mul(sr).add(mw.y.mul(cr)));
       const shR = vPadLily.div(radius).mul(0.45).max(1e-3);
-      const lilyShade = smoothstep(1.0, 0.55, length(local.sub(vec2(0.25, 0))).div(shR)).mul(0.55).mul(smoothstep(0.0, 0.02, vPadLily));
+      const shC = vec2(0.25, 0).sub(ml.mul(uLilyShadowLen.div(radius)));
+      const shV = local.sub(shC);
+      // Stretched along the light so it reads as cast, with a penumbra that widens away from the flower.
+      const shD = length(vec2(dot(shV, ml).mul(0.8), dot(shV, vec2(ml.y.negate(), ml.x)))).div(shR);
+      const lilyShade = smoothstep(1.15, 0.45, shD).mul(0.55).mul(smoothstep(0.0, 0.02, vPadLily));
       col.mulAssign(lilyShade.oneMinus());
       col.addAssign(albedo.mul(vPadTrans).mul(uPadTransGain));
-      // Bite-outs on old pads only: up to four hashed holes.
-      const hole = float(0).toVar();
-      Loop(4, ({ i }) => {
-        const k = float(i);
-        // The first hole is certain on an old pad; each further one is a coin toss.
-        const on = smoothstep(0.8, 1.0, age).mul(step(k.min(1).mul(0.5), hash(bite.mul(1.7).add(k.mul(3.1)))));
-        const hr = hash(bite.add(k.mul(7.3))).mul(0.5).add(0.3);
-        const ha = hash(bite.add(k.mul(11.9))).mul(TWO_PI);
-        const hs = hash(bite.add(k.mul(5.1))).mul(0.09).add(0.03).div(radius);
-        const dh = length(local.sub(vec2(hr.mul(cos(ha)), hr.mul(sin(ha))))).div(hs);
-        hole.addAssign(smoothstep(1.0, 0.75, dh).mul(on));
-      });
       return vec4(col, rimA.mul(hole.min(1).oneMinus()));
     })();
     mat.transparent = true;
@@ -692,21 +742,55 @@ export class PadSystem {
       const pushMag = Math.hypot(pushX, pushZ);
       if (pushMag > 1.2 && p.lastPush <= 1.2 && pushMag * 0.7 > plopBest) { plopBest = pushMag * 0.7; plopX = p.x; plopZ = p.z; }
       p.lastPush = pushMag;
+      // A wet pad that gets shoved sheds its beads: a short burst of randomized small drops off the rim,
+      // thrown the way the pad tipped (or away from the push), and the pad reads dry until it rains again.
+      const disturb = Math.max(lift, pushMag * 0.5, p.disturbed);
+      if (p.wet > 0.15 && disturb > SHED_THRESHOLD && now > p.shedUntil + 1.0) {
+        p.shedUntil = now + SHED_TIME;
+        p.wet = Math.max(0, p.wet - 0.35);
+        p.shedDir = pushMag * 0.5 >= lift ? Math.atan2(pushZ, pushX) : p.disturbed > lift ? Math.random() * TWO_PI_CPU : Math.atan2(RIM_TAPS[low][1], RIM_TAPS[low][0]);
+      }
+      p.disturbed = 0;
+      if (now < p.shedUntil && Math.random() < SHED_RATE * dt * (reduced ? 0.5 : 1)) {
+        const a = p.shedDir + (Math.random() - 0.5) * 2.4, rr = p.r * (1.05 + Math.random() * 0.5);
+        const [u, v] = this.sim.toUV(p.x + Math.cos(a) * rr, p.z + Math.sin(a) * rr);
+        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) drops.push({ u, v, s: SHED_STRENGTH * (0.6 + Math.random() * 0.8), r: SHED_RADIUS });
+      }
       p.swingVX += (pushX * 0.4 - p.swingX * 4 - p.swingVX * 2.4) * dt;
       p.swingVZ += (pushZ * 0.4 - p.swingZ * 4 - p.swingVZ * 2.4) * dt;
       p.swingX += p.swingVX * dt;
       p.swingZ += p.swingVZ * dt;
+      // Bead roll is integrated here because the water tilt lives on the GPU; the notch, a lifted rim, and
+      // the stalk swing are the three slopes the CPU does know. A dry pad resets so the offset never grows.
+      if (p.wet > 0.01) {
+        const ms = reduced ? 0.1 : 1;
+        const down = Math.min(1, lift) * BEAD_LIFT_ROLL * p.r;
+        // Both bead layers repeat every BEAD_RUN radii of creep, so the phase wraps there and a night-long
+        // shower never pushes the attribute out of float precision; the downhill slide is capped instead.
+        p.rollS = (p.rollS + BEAD_FLOW * p.r * ms * dt) % (BEAD_RUN * p.r);
+        p.rollX += (RIM_TAPS[low][0] * down + p.swingX * BEAD_SWING_ROLL) * dt;
+        p.rollZ += (RIM_TAPS[low][1] * down + p.swingZ * BEAD_SWING_ROLL) * dt;
+        const rm = Math.hypot(p.rollX, p.rollZ), rCap = ROLL_CAP * p.r;
+        if (rm > rCap) { p.rollX *= rCap / rm; p.rollZ *= rCap / rm; }
+      } else { p.rollX = 0; p.rollZ = 0; p.rollS = 0; }
       const sm = Math.hypot(p.swingX, p.swingZ);
       if (sm > 0.2) { const k = 0.2 / sm; p.swingX *= k; p.swingZ *= k; p.swingVX *= k; p.swingVZ *= k; }
 
       const o = i * 4;
       this.padD[o] = p.swingX; this.padD[o + 1] = p.swingZ; this.padD[o + 2] = p.wet;
       this.padD[o + 3] = p.flower ? p.flower.lifeScale * p.flower.size : 0;
+      this.padE[o] = p.rollX; this.padE[o + 1] = p.rollZ; this.padE[o + 2] = p.rollS;
     });
     this.aPadD.needsUpdate = true;
+    this.aPadE.needsUpdate = true;
     if (plopBest > 0 && now > this.plopAt) { this.plopAt = now + 1; this.events?.settle?.(plopX, plopZ); }
     if (drops.length && injector?.available) injector.inject(drops);
     this.updateLilies(dt, now, env);
+  }
+
+  /* A hand (or anything the CPU knows about) brushing a pad: its beads fling off on the next update. */
+  disturb(x, z, r = 0.3) {
+    for (const p of this.pads) if (Math.hypot(x - p.x, z - p.z) < p.r + r) p.disturbed = 1;
   }
 
   updateLilies(dt, now, env) {

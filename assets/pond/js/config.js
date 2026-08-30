@@ -15,7 +15,9 @@ export const MOON_COLOR = [0.62, 0.74, 1.0];
 export const EEL_COUNT = 6;
 export const EEL_POINTS = 24;
 export const INF_SLOTS = 8;          // creature influence capsules: 6 residents plus Eleanor's two chained capsules
-export const WAKE_RES = 128;         // wake memory + algae cover field, RGBA16F ping-pong over the whole pool
+// Wake memory + algae cover field, RGBA16F ping-pong over the whole pool. 256 halves the texel to
+// ~0.14 units, which is what stops the algae edges reading as a mosaic; the pass is still trivial.
+export const WAKE_RES = 256;
 export const COVER_DISCS = 48;       // surface-cover bake (mask G): up to 26 pads and 16 duckweed clumps
 export const COVER_CAPS = 48;        // surface-cover bake (mask G): rush stems as shadow capsules
 export const MAX_PIXELS = 2.6e6;     // internal render budget before DPR gets clamped

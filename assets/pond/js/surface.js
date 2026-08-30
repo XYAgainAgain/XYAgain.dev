@@ -18,6 +18,16 @@ export class SurfacePass {
     this.uMaxOffset = uniform(0.2);   // world units; keeps steep ripples from flinging pixels around
     this.uReveal = uniform(0.0);     // 0 = dim gate state, 1 = full
     this.uRainNoise = uniform(0.0);  // shower envelope × 0.35; 0 when dry, and always 0 in reduced motion
+    // The reflected moon. From straight above, a moon at 52° can never mirror into the camera, so the
+    // reflection uses a virtual moon parked low over the water: the ripples then break it up for real.
+    this.uMoonSpot = uniform(3.0);        // world units from center along the moon's azimuth; orbits with the clock
+    this.uMoonHeight = uniform(6.0);      // virtual moon height; lower = the disc scatters wider under the same ripple
+    this.uMoonCos = uniform(new THREE.Vector2(0.9950, 0.9985));   // disc edge (cos of angle to the virtual moon)
+    this.uMoonDisc = uniform(9.0);        // disc radiance before Fresnel
+    this.uMoonGlint = uniform(1.4);       // tight glitter around the disc
+    // Crest glint: ripple flanks tilted toward the moon catch it as silver, pond-wide, not just at the disc.
+    this.uCrestEdge = uniform(new THREE.Vector2(0.962, 0.998));   // flat water sits at cos 19° = 0.945, so it stays dark
+    this.uCrest = uniform(0.2);
     const texel = float(1 / sim.rtA.width);
     const under = texture(underRT.texture);
     const eta = float(1 / IOR_WATER);
@@ -92,15 +102,30 @@ export class SurfacePass {
       const Rr = reflect(I, nR);
       const moon = U.moonDir;
       const cosM = dot(Rr, moon).max(0);
-      // Straight down, the mirror direction sits ~38 deg off the moon, so the glow must be broad to read at all.
-      const disc = smoothstep(0.9975, 0.9995, cosM).mul(4.0);
-      const halo = pow(cosM, 400).mul(2.0).add(pow(cosM, 60).mul(0.7)).add(pow(cosM, 6).mul(0.35)).add(pow(cosM, 2).mul(0.08));
+      // Straight down, the mirror direction sits ~38 deg off the moon, so this glow is the broad sky wash.
+      const halo = pow(cosM, 400).mul(2.0).add(pow(cosM, 60).mul(0.7)).add(pow(cosM, 6).mul(0.2)).add(pow(cosM, 2).mul(0.05));
       const cloud = fbm2(Rr.xz.mul(3).add(vec2(t.mul(0.01), 0))).mul(0.02).add(0.01);
-      const sky = U.moonColor.mul(disc.add(halo).add(cloud));
+      // The virtual moon sees the full-noise normal: a shower should shatter the disc into glitter.
+      const az = normalize(vec2(moon.x, moon.z));
+      const spot = az.mul(this.uMoonSpot);
+      const toMoon = normalize(vec3(spot.x.sub(x), this.uMoonHeight, spot.y.sub(z)));
+      const cosV = dot(reflect(I, n), toMoon).max(0);
+      const disc = smoothstep(this.uMoonCos.x, this.uMoonCos.y, cosV).mul(this.uMoonDisc);
+      const glint = pow(cosV, 300).mul(this.uMoonGlint).add(pow(cosV, 40).mul(this.uMoonGlint.mul(0.25)));
+      const sky = U.moonColor.mul(disc.add(glint).add(halo).add(cloud));
+      // Blinn half-vector between the moon and straight up, read off the high-pass slope (2-texel minus
+      // 8-texel stencil) so the ~1.4 deg threshold can't be tipped into a hard band by a pool-wide slosh or swell.
+      const t8 = texel.mul(8);
+      const slope8 = vec2(read.sample(c.sub(vec2(t8, 0))).r.sub(read.sample(c.add(vec2(t8, 0))).r),
+        read.sample(c.sub(vec2(0, t8))).r.sub(read.sample(c.add(vec2(0, t8))).r)).mul(0.125);
+      const hp = slope.sub(slope8).mul(this.uSlope);
+      const nHP = normalize(vec3(hp.x.add(rx), scale, hp.y.add(rz)));
+      const Hm = normalize(moon.add(vec3(0, 1, 0)));
+      const crest = smoothstep(this.uCrestEdge.x, this.uCrestEdge.y, dot(nHP, Hm)).mul(this.uCrest);
       // F0 sits above the physical 0.02 on purpose: from straight above, the reflected sky is how ripples read.
       const F0 = float(0.035);
       const fresnel = F0.add(F0.oneMinus().mul(dot(nR, vec3(0, 1, 0)).max(0).oneMinus().pow(5)));
-      const water = mix(below, sky, fresnel.clamp(0, 0.6)).add(sky.mul(this.uSkyGain));
+      const water = mix(below, sky, fresnel.clamp(0, 0.6)).add(sky.mul(this.uSkyGain)).add(U.moonColor.mul(crest));
       // depthFrac 0 means the pixel is above the waterline (a rock top): no refraction, no sky film.
       const color = mix(water, sample.rgb, step(depthFrac0, float(0.001))).toVar();
       const vig = length(suv.sub(0.5)).mul(1.25).pow(2.2).oneMinus().clamp(0.25, 1);

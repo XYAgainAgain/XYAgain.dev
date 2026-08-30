@@ -5,8 +5,10 @@ import { INF_SLOTS, IOR_WATER, MOON_COLOR, SIM_RES } from './config.js';
 
 /* Shared TSL helpers used by the floor, rocks, log, eels, and the compose pass. */
 
+// TSL's hash() truncates its seed to a uint, and u32(negative) saturates to 0 on WGSL: without the offset
+// every lattice cell on one side of a diagonal through the origin hashed alike and the noise went flat there.
 export const hash2 = Fn(([p]) => {
-  return hash(dot(p, vec2(127.1, 311.7)).add(0.5));
+  return hash(dot(p, vec2(127.1, 311.7)).add(4194304.5));
 });
 
 export const valueNoise2 = Fn(([p]) => {
@@ -136,7 +138,7 @@ export function createSceneUniforms(waveSet, currentSet) {
   return {
     moonDir: uniform(new THREE.Vector3(0, 1, 0)),     // toward the moon, above water
     moonColor: uniform(new THREE.Color(...MOON_COLOR)),
-    moonStrength: uniform(0.15),
+    moonStrength: uniform(0.20),
     time: uniform(0),
     causticTex: texture(placeholder),                   // replaced by the caustics pass before any material builds
     causticCenter: uniform(new THREE.Vector2()),
@@ -162,6 +164,22 @@ export function createSceneUniforms(waveSet, currentSet) {
     maskExtent: uniform(1),
     coverStrength: uniform(0),                            // 0 until something floats: the floor's shadow fetches are gated on it
     coverWobble: uniform(0.08),                           // ripple nudge on the shadow's entry point; a rung-4 switch
+    // The wake buffer's read node and extent, swapped in by main.js; the floor reads algae cover from B.
+    wakeTex: texture(placeholder),
+    wakeExtent: uniform(1),
+    rainEnv: uniform(0),                                  // rain.envelope, republished each frame; 0 when dry
+    wetAir: uniform(0),                                   // how wet the dry rock tops and bark look: soaks in seconds, dries over a minute
+    // Algae cover look. Cooler than the pads' yellow-green and the duckweed's olive, so the three read apart.
+    algaeColThin: uniform(new THREE.Vector3(0.12, 0.34, 0.22)),
+    algaeColDense: uniform(new THREE.Vector3(0.05, 0.18, 0.11)),
+    algaeGain: uniform(1),                                // master strength; 0 kills the tint for comparison shots
+    algaeLift: uniform(0.11),                             // the floor's moon is 0.2; a tint alone vanishes, so cover carries its own faint light
+    algaeDetail: uniform(1),                              // rung-4 switch for the high-frequency octave and the filament grain
+    // Domain warp on the cover fetch: the field's texel grid is what reads as pixelated, so bend the
+    // lookup instead of paying for a finer field. World units, and the noise scale that drives them.
+    algaeWarp: uniform(0.45),
+    algaeWarpScale: uniform(2.6),
+    algaeRough: uniform(0.35),                            // algae is slimy, so smoother than the sand it covers
   };
 }
 
@@ -283,8 +301,12 @@ export function makeUnderwaterShading(U) {
         .add(U.reflCausticTex.sample(causticUV.sub(vec2(o, o))).r).mul(0.25);
       const reflCaustic = pow(smoothstep(0.7, 3.0, reflRatio), 1.0).mul(1.6).add(clamp(reflRatio, 0.0, 1.2).mul(0.3));
       const faceWater = n.y.negate().add(1).clamp(0, 1).mul(0.6).add(0.2);
-      direct.assign(ndlAir.mul(2.2).add(reflCaustic.mul(faceWater).mul(2.5)).add(0.2));
+      direct.assign(ndlAir.mul(2.9).add(reflCaustic.mul(faceWater).mul(2.5)).add(0.2));
     });
+    // Rain-wet stone and bark: darker and far glossier, only above the waterline (underwater is always wet).
+    const wet = U.wetAir.mul(smoothstep(-0.02, 0.02, p.y));
+    roughness.assign(mix(roughness, roughness.mul(0.4), wet));
+    const alb = albedo.mul(wet.mul(-0.28).add(1));
     // Surface cover shadow (pads, later mats and stems): the floor point is lit by a ray that crossed
     // the surface up-moon of it, so the mask is read at that entry point, not overhead. Two height
     // taps along the azimuth make the shadow crawl with the ripples. Nothing floating can shade a
@@ -307,7 +329,7 @@ export function makeUnderwaterShading(U) {
     const V = vec3(0, 1, 0);
     const H = normalize(L.add(V));
     const specPow = mix(kSpecHi, kSpecLo, roughness);
-    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25).mul(cover.oneMinus());
+    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25).mul(cover.oneMinus()).mul(wet.mul(2).add(1));
     // Wrapped Lambert over the normal map so gravel facets face or shade the glow; the roughness-
     // driven highlight puts a neon glint on wet stones.
     const glow = vec3(0).toVar();
@@ -331,12 +353,13 @@ export function makeUnderwaterShading(U) {
     if (dbg === 'caustic') return vec3(caustic.mul(0.5));
     if (dbg === 'albedo') return albedo;
     if (dbg === 'cover') return vec3(cover);
-    return albedo.mul(U.moonColor.mul(direct.add(ambient)))
+    return alb.mul(U.moonColor.mul(direct.add(ambient)))
       .add(U.moonColor.mul(spec))
-      .add(albedo.mul(glow).mul(0.9))
+      .add(alb.mul(glow).mul(0.9))
       .add(glow.mul(0.05))
       .add(glowSpec);
   });
 
-  return { shade, lightDir, eelGlowAt };
+  // U rides along so materials built from `shading` alone (the floor's) can reach the scene uniforms.
+  return { shade, lightDir, eelGlowAt, U };
 }

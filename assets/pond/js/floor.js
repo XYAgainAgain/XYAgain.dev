@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
-import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, uniform, sign, atan, cross, mat3, mat4, PI } from 'three/tsl';
-import { DEPTH } from './config.js';
+import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, cross, mat3, mat4, PI } from 'three/tsl';
+import { DEPTH, WAKE_RES } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
 
@@ -44,15 +44,22 @@ async function loadSet(loader, manifest, name) {
   return { albedo, normal, roughness, arm, height, opacity, tiling: entry.tiling ?? 1, bump: entry.bump ?? 1 };
 }
 
-/* Builds a NodeMaterial that writes (lit color, depthFrac) for the underwater RT.
-   Planar (floor) or triplanar (rocks, log) mapping; normals come from the height map when present. */
-function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar = false, cylinder = null) {
+/* Builds a NodeMaterial that writes (lit color, depthFrac) for the underwater RT. Planar (floor) or
+   triplanar (rocks, log) mapping; algaeGain 0 leaves the algae term out of the shader entirely (the bore). */
+function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar = false, cylinder = null, algaeGain = 0) {
+  const U = shading.U;
   const uTiling = uniform(tilingWorld);
   // cylinder: { inv: Matrix4 world→log-local, rot: Matrix3 local→world rotation } for bark mapping.
   const uInv = cylinder ? uniform(cylinder.inv) : null;
   const uRot = cylinder ? uniform(cylinder.rot) : null;
   const uBump = uniform(set.bump);
   const texel = float(1 / 2048);
+  // Algae knobs, built once per material: a uniform created inside the fragment Fn resolves as null.
+  const uAlgaeMat = uniform(algaeGain);
+  const uAlgaeDetailScale = uniform(9);
+  const uAlgaeRot = uniform(new THREE.Vector2(Math.cos(0.6), Math.sin(0.6)));
+  const uAlgaeGrainScale = uniform(new THREE.Vector2(6, 22));   // stretched along z: filaments, not blotches
+  const uAlgaeBlur = uniform(0.75 / WAKE_RES);                   // four diagonal taps: the field's steps read as a mosaic otherwise
   const mat = new THREE.NodeMaterial();
 
   // Height-map slope on one projection plane: (dh/du, dh/dv) over two texels.
@@ -124,11 +131,39 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       }
     }
 
+    // Algae cover, cached in the wake buffer's B channel: four taps, two noise octaves, no texture set.
+    let algae = null, algaeCol = null;
+    if (algaeGain > 0) {
+      // Warp the fetch, not the field: two noise taps bend the lookup so the cover's texel grid stops
+      // reading as a mosaic, which no amount of blur on a square lattice ever fixes.
+      const wq = p.xz.mul(U.algaeWarpScale);
+      const warp = vec2(valueNoise2(wq).sub(0.5), valueNoise2(wq.add(vec2(17.3, 9.1))).sub(0.5)).mul(U.algaeWarp);
+      const wc = p.xz.add(warp).div(U.wakeExtent).add(0.5);
+      const o = uAlgaeBlur;
+      const b = U.wakeTex.sample(wc.add(vec2(o, o))).z.add(U.wakeTex.sample(wc.sub(vec2(o, o))).z)
+        .add(U.wakeTex.sample(wc.add(vec2(o, o.negate()))).z).add(U.wakeTex.sample(wc.add(vec2(o.negate(), o))).z).mul(0.25);
+      // Value noise lives on a square lattice: axis-aligned, and multiplied into a steep curve, its cells
+      // were the mosaic Sam saw. Rotated 0.6 rad and added at low gain it reads as grain instead.
+      const rq = vec2(p.x.mul(uAlgaeRot.x).sub(p.z.mul(uAlgaeRot.y)), p.x.mul(uAlgaeRot.y).add(p.z.mul(uAlgaeRot.x)));
+      const detail = valueNoise2(rq.mul(uAlgaeDetailScale)).sub(0.5).mul(U.algaeDetail);
+      algae = smoothstep(0.12, 0.78, b.add(detail.mul(0.22)))
+        .mul(smoothstep(0.02, -0.06, p.y))                      // submerged only; nothing above the waterline furs up
+        .mul(mix(0.45, 1.0, geomN.y.clamp(0, 1)))               // settles on tops more than undersides
+        .mul(uAlgaeMat).mul(U.algaeGain).clamp(0, 1);
+      const streak = valueNoise2(rq.mul(uAlgaeGrainScale)).sub(0.5).mul(U.algaeDetail);
+      const tone = algae.add(streak.mul(0.35)).clamp(0, 1);
+      algaeCol = mix(U.algaeColThin, U.algaeColDense, tone);
+      albedo = mix(albedo, algaeCol, algae);
+      rough = mix(rough, U.algaeRough, algae);
+      n = normalize(mix(n, geomN, algae.mul(0.5)));              // algae fills microrelief
+    }
+
     const dbg = new URLSearchParams(location.search).get('shade');
     if (dbg === 'gn') return vec4(geomN.mul(0.5).add(0.5), 1);
-    const lit = shading.shade(albedo, n, p, rough);
     const depthFrac = p.y.negate().div(DEPTH).clamp(0, 1);
-    return vec4(lit, depthFrac);
+    if (dbg === 'algae') return algae ? vec4(algae, algae, algae, depthFrac) : vec4(vec3(0), depthFrac);
+    const lit = shading.shade(albedo, n, p, rough);
+    return vec4(algae ? lit.add(algaeCol.mul(algae).mul(U.algaeLift)) : lit, depthFrac);
   })();
   mat.side = THREE.FrontSide;
   return mat;
@@ -252,15 +287,16 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     fpos.setY(v, y);
   }
   floorGeo.computeVertexNormals();
-  const floor = new THREE.Mesh(floorGeo, makeSurfaceMaterial(shading, sand, placeholders.sand, 0.16 * sand.tiling));
+  // Sand greens well short of the stone and bark, which have something for the filaments to grip.
+  const floor = new THREE.Mesh(floorGeo, makeSurfaceMaterial(shading, sand, placeholders.sand, 0.16 * sand.tiling, false, null, 0.45));
   floor.position.y = -DEPTH;
   floor.frustumCulled = false;
   group.add(floor);
 
   // Rocks: displaced icosahedra (no pole pinch), triplanar-mapped, alternating stone and algae sets.
   const rockMats = [
-    makeSurfaceMaterial(shading, stone, placeholders.stone, 0.5 * stone.tiling, true),
-    makeSurfaceMaterial(shading, algae, placeholders.stone, 0.5 * algae.tiling, true),
+    makeSurfaceMaterial(shading, stone, placeholders.stone, 0.5 * stone.tiling, true, null, 1),
+    makeSurfaceMaterial(shading, algae, placeholders.stone, 0.5 * algae.tiling, true, null, 1),
   ];
   const rockCount = 14;
   for (let i = 0; i < rockCount; i++) {
@@ -432,7 +468,8 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     log.updateMatrixWorld(true);
     const logInv = new THREE.Matrix4().copy(log.matrixWorld).invert();
     const logRot = new THREE.Matrix3().setFromMatrix4(log.matrixWorld);
-    const woodMat = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
+    const woodMat = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot }, 1);
+    // The bore never greens: it is the eels' tunnel, and algae in there would read as mold.
     const woodInner = makeSurfaceMaterial(shading, wood, placeholders.wood, 0.55 * wood.tiling, false, { inv: logInv, rot: logRot });
     woodInner.side = THREE.BackSide;
 
@@ -484,6 +521,14 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
       a: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, -halfLen),
       b: new THREE.Vector3(lx, logY, lz).addScaledVector(dir, halfLen),
       rInner: logR * boreT, rOuter: logOuter,
+      // The shaped bark itself (t 0 at a, 1 at b; ang around the axis, cos(ang) is up): the collider
+      // is a crest-plus-bend envelope, and anything that must sit on the wood asks here instead.
+      bark: (t, ang) => {
+        const y = (0.5 - t) * 2 * halfLen, r = logR * radialK(ang, y);
+        const p = new THREE.Vector3(Math.cos(ang) * r + bendX(y), y, Math.sin(ang) * r + bendZ(y)).applyMatrix4(log.matrixWorld);
+        const nrm = new THREE.Vector3(Math.cos(ang), 0, Math.sin(ang)).applyMatrix3(logRot).normalize();
+        return { x: p.x, y: p.y, z: p.z, nx: nrm.x, ny: nrm.y, nz: nrm.z };
+      },
     });
     if (logY + logOuter > 0) {
       // The bark crest, not the nominal radius, is what stands dry; the mask must keep duckweed off all of it.

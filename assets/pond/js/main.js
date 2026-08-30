@@ -17,6 +17,7 @@ import { UnderwaterEffectsPool, KINDS as EFFECT_KINDS } from './effects.js';
 import { RainScheduler } from './rain.js';
 import { PadSystem } from './pads.js';
 import { FloaterSystem } from './floaters.js';
+import { AlgaeTufts } from './algae.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle } from './ui.js';
@@ -86,6 +87,9 @@ async function boot() {
   await impulse.probe();
   // Wake memory for the flora layers; runs from boot so the field is warm before anything reads it.
   const wake = new WakeBuffer(renderer, U, extent, seed);
+  // Published before buildFloor so the floor, rocks, and bark can read the algae cover out of channel B.
+  U.wakeTex = wake.read;
+  U.wakeExtent.value = wake.extent;
   const habitat = new Habitat();
 
   const underScene = new THREE.Scene();
@@ -193,7 +197,11 @@ async function boot() {
     overScene, U, sim, wake, shading, seed, view: { w: viewW, h: viewH }, colliders, habitat,
     carpet: textures.duckweed, rain, motion,
   });
+  // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
+  const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
   habitat.composeCover(sim);
+  // Reseeds the algae field with the rocks, logs, and this first cover bake all known.
+  wake.setSubstrate(colliders);
   let coverBakeAt = 2;
 
   // Audio already speaks for a nibble; this is the second subscriber, and it only makes bubbles.
@@ -407,10 +415,14 @@ async function boot() {
     // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
     pads.update(dt, t, rain, impulse);
     floaters.update(dt, t);
+    algae.update(dt, t);
     if (t > coverBakeAt) { coverBakeAt = t + 2; habitat.composeCover(sim); }
     // Before sim.update, so this frame's drops are stepped by the water they landed in.
     rain.update(dt);
     U.wind.value.set(rain.wind.x, rain.wind.z, rain.wind.gust, rain.wind.gustLag);
+    U.rainEnv.value = rain.envelope;
+    // Dry stone and bark soak in a couple of seconds and take about a minute to dry once the shower ends.
+    U.wetAir.value += (rain.envelope - U.wetAir.value) * Math.min(1, dt / (rain.envelope > U.wetAir.value ? 2 : 60));
     if (testDrops) {
       for (const d of testDrops) { d.u = 0.3 + Math.random() * 0.4; d.v = 0.3 + Math.random() * 0.4; }
       impulse.inject(testDrops);
@@ -424,7 +436,8 @@ async function boot() {
       if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
       // A finger crosses a texel in one frame where a body lingers for many, so it pushes 16× as hard.
       wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz, 0.35, 16);
-      // The 128² wake gains nothing from sub-frame precision; the CPU speck sim and the noise carve do,
+      pads.disturb(finger.x, finger.z);
+      // The wake field gains nothing from sub-frame precision; the CPU speck sim and the noise carve do,
       // so they get every coalesced sample since the last frame, newest 16 at most.
       const path = finger.path;
       if (path && path.length > 1) {
@@ -507,7 +520,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, textures,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, algae, textures,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       stats: fpsStats,
       diag: async () => {
