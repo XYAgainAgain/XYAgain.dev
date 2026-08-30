@@ -39,7 +39,8 @@ export class NameLabels {
     const y = ((h.z - NAME_LIFT) / this.view.h + 0.5) * innerHeight;
     // A tenth of the viewport of slack, so a tag only pops once its eel is well clear of the frame.
     const mx = innerWidth * 0.1, my = innerHeight * 0.1;
-    if (x < -mx || x > innerWidth + mx || y < -my || y > innerHeight + my) { el.hidden = true; return; }
+    // The NaN check ends the haunting: a poisoned eel once vanished but left its frozen tag on screen.
+    if (!Number.isFinite(x + y) || x < -mx || x > innerWidth + mx || y < -my || y > innerHeight + my) { el.hidden = true; return; }
     // A nickname wins when one has been rolled; comparing each frame catches rerolls and hot-swaps alike.
     const label = e.nick ?? e.name, pro = e.pronouns ?? '';
     if (el.firstChild.textContent !== label) el.firstChild.textContent = label;

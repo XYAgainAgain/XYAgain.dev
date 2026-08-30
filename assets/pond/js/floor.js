@@ -8,6 +8,9 @@ import { createRng, deriveSeed } from './rng.js';
    each missing map falls back to a procedural placeholder so nothing blocks on art. */
 
 const MANIFEST_URL = 'assets/pond/textures/manifest.json';
+const MAP_KEYS = ['albedo', 'normal', 'roughness', 'arm', 'height', 'opacity'];
+const DEFAULT_TEX_SIZE = 2048;
+const canBitmap = typeof createImageBitmap === 'function';
 
 async function loadManifest() {
   try {
@@ -17,9 +20,40 @@ async function loadManifest() {
   } catch { return null; }
 }
 
-function loadTex(loader, url, srgb) {
+/* The flip is baked at decode, paired with flipY false below: WebGPU's copyExternalImageToTexture
+   honors Texture.flipY even for a bitmap, so leaving it true would upend the floor there. */
+async function decodeBitmap(url, size) {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const full = await createImageBitmap(await res.blob(), { imageOrientation: 'flipY', premultiplyAlpha: 'none' });
+  const natural = full.width;
+  if (!(size > 0) || natural <= size) return { bitmap: full, natural };
+  // Resampling the decoded bitmap, never a second decode; a source already under the target is left alone.
+  const h = Math.max(1, Math.round(full.height * size / natural));
+  const small = await createImageBitmap(full, { resizeWidth: size, resizeHeight: h, resizeQuality: 'high' });
+  full.close();
+  return { bitmap: small, natural };
+}
+
+async function loadTex(loader, url, srgb, size) {
+  if (!url) return null;
+  if (canBitmap) {
+    let out;
+    try { out = await decodeBitmap(url, size); } catch { out = undefined; }
+    if (out === null) return null;                    // no such file: the procedural placeholder stands
+    if (out) {
+      const t = new THREE.Texture(out.bitmap);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+      t.anisotropy = 4;
+      t.flipY = false;   // the bitmap is already flipped; see decodeBitmap
+      t.userData.texUrl = url;
+      t.userData.texNatural = out.natural;
+      t.needsUpdate = true;
+      return t;
+    }
+  }
   return new Promise((resolve) => {
-    if (!url) return resolve(null);
     loader.load(url, (t) => {
       t.wrapS = t.wrapT = THREE.RepeatWrapping;
       t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
@@ -30,18 +64,63 @@ function loadTex(loader, url, srgb) {
 }
 
 /* Loads one material's maps from the manifest; any missing map comes back null. */
-async function loadSet(loader, manifest, name) {
+async function loadSet(loader, manifest, name, size) {
   const entry = manifest?.[name] || {};
   const base = 'assets/pond/textures/';
   const [albedo, normal, roughness, arm, height, opacity] = await Promise.all([
-    loadTex(loader, entry.albedo && base + entry.albedo, true),
-    loadTex(loader, entry.normal && base + entry.normal, false),
-    loadTex(loader, entry.roughness && base + entry.roughness, false),
-    loadTex(loader, entry.arm && base + entry.arm, false),
-    loadTex(loader, !entry.normal && entry.height && base + entry.height, false),   // height only feeds normals when no normal map
-    loadTex(loader, entry.opacity && base + entry.opacity, false),
+    loadTex(loader, entry.albedo && base + entry.albedo, true, size),
+    loadTex(loader, entry.normal && base + entry.normal, false, size),
+    loadTex(loader, entry.roughness && base + entry.roughness, false, size),
+    loadTex(loader, entry.arm && base + entry.arm, false, size),
+    loadTex(loader, !entry.normal && entry.height && base + entry.height, false, size),   // height only feeds normals when no normal map
+    loadTex(loader, entry.opacity && base + entry.opacity, false, size),
   ]);
   return { albedo, normal, roughness, arm, height, opacity, tiling: entry.tiling ?? 1, bump: entry.bump ?? 1 };
+}
+
+/* The grid the height-slope taps step across: whichever map they actually read. */
+function texWidth(set) {
+  return set?.height?.image?.width || set?.albedo?.image?.width || DEFAULT_TEX_SIZE;
+}
+
+function syncTexel(set) {
+  const us = set?.texelUniforms;
+  if (!us) return;
+  const t = 1 / texWidth(set);
+  for (const u of us) u.value = t;
+}
+
+let texGeneration = 0;
+
+/* Quality ladder rung 6: re-decodes every loaded map at a new size, swapping the bitmap into the same
+   THREE.Texture so pads.js and floaters.js keep the references they hold. Idempotent either way. */
+export async function setTextureSize(textures, size) {
+  if (!textures || !canBitmap || !(size > 0)) return;
+  const gen = ++texGeneration;
+  const jobs = [];
+  for (const set of Object.values(textures)) {
+    for (const key of MAP_KEYS) {
+      const tex = set?.[key];
+      const url = tex?.userData?.texUrl;
+      if (!url || !(tex.image instanceof ImageBitmap)) continue;
+      if (tex.image.width === Math.min(size, tex.userData.texNatural ?? size)) continue;
+      jobs.push(decodeBitmap(url, size).then((out) => (out ? { tex, bitmap: out.bitmap } : null), () => null));
+    }
+  }
+  if (!jobs.length) return;
+  const done = await Promise.all(jobs);
+  // A newer request landed while this one decoded: drop this batch rather than fight it back.
+  if (gen !== texGeneration) { for (const d of done) d?.bitmap.close(); return; }
+  for (const d of done) {
+    if (!d) continue;
+    const old = d.tex.image;
+    // dispose first: the backends allocate immutable storage, so a new size must free the old texture.
+    d.tex.dispose();
+    d.tex.image = d.bitmap;
+    d.tex.needsUpdate = true;
+    if (old instanceof ImageBitmap && old !== d.bitmap) old.close();
+  }
+  for (const set of Object.values(textures)) syncTexel(set);
 }
 
 /* Builds a NodeMaterial that writes (lit color, depthFrac) for the underwater RT. Planar (floor) or
@@ -53,7 +132,9 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
   const uInv = cylinder ? uniform(cylinder.inv) : null;
   const uRot = cylinder ? uniform(cylinder.rot) : null;
   const uBump = uniform(set.bump);
-  const texel = float(1 / 2048);
+  // Derived from the live map size: a halved texture would otherwise double the slope step and crunch the sand.
+  const texel = uniform(1 / texWidth(set));
+  (set.texelUniforms ??= []).push(texel);
   // Algae knobs, built once per material: a uniform created inside the fragment Fn resolves as null.
   const uAlgaeMat = uniform(algaeGain);
   const uAlgaeDetailScale = uniform(9);
@@ -262,13 +343,13 @@ const placeholders = {
   },
 };
 
-export async function buildFloor(scene, shading, extent, seed, view, habitat = null) {
+export async function buildFloor(scene, shading, extent, seed, view, habitat = null, { textureSize = DEFAULT_TEX_SIZE } = {}) {
   const rng = createRng(deriveSeed(seed, 77));
   const loader = new THREE.TextureLoader();
   const manifest = await loadManifest();
   // Every manifest set loads here, once; the flora takes leaf and duckweed from the returned library.
   const names = ['sand', 'stone', 'algae', 'wood', 'leaf', 'duckweed'];
-  const sets = await Promise.all(names.map((n) => loadSet(loader, manifest, n)));
+  const sets = await Promise.all(names.map((n) => loadSet(loader, manifest, n, textureSize)));
   const textures = Object.fromEntries(names.map((n, i) => [n, sets[i]]));
   const { sand, stone, algae, wood } = textures;
 

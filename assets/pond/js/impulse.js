@@ -103,7 +103,10 @@ export class ImpulseInjector {
     mat.vertexNode = Fn(() => {
       const d = attribute('aDrop', 'vec4');
       vStr.assign(d.z);
-      const q = positionGeometry.xy.mul(d.w.div(SIM_RES / 2));
+      // Radius floor: 2.5 texels of the LIVE grid (rung 6 shrinks it), or the micro carpet vanishes
+      // into linear filtering at 384. d.w stays in 512-grid texels, so world size is otherwise stable.
+      const r = d.w.max(float(MICRO_RADIUS * SIM_RES).mul(sim.uTexel));
+      const q = positionGeometry.xy.mul(r.div(SIM_RES / 2));
       return vec4(d.x.mul(2).sub(1).add(q.x), float(1).sub(d.y.mul(2)).add(q.y), 0, 1);
     })();
     // Same cosine bump dropQuad uses, reaching zero exactly at the sprite's own edge.

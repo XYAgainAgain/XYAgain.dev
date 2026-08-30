@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
 import { texture, Fn, vec4, uv, uniform } from 'three/tsl';
-import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS } from './config.js';
+import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS, SIM_RES, CAUSTIC_RES } from './config.js';
 import { seedFromUrl, deriveSeed } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
-import { buildFloor } from './floor.js';
+import { buildFloor, setTextureSize } from './floor.js';
 import { WakeBuffer } from './wake.js';
 import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
@@ -24,6 +24,7 @@ import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle } from './ui.js';
 import { NameLabels } from './names.js';
+import { QualityGovernor } from './quality.js';
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -82,6 +83,7 @@ async function boot() {
   // The floor's cover shadow reads the mask and the live sim through the scene uniforms; swapped in
   // before any material builds, the same way the caustics pass replaces its placeholder.
   U.simTex = sim.read;
+  U.simTexel = sim.uTexel;
   U.coverTex = sim.mask;
   U.maskExtent.value = sim.extent;
   const caustics = new CausticsPass(renderer, sim, U, viewW, viewH);
@@ -95,10 +97,19 @@ async function boot() {
   U.wakeExtent.value = wake.extent;
   const habitat = new Habitat();
 
+  // ?tier=0–8 pins a rung for testing; otherwise the ladder resumes where the last session settled.
+  const tierParam = params.get('tier');
+  const pinnedTier = tierParam !== null && /^[0-8]$/.test(tierParam.trim()) ? +tierParam : null;
+  const initialRung = pinnedTier ?? QualityGovernor.load();
+  const mobile = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  const texBase = mobile ? 1024 : 2048;
+  // Known from the first frame, so a remembered rung 6 boots straight into small maps instead of re-decoding 2K.
+  let texSizeNow = initialRung >= 6 ? texBase / 2 : texBase;
+
   const underScene = new THREE.Scene();
   // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
   const overScene = new THREE.Scene();
-  const { colliders, textures } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat);
+  const { colliders, textures } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat, { textureSize: texSizeNow });
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   // ?cast=jim,shelley pins those residents in first and freezes the off-screen rotation for testing;
   // a bare ?cast= freezes the seeded draw as-is.
@@ -140,13 +151,17 @@ async function boot() {
     debugQuad.update = () => {
       if (debugView === 'sim') tex.value = sim.rtA.texture;
       if (debugView === 'wake') tex.value = wake.rtA.texture;
+      if (debugView === 'caustics') tex.value = caustics.rt.texture;   // rung 6 reallocates it
     };
   }
+
+  // Rung 5's internal-resolution step; the pixel budget is measured on the true DPR first, then this scales under it.
+  let qualityScale = 1;
 
   function resize() {
     const dpr = Math.min(devicePixelRatio || 1, 2);
     const px = innerWidth * innerHeight * dpr * dpr;
-    const scale = px > MAX_PIXELS ? Math.sqrt(MAX_PIXELS / px) : 1;
+    const scale = (px > MAX_PIXELS ? Math.sqrt(MAX_PIXELS / px) : 1) * qualityScale;
     renderer.setPixelRatio(dpr * scale);
     renderer.setSize(innerWidth, innerHeight, false);
     const { w, h } = viewSize();
@@ -216,6 +231,57 @@ async function boot() {
   // Reseeds the algae field with the rocks, logs, and this first cover bake all known.
   wake.setSubstrate(colliders);
   let coverBakeAt = 2;
+
+  // The quality ladder. The governor walks one rung at a time, so each rung's "off" is the exact inverse
+  // of its "on"; these restore values are read here, before any rung has had a chance to apply.
+  const uRestore = { algaeDetail: U.algaeDetail.value, coverWobble: U.coverWobble.value };
+  // setQuality resets any field it is not given, so the whole desired state goes over on every call.
+  const floaterQ = { speckFraction: 1, detile: true };
+  const setFloaters = (patch) => { Object.assign(floaterQ, patch); floaters.setQuality({ ...floaterQ }); };
+  let texChain = Promise.resolve();
+  const setTex = (size) => {
+    if (size === texSizeNow) return;
+    texSizeNow = size;
+    // Serialized: two decodes in flight would leave whichever finished last applied, not whichever was asked last.
+    texChain = texChain
+      .then(() => (texSizeNow === size ? setTextureSize(textures, size) : null))
+      .catch((err) => console.warn('Pond: texture resize failed', err));
+  };
+
+  const RUNGS = {
+    // 1 is reserved for cutting pollen, which is unbuilt; the rung stays in the order so the rest keep their numbers.
+    2: { on: () => rain.setCap(0.5), off: () => rain.setCap(1) },
+    3: { on: () => setFloaters({ speckFraction: 0.4 }), off: () => setFloaters({ speckFraction: 1 }) },
+    4: {
+      on: () => {
+        algae.setQuality({ tuftFraction: 0.5 });
+        pads.setQuality({ lilyFraction: 0.4 });
+        U.algaeDetail.value = 0;
+        U.coverWobble.value = 0;
+        setFloaters({ detile: false });
+      },
+      off: () => {
+        algae.setQuality({ tuftFraction: 1 });
+        pads.setQuality({ lilyFraction: 1 });
+        U.algaeDetail.value = uRestore.algaeDetail;
+        U.coverWobble.value = uRestore.coverWobble;
+        setFloaters({ detile: true });
+      },
+    },
+    5: { on: () => { qualityScale = 0.75; resize(); }, off: () => { qualityScale = 1; resize(); } },
+    6: {
+      on: () => { sim.setResolution(384); caustics.setResolution(512); setTex(texBase / 2); },
+      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); setTex(texBase); },
+    },
+    // 7 halves the caustic update rate in the frame loop; 8 only derives eels.perfHot, which Eleanor already reads.
+  };
+
+  function applyRung(rung, prev) {
+    if (rung > prev) for (let r = prev + 1; r <= rung; r++) RUNGS[r]?.on();
+    else for (let r = prev; r > rung; r--) RUNGS[r]?.off();
+    eels.perfHot = rung >= 8;
+  }
+  const gov = new QualityGovernor({ initialRung, pinned: pinnedTier !== null, onChange: applyRung });
 
   // Audio already speaks for a nibble; this is the second subscriber, and it only makes bubbles.
   eels.on('nibble', (ev) => {
@@ -366,11 +432,10 @@ async function boot() {
   // under both backends without waiting on a live shower. One reused array, no per-frame allocation.
   const testDrops = params.get('impulse') === 'test' ? Array.from({ length: 40 }, () => ({ u: 0, v: 0, s: 0.006, r: 2.5 })) : null;
 
+  let causticFrame = 0;
   const timer = new THREE.Timer();
   timer.connect(document);
   let t = 0;
-  // Diegetic performance watcher: a sustained hot pond gates Eleanor's visits (and future quality tiers).
-  let perfEma = 8, perfHotFor = 0;
   let running = false;
   const moonDir = new THREE.Vector3();
   const epoch = (Date.now() / 1000) % MOON_ORBIT_SECONDS;
@@ -388,7 +453,7 @@ async function boot() {
     if (!s.length) return null;
     const sum = s.reduce((a, b) => a + b, 0);
     const pick = (q) => s[Math.min(s.length - 1, Math.floor(s.length * q))];
-    return { frames: s.length, avgFps: +(s.length / sum).toFixed(1), medianMs: +(pick(0.5) * 1000).toFixed(2), low1pctFps: +(1 / pick(0.99)).toFixed(1), worstMs: +(s[s.length - 1] * 1000).toFixed(1), over16ms: s.filter((v) => v > 1 / 60).length };
+    return { frames: s.length, rung: gov.rung, avgFps: +(s.length / sum).toFixed(1), medianMs: +(pick(0.5) * 1000).toFixed(2), low1pctFps: +(1 / pick(0.99)).toFixed(1), worstMs: +(s[s.length - 1] * 1000).toFixed(1), over16ms: s.filter((v) => v > 1 / 60).length };
   };
   function hud(rawDt, now) {
     fpsFrames++;
@@ -408,9 +473,9 @@ async function boot() {
     if (debug && rawDt > 0.05 && t > 3) console.warn(`Pond: slow frame ${(rawDt * 1000).toFixed(0)} ms (drops ${sim.pending.length}, foods ${eels.foods.length}, eels ${eels.enabled})`);
     const dt = Math.min(rawDt, 0.05);
     t += dt;
-    perfEma += (rawDt * 1000 - perfEma) * 0.05;
-    perfHotFor = perfEma > 14 ? perfHotFor + dt : 0;
-    eels.perfHot = perfHotFor > 4;
+    // Diegetic performance watcher: the ladder spends decorative budgets first and only gates Eleanor at the top.
+    // A hidden tab's throttled frames are not the pond's fault; without the gate a background tab climbs to rung 8.
+    if (!document.hidden) gov.update(rawDt * 1000);
     U.time.value = t % 4096;
     surface.uReveal.value += (revealTarget - surface.uReveal.value) * Math.min(1, dt * 1.2);
 
@@ -457,7 +522,11 @@ async function boot() {
       impulse.inject(testDrops);
     }
     // Caustics follow the water, so they only need redrawing on frames the sim actually stepped.
-    if (sim.update(dt) > 0 || t < 0.5) caustics.render();
+    if (sim.update(dt) > 0 || t < 0.5) {
+      // Rung 7 halves that again; the surface pass keeps sampling last frame's accumulation, which stays valid.
+      causticFrame++;
+      if (gov.rung < 7 || (causticFrame & 1) === 0 || t < 0.5) caustics.render();
+    }
     // The drag segment since the last frame becomes a pointer capsule; a flick is capped so it shoves, not teleports.
     if (finger.at >= 0 && performance.now() - finger.at < 120) {
       let vx = (finger.x - finger.px) / Math.max(dt, 1e-3), vz = (finger.z - finger.pz) / Math.max(dt, 1e-3);
@@ -553,6 +622,7 @@ async function boot() {
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,
+      quality: { get rung() { return gov.rung; }, get ema() { return gov.ema; }, get pinned() { return gov.pinned; }, setRung: (n) => gov.setRung(n) },
       diag: async () => {
         console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '), 'moonPhase', moon.phase01.toFixed(3), 'wind', U.wind.value.toArray().map((v) => v.toFixed(2)).join(' '));
         await stats(sim.rtA, 'sim');

@@ -10,7 +10,8 @@ export class SurfacePass {
     this.renderer = renderer;
     this.uView = uniform(new THREE.Vector2(viewW, viewH));
     this.uExtent = uniform(sim.extent);
-    this.uTexelW = uniform(sim.texelWorld);
+    // Derived, not baked: both follow sim.setResolution (quality rung 6) with no resync call.
+    this.uTexelW = this.uExtent.mul(sim.uTexel);
     this.uSlosh = uniform(1.0);
     this.uExposure = uniform(1.0);
     this.uSlope = uniform(1.8);
@@ -28,7 +29,7 @@ export class SurfacePass {
     // Crest glint: ripple flanks tilted toward the moon catch it as silver, pond-wide, not just at the disc.
     this.uCrestEdge = uniform(new THREE.Vector2(0.962, 0.998));   // flat water sits at cos 19° = 0.945, so it stays dark
     this.uCrest = uniform(0.2);
-    const texel = float(1 / sim.rtA.width);
+    const texel = sim.uTexel;
     const under = texture(underRT.texture);
     const eta = float(1 / IOR_WATER);
     const uDepth = uniform(DEPTH);

@@ -57,6 +57,7 @@ export class RainScheduler {
 
     this.envelope = 0;         // what the pond sees: intensity, capped under reduced motion
     this.intensity = 0;        // what the shower actually is; the audio bed rides this
+    this.qualityCap = 1;       // ladder rung 2; composes with the reduced-motion ceiling by min
     this.state = 'dry';
     this.stateT = 0;
     this.stateLen = 1;
@@ -147,8 +148,12 @@ export class RainScheduler {
     const shape = this.state === 'build' ? smooth(p) : this.state === 'tail' ? smooth(1 - p) : 1;
     this.intensity = this.peak * shape * (0.88 + 0.12 * this.gustRaw());
     // Clamped every frame, not per shower, so toggling the preference mid-downpour takes effect now.
-    this.envelope = this.motion.reduced ? Math.min(this.intensity, CALM_CEIL) : this.intensity;
+    const ceil = this.motion.reduced ? Math.min(CALM_CEIL, this.qualityCap) : this.qualityCap;
+    this.envelope = Math.min(this.intensity, ceil);
   }
+
+  /* Quality ladder rung 2: a ceiling on the visible half only, so the shower still sounds like one. */
+  setCap(cap) { this.qualityCap = Math.max(0, Math.min(1, cap)); }
 
   gustRaw() { return 0.5 + 0.5 * Math.sin(this.t * 0.23 + this.gustPhase); }
 

@@ -10,31 +10,24 @@ export class WaterSim {
   constructor(renderer, extent) {
     this.renderer = renderer;
     this.extent = extent;
+    this.res = SIM_RES;
     this.texelWorld = extent / SIM_RES;
     this.accumulator = 0;
     this.damping = SIM_DAMPING;
 
-    const mk = () => {
-      const rt = new THREE.RenderTarget(SIM_RES, SIM_RES, {
-        type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
-        minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
-      });
-      rt.texture.wrapS = rt.texture.wrapT = THREE.ClampToEdgeWrapping;
-      return rt;
-    };
-    this.rtA = mk();
-    this.rtB = mk();
+    this.rtA = this.mkState();
+    this.rtB = this.mkState();
     this.read = texture(this.rtA.texture);
 
-    const texel = float(1 / SIM_RES);
+    // A uniform, not a const: the quality ladder changes the resolution, and a const would force a
+    // material rebuild. Surface and caustics read it too, so their taps follow the same grid.
+    this.uTexel = uniform(1 / SIM_RES);
+    const texel = this.uTexel;
     this.uDamping = uniform(SIM_DAMPING);
     this.uWave = uniform(SIM_WAVE);
 
     // Obstacle mask (R = 1 where something solid crosses the waterline), baked once from the colliders.
-    this.maskRT = new THREE.RenderTarget(SIM_RES, SIM_RES, {
-      type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
-      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
-    });
+    this.maskRT = this.mkMask();
     this.mask = texture(this.maskRT.texture);
     this.obstacles = { discs: [], capsules: [] };
     this.cover = { discs: [], capsules: [] };
@@ -79,6 +72,50 @@ export class WaterSim {
     this.dropQuad = new THREE.QuadMesh(dropMat);
 
     this.pending = [];
+  }
+
+  mkState(res = this.res) {
+    const rt = new THREE.RenderTarget(res, res, {
+      type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+    });
+    rt.texture.wrapS = rt.texture.wrapT = THREE.ClampToEdgeWrapping;
+    return rt;
+  }
+
+  mkMask(res = this.res) {
+    return new THREE.RenderTarget(res, res, {
+      type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: false, stencilBuffer: false,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+    });
+  }
+
+  /* Quality ladder rung 6. World wave speed goes as texel × sqrt(gain), so the gain scales by
+     (res / SIM_RES)² or a smaller grid would visibly race; 0.039 at 384 is far under the 0.5 limit. */
+  setResolution(res) {
+    if (res === this.res || !(res > 0)) return;
+    const newA = this.mkState(res), newB = this.mkState(res), newMask = this.mkMask(res);
+    if (!this.copyQuad) {
+      const m = new THREE.NodeMaterial();
+      m.fragmentNode = Fn(() => this.read.sample(uv()))();
+      this.copyQuad = new THREE.QuadMesh(m);
+    }
+    const prev = this.renderer.getRenderTarget();
+    // Carry the live water across instead of restarting from flat: the pond would visibly stop dead.
+    this.renderer.setRenderTarget(newA);
+    this.copyQuad.render(this.renderer);
+    this.renderer.setRenderTarget(prev);
+    const oldA = this.rtA, oldB = this.rtB, oldMask = this.maskRT;
+    this.rtA = newA; this.rtB = newB; this.maskRT = newMask;
+    this.read.value = newA.texture;
+    this.mask.value = newMask.texture;
+    oldA.dispose(); oldB.dispose(); oldMask.dispose();
+    this.res = res;
+    this.texelWorld = this.extent / res;
+    this.uTexel.value = 1 / res;
+    this.uWave.value = SIM_WAVE * (res / SIM_RES) ** 2;
+    if (this.bake) this.bake.uEdge.value = this.texelWorld * 1.5;
+    this.bakeMask();
   }
 
   /* Waterline walls (xz + radius, or capsule a→b + radius): mask R, which the wave step bounces off. */
@@ -135,7 +172,7 @@ export class WaterSim {
         });
         return vec4(solid.min(1), cover.min(1), 0, 1);
       })();
-      this.bake = { quad: new THREE.QuadMesh(mat), uDiscs, uCaps, uCovD, uCovC };
+      this.bake = { quad: new THREE.QuadMesh(mat), uDiscs, uCaps, uCovD, uCovC, uEdge };
     }
     const { quad, uDiscs, uCaps, uCovD, uCovC } = this.bake;
     const { discs, capsules } = this.obstacles;
@@ -189,7 +226,7 @@ export class WaterSim {
     for (let i = 0; i < n; i++) {
       const d = this.pending[i];
       this.uCenter.value.set(d.u, d.v);
-      this.uRadius.value = Math.max(d.r, 3.5 / SIM_RES);
+      this.uRadius.value = Math.max(d.r, 3.5 / this.res);
       this.uStrength.value = d.s;
       this.renderPass(this.dropQuad);
     }
@@ -213,6 +250,7 @@ export class WaterSim {
   dispose() {
     this.rtA.dispose(); this.rtB.dispose(); this.maskRT.dispose();
     this.stepQuad.material.dispose(); this.dropQuad.material.dispose();
+    this.copyQuad?.material.dispose();
     this.bake?.quad.material.dispose();
   }
 }

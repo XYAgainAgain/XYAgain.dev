@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, attribute, uniform, uniformArray, varying, vec2, vec3, vec4, float, int, sin, cos, length, smoothstep, mix, pow, step, dot, normalize, texture, uv, fwidth, positionGeometry } from 'three/tsl';
-import { SIM_RES, WAKE_RES, MOON_ORBIT_SECONDS, INF_SLOTS } from './config.js';
+import { WAKE_RES, MOON_ORBIT_SECONDS, INF_SLOTS } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { segDist } from './eel-physics.js';
 import { makeCurrent, makeSwell, valueNoise2, capsuleInfluenceCPU } from './shading.js';
@@ -549,7 +549,7 @@ export class FloaterSystem {
     const uCarpetNoise = uniform(0.6);
     const uCarpetMixLo = uniform(0.35), uCarpetMixHi = uniform(0.65);
     const uCarpetRipple = uniform(0.55);
-    const uCarpetTexel2 = uniform(2 / SIM_RES);
+    const uCarpetTexel2 = this.sim.uTexel.mul(2);   // follows sim.setResolution (quality rung 6)
     const uCarpetWakeK = uniform(1.0);
     const uCarpetWakeWarp = uniform(0.07);         // an eel under the mat scrunches the fronds, never tears them
     const uCarpetWakeTilt = uniform(0.35);

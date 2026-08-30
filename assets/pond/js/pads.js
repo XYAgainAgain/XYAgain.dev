@@ -208,7 +208,7 @@ export class PadSystem {
       const life = lrng.range(3, 4);
       const f = {
         pad: host, size: Math.min(lrng.range(0.55, 1.1), host.r * 1.5), offset: lrng.range(-0.08, 0.08), seed: lrng.range(0, 6.28),
-        life, born: -lrng.range(0, life * 0.8), lifeScale: 1, bloom: 0, closeLevel: 1, heavyFor: 0, rng: lrng,
+        life, born: -lrng.range(0, life * 0.8), lifeScale: 1, bloom: 0, closeLevel: 1, heavyFor: 0, rng: lrng, active: true,
       };
       host.flower = f;
       this.flowers.push(f);
@@ -220,7 +220,9 @@ export class PadSystem {
   makeRide(U, sim) {
     const swell = makeSwell(U);
     this.uPadExtent = uniform(sim.extent);
-    this.uPadMinTap = uniform(sim.texelWorld * 2);
+    // Two sim texels, expressed against the live grid: rung 6 coarsens the sim, and a tap closer
+    // than it can resolve is noise.
+    this.uPadMinTap = this.uPadExtent.mul(sim.uTexel).mul(2);
     this.uPadTiltGain = uniform(1.6);
     this.uPadSwellGain = uniform(1.0);
     this.uPadTiltMax = uniform(0.30);
@@ -679,6 +681,16 @@ export class PadSystem {
     this.lilyMesh.renderOrder = 42;
   }
 
+  /* Quality ladder rung 4: the tail of the seeded flowers goes dark, pool and layout untouched, so
+     restoring at 1 is the exact mirror. Pads, petioles, and crowns are structural and never cut. */
+  setQuality({ lilyFraction = 1 } = {}) {
+    const n = Math.max(0, Math.min(this.flowers.length, Math.round(lilyFraction * this.flowers.length)));
+    if (n === this.lilyMesh.geometry.instanceCount) return;
+    this.lilyMesh.geometry.instanceCount = n;
+    // The pad's contact shadow is the one thing a dark lily would still cast; update() reads active.
+    this.flowers.forEach((f, i) => { f.active = i < n; });
+  }
+
   /* Public: a creature climbing onto a pad transfers water onto it; drips fire when it leaves. */
   wet(idx, amount) {
     const p = this.pads[idx];
@@ -868,7 +880,7 @@ export class PadSystem {
 
       const o = i * 4;
       this.padD[o] = p.swingX; this.padD[o + 1] = p.swingZ; this.padD[o + 2] = p.wet;
-      this.padD[o + 3] = p.flower ? p.flower.lifeScale * p.flower.size : 0;
+      this.padD[o + 3] = p.flower?.active ? p.flower.lifeScale * p.flower.size : 0;
       this.padE[o] = p.rollX; this.padE[o + 1] = p.rollZ; this.padE[o + 2] = p.rollS;
     });
     this.aPadD.needsUpdate = true;

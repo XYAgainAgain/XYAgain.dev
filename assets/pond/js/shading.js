@@ -1,7 +1,7 @@
 import { Fn, vec2, vec3, vec4, float, floor, fract, dot, mix, normalize, hash, Loop, length, uniformArray, uniform, texture, refract, sin, cos, smoothstep, pow, clamp, If } from 'three/tsl';
 import { createRng } from './rng.js';
 import * as THREE from 'three/webgpu';
-import { INF_SLOTS, IOR_WATER, MOON_COLOR, SIM_RES } from './config.js';
+import { INF_SLOTS, IOR_WATER, MOON_COLOR } from './config.js';
 
 /* Shared TSL helpers used by the floor, rocks, log, eels, and the compose pass. */
 
@@ -279,7 +279,7 @@ export function makeUnderwaterShading(U) {
   const kSpecLo = uniform(24), kSpecHi = uniform(140), kAmbient = uniform(0.004);
   // Shadow wobble stencil: two sim texels either side of the entry point, in mask uv; sim heights are
   // a few hundredths of a unit, so the gain turns them into a visible fraction-of-a-unit crawl.
-  const kMaskTexel2 = uniform(2 / SIM_RES), kWobbleGain = uniform(40);
+  const kWobbleGain = uniform(40);
   const shade = Fn(([albedo, n, p, roughnessIn]) => {
     const roughness = float(roughnessIn).toVar();
     const L = lightDir();
@@ -294,7 +294,7 @@ export function makeUnderwaterShading(U) {
     // Above the waterline: direct moon plus light bouncing off the rippling surface onto the object.
     If(p.y.greaterThan(0.0), () => {
       const ndlAir = dot(n, U.moonDir).max(0);
-      const o = float(1.5 / 512);
+      const o = U.reflCausticTexel.mul(1.5);   // 1.5 texels of the live refl target (rung 6 halves it)
       const reflRatio = U.reflCausticTex.sample(causticUV.add(vec2(o, o))).r
         .add(U.reflCausticTex.sample(causticUV.add(vec2(o.negate(), o))).r)
         .add(U.reflCausticTex.sample(causticUV.add(vec2(o, o.negate()))).r)
@@ -317,7 +317,8 @@ export function makeUnderwaterShading(U) {
       const entry = p.xz.add(L.xz.mul(p.y.negate().div(L.y.max(1e-3)))).toVar();
       const azim = L.xz.div(length(L.xz).max(1e-4));
       const c = entry.div(U.maskExtent).add(0.5);
-      const step2 = azim.mul(kMaskTexel2);
+      // U.simTexel is sim.uTexel (assigned in main beside simTex), so the stencil follows rung 6.
+      const step2 = azim.mul(U.simTexel.mul(2));
       const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
       entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
       const g = U.coverTex.sample(entry.div(U.maskExtent).add(0.5)).g;

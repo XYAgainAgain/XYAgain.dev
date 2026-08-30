@@ -32,6 +32,9 @@ export function attachEleanor(sys, seed) {
   e.prey = null;
   e.zoomAt = 0;
   e.slip = SLIP;
+  // park() re-rolls this per park, but a first depart-from-lair reads it first: undefined here fed
+  // cos/sin a NaN that poisoned her whole chain until the stuck rescue finally parked her.
+  e.parkAng = e.rng.range(0, Math.PI * 2);
   setExit(e, null);
   resetProgress(e);
   const log = sys.colliders.logs[0];

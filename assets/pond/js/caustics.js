@@ -20,13 +20,16 @@ export class CausticsPass {
       rt.texture.wrapS = rt.texture.wrapT = THREE.ClampToEdgeWrapping;
       return rt;
     };
+    this.mkRT = mkRT;
+    this.res = CAUSTIC_RES;
     this.rt = mkRT(CAUSTIC_RES);
     this.rtRefl = mkRT(CAUSTIC_RES >> 1);
     // Exponential history of the refracted caustics: ripple dispersion speckle averages out instead of racing.
     this.accA = mkRT(CAUSTIC_RES);
     this.accB = mkRT(CAUSTIC_RES);
     this.uBlend = uniform(0.14);
-    const freshTex = texture(this.rt.texture);
+    this.freshTex = texture(this.rt.texture);
+    const freshTex = this.freshTex;
     this.accRead = texture(this.accA.texture);
     const accMat = new THREE.NodeMaterial();
     accMat.fragmentNode = Fn(() => {
@@ -37,6 +40,7 @@ export class CausticsPass {
     // Replace the placeholder nodes outright: a TextureNode decides RT-specific handling when built.
     U.causticTex = texture(this.accB.texture);
     U.reflCausticTex = texture(this.rtRefl.texture);
+    U.reflCausticTexel = uniform(1 / (CAUSTIC_RES >> 1));   // shading's refl filter taps; rung 6 halves the target
     const swell = makeSwell(U);
 
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
@@ -52,8 +56,10 @@ export class CausticsPass {
     geoRefl.rotateX(-Math.PI / 2);
 
     const uExtent = uniform(sim.extent);
-    const uTexelW = uniform(sim.texelWorld);
-    const texel = float(1 / sim.rtA.width);
+    // Derived, not captured: one sim texel in world units, the run under the height taps' rise
+    // (slope = rise/run), so it must track the grid when rung 6 coarsens it.
+    const uTexelW = uExtent.mul(sim.uTexel);
+    const texel = sim.uTexel;   // follows sim.setResolution, so the wide taps stay three sim texels apart
     const uDepth = uniform(DEPTH);
     const eta = float(1 / IOR_WATER);
     this.uSlope = uniform(5.0);        // sim ripple slope gain (artistic: ripples here are small)
@@ -134,6 +140,23 @@ export class CausticsPass {
     this.meshRefl.frustumCulled = false;
     this.sceneRefl = new THREE.Scene();
     this.sceneRefl.add(this.meshRefl);
+  }
+
+  /* Quality ladder rung 6: one reallocation at the transition, never per frame. The accumulation
+     history starts from black and refills within a few frames, which is cheaper than resampling it. */
+  setResolution(res) {
+    if (res === this.res || !(res > 0)) return;
+    this.rt.dispose(); this.rtRefl.dispose(); this.accA.dispose(); this.accB.dispose();
+    this.res = res;
+    this.rt = this.mkRT(res);
+    this.rtRefl = this.mkRT(res >> 1);
+    this.accA = this.mkRT(res);
+    this.accB = this.mkRT(res);
+    this.freshTex.value = this.rt.texture;
+    this.accRead.value = this.accA.texture;
+    this.U.causticTex.value = this.accA.texture;
+    this.U.reflCausticTex.value = this.rtRefl.texture;
+    this.U.reflCausticTexel.value = 1 / (res >> 1);
   }
 
   /* Domain = visible floor plus margin; the grid covers more, since rays arrive from outside it. */
