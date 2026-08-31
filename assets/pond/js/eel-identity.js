@@ -47,6 +47,7 @@ export const IDENTITIES = [
     nicks: [['Jaz', 60], ['JD', 20], ['J-Dizzle', 10], ['The Warp-Warden', 10]],
     build: { length: [2.0, 2.6], radius: [0.105, 0.125] },
     colorsA: [TURQUOISE], colorsB: [PURPLE],
+    jelly: 0.33,
     pattern: { stripe: [0.2, 0.2, 0.5], spot: [0.95, 0.4, 1], flank: [0.9, 0.4, 1], wavy: [0, 1.6] },
     glow: [0, 1, 0, 0],
     traits: { holdChance: 0.7, holdTime: [3, 9], persistence: 2.5, cover: 1.7, cruise: [0.72, 0.88], turn: [4.2, 5.6], attention: [8, 16] },
@@ -116,6 +117,7 @@ export const IDENTITIES = [
     nicks: [['Morgan', 60], ['Mubgub', 20], ['Mubulous Gubulon', 20]],
     build: { length: [2.0, 2.4], radius: [0.095, 0.11] },
     colorsA: [GREEN], colorsB: [LIME_YELLOW],
+    jelly: 0.33,
     pattern: { stripe: [0.15, 0.2, 0.4], spot: [0.9, 0.5, 1], flank: [0.8, 0.4, 0.9], wavy: [0, 1.4] },
     glow: [0, 1, 1, 0],   // breathe and pulse together; the envelope normalizes by the weight sum
     traits: { curious: 0.85, cover: 1.1, hunger: 0.5 },
@@ -143,6 +145,7 @@ export const IDENTITIES = [
     pronouns: 'any/all',
     build: { length: [2.0, 2.4], radius: [0.135, 0.155] },   // thicc as hell: the roundest resident
     colorsA: [MILLENNIAL_PINK], colorsB: [GOLDENROD],
+    jelly: 0.45,   // fewer shipped varietals than the other two glass rollers, so Bee jellies more
     pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.6, 1], flank: [0.6, 0.3, 0.7], wavy: [0, 1.2] },
     glow: [1, 1, 0, 0],
     traits: { holdChance: 0.8, holdTime: [8, 25], curious: 1.1, spookMul: 1.2, cover: 1.35 },
@@ -287,6 +290,12 @@ export function rollIdentityColors(e, id, rng) {
   } else {
     e.rampStops = twoToneStops(e.colA.toArray(), e.colB.toArray());
     e.rampOpts = { ...ramp, soften: 1 };
+  }
+  // The glass roll, guarded like band (no draw unless the identity asks); a quarter fly the rainbow.
+  e.jelly = id.jelly ? rng.chance(id.jelly) : false;
+  if (e.jelly && rng.chance(0.25)) {
+    e.rampStops = PRIDE_FLAGS.rainbow;
+    e.rampOpts = { soften: 24 };
   }
   // The name tag wears the main color; a many-stop ramp (tablecloth, flag) picks any stop bright
   // enough to read on the water. getStyle() encodes the working-space value to sRGB for CSS.

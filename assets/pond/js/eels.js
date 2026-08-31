@@ -125,6 +125,7 @@ export class EelSystem {
     this.shim = null;
     this.shimFn = null;
     this.renderer = new EelRenderer(scene, U, shading, this.knobs);
+    this.knobs.jelly = this.renderer.jellyU;   // pond.eels.knobs.jelly.<dial>.value, tuned live
     this.group = this.renderer.group;
     // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.
     this.hotSwap = !opts.cast;   // null means no ?cast= at all; [] is a bare ?cast= that pins the seeded draw

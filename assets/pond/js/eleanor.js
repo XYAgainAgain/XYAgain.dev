@@ -71,6 +71,7 @@ function setVisible(e, v) {
 /* Every exit change clears the reverse-jam watch with it, so a fresh fold never inherits the last one's strikes. */
 function setExit(e, mode) {
   e.exiting = mode;
+  e.exitFor = 0;
   e.revJam = 0;
   e.revNudged = false;
   e.revX = e.head.x; e.revZ = e.head.z;
@@ -131,6 +132,19 @@ function goHome(sys, e, now) {
   else e.state = 'depart';
 }
 
+/* The surrender: spit anything held (never park with someone in her jaws), vanish offstage, try
+   again in a while. Both the visit-cap ladder and the give-up below end here. */
+function parkOffstage(sys, e, now) {
+  if (e.prey && e.prey.slurpedBy === e) spit(sys, e, now);
+  e.prey = null;
+  e.state = 'offstage';
+  park(sys, e);
+  setVisible(e, false);
+  e.rescued = false;
+  e.homeFails = 0;
+  e.nextSwimBy = now + e.rng.range(40, 80);
+}
+
 /* Obstacle push, written into the module scratch so the steering loops allocate nothing. Squared
    falloff keeps the far field a hint; the tangent is what saves a head-on, where radial alone cancels. */
 let avoidX = 0, avoidZ = 0;
@@ -186,14 +200,7 @@ function brain(sys, e, dt) {
   if (now - e.stateAt > VISIT_CAP + 20) {
     if (!e.rescued) { e.rescued = true; e.stateAt = now - VISIT_CAP - 10; e.nopePulse = now + 1.4; sys.emit('startle', e); }
     else {
-      // Never park with someone in her jaws: any abandoned meal gets spat before she vanishes.
-      if (e.prey && e.prey.slurpedBy === e) spit(sys, e, now);
-      e.prey = null;
-      e.state = 'offstage';
-      park(sys, e);
-      setVisible(e, false);
-      e.rescued = false;
-      e.nextSwimBy = now + e.rng.range(40, 80);
+      parkOffstage(sys, e, now);
       return;
     }
   }
@@ -244,6 +251,10 @@ function brain(sys, e, dt) {
   if (e.exiting) {
     const p = e.exiting === 'turn' ? e.lairApproach : e.lairExit;
     tx = p.x; tz = p.z; ty = e.lairPoint.y; wantBL = e.prowlBL;
+    // The fold runs with avoidance and the stuck watch both off, so a jam is steered only by collision;
+    // 2 s without arriving demotes it to the far-mouth exit (never reverse: a spent trail flips that back to turn).
+    e.exitFor += dt;
+    if (e.exiting === 'turn' && e.exitFor > 2) setExit(e, 'ahead');
     if (Math.hypot(tx - e.head.x, tz - e.head.z) < 0.8) setExit(e, null);
   } else if (e.state === 'depart') {
     const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
@@ -263,6 +274,7 @@ function brain(sys, e, dt) {
       if (e.returnLeg === 0) e.returnLeg = 1;
       else {
         e.state = 'lair';
+        e.homeFails = 0;
         e.nextSwimBy = now + e.rng.range(40, 80);
         return;
       }
@@ -375,7 +387,13 @@ function brain(sys, e, dt) {
       if (e.stuckFor > PROG_WINDOW * 2) {
         e.stuckFor = 0;
         e.stuckStrikes++;
-        if (e.stuckStrikes >= 2) { e.stuckStrikes = 0; goHome(sys, e, now); }
+        if (e.stuckStrikes >= 2) {
+          e.stuckStrikes = 0;
+          // The old rescue for a jammed return was another return, and goHome resets the visit clock,
+          // so the hard park never fired. A second failed trip home now surrenders the visit instead.
+          if (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2) parkOffstage(sys, e, now);
+          else goHome(sys, e, now);
+        }
         else { e.nopePulse = now + 1.3; sys.emit('startle', e); }
       }
     }

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld } from 'three/tsl';
+import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld, screenUV, screenSize, viewportSharedTexture, cameraViewMatrix, exp } from 'three/tsl';
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2 } from './shading.js';
 import { makeRampTexture, bakeRamp } from './eel-palette.js';
@@ -43,6 +43,14 @@ export class EelRenderer {
     this.U = U;
     this.shading = shading;
     this.knobs = knobs ?? { skin: 0.3, glow: 1.0 };   // the system owns them; pond.eels.knobs tunes live
+    // The jelly dials, live via pond.eels.knobs.jelly.<dial>.value; warp/wobble are pixels.
+    // halo is a CPU-side dimmer set at swap time; lamp is read live every frame in writeSlot.
+    this.jellyU = {
+      warp: uniform(11.0), wobble: uniform(1.5), depthEps: uniform(0.01),
+      desat: uniform(0.45), tint: uniform(0.75), gain: uniform(0.95),
+      rim: uniform(1.1), wash: uniform(0.4), ghost: uniform(0.2),
+      lamp: { value: 0.3 }, halo: { value: 0.2 },
+    };
     this.group = new THREE.Group();
     scene.add(this.group);
     this.geometry = makeTubeGeometry();
@@ -219,12 +227,13 @@ export class EelRenderer {
     bodyMat.side = THREE.FrontSide;
 
     // Halo: a fatter additive shell; alpha blend keeps the RT's depth channel from the body.
+    e.uHaloMul = uniform(1);
     const haloMat = new THREE.NodeMaterial();
     haloMat.positionNode = buildPosition(2.4);
     haloMat.fragmentNode = Fn(() => {
       const n = normalize(vNormal);
       const edge = dot(n, vec3(0, 1, 0)).max(0);
-      const glow = emission().mul(0.16).mul(edge.pow(1.5));
+      const glow = emission().mul(0.16).mul(edge.pow(1.5)).mul(e.uHaloMul);
       return vec4(glow, 0);
     })();
     haloMat.transparent = true;
@@ -235,6 +244,78 @@ export class EelRenderer {
     haloMat.blendDstAlpha = THREE.OneFactor;
     haloMat.depthWrite = false;
     haloMat.side = THREE.FrontSide;
+
+    // Lazy on purpose: the jelly pipeline only compiles for eels that actually roll jelly.
+    e.matBody = bodyMat;
+    e.matJelly = null;
+    e._mkJelly = () => {
+      const J = this.jellyU;
+      const m = new THREE.NodeMaterial();
+      m.positionNode = buildPosition(1);
+      // One copy, two taps: bent falls back to straight when it lands on something nearer than the
+      // eel (bent.a is scene depth), so foreground never gets dragged sideways through the body.
+      const sceneCopy = viewportSharedTexture();
+      // The under-target is half float; the shared framebuffer copy must match or both backends refuse the blit.
+      sceneCopy.value.type = THREE.HalfFloatType;
+      m.fragmentNode = Fn(() => {
+        const n = normalize(vNormal);
+        const nView = cameraViewMatrix.mul(vec4(n, 0)).xyz;
+        const wobPx = vec2(
+          valueNoise2(vec2(vUV.x.mul(5).add(U.time.mul(0.13)), vUV.y.mul(0.8).add(e.uSeed))),
+          valueNoise2(vec2(vUV.y.mul(0.9).add(U.time.mul(0.11)), vUV.x.mul(4).add(e.uSeed).add(7)))
+        ).sub(0.5).mul(J.wobble);
+        // Toward-center sampling magnifies, the way a water-filled tube actually lenses.
+        const warpedUV = screenUV.add(wobPx.sub(nView.xy.mul(J.warp)).div(screenSize));
+        const bent = sceneCopy.sample(warpedUV);
+        const straight = sceneCopy.sample(screenUV);
+        const depthFrac = vWorld.y.negate().div(DEPTH).clamp(0, 1);
+        const valid = step(depthFrac.sub(J.depthEps), bent.a);
+        const background = mix(straight.rgb, bent.rgb, valid);
+        // The ramp wash drifts down the body, desaturated: tinted glass is pale, not neon.
+        const drift = rampNode.sample(vec2(vUV.x.add(U.time.mul(0.02)), 0.5)).rgb;
+        const pale = mix(vec3(dot(drift, vec3(0.299, 0.587, 0.114))), drift, J.desat);
+        // Chord-thickness proxy: glass is thickest at the crown, so dye and presence peak mid-body
+        // while the wide rim band draws the silhouette.
+        const thick = dot(n, vec3(0, 1, 0)).max(0);
+        const rim = smoothstep(0.15, 0.8, thick.oneMinus());
+        const breathe = sin(U.time.mul(TWO_PI).mul(0.25).add(e.uSeed)).mul(0.2).add(0.8);
+        const density = J.tint.mul(thick.mul(0.75).add(0.25)).add(rim.mul(J.rim).mul(0.4));
+        const transmission = exp(vec3(1).sub(pale).mul(density).negate());
+        const refracted = background.mul(transmission).mul(J.gain.clamp(0, 1));
+        const opacity = J.wash.mul(thick.mul(0.6).add(0.4)).add(rim.mul(J.rim).mul(breathe)).clamp(0, 0.8);
+        return vec4(refracted.add(emission().mul(J.ghost)), opacity);
+      })();
+      // Alpha blending: the see-through part is the exact scene beneath, self-overlaps accumulate
+      // instead of punching floor-colored holes, and dst alpha survives for the depth pass below.
+      m.transparent = true;
+      m.blending = THREE.CustomBlending;
+      m.blendEquation = THREE.AddEquation;
+      m.blendSrc = THREE.SrcAlphaFactor;
+      m.blendDst = THREE.OneMinusSrcAlphaFactor;
+      m.blendSrcAlpha = THREE.ZeroFactor;
+      m.blendDstAlpha = THREE.OneFactor;
+      m.depthWrite = false;
+      m.side = THREE.FrontSide;
+      // Depth companion: RGB untouched, alpha becomes eel depth so the refraction pass keeps its contract.
+      const d = new THREE.NodeMaterial();
+      d.positionNode = buildPosition(1);
+      d.fragmentNode = Fn(() => vec4(vec3(0), vWorld.y.negate().div(DEPTH).clamp(0, 1)))();
+      d.transparent = true;
+      d.blending = THREE.CustomBlending;
+      d.blendEquation = THREE.AddEquation;
+      d.blendSrc = THREE.ZeroFactor;
+      d.blendDst = THREE.OneFactor;
+      d.blendSrcAlpha = THREE.OneFactor;
+      d.blendDstAlpha = THREE.ZeroFactor;
+      d.depthWrite = true;
+      d.side = THREE.FrontSide;
+      e.matJellyDepth = d;
+      e.jellyDepth = new THREE.Mesh(this.geometry, d);
+      e.jellyDepth.frustumCulled = false;
+      e.jellyDepth.renderOrder = 2.5;
+      this.group.add(e.jellyDepth);
+      return m;
+    };
 
     e.body = new THREE.Mesh(this.geometry, bodyMat);
     e.halo = new THREE.Mesh(this.geometry, haloMat);
@@ -247,6 +328,21 @@ export class EelRenderer {
     e.eyes = [new THREE.Mesh(eyeGeo, eyeMat), new THREE.Mesh(eyeGeo, eyeMat)];
     e.eyes.forEach((m) => { m.scale.setScalar(e.radius * 0.2); this.group.add(m); });
     this.group.add(e.body, e.halo);
+    // The boot cast can roll jelly before its mesh exists, so the swap runs here too.
+    this.syncBodyMaterial(e);
+  }
+
+  /* Jelly is the one roll that swaps the material. renderOrder 2 sits after the opaques (so the
+     copy holds the whole floor) but under algae, halos, and every surface layer. */
+  syncBodyMaterial(e) {
+    const want = e.jelly ? (e.matJelly ??= e._mkJelly()) : e.matBody;
+    if (e.body.material !== want) {
+      e.body.material = want;
+      e.body.renderOrder = e.jelly ? 2 : 0;
+    }
+    if (e.jellyDepth) e.jellyDepth.visible = !!e.jelly;
+    // The 2.4× additive shell screams "lamp"; a jelly keeps only a whisper of it.
+    if (e.uHaloMul) e.uHaloMul.value = e.jelly ? this.jellyU.halo.value : 1;
   }
 
   /* A reroll rebakes the ramp texture and moves uniforms; the node graph and the materials are the
@@ -262,6 +358,7 @@ export class EelRenderer {
     e.uPlaid.value.set(e.wPlaid, e.plaidFreq, e.wRidge);
     e.uGlowMode.value.copy(e.glowMode);
     e.uLayers.value.set(this.knobs.skin * e.skinMul, this.knobs.glow);
+    this.syncBodyMaterial(e);
   }
 
   createFoodMesh() { return new THREE.Mesh(this.foodGeo, this.foodMat); }
@@ -280,7 +377,8 @@ export class EelRenderer {
     // speedBL is body lengths per second, so a long eel pushes harder than a short one at equal gait.
     const v = e.speedBL * e.length;
     U.infC.array[i].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
-    const k = 0.7 + e.uExcite.value * 0.6;
+    // A jelly is a dim lamp: full sand glow fills the glass with its own color and reads as solid.
+    const k = (0.7 + e.uExcite.value * 0.6) * (e.jelly ? this.jellyU.lamp.value : 1);
     // Ramp half means (a whole-ramp mean of 26 tablecloth bands is beige), kept to the same narrow
     // span as before: a full head→tail lerp passes through grey on complementary palettes.
     U.eelCol.array[i].copy(e.rampHead).lerp(e.rampTail, 0.25).multiplyScalar(k);
@@ -362,7 +460,7 @@ export class EelRenderer {
 
   dispose(eels) {
     this.geometry.dispose();
-    for (const e of eels) { e.body.material.dispose(); e.halo.material.dispose(); e.rampTex.dispose(); }
+    for (const e of eels) { e.matBody.dispose(); e.matJelly?.dispose(); e.matJellyDepth?.dispose(); e.halo.material.dispose(); e.rampTex.dispose(); }
     this.foodGeo.dispose(); this.foodMat.dispose();
   }
 }
