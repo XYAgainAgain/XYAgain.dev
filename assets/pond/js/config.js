@@ -26,3 +26,4 @@ export const NAME_LIFT = 0.2;          // world units a name tag floats above it
 export const STORAGE_KEY = 'xy.eels';
 export const NAMES_KEY = 'xy.names';
 export const QUALITY_KEY = 'xy.quality';
+export const JUNK_KEY = 'xy.junk';

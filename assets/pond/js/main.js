@@ -23,7 +23,7 @@ import { FloaterSystem } from './floaters.js';
 import { AlgaeTufts } from './algae.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
-import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle } from './ui.js';
+import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle, bindJunk } from './ui.js';
 import { NameLabels } from './names.js';
 import { QualityGovernor } from './quality.js';
 
@@ -185,12 +185,23 @@ async function boot() {
   // Audio + UI
   const audio = new PondAudio();
   const soundBtn = document.getElementById('sound');
-  bindSoundButton(soundBtn, document.getElementById('volume-panel'), audio);
+  bindSoundButton(soundBtn, document.getElementById('volume-panel'), audio, document.getElementById('mute'));
   // Dev-only mix console; the module never loads without the flag.
   if (params.get('mixer') === '1') import('./mixer.js').then((m) => m.attachMixer(audio)).catch((err) => console.warn('Pond: mixer failed to load', err));
   const eelToggleRender = bindEelToggle(document.getElementById('eel-toggle'), (v) => eels.setEnabled(v === 'yes'));
   const names = new NameLabels(document.getElementById('eel-names'), view);
   bindNamesToggle(document.getElementById('names-toggle'), (on) => names.setEnabled(on));
+  const moonKnobs = bindJunk({
+    seg: document.getElementById('junk'),
+    moon: document.getElementById('moon'),
+    drawer: document.getElementById('controls-drawer'),
+    cluster: document.querySelector('.chrome-controls'),
+    volumeRows: document.querySelector('.volume-rows'),
+    volumeWrap: document.getElementById('volume-panel'),
+    volumeDock: document.getElementById('volume-dock'),
+  });
+  // jelly-kbd ships focusable button semantics; these caps are decorative labels, not controls.
+  for (const k of document.querySelectorAll('.legend jelly-kbd')) { k.tabIndex = -1; k.removeAttribute('role'); }
   setupIdleFade(root);
   // World x → stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
   const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
@@ -450,7 +461,10 @@ async function boot() {
   // Frame-rate HUD; in debug mode every frame time is kept so pond.stats() can report averages and lows.
   const debug = params.get('debug') === '1';
   const fpsEl = document.getElementById('fps');
-  document.getElementById('backend').textContent = root.dataset.backend === 'webgpu' ? 'WebGPU' : 'WebGL2';
+  const fpsEl2 = document.getElementById('fps2');
+  const backendName = root.dataset.backend === 'webgpu' ? 'WebGPU' : 'WebGL2';
+  document.getElementById('backend').textContent = backendName;
+  document.getElementById('backend2').textContent = backendName;
   let fpsFrames = 0, fpsSince = 0, fpsLastLog = 0;
   const frameTimes = [];
   const fpsStats = () => {
@@ -463,7 +477,7 @@ async function boot() {
   function hud(rawDt, now) {
     fpsFrames++;
     if (now - fpsSince >= 0.5) {
-      fpsEl.textContent = `${Math.round(fpsFrames / (now - fpsSince))} FPS`;
+      fpsEl.textContent = fpsEl2.textContent = `${Math.round(fpsFrames / (now - fpsSince))} FPS`;
       fpsFrames = 0; fpsSince = now;
     }
     if (!debug || t < 3) return;
@@ -627,6 +641,7 @@ async function boot() {
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,
+      moonButton: moonKnobs,
       quality: { get rung() { return gov.rung; }, get ema() { return gov.ema; }, get pinned() { return gov.pinned; }, setRung: (n) => gov.setRung(n) },
       diag: async () => {
         console.log('backend', root.dataset.backend, 'moonDir', U.moonDir.value.toArray().map((v) => v.toFixed(3)).join(' '), 'moonPhase', moon.phase01.toFixed(3), 'wind', U.wind.value.toArray().map((v) => v.toFixed(2)).join(' '));

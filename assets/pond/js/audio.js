@@ -89,9 +89,16 @@ export class PondAudio {
 
   /* Call from a user gesture. Builds the graph and starts the bed. The promise latch matters: two
      gestures racing past a boolean while Tone.start() awaits would build two live graphs. */
-  unlock() {
-    this.unlockP ??= this.buildGraph();
-    return this.unlockP;
+  async unlock() {
+    try {
+      this.unlockP ??= this.buildGraph();
+      await this.unlockP;
+    } catch (err) {
+      // A rejected latch would wedge every later gesture on the same dead promise; clear it to retry.
+      this.unlockP = null;
+      this.onState?.();
+      throw err;
+    }
   }
 
   async buildGraph() {

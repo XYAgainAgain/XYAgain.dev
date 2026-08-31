@@ -55,26 +55,39 @@ html.no-renderer #pond { display: none; }
   z-index: 2;
   transition: opacity var(--fade) ease;
 }
-.chrome-top {
+.chrome-header {
   top: max(14px, env(safe-area-inset-top));
-  right: max(14px, env(safe-area-inset-right));
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.chrome-links {
   left: max(14px, env(safe-area-inset-left));
-  bottom: max(14px, env(safe-area-inset-bottom));
+}
+.header-links {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   max-width: min(60vw, 560px);
 }
-.chrome-legend {
-  right: max(14px, env(safe-area-inset-right));
+/* Anchor shells around the link buttons: the anchor keeps real link semantics (new tab,
+   middle-click, rel=me) while the focus stop lives on the jelly button inside. */
+.link-wrap { display: inline-flex; text-decoration: none; }
+.chrome-controls {
+  left: max(14px, env(safe-area-inset-left));
   bottom: max(14px, env(safe-area-inset-bottom));
-  max-width: min(38vw, 420px);
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+/* The stats live in the header's DOM (so they hide and fade with it) but sit bottom-right on
+   desktop; the mobile query drops them into flow as the header's second line. */
+.chrome-header .stats {
+  position: fixed;
+  inset-inline-end: max(14px, env(safe-area-inset-right));
+  inset-block-end: max(14px, env(safe-area-inset-bottom));
   text-align: right;
+}
+
+/* Jelly components inherit the site face through the theme wrapper's computed font tokens. */
+jelly-theme {
+  --jelly-font-display: var(--font-body);
+  --jelly-font-text: var(--font-body);
 }
 .stats {
   margin-block-end: 0.35em;
@@ -90,76 +103,166 @@ html.is-idle .chrome:focus-within {
   opacity: 1;
 }
 
-.btn-icon {
-  padding: 0.5em;
-  inline-size: 2.5rem;
-  block-size: 2.5rem;
-  justify-content: center;
-}
-.btn-icon svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.btn-icon .spk { fill: currentColor; stroke: none; }
-.btn-icon .mute-x { display: none; }
-#sound[data-state="locked"] .wave, #sound[data-state="muted"] .wave { display: none; }
-#sound[data-state="muted"] .mute-x { display: block; }
-#sound[data-state="locked"] { opacity: 0.75; }
-.btn-tiny {
-  padding-block: 0.2em;
-  padding-inline: 0.6em;
-  font-size: 0.8rem;
-  opacity: 0.8;
-}
-.btn-tiny[aria-pressed="true"] { border-color: rgb(140 255 220 / 0.5); opacity: 1; }
+#sound { --jelly-icon-button-size: 44px; }
+#mute { --jelly-icon-button-size: 28px; --jelly-icon-button-icon-size: 18px; }
+/* Measured 0.8px high in the bubble plus the glyph's top-heavy optics; the nudge splits the difference. */
+#mute svg { translate: 0 1.5px; }
+.spk-btn svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.spk-btn .spk { fill: currentColor; stroke: none; }
+.spk-btn .mute-x { display: none; }
+.spk-btn[data-state="locked"] .wave, .spk-btn[data-state="muted"] .wave { display: none; }
+.spk-btn[data-state="muted"] .mute-x { display: block; }
+.spk-btn[data-state="locked"] { opacity: 0.75; }
 
-.sound { position: relative; display: flex; align-items: center; gap: 6px; }
-/* Dropdown mixer under the sound button. The wrap itself is a transparent hover bridge so the
-   pointer can cross from button to panel without the :hover chain breaking. */
+.sound { position: relative; display: flex; align-items: center; }
+/* The wrap is a transparent hover bridge so the pointer can cross from the sound button
+   to the mixer panel without breaking :hover. */
 .volume-wrap {
   position: absolute;
-  inset-block-start: 100%;
-  inset-inline-end: 0;
-  padding-block-start: 8px;
+  inset-block-end: 100%;
+  inset-inline-start: 0;
+  padding-block-end: 8px;
+  /* Denser glass + z-index so the flyout reads as a layer over whatever sits behind it. */
+  z-index: 3;
   opacity: 0;
   visibility: hidden;
-  translate: 0 -4px;
+  translate: 0 4px;
   transition: opacity 200ms ease, translate 200ms ease, visibility 200ms;
 }
-.sound:hover .volume-wrap,
-.sound:focus-within .volume-wrap { opacity: 1; visibility: visible; translate: 0 0; }
+/* :has() gate: while the Controls drawer is expanded, the mixer never reveals, pinned or hovered. */
+.chrome-controls:not(:has(#controls-drawer[open])) .sound:is(:hover, :focus-within, .pinned) .volume-wrap {
+  opacity: 1;
+  visibility: visible;
+  translate: 0 0;
+}
 .volume-rows {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding-block: 10px;
-  padding-inline: 12px;
+  gap: 6px;
+  padding-block: 12px;
+  padding-inline: 14px;
   border: 1px solid var(--glass-edge);
-  border-radius: 12px;
-  background: var(--glass);
+  border-radius: 16px;
+  background: oklch(12% 0.02 260 / 0.82);
   backdrop-filter: blur(10px);
 }
 .volume-row {
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   font-size: 0.75rem;
   color: var(--ink);
   white-space: nowrap;
 }
 .volume-row:first-child { color: var(--ink-strong); }
-.volume {
-  width: 100px;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
+.volume-row jelly-slider { width: 130px; height: 26px; }
+.vol-label { display: inline-flex; align-items: center; gap: 0.4em; }
 
+/* The controls drawer: same glass as the rest of the chrome, jelly on the inside. 340px is what the
+   widest row (label + 130px slider, or the segmented) actually needs; the caps keep phones honest. */
+.drawer {
+  min-inline-size: min(340px, calc(100vw - 96px));
+  max-inline-size: calc(100vw - 96px);
+  border: 1px solid var(--glass-edge);
+  border-radius: 16px;
+  background: var(--glass);
+  backdrop-filter: blur(10px);
+  color: var(--ink-strong);
+}
+/* Moon mode has no sound button beside the drawer, so it may use the full margin-to-margin width. */
+html[data-junk="none"] .drawer {
+  min-inline-size: min(340px, calc(100vw - 28px));
+  max-inline-size: calc(100vw - 28px);
+}
+.drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.drawer-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.85rem;
+  color: var(--ink-strong);
+}
 .legend {
-  margin: 0;
+  margin: 0.35em 0 0;
+  padding: 0;
+  list-style: none;
   font-size: 0.8rem;
-  line-height: 1.7;
+  line-height: 2;
   color: var(--ink);
 }
-.legend span { white-space: nowrap; }
-.legend span + span::before { content: " · "; opacity: 0.5; }
+.legend li { white-space: normal; }
+.legend jelly-kbd { margin-inline-end: 0.35em; }
+
+/* UI junk modes. none: everything condenses behind the moon; some: the idle fade; tons: always on. */
+html:not([data-junk="none"]) .moon-only { display: none; }
+html:not([data-junk="none"]) #moon { display: none; }
+html[data-junk="none"] :is(.chrome-header, .sound) { display: none; }
+html[data-junk="none"]:not(.moon-open) .drawer { display: none; }
+html[data-junk="tons"].is-idle .chrome { opacity: 1; }
+/* The jelly membrane itself is the moon disc, so the wobble IS the moon; the SVG only adds craters.
+   Full moonlight fill; the idle fade handles the fading, not the color. */
+#moon {
+  --jelly-icon-button-size: 44px;
+  --jelly-icon-button-icon-size: 34px;
+  --jelly-fill: oklch(91% 0.055 95 / 0.92);
+}
+#moon svg { opacity: 0.75; }
+#moon .moon-crater { fill: oklch(58% 0.06 85 / 0.38); }
+/* Craters and the XY wordmark stack in one grid cell over the wobbling disc. */
+#moon::part(button) { display: grid; place-items: center; }
+#moon svg, #moon .moon-xy { grid-area: 1 / 1; }
+.moon-xy {
+  font-weight: 700;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+  color: oklch(16% 0.02 260);
+  /* Providence's glyphs ride high in their em box; nudge to the optical center of the disc. */
+  translate: 0 1px;
+  pointer-events: none;
+  user-select: none;
+}
+/* First-visit discoverability: the moon never idle-fades until it has been clicked once. */
+html[data-junk="none"].moon-unseen.is-idle .chrome-controls { opacity: 1; }
+/* In moon mode the drawer header trades its label for the live stats readout. */
+.head-stats { display: none; font-variant-numeric: tabular-nums; }
+html[data-junk="none"] .head-controls { display: none; }
+html[data-junk="none"] .head-stats { display: inline; }
+/* Popped out, the moon docks on the drawer's top-right corner: the condenser condenses with it.
+   .chrome is already position:absolute, so the cluster is the containing block as-is. */
+html[data-junk="none"].moon-open #moon {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  translate: 35% -35%;
+  z-index: 1;
+}
+/* The moon is the hover target in this mode: it swells (its ripple also deepens, driven in JS)
+   while the Controls header drops its hover wash but keeps its click. */
+#moon { transition: scale 250ms ease; }
+#moon:hover { scale: 1.07; }
+html[data-junk="none"] #controls-drawer::part(header):hover { background: transparent; }
+@media (prefers-reduced-motion: reduce) {
+  #moon { transition: none; }
+  #moon:hover { scale: none; }
+}
+/* The moon must stay findable when it is the only chrome left. */
+html[data-junk="none"].is-idle .chrome-controls { opacity: 0.3; }
+#volume-dock .volume-rows {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  backdrop-filter: none;
+  padding: 0;
+}
+/* Four stupid little buttons, smooshed: kill the small size's 42px min-width so they pack tight. */
+.drawer-links { display: flex; justify-content: center; gap: 6px; }
+.drawer-links jelly-button { --jelly-button-min-width: 0; --jelly-button-padding-inline: 12px; }
 
 /* Name tags ride between the canvas and the chrome, and never eat a click: the pond takes them everywhere. */
 #eel-names {
@@ -210,6 +313,8 @@ html.is-idle .chrome:focus-within {
 .gate[open] {
   display: grid;
   justify-items: center;
+  /* The UA gives dialogs overflow:auto; visible kills the scrollbar and lets the jelly wobble breathe. */
+  overflow: visible;
 }
 .gate::backdrop { background: oklch(5% 0.01 260 / 0.35); }
 .gate-text {
@@ -239,10 +344,27 @@ html.is-idle .chrome:focus-within {
 }
 
 @media (max-width: 720px) {
-  .chrome-links { max-width: calc(100vw - 28px); bottom: calc(max(14px, env(safe-area-inset-bottom)) + 74px); }
-  .chrome-legend { left: 14px; right: 14px; max-width: none; text-align: left; }
+  .header-links { max-width: calc(100vw - 28px); }
+  .header-links .lbl-full { display: none; }
+  .header-links .lbl-mini { display: inline; }
+  /* Narrow screens: the stats become the header's own second line instead of a floating corner. */
+  .chrome-header .stats { position: static; text-align: left; margin-block: 8px 0; }
   .legend { font-size: 0.75rem; }
   .gate-text { font-size: 1.05rem; }
+}
+.lbl-mini { display: none; }
+
+/* Short viewports: the drawer scrolls inside itself. Clip x and reserve the gutter, or a classic
+   scrollbar steals 15px of inline space and the fixed-width slider rows spawn a horizontal bar. */
+@media (max-height: 560px) {
+  .drawer-body {
+    max-block-size: 55dvh;
+    overflow-y: auto;
+    overflow-x: clip;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    overscroll-behavior: contain;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

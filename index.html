@@ -28,6 +28,7 @@
 </head>
 <body>
     <main id="stage">
+        <jelly-theme mode="dark" accent="amber">
         <canvas id="pond" role="img" aria-label="A moonlit pond seen from above, with eels."></canvas>
 
         <div id="fallback" class="fallback" aria-hidden="true">
@@ -39,58 +40,102 @@
         <dialog id="gate" class="gate" aria-labelledby="gate-title">
             <p id="gate-title" class="gate-text">Howdy pardner. Welcome to XYAgain.dev, where <br> Sam Atwood will soon display his creative projects.<br>Before we go any further, how do you feel about eels?</p>
             <div class="gate-actions">
-                <button type="button" class="btn" data-eels="yes">Eels are cool</button>
-                <button type="button" class="btn" data-eels="no">Not a fan</button>
+                <jelly-button size="small" variant="platinum" data-eels="yes">Eels are cool</jelly-button>
+                <jelly-button size="small" variant="platinum" data-eels="no">Not a fan</jelly-button>
             </div>
         </dialog>
 
         <div id="eel-names" aria-hidden="true"></div>
 
-        <div class="chrome chrome-top">
-            <button id="eel-toggle" type="button" class="btn btn-tiny" aria-pressed="false">eels: off</button>
-            <button id="names-toggle" type="button" class="btn btn-tiny" aria-pressed="false">names: off</button>
-            <div class="sound">
-                <button id="sound" type="button" class="btn btn-icon" aria-pressed="false" aria-label="Turn sound on" title="Sound">
-                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
-                        <path class="spk" d="M4 9v6h4l5 4V5L8 9H4z"/>
-                        <path class="wave wave-1" d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/>
-                        <path class="wave wave-2" d="M17.5 7a7 7 0 0 1 0 10"/>
-                        <path class="mute-x" d="M16 9l5 6M21 9l-5 6"/>
-                    </svg>
-                </button>
-                <div class="volume-wrap" id="volume-panel">
-                    <div class="volume-rows">
-                        <label class="volume-row"><span>Master</span>
-                            <input id="volume" type="range" min="0" max="100" value="50" class="volume"></label>
-                        <label class="volume-row"><span>Ambience</span>
-                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="ambience"></label>
-                        <label class="volume-row"><span>Eel Sounds</span>
-                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="eel"></label>
-                        <label class="volume-row"><span>Environmental SFX</span>
-                            <input type="range" min="0" max="100" value="100" class="volume" data-bus="env"></label>
+            <header class="chrome chrome-header">
+                <nav class="header-links" aria-label="Elsewhere">
+                    <a class="link-wrap" href="https://github.com/XYAgainAgain" target="_blank" rel="me noopener" tabindex="-1"><jelly-button size="small" variant="platinum" label="GitHub"><img class="btn-mark" src="assets/shared/svg/GitHub_Invertocat_White.svg" alt="" width="18" height="18"><span class="lbl-full">GitHub</span><span class="lbl-mini">GH</span></jelly-button></a>
+                    <a class="link-wrap" href="https://tkb.band/" target="_blank" rel="noopener" tabindex="-1"><jelly-button size="small" variant="platinum" label="TKB.band"><span class="lbl-full">TKB.band</span><span class="lbl-mini">TKB</span></jelly-button></a>
+                    <a class="link-wrap" href="https://ko-fi.com/xyagain" target="_blank" rel="noopener" tabindex="-1"><jelly-button size="small" variant="platinum">Ko-fi</jelly-button></a>
+                    <a class="link-wrap" href="mailto:sam@xyagain.dev" target="_blank" tabindex="-1"><jelly-button size="small" variant="platinum" label="Email Sam"><span class="lbl-full">sam@xyagain.dev</span><span class="lbl-mini">email</span></jelly-button></a>
+                </nav>
+                <p class="stats" aria-hidden="true"><span id="fps">-- FPS</span> <span id="backend"></span></p>
+            </header>
+
+            <div class="chrome chrome-controls">
+                <div class="sound">
+                    <jelly-icon-button id="sound" class="spk-btn" shape="circle" variant="platinum" label="Turn sound on" title="Sound">
+                        <svg viewBox="3 2 20 20" width="20" height="20" aria-hidden="true" focusable="false">
+                            <path class="spk" d="M4 9v6h4l5 4V5L8 9H4z"/>
+                            <path class="wave wave-1" d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/>
+                            <path class="wave wave-2" d="M17.5 7a7 7 0 0 1 0 10"/>
+                            <path class="mute-x" d="M16 9l5 6M21 9l-5 6"/>
+                        </svg>
+                    </jelly-icon-button>
+                    <div class="volume-wrap" id="volume-panel">
+                        <div class="volume-rows">
+                            <label class="volume-row"><span class="vol-label">All
+                                <jelly-icon-button id="mute" class="spk-btn" shape="circle" label="Mute">
+                                    <svg viewBox="3 2 20 20" width="18" height="18" aria-hidden="true" focusable="false">
+                                        <path class="spk" d="M4 9v6h4l5 4V5L8 9H4z"/>
+                                        <path class="wave wave-1" d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/>
+                                        <path class="wave wave-2" d="M17.5 7a7 7 0 0 1 0 10"/>
+                                        <path class="mute-x" d="M16 9l5 6M21 9l-5 6"/>
+                                    </svg>
+                                </jelly-icon-button></span>
+                                <jelly-slider id="volume" min="0" max="100" value="50" size="small" label="All volume"></jelly-slider></label>
+                            <label class="volume-row"><span>Ambience</span>
+                                <jelly-slider min="0" max="100" value="100" size="small" label="Ambience volume" data-bus="ambience"></jelly-slider></label>
+                            <label class="volume-row"><span>Eel Sounds</span>
+                                <jelly-slider min="0" max="100" value="100" size="small" label="Eel sounds volume" data-bus="eel"></jelly-slider></label>
+                            <label class="volume-row"><span>Environmental SFX</span>
+                                <jelly-slider min="0" max="100" value="100" size="small" label="Environmental SFX volume" data-bus="env"></jelly-slider></label>
+                        </div>
                     </div>
                 </div>
+                <jelly-collapsible id="controls-drawer" class="drawer" size="small">
+                    <span slot="header" class="drawer-head">
+                        <span class="head-controls">Controls</span>
+                        <span class="head-stats" aria-hidden="true"><span id="fps2">-- FPS</span> <span id="backend2"></span></span>
+                    </span>
+                    <div class="drawer-body">
+                        <div class="drawer-row"><span>UI junk</span>
+                            <jelly-segmented id="junk" size="small" value="some" label="UI junk">
+                                <jelly-segment value="none">none</jelly-segment>
+                                <jelly-segment value="some">some</jelly-segment>
+                                <jelly-segment value="tons">tons</jelly-segment>
+                            </jelly-segmented></div>
+                        <label class="drawer-row"><span>Eels</span>
+                            <jelly-switch id="eel-toggle" label="Eels"></jelly-switch></label>
+                        <label class="drawer-row"><span>Name tags</span>
+                            <jelly-switch id="names-toggle" label="Name tags"></jelly-switch></label>
+                        <ul class="legend" aria-label="Pointer controls">
+                            <li><jelly-kbd size="small">left-click</jelly-kbd> poke</li>
+                            <li><jelly-kbd size="small">left-drag</jelly-kbd> swish</li>
+                            <li><jelly-kbd size="small">right-click</jelly-kbd> give treato</li>
+                            <li><jelly-kbd size="small">right-drag</jelly-kbd> lil treatos</li>
+                            <li><jelly-kbd size="small">middle-click</jelly-kbd> recolor</li>
+                            <li><jelly-kbd size="small">touch</jelly-kbd> 2 fingers = right, 3 = middle</li>
+                        </ul>
+                        <jelly-divider content="sounds" size="small" class="moon-only"></jelly-divider>
+                        <div id="volume-dock" class="moon-only"></div>
+                        <jelly-divider content="elsewhere" size="small" class="moon-only"></jelly-divider>
+                        <nav class="drawer-links moon-only" aria-label="Elsewhere">
+                            <a class="link-wrap" href="https://github.com/XYAgainAgain" target="_blank" rel="me noopener" tabindex="-1"><jelly-button size="small" variant="platinum" label="GitHub"><img class="btn-mark" src="assets/shared/svg/GitHub_Invertocat_White.svg" alt="" width="14" height="14">GH</jelly-button></a>
+                            <a class="link-wrap" href="https://tkb.band/" target="_blank" rel="noopener" tabindex="-1"><jelly-button size="small" variant="platinum" label="TKB.band">TKB</jelly-button></a>
+                            <a class="link-wrap" href="https://ko-fi.com/xyagain" target="_blank" rel="noopener" tabindex="-1"><jelly-button size="small" variant="platinum" label="Ko-fi">Ko-fi</jelly-button></a>
+                            <a class="link-wrap" href="mailto:sam@xyagain.dev" target="_blank" tabindex="-1"><jelly-button size="small" variant="platinum" label="Email Sam">email</jelly-button></a>
+                        </nav>
+                    </div>
+                </jelly-collapsible>
+                <jelly-icon-button id="moon" shape="circle" label="Pond controls" title="Pond controls">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <circle class="moon-crater" cx="8.2" cy="8.6" r="2.1"/>
+                        <circle class="moon-crater" cx="15" cy="13.8" r="2.7"/>
+                        <circle class="moon-crater" cx="9.8" cy="16" r="1.3"/>
+                        <circle class="moon-crater" cx="15.8" cy="7.6" r="1.2"/>
+                        <circle class="moon-crater" cx="6.4" cy="13" r="0.9"/>
+                    </svg>
+                    <span class="moon-xy" aria-hidden="true">XY</span>
+                </jelly-icon-button>
             </div>
-        </div>
 
-        <nav class="chrome chrome-links" aria-label="Elsewhere">
-            <a class="btn" href="https://github.com/XYAgainAgain" target="_blank" rel="me noopener"><img class="btn-mark" src="assets/shared/svg/GitHub_Invertocat_White.svg" alt="" width="18" height="18">GitHub</a>
-            <a class="btn" href="https://tkb.band/" target="_blank" rel="noopener">TKB.band</a>
-            <a class="btn" href="https://ko-fi.com/xyagain" target="_blank" rel="noopener">Ko-fi</a>
-            <a class="btn" href="mailto:sam@xyagain.dev" target="_blank">sam@xyagain.dev</a>
-        </nav>
-
-        <footer class="chrome chrome-legend">
-            <p class="stats" aria-hidden="true"><span id="fps">-- FPS</span> <span id="backend"></span></p>
-            <p class="legend" aria-label="Pointer controls">
-                <span>click: poke</span>
-                <span>drag: finger through</span>
-                <span>right-click: feed</span>
-                <span>right-drag around eels: corral</span>
-                <span>middle-click: recolor</span>
-                <span>touch: 2 fingers = right, 3 = middle</span>
-            </p>
-        </footer>
+        </jelly-theme>
     </main>
 
     <noscript>
@@ -99,6 +144,7 @@
         </div>
     </noscript>
 
+    <script type="module" src="assets/pond/vendor/jelly/jelly.js"></script>
     <script type="module" src="assets/pond/js/main.js"></script>
 </body>
 </html>
