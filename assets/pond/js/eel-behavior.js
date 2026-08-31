@@ -48,6 +48,7 @@ function initQuirkState(e) {
   e.cuddle = { with: null, until: 0 };
   e.singAt = 0;
   e.snapAt = 0;
+  e.shipAt = 0;
   e.stuckAt = NOT_STUCK;
   e.gaitFrom = e.gaitFrom ?? 0;
   if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
@@ -87,6 +88,8 @@ export function pickTarget(sys, e, now) {
   // existing roll: no extra targets, no extra rolls, nothing new to simulate.
   const env = sys?.rain?.envelope ?? 0;
   const act = 1 + 0.35 * env;
+  // The kettle outranks the log: a due cup keeps the tea drinker out of the bore until it is drunk.
+  if (e.quirks.tea && sys?.tea?.pickTarget(sys, e, now)) return;
   // Tunnel runs: a good share of the time the next destination is one log mouth, then the other.
   // Crowded cover loses its appeal, and a laired guest closes the log to everyone but her admirer.
   const log = e.colliders.logs[0];
@@ -561,6 +564,18 @@ export function steer(sys, e, dt) {
     if (d < 2 && e.gait === 'hold') { e.gaitUntil = Math.min(e.gaitUntil, now); e.snuggle.with = null; }   // a finger nearby wakes a napper
   }
 
+  // Matthew's whole heart, geometrically: the beloved is whoever is closest, re-surveyed on a slow
+  // clock, and the moment someone nearer drifts by it transfers instantly and without ceremony.
+  if (e.quirks.shipsNearest && now >= e.shipAt) {
+    e.shipAt = now + 2;
+    let pick = null, pd = Infinity;
+    for (const o of e.flock) {
+      if (o === e || o.slurpedBy) continue;
+      const d = Math.hypot(o.head.x - head.x, o.head.z - head.z);
+      if (d < pd) { pd = d; pick = o; }
+    }
+    e.partner = pick;
+  }
   // Bonded following: drift toward the partner when the gap opens; never overrides a run or a meal.
   if (e.partner && !e.tunnel && !e.food) {
     const dx = e.partner.head.x - head.x, dz = e.partner.head.z - head.z;
@@ -708,6 +723,7 @@ export function steer(sys, e, dt) {
   } else if (e.food) { e.food = null; }
   // Grazing is another builder's module and may not be wired yet; everything here works without it.
   if (e.quirks.graze && sys.graze) sys.graze.tick(sys, e, dt);
+  if (e.quirks.tea && sys.tea) sys.tea.tick(sys, e, dt);
   // The table clears and Bee keeps circling it for a while.
   if (e.census.party === 'snacks' && hadFood && !e.food) {
     e.snack.x = hadFood.x; e.snack.z = hadFood.z;
@@ -827,7 +843,8 @@ export function steer(sys, e, dt) {
 
   // Deep rest reads last tick's bout, same one-tick lag as the pose and loop states above.
   const deepHold = e.gait === 'hold' && now < e.gaitUntil && e.gaitUntil - e.gaitFrom > 5;
-  const asleep = deepHold && e.census.twoAM === 'asleep' && !e.tunnel && !e.food && !e.pose.kind;
+  // A long sip parks him in a hold too, but tea is drunk at the surface, never half-buried.
+  const asleep = deepHold && e.census.twoAM === 'asleep' && !e.tunnel && !e.food && !e.pose.kind && e.coverSpot?.type !== 'tea';
   const forced = force.x * force.x + force.z * force.z > 1e-6;
   // At rest the grid comes off, so the coil can be a real spiral instead of a staircase.
   const resting = (e.gait === 'hold' && !e.food && !(snug && snugFar)) || !!e.pose.kind;

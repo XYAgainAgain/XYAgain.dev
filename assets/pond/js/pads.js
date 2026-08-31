@@ -702,6 +702,15 @@ export class PadSystem {
 
   canBite(i) { const p = this.pads[i]; return !!p && !p.graze && !p.flower && p.r > 0.01 && p.notchHalf < BITE_NOTCH_MAX; }
 
+  /* Tea, public: the notch mouth in world space, null while the pad is grazed away or too small.
+     The notch faces the crown; `notch` is the gape half-angle, for preferring a well-torn spout. */
+  sipSpot(i) {
+    const p = this.pads[i];
+    if (!p || p.graze || p.r < 0.3) return null;
+    const d = p.r * (1 - p.notchDepth * 0.5);
+    return { x: p.x + Math.cos(p.rot) * d, z: p.z + Math.sin(p.rot) * d, notch: p.notchHalf };
+  }
+
   /* Eaten whole: the disc shrinks away, then a new leaf unrolls from the same petiole over an orbit. */
   eatPad(i) {
     if (!this.canEat(i)) return false;

@@ -11,6 +11,7 @@ import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
 import { attachEleanor } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
+import { TeaTime } from './eel-tea.js';
 import { IDENTITIES } from './eel-identity.js';
 import { growEel } from './eel-physics.js';
 import { SurfacePass } from './surface.js';
@@ -227,6 +228,10 @@ async function boot() {
   // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
   eels.graze = new Grazing({ floaters, algae, pads, habitat });
+  eels.tea = new TeaTime({ pads });
+  eels.knobs.tea = eels.tea.knobs;   // pond.eels.knobs.tea.<dial>, tuned live
+  eels.on('tea', (ev) => audio.sip({ pan: ev.pan, step: ev.food?.step ?? 0 }));
+  eels.on('eat', (ev) => eels.tea.onMeal(ev));
   habitat.composeCover(sim);
   // Reseeds the algae field with the rocks, logs, and this first cover bake all known.
   wake.setSubstrate(colliders);
@@ -618,7 +623,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, algae, textures,
+      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

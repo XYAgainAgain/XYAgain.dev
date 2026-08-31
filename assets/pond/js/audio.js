@@ -16,9 +16,10 @@ const SETS = {
   slurps: seq('sfx/slurp', 4),
   shortBubs: seq('sfx/short-bubs', 5),
   tinyBubs: seq('sfx/tiny-bubs', 8),
+  sips: ['sfx/sippy.ogg'],
 };
 // Sounds the eels make ride the eel bus; player-made water and pond environment ride env.
-const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', 'tinyBubs']);
+const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', 'tinyBubs', 'sips']);
 // Rain's lowpass sweep: a shut-in patter at the first drops, wide open in a downpour.
 const RAIN_LP = [700, 7000];
 
@@ -30,7 +31,7 @@ const DEFAULT_MIX = {
     plip: -5, swish: -1.5, plopBig: -2, plopSmol: -2,
     startle: -10, eleanorStartle: -8,
     crackleLil: -2.5, crackleMed: -2.5, crackleBig: -2.5,
-    eat: -3, slurp: -3, tinyBub: -18, shortBub: -15,
+    eat: -3, slurp: -3, tinyBub: -18, shortBub: -15, sip: 4,
     drip: -17, padSettle: -8,
   },
 };
@@ -276,6 +277,13 @@ export class PondAudio {
   }
 
   slurp({ pan = null } = {}) { this.pick('slurps', 'slurp', { jitter: 0.2, trim: true, pan }); }
+
+  /* Matthew at the notch. One "sshpp" per sip, pitch-and-time squished by playbackRate: a wide random
+     spread plus a climb through the cup (`step` counts sips since the cup began), so no two land alike. */
+  sip({ pan = null, step = 0 } = {}) {
+    const rate = 1.0 + Math.min(0.35, step * 0.07) + Math.random() * 0.25;
+    if (!this.shot('sips', 0, 'sip', { jitter: 0.15, rate, pan })) this.pick('shortBubs', 'shortBub', { db: -4, jitter: 0.35, rate: 1.4, pan });
+  }
 
   /* Chandler's song: pentatonic big-plops walking up then back down, forced onto the eel bus because
      it is a creature making it, not the water. Scheduled ahead so the phrase survives a busy frame. */

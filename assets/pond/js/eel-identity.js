@@ -14,6 +14,8 @@ const SILVER = [0.78, 0.82, 0.90];
 const PINK = [1.00, 0.40, 0.68], NEON_GREEN = [0.45, 1.00, 0.10], TURQUOISE = [0.15, 0.90, 0.82];
 const LIME_YELLOW = [0.80, 1.00, 0.15], MILLENNIAL_PINK = [1.00, 0.62, 0.60], GOLDENROD = [0.92, 0.66, 0.10];
 const GOLD = [1.00, 0.84, 0.25], BLACK = [0, 0, 0];
+// Matthew's census pair, stalker camo: dark-leaning but still lit, two variants each for variety.
+const FOREST = [0.10, 0.62, 0.20], MOSS = [0.30, 0.85, 0.25], DEEP_BLUE = [0.12, 0.32, 0.95], LAKE = [0.22, 0.55, 1.00];
 const POOL = [TEAL, MAGENTA, BLUE, YELLOW, ORANGE, PURPLE, GREEN, RED];
 // The tablecloth's two most saturated bands; only the fallback and the guest capsules still read these.
 const CLOTH_NAVY = [0.2784, 0.3216, 0.4471], CLOTH_EMBER = [0.7333, 0.3137, 0.2353];
@@ -31,14 +33,17 @@ const DEFAULT_BUILD = { length: [1.6, 3.4], radius: [0.07, 0.12] };
 
 export const IDENTITIES = [
   {
-    name: 'Matthew',   // long, skinny, blue-green, racing stripes (a former mountain bike racer); snacks constantly; log lover
+    name: 'Matthew',   // forest-and-lake stalker camo (a former mountain bike racer); tea with every rest,
+                       // a chaos wardrobe, and a heart that belongs to whoever is currently closest
     pronouns: 'he/him',
     nicks: [['Matthew', 80], ['Thew', 20]],
-    build: { length: [2.8, 3.3], radius: [0.065, 0.08] },
-    colorsA: [TEAL, GREEN], colorsB: [BLUE, TEAL],
-    // Two kits: racing decals most visits, Eleanor-style ridge lights in his own teal the rest (sometimes both).
-    pattern: { stripe: [0, 0, 0], race: [0.65, 0.8, 1], ridge: [0.6, 0.7, 1], spot: [0.3, 0.2, 0.5], flank: [0.5, 0.3, 0.6], wavy: [0.5, 1.8] },
-    traits: { hunger: 1.5, cover: 1.5 },
+    build: { length: [2.8, 3.3], radius: [0.08, 0.095] },   // still the racer silhouette, bulked up a bit
+    colorsA: [FOREST, MOSS], colorsB: [DEEP_BLUE, LAKE],
+    chaos: true,   // the census draw lives in chaosKit: splotches, sheen, or the whole closet
+    glow: [0, 1, 0, 0],
+    traits: { hunger: 1.5, cover: 1.5, persistence: 2.2, holdChance: 0.8, holdTime: [8, 25] },
+    census: { startle: 'freeze', hunt: 'stalk', party: 'corner', twoAM: 'asleep' },
+    quirks: { gourmet: true, tea: true, shipsNearest: true, followWeight: 0.4 },
   },
   {
     name: 'Jaz',   // turquoise and purple, spotted and mottled; chunky, calm, slow breather;
@@ -315,9 +320,21 @@ export function rollNickname(e, id, rng) {
   e.nick = nicks[nicks.length - 1][0];
 }
 
+// Matthew's answers, split 33:33:34 stated:stated:any. The closet is every shipped family at equal odds.
+const CLOSET = ['stripe', 'spot', 'band', 'race', 'plaid', 'ridge', 'flank'];
+function chaosKit(rng) {
+  const u = rng.next();
+  if (u < 0.33) return { stripe: [0, 0, 0], spot: [1, 0.5, 0.9], flank: [0.8, 0.3, 0.7], wavy: [0, 1.4] };   // splotches
+  if (u < 0.66) return { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [1, 0.1, 0.25], wavy: [0, 1] };   // near-solid, subtle sheen
+  const kit = { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 3] };
+  kit[rng.pick(CLOSET)] = [1, 0.6, 1];
+  if (kit.band) kit.repeats = [2.5, 5];   // banded at repeats 1 on a two-stop ramp splits the body in half
+  return kit;
+}
+
 /* Pattern spec per family is [chance, lo, hi]: the chance gates the family, lo–hi bounds its weight. */
 export function rollIdentityPattern(e, id, rng) {
-  const p = id.pattern;
+  const p = id.chaos ? chaosKit(rng) : id.pattern;
   const roll = ([c, lo, hi]) => (rng.chance(c) ? rng.range(lo, hi) : 0);
   e.stripeFreq = rng.range(4, 14);
   e.spotFreq = rng.range(6, 16);
@@ -334,7 +351,7 @@ export function rollIdentityPattern(e, id, rng) {
   e.wavy = rng.range(p.wavy[0], p.wavy[1]);
   e.pulseRate = rng.range(1.5, 4);
   // Same rule as band: no draw unless the identity asks, so the old residents keep their rng streams.
-  const rep = id.ramp?.repeats;
+  const rep = id.ramp?.repeats ?? p.repeats;
   e.repeats = rep ? rng.range(rep[0], rep[1]) : 1;
   e.glowMode = new THREE.Vector4(...(id.glow ?? STEADY_PULSE));
   if (e.flagBands) { e.wStripe = e.wSpot = e.wRace = e.wPlaid = e.wRidge = e.wFlank = 0; e.wBand = 1; e.repeats = 1; }

@@ -17,3 +17,4 @@ All files OGG Opus under `assets/pond/audio/`. A file that fails to load warns o
 | `sfx/slurp-1..4.ogg` | The BIG SLURP | Random pick, pitch + trim variance, when Eleanor inhales a resident |
 | `sfx/short-bubs-1..5.ogg` | Pond bubbles | Stray ambient bubble every 7–20 s with a tiny ripple in view |
 | `sfx/tiny-bubs-1..8.ogg` | Eel bubbles | Nibbling at crumbs and Eleanor's shallow swim-bys |
+| `sfx/sippy.ogg` | Matthew's tea sip | One “sshpp” per sip at a pad notch; playbackRate squishes pitch and time together, random spread plus a climb through each cup |

@@ -93,7 +93,7 @@ export class Eel {
 }
 
 // The shim fans out across every type the pond emits; a new event type belongs here too.
-const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble', 'swap', 'sing', 'headbutt', 'rescue', 'graze'];
+const EVENT_TYPES = ['startle', 'eat', 'slurp', 'nibble', 'swap', 'sing', 'headbutt', 'rescue', 'graze', 'tea'];
 
 export class EelSystem {
   constructor(scene, U, shading, seed, extent, colliders, sim, motion, view, opts = {}) {
@@ -114,6 +114,7 @@ export class EelSystem {
     this.rain = null;              // the shower scheduler, one shared reference: behavior reads its envelope
     this.habitat = null;           // the cover registry; pads become loiter targets once it is set
     this.graze = null;             // the herbivore menu (eel-graze.js); behavior calls it only for grazers
+    this.tea = null;               // Matthew's kettle (eel-tea.js); behavior calls it only for tea drinkers
     this.feedRecent = 0;           // decaying feed-spree meter; the residents eat too fast for a stock check
     this.spooks = [];              // { x, z, t, strength }
     this.lures = [];               // curiosity points from drags: { x, z, t }

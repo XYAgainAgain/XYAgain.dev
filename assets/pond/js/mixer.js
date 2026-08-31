@@ -20,6 +20,7 @@ const ROWS = [
   { key: 'crackleBig', label: 'crackle big', fire: (a) => a.crackle('big', { force: true }) },
   { key: 'eat', label: 'eel eat', multi: [['1', (a) => a.eat(1)], ['2', (a) => a.eat(2)], ['3', (a) => a.eat(3)]] },
   { key: 'slurp', label: 'slurp', fire: (a) => a.slurp() },
+  { key: 'sip', label: 'tea sip', multi: [['1', (a) => a.sip({ step: 0 })], ['4', (a) => a.sip({ step: 3 })], ['8', (a) => a.sip({ step: 7 })]] },
   { key: 'tinyBub', label: 'tiny bubs', fire: (a) => a.tinyBub() },
   { key: 'shortBub', label: 'short bubs', fire: (a) => a.shortBub() },
   { key: 'drip', label: 'pad drip', fire: (a) => a.drip() },
