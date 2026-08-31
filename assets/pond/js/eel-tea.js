@@ -1,6 +1,5 @@
-/* Matthew's kettle. The census MUST ("must be drinking tea"): he sips at lily pad notches, snoot
-   poked up under the slit where rain runs off the leaf. A cup whenever it rains, one before every
-   deep rest and another on waking, and a one-in-four nightcap after a meal. Two hooks, from steer. */
+/* Matthew's kettle, shared by every tea-quirk eel: sips at lily pad notches when it rains, before and
+   after deep rests, and one-in-four after a meal (a grazer's finished tuft or pad counts). Two hooks, from steer. */
 
 const LEAD = 0.9;     // steering target rides past the notch; arrival is measured at the notch itself
 const REACH = 8;      // no pad past this is worth the swim
@@ -97,9 +96,9 @@ export class TeaTime {
     if (st.wasDeep && (e.gait !== 'hold' || now >= e.gaitUntil)) { st.wasDeep = false; if (!st.want) st.want = 'wake'; }
     const env = sys.rain?.envelope ?? 0;
     if (!st.want && env > k.rainOn && now >= st.breakUntil) st.want = 'rain';
-    // A due cup with no trip started yet expedites the next retarget, where hook one takes over.
-    // The live-crumb guard mirrors hook one's, or this would re-expedite every tick through a meal.
-    if (st.want && st.padIdx < 0 && now >= st.breakUntil && !e.food && !e.tunnel && !sys.foods.some((f) => f.amount > 0)) {
+    // A due cup with no trip yet expedites the next retarget. The crumb guard mirrors hook one's;
+    // the graze guard lets a tea-drinking grazer (Morgan) finish her salad before the kettle calls.
+    if (st.want && st.padIdx < 0 && now >= st.breakUntil && !e.food && !e.tunnel && e.coverSpot?.type !== 'graze' && !sys.foods.some((f) => f.amount > 0)) {
       e.retargetAt = Math.min(e.retargetAt, now);
     }
 

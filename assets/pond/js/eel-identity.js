@@ -117,7 +117,7 @@ export const IDENTITIES = [
   },
   {
     name: 'Morgan',   // green and yellow, spotted with a solid sheen; an herbivore who files a scare
-                      // away to worry about later, hugs the exits, and crushes on Jaz
+                      // away to worry about later, hugs the exits, crushes on Jaz, and sips tea like Matthew
     pronouns: 'they/she',
     nicks: [['Morgan', 60], ['Mubgub', 20], ['Mubulous Gubulon', 20]],
     build: { length: [2.0, 2.4], radius: [0.095, 0.11] },
@@ -127,7 +127,7 @@ export const IDENTITIES = [
     glow: [0, 1, 1, 0],   // breathe and pulse together; the envelope normalizes by the weight sum
     traits: { curious: 0.85, cover: 1.1, hunger: 0.5 },
     census: { startle: 'later', hunt: 'bonk', party: 'exits', twoAM: 'cozy' },
-    quirks: { follows: 'Jaz', followWeight: 0.25, rescue: true, loopies: true, graze: true, herbivore: true, floor: true },
+    quirks: { follows: 'Jaz', followWeight: 0.25, rescue: true, loopies: true, graze: true, herbivore: true, floor: true, tea: true },
   },
   {
     name: 'Vi',   // Violet, who jives with Vi; purple over black, all splotches, a restless flicker; loud,

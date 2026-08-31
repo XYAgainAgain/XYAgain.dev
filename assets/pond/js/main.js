@@ -243,6 +243,8 @@ async function boot() {
   eels.knobs.tea = eels.tea.knobs;   // pond.eels.knobs.tea.<dial>, tuned live
   eels.on('tea', (ev) => audio.sip({ pan: ev.pan, step: ev.food?.step ?? 0 }));
   eels.on('eat', (ev) => eels.tea.onMeal(ev));
+  // A finished graze meal earns the nightcap roll too; per-bite furrow events would over-queue cups.
+  eels.on('graze', (ev) => { if (!ev.food?.bite) eels.tea.onMeal(ev); });
   habitat.composeCover(sim);
   // Reseeds the algae field with the rocks, logs, and this first cover bake all known.
   wake.setSubstrate(colliders);
