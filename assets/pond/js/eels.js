@@ -129,6 +129,7 @@ export class EelSystem {
     this.knobs.jelly = this.renderer.jellyU;   // pond.eels.knobs.jelly.<dial>.value, tuned live
     this.group = this.renderer.group;
     // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.
+    this.debug = !!opts.debug;
     this.hotSwap = !opts.cast;   // null means no ?cast= at all; [] is a bare ?cast= that pins the seeded draw
     const cast = drawCast(seed, opts.cast ?? []);
     for (let i = 0; i < cast.length; i++) {
@@ -327,6 +328,7 @@ export class EelSystem {
     collide(all, this.colliders);
     for (const e of all) if (!e.slurpedBy) constrain(e);
     for (const e of all) if (!e.slurpedBy) rememberPushes(e);
+    if (this.debug) this.sweepNaN(all);
     // Food sinks slowly, then rests on the sand; spent crumbs disappear.
     for (let i = this.foods.length - 1; i >= 0; i--) {
       const f = this.foods[i];
@@ -337,6 +339,20 @@ export class EelSystem {
     expire(this.spooks, this.time, 1.6);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
+  }
+
+  /* Debug-only tripwire: a NaN anywhere in a chain spreads through constrain() and the eel simply
+     vanishes; Eleanor's first depart once hid that way for a whole rescue cycle. Warns once per eel. */
+  sweepNaN(all) {
+    for (const e of all) {
+      let sum = 0;
+      for (const p of e.pts) sum += p.x + p.y + p.z;
+      if (Number.isFinite(sum)) { e.nanWarned = false; continue; }
+      if (e.nanWarned) continue;
+      e.nanWarned = true;
+      const i = e.pts.findIndex((p) => !Number.isFinite(p.x + p.y + p.z));
+      console.warn(`[eels] ${e.name ?? 'guest'} chain went NaN at point ${i} (t=${this.time.toFixed(2)})`, e);
+    }
   }
 
   dispose() { this.renderer.dispose(this.eels.concat(this.guests)); }

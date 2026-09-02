@@ -115,7 +115,7 @@ async function boot() {
   // ?cast=jim,shelley pins those residents in first and freezes the off-screen rotation for testing;
   // a bare ?cast= freezes the seeded draw as-is.
   const cast = params.has('cast') ? (params.get('cast') ?? '').split(',').map((s) => s.trim()).filter(Boolean) : null;
-  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view, { cast });
+  const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view, { cast, debug: params.get('debug') === '1' });
   const eleanor = attachEleanor(eels, seed);
   const effects = new UnderwaterEffectsPool();
   underScene.add(effects.mesh);

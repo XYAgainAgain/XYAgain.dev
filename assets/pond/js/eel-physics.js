@@ -6,6 +6,7 @@ export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit 
 const OFF_DECAY = Math.exp(-2.5 * TICK);
 const SLIP_POINTS = 4;   // how far back the head's slip reaches; behind it the body takes full pushes
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
+let near = new Uint8Array(0);   // per-tick pair cull scratch, grown to the cast size
 
 export function segDist(px, pz, ax, az, bx, bz) {
   const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9;
@@ -118,6 +119,7 @@ export function rememberPushes(e) {
 export function collide(eels, colliders) {
   const floorY = -DEPTH;
   const { spheres, logs } = colliders;
+  if (near.length < eels.length) near = new Uint8Array(eels.length);
   // Bounding sphere per eel so distant pairs skip the 24×24 point test.
   for (const e of eels) {
     const c = e.pts[EEL_POINTS >> 1];
@@ -125,65 +127,66 @@ export function collide(eels, colliders) {
     for (const p of e.pts) r2 = Math.max(r2, p.distanceToSquared(c));
     e.boundR = Math.sqrt(r2) + e.radius;
   }
-  for (let pass = 0; pass < 1; pass++) {
-    for (let a = 0; a < eels.length; a++) {
-      const ea = eels[a];
-      if (ea.slurpedBy) continue;
-      const ca = ea.pts[EEL_POINTS >> 1];
-      // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
-      // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
-      const slip = ea.slip ?? 1;
-      for (let i = 0; i < EEL_POINTS; i++) {
-        const p = ea.pts[i];
-        const r = ea.radius;
-        const soft = i === 0 ? 0.35 : 1;   // the head eases out of contact; a full shove kinks the trail
-        const glance = i < SLIP_POINTS ? slip : 1;
-        // Rock and log colliders both sit proud of what they draw (the log's is a crest-plus-bend
-        // envelope), so a slippery snout may take a small bite out of one before the push counts.
-        const sink = (1 - glance) * r * 0.35;
-        if (p.y < floorY + r + 0.08) p.y = floorY + r + 0.08;   // floor has bumps up to ~0.08
-        if (p.y > -r * 0.5) p.y = -r * 0.5;
-        for (const s of spheres) {
-          // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
-          // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
-          const sr = s.rHit ?? s.r, ky = sr / (s.ryHit ?? sr);
-          const dx = p.x - s.x, dy = s.y + sr > -r * 2 ? 0 : (p.y - s.y) * ky, dz = p.z - s.z;
-          const d = Math.hypot(dx, dy, dz), min = sr + r - sink;
-          if (d < min && d > 1e-5) { const k = (min - d) / d * soft * glance; p.x += dx * k; p.y += dy * k / ky; p.z += dz * k; }
+  for (let a = 0; a < eels.length; a++) {
+    const ea = eels[a];
+    if (ea.slurpedBy) continue;
+    const ca = ea.pts[EEL_POINTS >> 1];
+    // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
+    // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
+    const slip = ea.slip ?? 1;
+    // Decide the pair cull once per eel, outside the 24×24 point loop it gates.
+    for (let b = a + 1; b < eels.length; b++) {
+      const eb = eels[b];
+      near[b] = !eb.slurpedBy && ca.distanceTo(eb.pts[EEL_POINTS >> 1]) <= ea.boundR + eb.boundR ? 1 : 0;
+    }
+    for (let i = 0; i < EEL_POINTS; i++) {
+      const p = ea.pts[i];
+      const r = ea.radius;
+      const soft = i === 0 ? 0.35 : 1;   // the head eases out of contact; a full shove kinks the trail
+      const glance = i < SLIP_POINTS ? slip : 1;
+      // Rock and log colliders both sit proud of what they draw (the log's is a crest-plus-bend
+      // envelope), so a slippery snout may take a small bite out of one before the push counts.
+      const sink = (1 - glance) * r * 0.35;
+      if (p.y < floorY + r + 0.08) p.y = floorY + r + 0.08;   // floor has bumps up to ~0.08
+      if (p.y > -r * 0.5) p.y = -r * 0.5;
+      for (const s of spheres) {
+        // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
+        // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
+        const sr = s.rHit ?? s.r, ky = sr / (s.ryHit ?? sr);
+        const dx = p.x - s.x, dy = s.y + sr > -r * 2 ? 0 : (p.y - s.y) * ky, dz = p.z - s.z;
+        const d = Math.hypot(dx, dy, dz), min = sr + r - sink;
+        if (d < min && d > 1e-5) { const k = (min - d) / d * soft * glance; p.x += dx * k; p.y += dy * k / ky; p.z += dz * k; }
+      }
+      for (const l of logs) {
+        // Distance to the log's axis segment; inside the bore is fine, the wall is not.
+        tmpA.subVectors(l.b, l.a); const len2 = tmpA.lengthSq();
+        tmpB.subVectors(p, l.a);
+        const t = Math.max(0, Math.min(1, tmpB.dot(tmpA) / len2));
+        tmpC.copy(l.a).addScaledVector(tmpA, t);
+        const dx = p.x - tmpC.x, dy = p.y - tmpC.y, dz = p.z - tmpC.z;
+        const d = Math.hypot(dx, dy, dz);
+        // Hollow logs have open mouths; a solid stub (rInner 0) keeps its tip as a sphere cap.
+        const endCap = t <= 0 || t >= 1;
+        if (endCap && l.rInner > 0) continue;
+        const inner = l.rInner - r + sink, outer = l.rOuter + r - sink;
+        if (d > inner && d < outer && d > 1e-5) {
+          const toInner = d - inner, toOuter = outer - d;
+          const k = (l.rInner > 0 && toInner < toOuter ? -toInner : toOuter) / d * soft * glance;
+          p.x += dx * k; p.y += dy * k; p.z += dz * k;
         }
-        for (const l of logs) {
-          // Distance to the log's axis segment; inside the bore is fine, the wall is not.
-          tmpA.subVectors(l.b, l.a); const len2 = tmpA.lengthSq();
-          tmpB.subVectors(p, l.a);
-          const t = Math.max(0, Math.min(1, tmpB.dot(tmpA) / len2));
-          tmpC.copy(l.a).addScaledVector(tmpA, t);
-          const dx = p.x - tmpC.x, dy = p.y - tmpC.y, dz = p.z - tmpC.z;
-          const d = Math.hypot(dx, dy, dz);
-          // Hollow logs have open mouths; a solid stub (rInner 0) keeps its tip as a sphere cap.
-          const endCap = t <= 0 || t >= 1;
-          if (endCap && l.rInner > 0) continue;
-          const inner = l.rInner - r + sink, outer = l.rOuter + r - sink;
-          if (d > inner && d < outer && d > 1e-5) {
-            const toInner = d - inner, toOuter = outer - d;
-            const k = (l.rInner > 0 && toInner < toOuter ? -toInner : toOuter) / d * soft * glance;
+      }
+      for (let b = a + 1; b < eels.length; b++) {
+        if (!near[b]) continue;
+        const eb = eels[b];
+        const min = r + eb.radius;
+        for (let j = 0; j < EEL_POINTS; j++) {
+          const q = eb.pts[j];
+          const dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < min * min && d2 > 1e-8) {
+            const d = Math.sqrt(d2), k = (min - d) / d * 0.25;
             p.x += dx * k; p.y += dy * k; p.z += dz * k;
-          }
-        }
-        for (let b = a + 1; b < eels.length; b++) {
-          const eb = eels[b];
-          if (eb.slurpedBy) continue;
-          if (i === 0) eb.skip = ca.distanceTo(eb.pts[EEL_POINTS >> 1]) > ea.boundR + eb.boundR;
-          if (eb.skip) continue;
-          const min = r + eb.radius;
-          for (let j = 0; j < EEL_POINTS; j++) {
-            const q = eb.pts[j];
-            const dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
-            const d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 < min * min && d2 > 1e-8) {
-              const d = Math.sqrt(d2), k = (min - d) / d * 0.25;
-              p.x += dx * k; p.y += dy * k; p.z += dz * k;
-              q.x -= dx * k; q.y -= dy * k; q.z -= dz * k;
-            }
+            q.x -= dx * k; q.y -= dy * k; q.z -= dz * k;
           }
         }
       }
