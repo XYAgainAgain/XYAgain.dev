@@ -1,9 +1,10 @@
 import { SIM_RES, SIM_STEPS_HZ } from './config.js';
 import { MAX_IMPULSES, MICRO_RADIUS } from './impulse.js';
+import { createRng, deriveSeed } from './rng.js';
 
 /* Intensity is the shower's real strength and alone drives the audio bed; envelope is intensity
    capped for reduced motion, and drives impulse density, the surface's micro-ripple noise, and the
-   eels' activity. Weather rolls off Math.random like idleDrops, not the pond seed, which is layout only. */
+   eels' activity. The weather itself runs on its own stream off the pond seed, so a shower replays. */
 
 // Weather by coin toss: every 15 dry minutes, 50/50 whether a shower starts; while it pours, each
 // completed audio loop tosses again and the rain chains until it loses. Losing resets the timer.
@@ -40,13 +41,21 @@ const AUDIO_HZ = 8;
 
 const FORCE_BUILD = 4, FORCE_STEADY = 240;
 
+// Decorative per-frame draws only. The weather's own rolls go through this.roll, which is seeded;
+// feeding these into that stream would make the shower's transitions follow the frame rate.
 const roll = ([lo, hi]) => lo + Math.random() * (hi - lo);
 const smooth = (p) => p * p * (3 - 2 * p);
+const WEATHER_SALT = 2400, INTEREST_SALT = 2401;
 
 const WIND_LAG = 1.5;                 // seconds for a gust to reach the reeds after it crosses the water
 
 export class RainScheduler {
-  constructor({ sim, injector, motion, view, surface = null, audio = null, bearing = 0 }) {
+  constructor({ sim, injector, motion, view, surface = null, audio = null, bearing = 0, seed = 0 }) {
+    // The weather is part of the pond's night, not a coin the browser flips: a fixed seed replays the
+    // same shower. The per-frame drop placement below stays on Math.random; it decides nothing.
+    this.rng = createRng(deriveSeed(seed, WEATHER_SALT));
+    this.irng = createRng(deriveSeed(seed, INTEREST_SALT));
+    this.roll = ([lo, hi]) => lo + this.rng.next() * (hi - lo);
     this.sim = sim;
     this.injector = injector;
     this.motion = motion;
@@ -62,7 +71,7 @@ export class RainScheduler {
     this.stateT = 0;
     this.stateLen = 1;
     this.peak = 0;
-    this.gustPhase = Math.random() * Math.PI * 2;
+    this.gustPhase = this.rng.next() * Math.PI * 2;
     // The pond's one wind: bearing from the swell so they agree, a light breeze when dry, real gusts
     // in a shower. gustLag is the copy the reeds read, so a gust visibly crosses the water first.
     this.wind = { x: Math.cos(bearing), z: Math.sin(bearing), gust: 0, gustLag: 0 };
@@ -81,7 +90,7 @@ export class RainScheduler {
     this.pushedEnv = 0;
     this.pushedNoise = -1;     // forces the first write, so a stale uniform can never linger
 
-    this.enter(Math.random() < BOOT_P ? 'build' : 'dry');
+    this.enter(this.rng.next() < BOOT_P ? 'build' : 'dry');
   }
 
   get raining() { return this.state !== 'dry'; }
@@ -91,14 +100,14 @@ export class RainScheduler {
     this.state = state;
     this.stateT = 0;
     if (state === 'build') {
-      this.stateLen = roll(T.build);
-      this.peak = roll(PEAK);
+      this.stateLen = this.roll(T.build);
+      this.peak = this.roll(PEAK);
     } else if (state === 'steady') {
       // One audio loop per link of the chain, so the continue toss lands on the seam of the bed.
       this.stateLen = this.forceSteady ? FORCE_STEADY : (this.audio?.rainLoopSeconds?.() ?? LOOP_FALLBACK);
       this.forceSteady = false;
     } else if (state === 'tail') {
-      this.stateLen = roll(T.tail);
+      this.stateLen = this.roll(T.tail);
     } else {
       this.stateLen = TOSS_INTERVAL;
       this.peak = 0;
@@ -108,8 +117,8 @@ export class RainScheduler {
   /* Dry expiry tosses for a shower; steady expiry tosses to chain another loop or let go. */
   transition() {
     const p = this.motion.reduced ? CALM_P : TOSS_P;
-    if (this.state === 'dry') return this.enter(Math.random() < p ? 'build' : 'dry');
-    if (this.state === 'steady') return this.enter(Math.random() < p ? 'steady' : 'tail');
+    if (this.state === 'dry') return this.enter(this.rng.next() < p ? 'build' : 'dry');
+    if (this.state === 'steady') return this.enter(this.rng.next() < p ? 'steady' : 'tail');
     this.enter(NEXT[this.state]);
   }
 
@@ -235,7 +244,7 @@ export class RainScheduler {
       const p = this.interestPoints[this.interestHead];
       p.x = x; p.z = z; p.t = this.t;
       this.interestHead = (this.interestHead + 1) % INTEREST_SLOTS;
-      this.interestNext = this.t + 1 / roll(INTEREST_RATE);
+      this.interestNext = this.t + 1 / (INTEREST_RATE[0] + this.irng.next() * (INTEREST_RATE[1] - INTEREST_RATE[0]));
       return;
     }
   }
@@ -246,7 +255,7 @@ export class RainScheduler {
     for (const p of this.interestPoints) {
       if (this.t - p.t > maxAge) continue;
       seen++;
-      if (Math.random() < 1 / seen) best = p;
+      if (this.irng.next() < 1 / seen) best = p;
     }
     return best;
   }

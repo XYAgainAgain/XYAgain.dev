@@ -24,10 +24,18 @@ const STEADY_PULSE = [0, 0, 1, 0];   // (lantern, breathe, pulse, flicker); toda
 
 // Knob meanings: cover/hunger/yield/persistence/spookMul/curious scale existing steering terms;
 // prowl/cruise are BL/s bands; attention is the retarget interval; hold/travel are gait bout seconds.
+// The second row is the braincell wave's per-eel set: how much of the shared braincell this one uses,
+// smell reach, fidget and leap odds, the anchor it drifts home to, who it fears, and its spin odds.
 const DEFAULT_TRAITS = {
   prowl: [0.28, 0.45], cruise: [0.8, 1.0], turn: [4.5, 6.5],
   holdChance: 0.55, holdTime: [1, 6], travelTime: [2, 8], attention: [5, 12],
   cover: 1, hunger: 1, yield: 0, persistence: 1, spookMul: 1, curious: 1,
+  braincellUsage: 0.5, nose: 1, stim: 0.3, leap: 0.2, home: 'roam',
+  // An explicit 0 is an immunity the size term cannot override, which is how kind `sam` is feared
+  // by nobody however big he gets.
+  fears: { eleanor: 0.6, finger: 0.2, sam: 0 }, spinOdds: 0.35, kind: 'eel',
+  // Diet as a per-kind weight rather than a branch, so a fish, a firefly, or a strider is a table row.
+  eats: { crumb: 1 },
 };
 const DEFAULT_BUILD = { length: [1.6, 3.4], radius: [0.07, 0.12] };
 
@@ -41,7 +49,7 @@ export const IDENTITIES = [
     colorsA: [FOREST, MOSS], colorsB: [DEEP_BLUE, LAKE],
     chaos: true,   // the census draw lives in chaosKit: splotches, sheen, or the whole closet
     glow: [0, 1, 0, 0],
-    traits: { hunger: 1.5, cover: 1.5, persistence: 2.2, holdChance: 0.8, holdTime: [8, 25] },
+    traits: { hunger: 1.5, cover: 1.5, persistence: 2.2, holdChance: 0.8, holdTime: [8, 25], braincellUsage: 0.75, nose: 1.2, stim: 0.3, leap: 0.9, home: 'log', fears: { eleanor: 0.5 } },
     census: { startle: 'freeze', hunt: 'stalk', party: 'corner', twoAM: 'asleep' },
     quirks: { gourmet: true, tea: true, shipsNearest: true, followWeight: 0.4 },
   },
@@ -55,7 +63,7 @@ export const IDENTITIES = [
     jelly: 0.33,
     pattern: { stripe: [0.2, 0.2, 0.5], spot: [0.95, 0.4, 1], flank: [0.9, 0.4, 1], wavy: [0, 1.6] },
     glow: [0, 1, 0, 0],
-    traits: { holdChance: 0.7, holdTime: [3, 9], persistence: 2.5, cover: 1.7, cruise: [0.72, 0.88], turn: [4.2, 5.6], attention: [8, 16] },
+    traits: { holdChance: 0.7, holdTime: [3, 9], persistence: 2.5, cover: 1.7, cruise: [0.72, 0.88], turn: [4.2, 5.6], attention: [8, 16], braincellUsage: 1.0, nose: 1.0, stim: 0.3, leap: 0, home: 'log', fears: { eleanor: 0.2 } },
     census: { startle: 'freeze', hunt: 'stalk', party: 'corner', twoAM: 'cozy' },
     quirks: { follows: 'Bee', followWeight: 0.4, snake: true, spiralSleep: true, gourmet: true, graze: true },
   },
@@ -69,7 +77,7 @@ export const IDENTITIES = [
     // gain lives in the bake and clamps per channel, so anything past ~1.2 bleaches the pale bands white.
     ramp: { stops: JIM_TABLECLOTH, rotate: true, jitter: 0.15, sat: 1.4, gain: 1.15, skin: 1 },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], band: [1, 1, 1], flank: [0, 0, 0], wavy: [0, 1] },   // every stripe edge lights, no flank
-    traits: { cruise: [0.68, 0.82], prowl: [0.24, 0.34], hunger: 0.5, yield: 1, curious: 1.25 },
+    traits: { cruise: [0.68, 0.82], prowl: [0.24, 0.34], hunger: 0.5, yield: 1, curious: 1.25, braincellUsage: 0.7, nose: 0.8, stim: 0.2, leap: 0.1, home: 'pad', fears: { eleanor: 0.7 }, spinOdds: 0.2 },
     quirks: { follows: 'Shelley', followWeight: 0.7 },
   },
   {
@@ -79,7 +87,7 @@ export const IDENTITIES = [
     build: { length: [2.2, 2.6], radius: [0.08, 0.095] },
     colorsA: [SILVER], colorsB: [SILVER, MAGENTA],
     pattern: { stripe: [0.4, 0.2, 0.5], spot: [0.4, 0.2, 0.5], flank: [0.9, 0.5, 0.9], wavy: [0, 1.2] },
-    traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4 },
+    traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 } },
     quirks: { follows: 'Jim', followWeight: 0.45 },
   },
   {
@@ -89,7 +97,7 @@ export const IDENTITIES = [
     colorsA: [ORANGE], colorsB: [YELLOW, RED, MAGENTA],
     // Plaid is effectively mandated where he lives (Alaska), so it wins most rolls.
     pattern: { stripe: [0.6, 0.4, 0.9], spot: [0.5, 0.3, 0.7], flank: [0.8, 0.5, 1], plaid: [0.65, 0.7, 1], wavy: [0.5, 2] },
-    traits: { spookMul: 0.6, cruise: [0.95, 1.15], turn: [5.8, 7.2], hunger: 1.2, cover: 0.6 },
+    traits: { spookMul: 0.6, cruise: [0.95, 1.15], turn: [5.8, 7.2], hunger: 1.2, cover: 0.6, braincellUsage: 0.6, nose: 1.0, stim: 0.4, leap: 1.0, home: 'rock', fears: { eleanor: 0 }, spinOdds: 0.5 },
     quirks: { follows: 'Eleanor', followWeight: 0.35 },
   },
   {
@@ -98,7 +106,7 @@ export const IDENTITIES = [
     build: { length: [2.4, 2.9], radius: [0.085, 0.1] },
     colorsA: [BLUE], colorsB: [YELLOW],
     pattern: { stripe: [1, 0.7, 1], spot: [0.2, 0.2, 0.4], flank: [0.5, 0.3, 0.6], wavy: [0.8, 2.2] },
-    traits: { curious: 1.5, hunger: 0.9 },
+    traits: { curious: 1.5, hunger: 0.9, braincellUsage: 0.15, nose: 1.4, stim: 0.6, leap: 0.8, home: 'rock', fears: { eleanor: 0.5 } },
     quirks: { rippleChase: true },
   },
   {
@@ -110,7 +118,7 @@ export const IDENTITIES = [
     colorsA: [PINK], colorsB: [NEON_GREEN],
     pattern: { stripe: [0.9, 0.5, 1], spot: [0.9, 0.5, 1], flank: [0.3, 0.2, 0.4], wavy: [1.8, 3] },
     glow: STEADY_PULSE,
-    traits: { curious: 1.6, spookMul: 0.8, cover: 0.85, persistence: 2.2, hunger: 1.2 },
+    traits: { curious: 1.6, spookMul: 0.8, cover: 0.85, persistence: 2.2, hunger: 1.2, braincellUsage: 0.5, nose: 1.1, stim: 0.9, leap: 0.6, home: 'rock', fears: { eleanor: 0.3 } },
     census: { startle: 'flip', hunt: 'stalk', party: 'corner', twoAM: 'cozy' },
     // zoomies is read by eleanor.js: the hunt turns into a chase instead of a slurp.
     quirks: { sings: [8, 20], gourmet: true, cuddly: true, zoomies: true, graze: true },
@@ -125,7 +133,7 @@ export const IDENTITIES = [
     jelly: 0.33,
     pattern: { stripe: [0.15, 0.2, 0.4], spot: [0.9, 0.5, 1], flank: [0.8, 0.4, 0.9], wavy: [0, 1.4] },
     glow: [0, 1, 1, 0],   // breathe and pulse together; the envelope normalizes by the weight sum
-    traits: { curious: 0.85, cover: 1.1, hunger: 0.5 },
+    traits: { curious: 0.85, cover: 1.1, hunger: 0.5, braincellUsage: 0.85, nose: 0.9, stim: 0.3, leap: 0.3, home: 'pad', fears: { eleanor: 0.75, vi: 0.2 }, spinOdds: 0, eats: { crumb: 0 } },
     census: { startle: 'later', hunt: 'bonk', party: 'exits', twoAM: 'cozy' },
     quirks: { follows: 'Jaz', followWeight: 0.25, rescue: true, loopies: true, graze: true, herbivore: true, floor: true, tea: true },
   },
@@ -139,7 +147,7 @@ export const IDENTITIES = [
     colorsA: [PURPLE], colorsB: [BLACK],   // black stops are unlit in both layers, so the gaps come free
     pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.7, 1], flank: [0.35, 0.2, 0.5], wavy: [0, 1.2] },
     glow: [0, 0, 0, 1],
-    traits: { curious: 1.35, spookMul: 1.4, cover: 1.6 },
+    traits: { curious: 1.35, spookMul: 1.4, cover: 1.6, braincellUsage: 0.4, nose: 0.7, stim: 0.7, leap: 0.5, home: 'rock', fears: { eleanor: 0.1 }, spinOdds: 0.6 },
     census: { startle: 'flip', hunt: 'doordash', party: 'exits', twoAM: 'cozy' },
     // spare: the parents are off limits, and so is a ghost, once Chrys is in the pool
     quirks: { headbutt: { every: [40, 90], favorite: 'Bee', favoriteWeight: 3, spare: ['Jim', 'Shelley', 'Chrys'] }, cuddly: true, dominant: true },
@@ -153,7 +161,7 @@ export const IDENTITIES = [
     jelly: 0.45,   // fewer shipped varietals than the other two glass rollers, so Bee jellies more
     pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.6, 1], flank: [0.6, 0.3, 0.7], wavy: [0, 1.2] },
     glow: [1, 1, 0, 0],
-    traits: { holdChance: 0.8, holdTime: [8, 25], curious: 1.1, spookMul: 1.2, cover: 1.35 },
+    traits: { holdChance: 0.8, holdTime: [8, 25], curious: 1.1, spookMul: 1.2, cover: 1.35, braincellUsage: 0.5, nose: 1.0, stim: 0.4, leap: 0, home: 'pad', fears: { eleanor: 0.4, vi: 0.5 } },
     census: { startle: 'investigate', hunt: 'doordash', party: 'snacks', twoAM: 'asleep' },
     quirks: { follows: 'Jaz', followWeight: 0.3, matchmaker: true, cuddly: true },
   },
@@ -167,7 +175,7 @@ export const IDENTITIES = [
     pattern: { stripe: [0.9, 0.5, 1], spot: [0.85, 0.4, 0.9], flank: [0.3, 0.2, 0.5], wavy: [1.8, 3] },
     glow: [0, 1, 0, 0],
     // turn is up so the long way round for a right-hand turn is a loop, not a glacial arc.
-    traits: { holdChance: 0.8, holdTime: [8, 25], curious: 0.85, cover: 1.1, turn: [7.0, 8.5] },
+    traits: { holdChance: 0.8, holdTime: [8, 25], curious: 0.85, cover: 1.1, turn: [7.0, 8.5], braincellUsage: 0.3, nose: 1.0, stim: 0.1, leap: 0.2, home: 'rock', fears: { eleanor: 0.7, vi: 0 } },
     census: { startle: 'investigate', hunt: 'bonk', party: 'corner', twoAM: 'asleep' },
     quirks: { follows: 'Jaz', followWeight: 0.4, leftOnly: true },
   },
@@ -182,7 +190,7 @@ export const IDENTITIES = [
     ramp: { stops: [{ color: RED, width: 3 }, { color: GOLD, width: 2 }], repeats: [3, 5], skin: 0.35 },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], band: [1, 0.8, 1], flank: [0.25, 0.15, 0.35], wavy: [0, 1] },
     glow: [1, 0, 1, 0],
-    traits: { curious: 0.6, spookMul: 0.8, cover: 0.85, hunger: 0.3, persistence: 0.5, attention: [12, 20], prowl: [0.18, 0.28] },
+    traits: { curious: 0.6, spookMul: 0.8, cover: 0.85, hunger: 0.3, persistence: 0.5, attention: [12, 20], prowl: [0.18, 0.28], braincellUsage: 0.8, nose: 0.8, stim: 0.2, leap: 0.15, home: 'log', fears: { eleanor: 0.5 }, spinOdds: 0.2 },
     census: { startle: 'investigate', hunt: 'lunge', party: 'corner', twoAM: 'cozy' },
     // follows Chrys, who is not in the pool, so this stays unrequited
     quirks: { follows: 'Chrys', followWeight: 0.4, sickleRest: true, dinnerCircle: true, wander: true },
@@ -195,7 +203,7 @@ export const IDENTITIES = [
     build: { length: [7.5, 8.5], radius: [0.24, 0.28] },   // barely fits under the surface; drifting up breaches
     colorsA: [PURPLE], colorsB: [TEAL],
     pattern: { stripe: [0.4, 0.3, 0.6], spot: [0.9, 0.6, 1], flank: [0.9, 0.6, 1], wavy: [1, 2.5] },
-    traits: { spookMul: 0.3, cover: 0.4, turn: [1.2, 1.8], cruise: [0.3, 0.42], prowl: [0.15, 0.25] },
+    traits: { spookMul: 0.3, cover: 0.4, turn: [1.2, 1.8], cruise: [0.3, 0.42], prowl: [0.15, 0.25], kind: 'eleanor', braincellUsage: 0.5, nose: 0.4, stim: 0.15, leap: 0, home: 'log', spinOdds: 0, fears: { eleanor: 0, finger: 0, eel: 0, sam: 0 } },
   },
 ];
 
@@ -267,6 +275,17 @@ export function applyIdentity(e, id, rng) {
     cover: t.cover, hunger: t.hunger, yield: t.yield, persistence: t.persistence,
     spookMul: t.spookMul, curious: t.curious,
   };
+  // The braincell wave's knobs ride on the eel, not inside traits, because modules read them by name.
+  // fears merges key by key so an identity's explicit 0 survives as a hard immunity later.
+  e.kind = t.kind;
+  e.braincellUsage = t.braincellUsage;
+  e.nose = t.nose;
+  e.stim = t.stim;
+  e.leap = t.leap;
+  e.home = t.home;
+  e.spinOdds = t.spinOdds;
+  e.fears = { ...DEFAULT_TRAITS.fears, ...id.traits?.fears };
+  e.eats = { ...DEFAULT_TRAITS.eats, ...id.traits?.eats };
   e.quirks = id.quirks || {};
   e.pronouns = id.pronouns ?? '';   // the tag's second line; blank until an identity carries one
   // The four census enums; an absent knob means today's behavior, which is why the old five carry none.

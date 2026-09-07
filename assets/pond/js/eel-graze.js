@@ -48,7 +48,8 @@ export class Grazing {
   /* Hook one, from pickTarget right after the tunnel branch. False falls through to cover and wander. */
   pickTarget(sys, e, now) {
     const rng = e.rng;
-    if (!e.quirks.herbivore && sys.foods.some((f) => f.amount > 0)) return false;   // crumbs first for an omnivore
+    // Crumbs first for an omnivore, but only the ones it can actually smell.
+    if (!e.quirks.herbivore && (sys.braincell?.hasSensedFood(e) ?? sys.foods.some((f) => f.amount > 0))) return false;
     if (!rng.chance(PICK_BASE + PICK_HUNGER * e.traits.hunger)) return false;
     const st = this.stateFor(e);
     const head = e.head;
@@ -159,9 +160,11 @@ export class Grazing {
   tick(sys, e, dt) {
     const spot = e.coverSpot;
     if (!spot || spot.type !== 'graze') return;
+    // A scattering eel is not eating salad: drop the meal outright rather than keep steering at it.
+    if (sys.fear?.scattering(e)) { this.done(sys, e, this.stateFor(e), false); return; }
     if (e.food) { this.done(sys, e, this.stateFor(e), false); return; }   // an omnivore drops the salad for a crumb
     // A rest pose owns the target while it holds its shape; the give-up clock drops the meal for us.
-    if (e.pose?.kind) return;
+    if (e.restPose?.kind) return;
     const now = sys.time;
     const st = this.stateFor(e);
     const head = e.head;

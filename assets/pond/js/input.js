@@ -1,3 +1,6 @@
+const SPEED_WINDOW = 80;   // ms of path the reported pointer speed is measured over
+const STILL_MOVE = 0.05;   // world units a pointer has to travel before it counts as having moved
+
 /* Pointer handling for the pond. Mouse buttons map directly; touch counts fingers:
    1 = left, 2 = right, 3 = middle. A short hold-off on touch lets extra fingers arrive. */
 export class PondInput {
@@ -12,6 +15,10 @@ export class PondInput {
     this.movedAcc = 0;
     this.touchTimer = null;
     this.touchStart = null;
+    this.stillAcc = 0;
+    // The published snapshot. gestureId counts presses so a rhythm reader can tell one hold from the
+    // next, and speed is deliberately uncapped: the flora's 3 units/s clamp stays local to the flora.
+    this.snapshot = { mode: 'none', gestureId: 0, x: 0, z: 0, vx: 0, vz: 0, speed: 0, moveSeq: 0 };
     this.bind();
   }
 
@@ -22,6 +29,13 @@ export class PondInput {
     window.addEventListener('pointermove', (e) => this.onMove(e));
     window.addEventListener('pointerup', (e) => this.onUp(e));
     window.addEventListener('pointercancel', (e) => this.onUp(e));
+    // A null relatedTarget means that pointer left the document, not that it slid under the chrome:
+    // the only way a mouse dragged out of the window ever ends, and only for the pointer that left.
+    document.addEventListener('pointerout', (e) => {
+      if (e.pointerType === 'touch' || e.relatedTarget || !this.pointers.has(e.pointerId)) return;
+      this.pointers.delete(e.pointerId);
+      this.endMode();
+    });
     c.addEventListener('dragstart', (e) => e.preventDefault());
   }
 
@@ -58,8 +72,27 @@ export class PondInput {
     this.path = [{ x, z, t: performance.now() }];
     this.lastMoveAt = performance.now();
     this.movedAcc = 0;
+    this.stillAcc = 0;
+    const s = this.snapshot;
+    s.gestureId++;
+    s.mode = mode === 'left' ? 'poke' : 'feed';
+    s.x = x; s.z = z; s.vx = 0; s.vz = 0; s.speed = 0;
+    this.h.input?.(s);
     if (mode === 'left') { this.h.poke?.(x, z); this.h.dragStart?.(x, z); }
     else { this.h.feed?.(x, z); }
+  }
+
+  /* Uncapped pointer speed over the last 80 ms of samples; a tip older than the window reads zero,
+     which is what makes a held-still hand look still rather than frozen mid-flick. */
+  measure(now) {
+    const p = this.path, n = p.length, s = this.snapshot;
+    if (n < 2 || now - p[n - 1].t > SPEED_WINDOW) { s.vx = 0; s.vz = 0; s.speed = 0; return; }
+    let i = n - 1;
+    while (i > 0 && now - p[i - 1].t <= SPEED_WINDOW) i--;
+    const a = p[i], b = p[n - 1];
+    const span = Math.max(1e-3, (b.t - a.t) / 1000);
+    s.vx = (b.x - a.x) / span; s.vz = (b.z - a.z) / span;
+    s.speed = Math.hypot(s.vx, s.vz);
   }
 
   onMove(e) {
@@ -77,15 +110,19 @@ export class PondInput {
     // Every sub-frame sample the browser coalesced goes into the path, so a fast swish is a polyline
     // and not one chord; the handler stays throttled, because it drives audio and sim drops.
     const raw = (this.mode === 'left' && e.getCoalescedEvents?.().length) ? e.getCoalescedEvents() : null;
+    // Coalesced samples carry their own timeStamp, shifted onto this clock: stamping a whole batch
+    // with now() collapses measure()'s span and reads an ordinary move as an extreme flick.
+    const skew = Number.isFinite(e.timeStamp) ? now - e.timeStamp : 0;
     let added = 0;
     if (raw) {
-      for (const s of raw) {
-        const [x, z] = this.toWorld(s.clientX, s.clientY);
+      for (const c of raw) {
+        const [x, z] = this.toWorld(c.clientX, c.clientY);
         const last = this.path[this.path.length - 1];
         const d = Math.hypot(x - last.x, z - last.z);
         if (d < 0.04) continue;
-        this.path.push({ x, z, t: now });
+        this.path.push({ x, z, t: Number.isFinite(c.timeStamp) ? c.timeStamp + skew : now });
         this.movedAcc += d;
+        this.stillAcc += d;
         added++;
       }
     } else {
@@ -95,11 +132,18 @@ export class PondInput {
       if (d < 0.04) return;
       this.path.push({ x, z, t: now });
       this.movedAcc += d;
+      this.stillAcc += d;
       added = 1;
     }
     if (!added || now - this.lastMoveAt < 40) return;
     this.lastMoveAt = now;
     const tip = this.path[this.path.length - 1];
+    const s = this.snapshot;
+    if (this.mode === 'left') s.mode = 'drag';
+    s.x = tip.x; s.z = tip.z;
+    if (this.stillAcc >= STILL_MOVE) { this.stillAcc = 0; s.moveSeq++; }
+    this.measure(now);
+    this.h.input?.(s);
     const moved = this.movedAcc;
     this.movedAcc = 0;
     if (this.mode === 'left') this.h.dragMove?.(tip.x, tip.z, moved, this.path);
@@ -111,19 +155,28 @@ export class PondInput {
     this.pointers.delete(e.pointerId);
     if (e.pointerType === 'touch') {
       clearTimeout(this.touchTimer);
-      if (this.pointers.size > 0) return;     // wait for the last finger
+      // A one-finger drag waits for the last finger, but a two-finger feed is over the moment it
+      // stops being two: waiting left the hold live and it kept dropping crumbs.
+      if (this.pointers.size > 0 && this.mode !== 'right') return;
     }
     this.endMode();
   }
 
-  cancelMode() { this.mode = null; this.path = []; }
+  cancelMode() { this.mode = null; this.path = []; this.release(); }
 
   endMode() {
     if (!this.mode) return;
     const mode = this.mode, path = this.path;
     this.mode = null; this.path = [];
+    this.release();
     if (mode === 'left') this.h.dragEnd?.(path);
     else this.h.feedDragEnd?.(path);
+  }
+
+  release() {
+    const s = this.snapshot;
+    s.mode = 'none'; s.vx = 0; s.vz = 0; s.speed = 0;
+    this.h.input?.(s);
   }
 }
 

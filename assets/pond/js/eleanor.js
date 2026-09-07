@@ -18,6 +18,9 @@ const SLIP = 0.5;         // rock and log pushes on her snout, halved: she is fa
 const REV_JAM = 1;        // seconds of motionless head before a backing-out fold gets help
 const REV_TRAIL = 6;      // retreatAlongTrail starves at 4; below this the path can no longer feed a reverse
 const PROG_WINDOW = 0.5;  // stuck is judged over this window, never tick to tick
+const COMMOTION_NEAR = 4; // she picks out individual crumbs only once she is this close to the table
+// F2's published threat, by state. Anything that frightens residents publishes one of these.
+const THREAT = { lair: 0.15, depart: 0.3, return: 0.3, hunt: 1, slurp: 1, graze: 0.7, swimby: 0.5, wriggle: 0, offstage: 0 };
 
 export function attachEleanor(sys, seed) {
   const id = IDENTITIES.find((i) => i.name === 'Eleanor');
@@ -32,6 +35,9 @@ export function attachEleanor(sys, seed) {
   e.prey = null;
   e.zoomAt = 0;
   e.slip = SLIP;
+  e.threat = 0;      // F2: how scary she is being right now; her own brain() keeps it current
+  e.threatOn = null; // whoever she is actually hunting, so bystanders read a lighter threat
+  e.table = null;    // the commotion she is investigating this visit
   // park() re-rolls this per park, but a first depart-from-lair reads it first: undefined here fed
   // cos/sin a NaN that poisoned her whole chain until the stuck rescue finally parked her.
   e.parkAng = e.rng.range(0, Math.PI * 2);
@@ -160,6 +166,8 @@ function avoid(e, dx, dz, d, reach) {
 
 function brain(sys, e, dt) {
   const now = sys.time;
+  e.threat = THREAT[e.state] ?? 0.3;
+  e.threatOn = e.state === 'hunt' ? e.prey : null;
   sys.lairGuest = e.lair && (e.state === 'lair' || e.state === 'return') ? e : null;
   if (sys.perfHot) e.coolAt = now + 10;
 
@@ -181,6 +189,7 @@ function brain(sys, e, dt) {
         } else if (sys.feedRecent >= FEED_WORTH) {
           sys.feedRecent = 0;
           begin(e, 'graze', now);
+          e.table = sys.commotion;
           setExit(e, fromLair ? pickExit(sys, e) : null);
         } else if (now > e.nextSwimBy) {
           begin(e, 'swimby', now);
@@ -294,27 +303,50 @@ function brain(sys, e, dt) {
     if (p.quirks?.zoomies) zoomTick(sys, e, p, dt, now);
     else if (Math.min(Math.hypot(e.head.x - tail.x, e.head.z - tail.z), Math.hypot(e.head.x - p.head.x, e.head.z - p.head.z)) < 0.9) {
       p.slurpedBy = e;
+      // The slurp owns the pose from here: no air exemption may outlive the jaws closing on it.
+      sys.air?.cancel(p);
       e.slurpT = 0;
       begin(e, 'slurp', now);
+      // F1: everybody close enough to watch loses every second of trust she had earned, and carries
+      // two minutes of extra fear on top of it.
+      sys.fear?.witnessSlurp(sys, e, p);
       sys.emit('slurp', e);
       return;
     }
   } else {
+    // A feed spree does not depend on her short nose. She heads for the commotion, and only once she
+    // is on top of it does she pick out individual crumbs by smell; smelling none on the way over is
+    // never a reason to swim home.
+    const spot = sys.commotion;
+    if (spot) { e.table = e.table ?? { x: 0, z: 0 }; e.table.x = spot.x; e.table.z = spot.z; }
+    // No table at all is a different thing from a table she cannot smell yet: the first is a wasted
+    // trip, the second is what the investigate phase exists to survive.
+    if (!e.table) { goHome(sys, e, now); return; }
+    const far = Math.hypot(e.table.x - e.head.x, e.table.z - e.head.z);
+    const arrived = far <= COMMOTION_NEAR;
     let best = null, bd = 1e9;
-    for (const f of sys.foods) {
-      if (f.amount <= 0) continue;
-      const d = Math.hypot(f.x - e.head.x, f.z - e.head.z);
-      if (d < bd) { bd = d; best = f; }
+    if (arrived) {
+      for (const f of (sys.braincell?.sense(e) ?? sys.foods)) {
+        if (f.amount <= 0) continue;
+        const d = Math.hypot(f.x - e.head.x, f.z - e.head.z);
+        if (d < bd) { bd = d; best = f; }
+      }
     }
-    if (!best || now - e.stateAt > VISIT_CAP) { goHome(sys, e, now); return; }
-    tx = best.x; tz = best.z;
-    ty = Math.max(-DEPTH + e.radius, best.y + 0.05);
-    if (bd < 0.9) {
-      wantBL = e.prowlBL;
-      best.amount -= dt * 3;
-      e.uExcite.value += (0.7 - e.uExcite.value) * Math.min(1, dt * 2);
-      if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(0.4, 0.9); sys.emit('nibble', e); }
-      if (best.amount <= 0) sys.emit('eat', e, best);
+    // The visit ends on its own clock or when the table is genuinely gone, never because her short
+    // nose has not reached a crumb yet: that failure is what the investigate phase exists to survive.
+    if (now - e.stateAt > VISIT_CAP || !sys.foods.some((f) => f.amount > 0)) { goHome(sys, e, now); return; }
+    if (!best) {
+      tx = e.table.x; tz = e.table.z;
+    } else {
+      tx = best.x; tz = best.z;
+      ty = Math.max(-DEPTH + e.radius, best.y + 0.05);
+      if (bd < 0.9) {
+        wantBL = e.prowlBL;
+        best.amount -= dt * 3;
+        e.uExcite.value += (0.7 - e.uExcite.value) * Math.min(1, dt * 2);
+        if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(0.4, 0.9); sys.emit('nibble', e); }
+        if (best.amount <= 0) sys.emit('eat', e, best);
+      }
     }
   }
 
@@ -455,6 +487,8 @@ function spit(sys, e, now) {
   if (!p) return;
   teleport(p, e.head.x + e.heading.x * 0.5, e.head.z + e.heading.z * 0.5, Math.atan2(e.heading.z, e.heading.x), Math.max(-DEPTH + p.radius + 0.1, e.head.y));
   p.slurpedBy = null;
+  // Bounds back from the current radius, after the chain reset above.
+  sys.air?.restore(p);
   p.speedMul = 2.2;
   p.speedBL = p.cruiseBL;
   p.fleeUntil = now + 1;

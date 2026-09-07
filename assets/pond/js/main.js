@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { texture, Fn, vec4, uv, uniform } from 'three/tsl';
-import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS, SIM_RES, CAUSTIC_RES } from './config.js';
-import { seedFromUrl, deriveSeed } from './rng.js';
+import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS, SIM_RES, CAUSTIC_RES, SEDIMENT_POOL, finite01 } from './config.js';
+import { seedFromUrl, deriveSeed, createRng } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
@@ -9,6 +9,9 @@ import { buildFloor, setTextureSize } from './floor.js';
 import { WakeBuffer } from './wake.js';
 import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
+import { attachBraincell } from './eel-brain.js';
+import { attachFear } from './eel-fear.js';
+import { attachAir } from './eel-air.js';
 import { attachEleanor } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
 import { TeaTime } from './eel-tea.js';
@@ -116,9 +119,28 @@ async function boot() {
   // a bare ?cast= freezes the seeded draw as-is.
   const cast = params.has('cast') ? (params.get('cast') ?? '').split(',').map((s) => s.trim()).filter(Boolean) : null;
   const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view, { cast, debug: params.get('debug') === '1' });
+  // ?brain= and ?moon= pin a 0–1 scalar for testing; a bare or junk value is no pin at all.
+  const pin = (name) => { const raw = params.get(name); return raw === null || raw.trim() === '' ? null : finite01(Number(raw), null); };
+  eels.pins = { brain: pin('brain'), moon: pin('moon') };
   const eleanor = attachEleanor(eels, seed);
+  // After Eleanor, so addModule's init hook reaches the guest too: she gets wits and module state at
+  // attach time even though her controller never runs steer. Fear registers first, because the
+  // braincell's focus reads this tick's panic out of it in the same prepass.
+  const fear = attachFear(eels, seed);
+  const braincell = attachBraincell(eels, seed);
   const effects = new UnderwaterEffectsPool();
   underScene.add(effects.mesh);
+  eels.effects = effects;
+  // Sediment is a second instance rather than more slots: premultiplied, so a dig puff occludes the
+  // sand instead of glowing over it, on its own seeded stream so puff counts never move a decision.
+  const sediment = new UnderwaterEffectsPool({ pool: SEDIMENT_POOL, blend: 'premultiplied', rng: createRng(deriveSeed(seed, 3171)) });
+  underScene.add(sediment.mesh);
+  eels.sediment = sediment;
+  // Last of the three, so its initEel sees the wits and fear state the other two already installed.
+  const air = attachAir(eels, seed);
+  // Where a flat pond would put the moon's reflection, from the same CPU-owned uniforms the surface
+  // pass reads. The glitter itself wanders with the water normal; the eel is wrong about it anyway.
+  eels.moonBiteAnchor = { x: 0, z: 0 };
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -190,6 +212,12 @@ async function boot() {
   if (params.get('mixer') === '1') import('./mixer.js').then((m) => m.attachMixer(audio)).catch((err) => console.warn('Pond: mixer failed to load', err));
   const eelToggleRender = bindEelToggle(document.getElementById('eel-toggle'), (v) => eels.setEnabled(v === 'yes'));
   const names = new NameLabels(document.getElementById('eel-names'), view);
+  // ?debug=1&overlay=brain draws the context rings. Nothing is imported, allocated, or kept without it.
+  let brainOverlay = null;
+  if (params.get('debug') === '1' && params.get('overlay') === 'brain') {
+    const { BrainOverlay } = await import('./debug-overlay.js');
+    brainOverlay = new BrainOverlay(view);
+  }
   bindNamesToggle(document.getElementById('names-toggle'), (on) => names.setEnabled(on));
   const moonKnobs = bindJunk({
     seg: document.getElementById('junk'),
@@ -206,18 +234,34 @@ async function boot() {
   // World x → stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
   const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
   // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
-  eels.on('startle', (ev) => { ev.source === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
-  eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.source === 'eleanor' ? 0.5 : 1 }));
+  eels.on('startle', (ev) => { ev.kind === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
+  eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.kind === 'eleanor' ? 0.5 : 1 }));
+  // Every held-feed crumb announces itself; the dimple and the little plop are subscribers now.
+  eels.on('drop', (ev) => { sim.addDrop(ev.x, ev.z, 0.14, 0.006); audio.plop('smol', ev.pan); });
   eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
   eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
   eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
   eels.on('headbutt', (ev) => audio.headbutt({ pan: ev.pan, length: ev.length }));
   eels.on('rescue', (ev) => audio.rescue({ pan: ev.pan }));
+  // A scatter is the startle heard from farther off: same voice, quieter, so a whole pond bolting
+  // does not stack into noise.
+  eels.on('scatter', (ev) => audio.startle({ pan: ev.pan, length: ev.length, db: -8 }));
+  // Deliberate silence until Sam records them: SFX-Wishlist rows "gape hiss", "lunge swish", "the sigh".
+  const silent = () => {};
+  eels.on('gape', silent);
+  eels.on('lunge', silent);
+  eels.on('overit', silent);
   eels.on('graze', (ev) => audio.graze({ pan: ev.pan, muffled: ev.food?.kind === 'algae' }));   // a tuft is eaten under water
+  // Verticality, all placeholders until Sam records the wishlist rows (wet snout-pop, leap splash,
+  // sand scrunch, wet snap on nothing). splash branches once: a belly flop is never both variants.
+  eels.on('peek', (ev) => audio.peek({ pan: ev.pan }));
+  eels.on('splash', (ev) => audio.splash({ pan: ev.pan, length: ev.length, bellyflop: !!ev.detail?.bellyflop }));
+  eels.on('dig', (ev) => audio.dig({ pan: ev.pan }));
+  eels.on('moonbite', (ev) => audio.moonbite({ pan: ev.pan }));
 
   // Showers own their own clock: envelope drives impulses, surface noise, and eel activity; intensity
   // alone drives the rain bed. ?rain=1 skips the wait and starts one now.
-  const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio, bearing: waveSet.mainDir });
+  const rain = new RainScheduler({ sim, injector: impulse, motion, view, surface, audio, bearing: waveSet.mainDir, seed });
   if (params.get('rain') === '1') rain.force();
   eels.rain = rain;
   rain.habitat = habitat;
@@ -327,11 +371,9 @@ async function boot() {
   let lastCrackle = 0;
   // A finger through the water leaves a wake too; the frame loop hands the drag segment to the wake buffer.
   const finger = { x: 0, z: 0, px: 0, pz: 0, at: -1, path: null, idx: 0 };
-  // R-hold crumbs drop on a fixed 250 BPM clock (Tetris-ish tempo), moving or not.
-  const CRUMB_MS = 60000 / 250;
-  let feeding = null;
-  let nextCrumbAt = 0;
-  new PondInput(liveCanvas, toWorld, {
+  // One handler set: PondInput drives it live and eels.playInput drives the same functions, so a
+  // recorded gesture makes the same water, sounds, and spooks a hand does.
+  const hand = {
     poke: (x, z) => {
       sim.addDrop(x, z, 0.5, motion.reduced ? 0.08 : 0.2);
       eels.spook(x, z, 1);
@@ -340,7 +382,7 @@ async function boot() {
     dragStart: () => {},
     dragMove: (x, z, moved, path) => {
       sim.addDrop(x, z, 0.55, Math.min(0.07, 0.01 + moved * 0.07));
-      if (path.length < 8) eels.spook(x, z, 0.5); else eels.lure(x, z);
+      if (path.length < 8) eels.spook(x, z, 0.5, { cause: 'swish' }); else eels.lure(x, z);
       swishUntil = performance.now() + 180;
       audio.swish(true);
       audio.swishPan(toPan(x));
@@ -365,20 +407,39 @@ async function boot() {
       for (const p of path.slice(-6)) eels.lure(p.x, p.z);
     },
     feed: (x, z) => {
-      eels.feed(x, z, 1);
+      eels.feed(x, z, 1, { origin: 'click' });
       sim.addDrop(x, z, 0.18, 0.012);
       audio.plop('big', toPan(x));
-      feeding = { x, z };
-      nextCrumbAt = performance.now() + CRUMB_MS;
+      eels.holdFeed(x, z);
     },
-    feedDragMove: (x, z) => { if (feeding) { feeding.x = x; feeding.z = z; } },
+    feedDragMove: (x, z) => eels.moveFeed(x, z),
     feedDragEnd: (path) => {
-      feeding = null;
+      eels.endFeed();
       const loop = detectLoop(path);
       if (loop) { eels.vortex(loop.x, loop.z, loop.radius); audio.crackle('med', { pan: toPan(loop.x) }); }
     },
-    recolor: () => { feeding = null; eels.recolor(); audio.crackle('lil'); },
-  });
+    recolor: () => { eels.endFeed(); eels.recolor(); audio.crackle('lil'); },
+    // sys.finger is the eels' copy of the snapshot; the prepass advances its clocks from here.
+    input: (s) => {
+      const f = eels.finger;
+      if (s.gestureId !== f.gestureId) { f.gestureId = s.gestureId; f.heldFor = 0; f.stillFor = 0; }
+      if (s.moveSeq !== f.moveSeq) { f.moveSeq = s.moveSeq; f.stillFor = 0; }
+      f.mode = s.mode; f.x = s.x; f.z = s.z; f.vx = s.vx; f.vz = s.vz; f.speed = s.speed; f.vAge = 0;
+    },
+  };
+  new PondInput(liveCanvas, toWorld, hand);
+  // The script's vocabulary onto the same handlers; a synthetic path is one sample long, which the
+  // drag branches already handle (under eight samples reads as a poke, not a swish).
+  eels.inputHandlers = {
+    poke: hand.poke,
+    'drag-start': hand.dragStart,
+    'drag-move': (x, z) => hand.dragMove(x, z, 0.2, [{ x, z, t: performance.now() }]),
+    'drag-end': (x, z) => hand.dragEnd([{ x, z, t: performance.now() }]),
+    'feed-start': hand.feed,
+    'feed-move': hand.feedDragMove,
+    'feed-end': () => hand.feedDragEnd([]),
+    recolor: hand.recolor,
+  };
 
   // Gate
   const dialog = document.getElementById('gate');
@@ -506,16 +567,14 @@ async function boot() {
     U.moonPhase.value = moon.phase01;
     moonDir.set(Math.cos(MOON_ELEVATION) * Math.cos(az), Math.sin(MOON_ELEVATION), Math.cos(MOON_ELEVATION) * Math.sin(az));
     U.moonDir.value.copy(moonDir);
+    const moonAz = Math.hypot(moonDir.x, moonDir.z) || 1;
+    eels.moonBiteAnchor.x = surface.uMoonSpot.value * moonDir.x / moonAz;
+    eels.moonBiteAnchor.z = surface.uMoonSpot.value * moonDir.z / moonAz;
 
     if (performance.now() > swishUntil) audio.swish(false);
-    if (feeding && performance.now() >= nextCrumbAt) {
-      nextCrumbAt = performance.now() + CRUMB_MS;
-      eels.feed(feeding.x, feeding.z, 0.35);
-      sim.addDrop(feeding.x, feeding.z, 0.14, 0.006);
-      audio.plop('smol', toPan(feeding.x));
-    }
     // Ahead of anything that spawns, so this frame's effects are stamped with this frame's clock.
     effects.setTime(t);
+    sediment.setTime(t);
     for (let i = singBubs.length - 1; i >= 0; i--) {
       if (t < singBubs[i].at) continue;
       const q = singBubs[i];
@@ -527,6 +586,7 @@ async function boot() {
     popBubbles(t);
     eels.update(dt);
     names.update(eels);
+    brainOverlay?.update(eels);
     // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
     pads.update(dt, t, rain, impulse);
     floaters.update(dt, t);
@@ -639,10 +699,15 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, U, surface, seed, overScene, impulse, effects, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,
+      // pond.play('held-feed') or pond.play([...]): recorded input on the simulation clock.
+      play: async (src) => {
+        const script = Array.isArray(src) ? src : await (await fetch(`/.dev/tests/fixtures/${src}.json`)).json();
+        return eels.playInput(script) ? script.length : 0;
+      },
       moonButton: moonKnobs,
       quality: { get rung() { return gov.rung; }, get ema() { return gov.ema; }, get pinned() { return gov.pinned; }, setRung: (n) => gov.setRung(n) },
       diag: async () => {

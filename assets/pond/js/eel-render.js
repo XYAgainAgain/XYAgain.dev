@@ -79,6 +79,7 @@ export class EelRenderer {
     e.uWeights = uniform(new THREE.Vector3(e.wStripe, e.wSpot, e.wFlank));
     e.uSeed = uniform(e.index * 17.3 + 3.1);
     e.uExcite = uniform(0);
+    e.uRoll = uniform(0);   // body roll about the long axis, wrapped into [0, 2pi) by commitPose
     // One 256 × 1 ramp per eel, allocated here and rebaked in place forever after; every mask reads
     // its color from it, so a reroll is a texture upload and some uniforms, never a new pipeline.
     e.rampTex = makeRampTexture();
@@ -145,7 +146,10 @@ export class EelRenderer {
       const eyeT = smoothstep(0.0, 0.05, t).oneMinus();
       return body.add(tail).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.25));
     }) : Fn(() => {
-      const t = vUV.x, ang = vUV.y;
+      // Roll spins the pattern, wrapped into [0, 2pi) for the dorsal and ridge terms. At roll 0 the
+      // raw attribute passes through: wrapping moves the seam vertex, and the spot noise notices.
+      const rolled = vUV.y.add(e.uRoll).div(TWO_PI).fract().mul(TWO_PI);
+      const t = vUV.x, ang = mix(vUV.y, rolled, step(1e-6, e.uRoll));
       const time = U.time;
       const wave = sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5);
       const stripes = smoothstep(0.35, 0.65, wave);

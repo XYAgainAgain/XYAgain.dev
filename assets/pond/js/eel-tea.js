@@ -53,7 +53,8 @@ export class TeaTime {
   pickTarget(sys, e, now) {
     const st = this.stateFor(e);
     if (!st.want || now < st.breakUntil) return false;
-    if (sys.foods.some((f) => f.amount > 0)) return false;   // crumbs first; the meal roll re-queues anyway
+    // Crumbs first, and only the ones in smelling range; the meal roll re-queues the cup anyway.
+    if (sys.braincell?.hasSensedFood(e) ?? sys.foods.some((f) => f.amount > 0)) return false;
     const idx = st.padIdx >= 0 ? st.padIdx : this.pickPad(e);
     if (idx < 0) {
       if (st.want === 'rest') this.rest(e, st, now);   // no pad in reach: straight to bed, no cup
@@ -87,7 +88,7 @@ export class TeaTime {
     if (deep && st.seenBout !== e.gaitFrom) {
       st.seenBout = e.gaitFrom;
       // Bedtime cup: hijack a fresh deep rest unless one just happened; rest() resumes the bout after.
-      if (now - st.lastTeaAt > k.grace && !e.snuggle.with && !e.pose.kind && !st.want) {
+      if (now - st.lastTeaAt > k.grace && !e.snuggle.with && !e.restPose.kind && !st.want) {
         st.want = 'rest';
         st.restLen = Math.max(8, e.gaitUntil - now);
         e.gaitUntil = now;
@@ -98,7 +99,8 @@ export class TeaTime {
     if (!st.want && env > k.rainOn && now >= st.breakUntil) st.want = 'rain';
     // A due cup with no trip yet expedites the next retarget. The crumb guard mirrors hook one's;
     // the graze guard lets a tea-drinking grazer (Morgan) finish her salad before the kettle calls.
-    if (st.want && st.padIdx < 0 && now >= st.breakUntil && !e.food && !e.tunnel && e.coverSpot?.type !== 'graze' && !sys.foods.some((f) => f.amount > 0)) {
+    const liveCrumb = sys.braincell?.hasSensedFood(e) ?? sys.foods.some((f) => f.amount > 0);
+    if (st.want && st.padIdx < 0 && now >= st.breakUntil && !e.food && !e.tunnel && e.coverSpot?.type !== 'graze' && !liveCrumb) {
       e.retargetAt = Math.min(e.retargetAt, now);
     }
 

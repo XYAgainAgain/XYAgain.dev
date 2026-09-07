@@ -15,6 +15,12 @@ export const MOON_COLOR = [0.62, 0.74, 1.0];
 export const EEL_COUNT = 6;
 export const EEL_POINTS = 24;
 export const INF_SLOTS = 8;          // creature influence capsules: 6 residents plus Eleanor's two chained capsules
+// Context-steering ring width. At 16 the sampled directions sit wider apart than an eel is thick, so a
+// passable gap can hold no slot at all; pond.eels.knobs.slots is the live A/B.
+export const BRAIN_SLOTS = 32;
+// Dig puffs get their own premultiplied pool: about 26 grains and 16 silt per dig, so 128 slots hold
+// three overlapping digs plus a wake-up with the billows still alive.
+export const SEDIMENT_POOL = 128;
 // Wake memory + algae cover field, RGBA16F ping-pong over the whole pool. 256 halves the texel to
 // ~0.14 units, which is what stops the algae edges reading as a mosaic; the pass is still trivial.
 export const WAKE_RES = 256;
@@ -27,3 +33,9 @@ export const STORAGE_KEY = 'xy.eels';
 export const NAMES_KEY = 'xy.names';
 export const QUALITY_KEY = 'xy.quality';
 export const JUNK_KEY = 'xy.junk';
+
+// One gate for every 0–1 pin and live knob: NaN, Infinity, or a non-number keeps the fallback, so a
+// junk ?brain= can never poison a multiplier downstream.
+export function finite01(v, fallback = 0) {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback;
+}

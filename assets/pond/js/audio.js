@@ -251,8 +251,8 @@ export class PondAudio {
   /* Bigger eel, deeper voice: residents run ~1.6–3.6 units and grow toward 7 before the SLURP. */
   rateForLength(len = 2.8) { return Math.max(0.6, Math.min(1.3, (2.8 / len) ** 0.5)); }
 
-  startle({ length, pan = null } = {}) {
-    this.pick('startles', 'startle', { jitter: 0.2, rate: this.rateForLength(length), pan });
+  startle({ length, pan = null, db = 0 } = {}) {
+    this.pick('startles', 'startle', { db, jitter: 0.2, rate: this.rateForLength(length), pan });
   }
 
   /* The big girl's chunky startle: throttled, and trimmed/jittered since there's only one file. */
@@ -338,6 +338,34 @@ export class PondAudio {
 
   /* A pad or leaf settling back after a body shoved it: a low plip. */
   padSettle({ pan = null } = {}) { this.pick('plips', 'padSettle', { jitter: 0.2, rate: 0.7, pan }); }
+
+  /* Verticality placeholders, all standing in for SFX-Wishlist rows Sam has yet to record. */
+
+  // A snout breaking the film: the plip, five semitones down.
+  peek({ pan = null } = {}) { this.pick('plips', 'plip', { db: -4, jitter: 0.25, rate: st(-5), pan }); }
+
+  // A body coming back down. One branch, never both: a belly flop is an octave under with a burst
+  // behind it, an ordinary re-entry is the length-pitched plop with a single short-bubs after.
+  splash({ pan = null, length = 2.8, bellyflop = false } = {}) {
+    if (bellyflop) {
+      this.shot('plops', 0, 'plopBig', { rate: 0.5, jitter: 0.02, pan });
+      this.pick('shortBubs', 'shortBub', { db: 4, jitter: 0.3, delay: 0.06, pan });
+    } else {
+      this.shot('plops', 0, 'plopBig', { rate: this.rateForLength(length), jitter: 0.04, pan });
+      this.pick('shortBubs', 'shortBub', { jitter: 0.3, delay: 0.09, pan });
+    }
+  }
+
+  // Sand moving under a digging head: short-bubs, low-passed into a scrunch and throttled to a beat.
+  dig({ pan = null } = {}) {
+    const now = Tone.now();
+    if (now - (this.digAt ?? 0) < 0.35) return;
+    this.digAt = now;
+    this.pick('shortBubs', 'shortBub', { db: -3, jitter: 0.4, rate: 0.75, lp: 700, pan });
+  }
+
+  // Snapping at the reflection and getting water: the plip, four semitones up.
+  moonbite({ pan = null } = {}) { this.pick('plips', 'plip', { jitter: 0.2, rate: st(4), pan }); }
 
   /* The shower envelope (0–1) from rain.js. Gain is squared so the build feels gradual rather than
      arriving all at once, and the lowpass opens as the rain gets closer. */

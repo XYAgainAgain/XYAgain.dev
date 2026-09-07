@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, cross, mat3, mat4, PI } from 'three/tsl';
-import { DEPTH, WAKE_RES } from './config.js';
+import { DEPTH, WAKE_RES, MOON_COLOR } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
 
@@ -303,6 +303,70 @@ function segPointDist(px, py, pz, ax, ay, az, bx, by, bz) {
   return Math.hypot(px - (ax + ux * t), py - (ay + uy * t), pz - (az + uz * t));
 }
 
+// The floor mesh's own dune parameters, captured in buildFloor so the CPU can evaluate the same
+// surface. Null until a floor is built; floorHeightAt then reads a flat -DEPTH, which is honest.
+let duneF = null, dunePh = null;
+
+/* The CPU twin of the floor's vertex displacement. Anything that has to sit on, sink into, or land
+   on the sand asks here: -DEPTH alone buries a grain behind the opaque mesh. */
+export function floorHeightAt(x, z) {
+  if (!duneF) return -DEPTH;
+  return -DEPTH + 0.06 * lumpNoise(x, 0, z, duneF, dunePh) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, duneF, dunePh);
+}
+
+// 64 x 64 of the sand albedo, linearized once at boot; the average stands in until it exists.
+let sandPix = null;
+let sandTiling = 1;
+const sandAvg = [0.42, 0.38, 0.32];
+const MOONLIT = 0.45;   // the floor's moonlit term, so a grain reads as the sand it came from
+
+function srgbToLinear(u) {
+  const c = u / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/* One 64 x 64 draw of the already-decoded bitmap: no second fetch, no GPU readback. Any failure
+   (no manifest, no canvas) leaves the average in place rather than throwing at boot. */
+function bakeSandSamples(set, tilingWorld) {
+  sandTiling = tilingWorld;
+  const img = set?.albedo?.image;
+  if (!img || typeof document === 'undefined') return;
+  try {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+    ctx.drawImage(img, 0, 0, 64, 64);
+    const data = ctx.getImageData(0, 0, 64, 64).data;
+    const px = new Float32Array(64 * 64 * 3);
+    let sr = 0, sg = 0, sb = 0;
+    for (let i = 0, o = 0; i < px.length; i += 3, o += 4) {
+      px[i] = srgbToLinear(data[o]); px[i + 1] = srgbToLinear(data[o + 1]); px[i + 2] = srgbToLinear(data[o + 2]);
+      sr += px[i]; sg += px[i + 1]; sb += px[i + 2];
+    }
+    const n = 64 * 64;
+    sandAvg[0] = sr / n; sandAvg[1] = sg / n; sandAvg[2] = sb / n;
+    sandPix = px;
+  } catch { sandPix = null; }
+}
+
+/* Moonlit sand albedo at a world point, sampled through the floor's own tiling. Writes into `out`
+   so a per-grain spawn allocates nothing. */
+export function sandColorAt(x, z, out = [0, 0, 0]) {
+  let r = sandAvg[0], g = sandAvg[1], b = sandAvg[2];
+  if (sandPix) {
+    const u = x * sandTiling, v = z * sandTiling;
+    const iu = ((Math.floor(u * 64) % 64) + 64) % 64;
+    const iv = ((Math.floor(v * 64) % 64) + 64) % 64;
+    const o = (iv * 64 + iu) * 3;
+    r = sandPix[o]; g = sandPix[o + 1]; b = sandPix[o + 2];
+  }
+  out[0] = r * MOON_COLOR[0] * MOONLIT;
+  out[1] = g * MOON_COLOR[1] * MOONLIT;
+  out[2] = b * MOON_COLOR[2] * MOONLIT;
+  return out;
+}
+
 /* Cheap smooth 3D noise: a few hashed sines, enough for lumpy rocks without a library. */
 function lumpNoise(x, y, z, f, ph) {
   return Math.sin(x * f[0] + ph[0]) * Math.sin(y * f[1] + ph[1]) * 0.5
@@ -362,6 +426,8 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const fpos = floorGeo.attributes.position;
   const ff = [rng.range(0.25, 0.5), rng.range(0.25, 0.5), rng.range(0.25, 0.5)];
   const fph = [rng.range(0, 6), rng.range(0, 6), rng.range(0, 6)];
+  duneF = ff; dunePh = fph;
+  bakeSandSamples(sand, 0.16 * sand.tiling);
   for (let v = 0; v < fpos.count; v++) {
     const x = fpos.getX(v), z = fpos.getZ(v);
     const y = 0.06 * lumpNoise(x, 0, z, ff, fph) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, ff, fph);

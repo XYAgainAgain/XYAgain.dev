@@ -131,6 +131,11 @@ export function collide(eels, colliders) {
     const ea = eels[a];
     if (ea.slurpedBy) continue;
     const ca = ea.pts[EEL_POINTS >> 1];
+    const r = ea.radius;
+    // Per-eel bounds so eel-air.js can open the floor for a burrow or the ceiling for a leap. The
+    // fallbacks are today's constants exactly, so a pond with no air module clamps as it always did.
+    const bFloor = ea.floorY ?? (floorY + r + 0.08);   // floor has bumps up to ~0.08
+    const bCeil = ea.ceilingY ?? (-r * 0.5);
     // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
     // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
     const slip = ea.slip ?? 1;
@@ -141,14 +146,13 @@ export function collide(eels, colliders) {
     }
     for (let i = 0; i < EEL_POINTS; i++) {
       const p = ea.pts[i];
-      const r = ea.radius;
       const soft = i === 0 ? 0.35 : 1;   // the head eases out of contact; a full shove kinks the trail
       const glance = i < SLIP_POINTS ? slip : 1;
       // Rock and log colliders both sit proud of what they draw (the log's is a crest-plus-bend
       // envelope), so a slippery snout may take a small bite out of one before the push counts.
       const sink = (1 - glance) * r * 0.35;
-      if (p.y < floorY + r + 0.08) p.y = floorY + r + 0.08;   // floor has bumps up to ~0.08
-      if (p.y > -r * 0.5) p.y = -r * 0.5;
+      if (p.y < bFloor) p.y = bFloor;
+      if (p.y > bCeil) p.y = bCeil;
       for (const s of spheres) {
         // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
         // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
