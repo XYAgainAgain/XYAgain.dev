@@ -5,9 +5,9 @@ export const EFFECT_POOL = 64;
 
 /* Kind is resolved on the CPU at spawn so the shader stays branchless: colors, rise speed, half-size
    in world units, and life in seconds. rise is +y because the pond's floor is at -DEPTH. Color may
-   exceed 1: the pass is additive into a half-float target, so a pop reads as a real flash.
-   style is the drawn shape (0 blob, 1 wobbling ring, 2 expanding ring, 3 blob that holds then goes);
-   gravity, grow, and opacity ride the sediment attribute and are 0/0/1 for the additive kinds. */
+   exceed 1: the pass is additive into a half-float target, so a pop reads as a real flash. */
+// style is the drawn shape (0 blob, 1 wobbling ring, 2 expanding ring, 3 blob that holds then goes).
+// gravity, grow, and opacity ride the sediment attribute, defaulting to 0/0/1 for the additive kinds.
 export const KINDS = {
   spark: { color: [1.0, 0.86, 0.52], rise: 0.10, size: 0.055, life: 0.9, style: 0 },
   // ~1.3 cm at pond scale: a true-to-life bubble is too small to read from a straight-down camera.
@@ -19,14 +19,13 @@ export const KINDS = {
   // Sediment, premultiplied instance only: a grain thunks sideways under gravity and sits where it
   // lands; silt swells and dissipates. Color comes from the sand at the dig, per spawn.
   grain: { color: [0.42, 0.38, 0.32], rise: 0.12, size: 0.018, life: 3.0, style: 3, gravity: 0.6, opacity: 1 },
-  silt: { color: [0.48, 0.44, 0.38], rise: 0.05, size: 0.03, life: 4.5, style: 0, grow: 1.5, opacity: 0.35 },
+  silt: { color: [0.48, 0.44, 0.38], rise: 0.05, size: 0.06, life: 4.5, style: 0, grow: 2.0, opacity: 0.6 },
 };
 
 const NO_LANDING = -1e6;   // a grain-only clamp; every other kind falls through max() untouched
 
 /* One bounded instanced draw for every below-the-waterline effect: fish-death sparks, nibble bubbles,
-   Eleanor's slurp motes, and (in a second premultiplied instance) the dig's sediment. Lives in
-   underScene so the surface pass refracts it like everything else. */
+   Eleanor's slurp motes, and (a second premultiplied instance) the dig's sediment; underScene refracts it like everything else. */
 export class UnderwaterEffectsPool {
   constructor({ pool = EFFECT_POOL, blend = 'additive', rng = null } = {}) {
     this.time = 0;
@@ -102,11 +101,17 @@ export class UnderwaterEffectsPool {
       const holdEnv = smoothstep(0.0, 0.1, f).mul(smoothstep(1.0, 0.82, f));
       vFade.assign(mix(softEnv, holdEnv, hold));
       const tp = t.max(0);
-      const c = o.xyz.add(m.xyz.mul(tp));
+      const grav = gr.x;
+      // A landed grain sits: the ballistic solve for the touchdown time freezes its horizontal travel,
+      // or it slides on under the height it was given. Gravity 0 pushes the settle time out of range.
+      const settle = m.y.add(m.y.mul(m.y).add(grav.mul(o.y.sub(gr.y)).mul(2)).max(0).sqrt()).div(grav.max(1e-4))
+        .add(step(grav, float(1e-6)).mul(1e9));
+      const th = tp.min(settle);
+      const c = o.xyz.add(m.xyz.mul(vec3(th, tp, th)));
       // Gravity and the per-instance landing height live here so a grain flies, lands, and sits with
       // no CPU work; every other kind carries gravity 0 and a landing height far below the pond.
-      const y = c.y.sub(gr.x.mul(tp).mul(tp).mul(0.5)).max(gr.y);
-      const sway = sin(tp.mul(5).add(o.x.mul(7))).mul(0.012);
+      const y = c.y.sub(grav.mul(tp).mul(tp).mul(0.5)).max(gr.y);
+      const sway = sin(th.mul(5).add(o.x.mul(7))).mul(0.012);
       const half = look.w.mul(live).mul(gr.z.mul(f).add(1));
       const q = positionGeometry.xy;
       return vec3(c.x.add(sway).add(q.x.mul(half)), y, c.z.add(q.y.mul(half)));
@@ -153,6 +158,13 @@ export class UnderwaterEffectsPool {
   setTime(t) {
     this.time = t;
     this.uTime.value = t;
+  }
+
+  /* Occupancy, so an idle trickle can stand aside for a dig-in burst instead of evicting one. */
+  live() {
+    let n = 0;
+    for (let i = 0; i < this.pool; i++) if (this.dieAt[i] > this.time) n++;
+    return n;
   }
 
   /* Expired first, then the most-faded grain: a busy dig loses settled grains, never a live billow.

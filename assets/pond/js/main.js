@@ -12,6 +12,7 @@ import { EelSystem } from './eels.js';
 import { attachBraincell } from './eel-brain.js';
 import { attachFear } from './eel-fear.js';
 import { attachAir } from './eel-air.js';
+import { attachQuirks } from './eel-quirks.js';
 import { attachEleanor } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
 import { TeaTime } from './eel-tea.js';
@@ -141,6 +142,9 @@ async function boot() {
   // Where a flat pond would put the moon's reflection, from the same CPU-owned uniforms the surface
   // pass reads. The glitter itself wanders with the water normal; the eel is wrong about it anyway.
   eels.moonBiteAnchor = { x: 0, z: 0 };
+  // Last of the four: its heading adapter wraps the braincell's, and its bonk watch reads the head
+  // push the physics pass left behind.
+  const quirks = attachQuirks(eels, seed);
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -251,6 +255,9 @@ async function boot() {
   eels.on('gape', silent);
   eels.on('lunge', silent);
   eels.on('overit', silent);
+  // A soft bonk (Q-A's snout probe) stays silent forever; the hard one waits on the thup.
+  eels.on('bonk', silent);
+  eels.on('spin', (ev) => audio.spin({ pan: ev.pan, revs: ev.detail?.revs ?? 3 }));
   eels.on('graze', (ev) => audio.graze({ pan: ev.pan, muffled: ev.food?.kind === 'algae' }));   // a tuft is eaten under water
   // Verticality, all placeholders until Sam records the wishlist rows (wet snout-pop, leap splash,
   // sand scrunch, wet snap on nothing). splash branches once: a belly flop is never both variants.
@@ -699,7 +706,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

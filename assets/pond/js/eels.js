@@ -86,6 +86,9 @@ export class Eel {
     this.tick = { owner: null, tier: null };
     this.pose = { speed: null, targetY: null, ampMul: null, squash: null, roll: null, excite: null };
     this.slurpedBy = null;
+    // Swap generation: a hot-swap reuses this object, so anything stored off the eel that must
+    // outlive the tick (a crumb's claimant) records the name and this counter, never the reference.
+    this.gen = 0;
     this.offscreenFor = 0;   // seconds the whole body has been out of view; 5 buys an identity swap
     this.rollColors(rng);
     this.rollPattern(rng);
@@ -137,10 +140,15 @@ export class EelSystem {
       brain: 1, anticipation: 1, slots: BRAIN_SLOTS, brake: 0.7, brakeAngle: 30, brainFloor: 0.2,
       // 1.5 rather than 1: at 1 a grazing guest tops out at 0.49 panic, one hundredth under the
       // scatter line, and the dinner table never empties.
-      fear: 1.5, air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1 }, stim: 1, spin: 1, moon: 1,
+      // puffSize scales the silt billow's half-size, puffTrickle is seconds between buried puffs.
+      fear: 1.5, stim: 1, spin: 1, moon: 1,
+      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, puffTrickle: 0.8 },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
+      // Q-A to Q-C's taste dials. stim and spin above stay plain multipliers, as Part Five declares
+      // them, so a primitive cannot carry these: bonk push in radii, its rate limit and aim, the meals.
+      quirks: { bonkPush: 0.6, bonkEvery: 2, bonkNear: 1.2, bonkAngle: Math.PI / 3, gratitude: 3 },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
     // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt) and initEel(sys, e).
@@ -151,6 +159,7 @@ export class EelSystem {
     this.held = null;              // live right-hold feed: { x, z, gestureId, next }
     this.inputHandlers = null;     // main's own pointer handlers, so a recorded script makes real side effects
     this.script = null;
+    this.pokeRelease = null;       // tick a replayed poke lets go on; the fixture vocabulary has no release
     this.ticks = 0;                // simulation ticks since boot; the recorded-input player's clock
     this.spookId = 0;
     this.dropId = 0;
@@ -163,6 +172,7 @@ export class EelSystem {
     this.tea = null;               // Matthew's kettle (eel-tea.js); behavior calls it only for tea drinkers
     this.braincell = null;         // eel-brain.js; sense, the context maps, memory, the tells
     this.fear = null;              // eel-fear.js; the fear map, scatter, refuge contests, alarm and calm
+    this.stim = null;              // eel-quirks.js; stimming, bonks, spin feeding, the one roll owner
     this.headingAdapter = null;    // Chunk 1's context steering: (sys, e, force, dt) -> desired heading angle
     // Everything smellable, keyed by kind. Crumbs register themselves in feed(); a fish school or a
     // dipping firefly registers the same shape with its own plume growth and plop radius.
@@ -313,7 +323,7 @@ export class EelSystem {
     // The drop stream: a rhythm reader needs to know which crumb this was, which gesture made it,
     // and when it actually landed in simulation time rather than when a frame noticed it.
     const crumb = {
-      x, z, y: -0.05, amount, size, mesh, claims: 0, vy: 0, growPerAmt: 0.02,
+      x, z, y: -0.05, amount, size, mesh, claims: 0, claimedBy: null, contested: false, vy: 0, growPerAmt: 0.02,
       dropId: ++this.dropId,
       gestureId: opts?.gestureId ?? this.finger.gestureId,
       origin: opts?.origin ?? 'click',
@@ -380,6 +390,7 @@ export class EelSystem {
     const to = id ?? pickAbsent(this.rng, names);
     if (!to) return false;
     const from = e.name, oldLen = e.length;
+    e.gen++;   // the body is reused; the generation is what tells the outgoing eel's records apart
     // A braid does not survive one of its strands turning into someone else.
     if (e.twine) { for (const m of e.twine.members) if (m.twine === e.twine) m.twine = null; }
     e.identity = to;
@@ -438,11 +449,29 @@ export class EelSystem {
   playInput(script) {
     this.script = Array.isArray(script) && script.length ? script.slice().sort((a, b) => a.tick - b.tick) : null;
     this.scriptAt = 0;
-    this.scriptFrom = this.ticks;
+    // tick() increments before the prepass runs runScript, so the next one is the fixture's tick 0;
+    // anchoring on the current count collapses recorded ticks 0 and 1 onto the same prepass.
+    this.scriptFrom = this.ticks + 1;
+    this.scriptPrev = null;
+    this.pokeRelease = null;
     return !!this.script;
   }
 
+  /* A discrete poke has no matching release in the fixture vocabulary, so it lets go of its own
+     accord; without this a fixture that ends on one leaves an immortal, ever-more-familiar hand. */
+  releaseScriptPoke() {
+    if (this.pokeRelease === null || this.ticks < this.pokeRelease) return;
+    this.pokeRelease = null;
+    const f = this.finger;
+    if (f.mode !== 'poke') return;
+    f.mode = 'none';
+    f.vx = 0; f.vz = 0; f.speed = 0;
+    f.heldFor = 0; f.stillFor = 0;
+    this.scriptPrev = null;
+  }
+
   runScript() {
+    this.releaseScriptPoke();
     const s = this.script;
     if (!s) return;
     const rel = this.ticks - this.scriptFrom;
@@ -461,9 +490,22 @@ export class EelSystem {
     const mode = SCRIPT_MODES[ev.type];
     if (mode === undefined) return;
     // Published before the handler runs, so a crumb fed on this entry already carries the right id.
-    if (SCRIPT_STARTS.has(ev.type)) { f.gestureId++; f.heldFor = 0; }
+    const starting = SCRIPT_STARTS.has(ev.type);
+    if (starting) { f.gestureId++; f.heldFor = 0; }
+    const x = ev.x ?? 0, z = ev.z ?? 0;
+    // Velocity comes off the fixture's own cadence, never off whatever real flick preceded the replay:
+    // without this a scripted swipe reads as a standing hand to the speed-sensitive fear and stim paths.
+    const prev = starting || mode === 'none' ? null : this.scriptPrev;
+    const span = prev ? (ev.tick - prev.tick) * TICK : 0;
+    if (span > 0) { f.vx = (x - prev.x) / span; f.vz = (z - prev.z) / span; f.speed = Math.hypot(f.vx, f.vz); }
+    else if (!prev) { f.vx = 0; f.vz = 0; f.speed = 0; }
+    f.vAge = 0;
+    this.scriptPrev = mode === 'none' ? null : { x, z, tick: ev.tick };
+    // Armed by a poke, disarmed by anything else on the same tick: a drag or a feed opened over it is
+    // a deliberate hold and must not be released a tick later.
+    this.pokeRelease = ev.type === 'poke' ? this.ticks + 1 : null;
     f.mode = mode;
-    if (mode !== 'none') { f.x = ev.x ?? 0; f.z = ev.z ?? 0; f.stillFor = 0; f.moveSeq++; }
+    if (mode !== 'none') { f.x = x; f.z = z; f.stillFor = 0; f.moveSeq++; }
   }
 
   /* F2a's finger clock. Familiarity rises while the hand is in the water, holds through a short

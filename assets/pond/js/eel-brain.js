@@ -1,7 +1,9 @@
 import { BRAIN_SLOTS, DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { retreatAlongTrail } from './eel-physics.js';
-import { makeRings, clearRings, addInterest, addDanger, addDangerArc, adapt, wrapPi, slotAngle, TAU } from './eel-brain-core.js';
+import { tickHeldAbove } from './eel-behavior.js';
+import { makeRings, clearRings, addInterest, addDanger, addDangerArc, adapt, wrapPi, slotAngle, legalNudge, TAU } from './eel-brain-core.js';
+import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
 
 /* The Shared Braincell. One number per eel says how much of it they bother to use; everything below
    is the same machinery for everyone. Mounted as sys.braincell and as sys.headingAdapter. */
@@ -14,6 +16,9 @@ const NOTICE_LIFE = 6;           // seconds a quorum notice stands
 const NAP_REACH = 3.5;           // same reach the nap field uses, so a pile is one thing to both
 const SULK_RANGE = [20, 40];
 const SIDE_EYE_NEAR = 1.5, SIDE_EYE_YAW = 0.35;
+// Above the 0.2 legality floor on purpose: at or under it the grudge can never mask a heading, and
+// danger combines by maximum, so a writer below the floor is worth exactly nothing.
+const SIDE_EYE_DANGER = 0.35;
 const BOXED_LIMIT = 2.5, ESCAPE_LIMIT = 3;
 const ANCHOR_REFRESH = [240, 480];
 const WAVE_WRAP = Math.PI * 2 * 1000;   // same phase wrap the swim wave uses, so a long escape cannot drift
@@ -303,7 +308,9 @@ class Braincell {
      and the anticipation phantom, which is an ordinary force term like every other pull. */
   preSteer(sys, e, dt, force) {
     const st = this.stateFor(e), now = sys.time, head = e.head;
-    const spot = e.coverSpot;
+    // A run, a scatter, or a contest has already claimed the tick by the time this hook is reached;
+    // the sniff hold is voluntary tier and stands down for them rather than co-steering.
+    const spot = tickHeldAbove(e, 'voluntary') ? null : e.coverSpot;
     if (spot?.type === 'memory') {
       if (spot.holdUntil > 0) {
         if (now >= spot.holdUntil) e.coverSpot = null;
@@ -357,6 +364,9 @@ class Braincell {
     st.noProgressFor = 0;
     st.giveUpOn = null;
     this.writeMemory(st, f.x, f.z, f.y, now, Math.round(3 * e.wits));
+    // Sensing skips a sulked drop, so leaving it in `seen` makes remember() write the same site again
+    // next prepass and two duplicates fill a two-site memory.
+    if (f.dropId !== undefined) st.seen.delete(f.dropId);
     if (e.food === f) { f.claims = Math.max(0, f.claims - 1); e.food = null; }
     e.attnReset = true;
     if (e.wits > 0.4 && f.dropId !== undefined) {
@@ -522,21 +532,27 @@ class Braincell {
     return n;
   }
 
+  /* Only a live rock occupant counts against a refuge: a memory sniff or a pad loiter has coordinates
+     too, and an eel that left for a crumb or got slurped is not holding the hole. */
   claimsAt(sys, e, c, radius) {
     let n = 0;
     for (const o of sys.eels) {
-      if (o === e || !o.coverSpot) continue;
+      if (o === e || o.slurpedBy || o.coverSpot?.type !== 'rock') continue;
       if (o.coverSpot.refuge === c.refuge) { n++; continue; }
-      if (o.coverSpot.x !== undefined && Math.hypot(o.coverSpot.x - c.x, o.coverSpot.z - c.z) < radius) n++;
+      if (Math.hypot(o.coverSpot.x - c.x, o.coverSpot.z - c.z) < radius) n++;
     }
     return n;
   }
 
-  /* One-segment reject: a spot behind a rock is not cover, it is a detour. The maps route the rest. */
+  /* One-segment reject: a spot behind a rock or across a log is not cover, it is a detour. The maps
+     route the rest. */
   blockedLine(sys, e, ax, az, bx, bz) {
     const r = e.radius;
     for (const o of sys.colliders.spheres) {
       if (segPoint(o.x, o.z, ax, az, bx, bz) < (o.rHit ?? o.r) + r * 1.15 - 1e-3) return true;
+    }
+    for (const l of sys.colliders.logs) {
+      if (segSegDist(ax, az, bx, bz, l.a.x, l.a.z, l.b.x, l.b.z) < l.rOuter + r * 1.15 - 1e-3) return true;
     }
     return false;
   }
@@ -603,12 +619,12 @@ class Braincell {
       const dx = w.x - head.x, dz = w.z - head.z;
       const d = Math.hypot(dx, dz);
       if (d < 1e-4 || d - w.r > look) continue;
-      addDanger(danger, n, Math.atan2(dz, dx), Math.asin(Math.min(1, w.r / Math.max(d, 1e-4))), clamp01(w.strength));
+      this.writeField(danger, Math.atan2(dz, dx), Math.asin(Math.min(1, w.r / Math.max(d, 1e-4))), clamp01(w.strength));
     }
 
     // The view limit is a boundary, so the whole outward half reads as unwelcome rather than solid.
-    if (Math.abs(head.x) > sys.view.w * 0.7) addDangerArc(danger, n, head.x > 0 ? 0 : Math.PI, Math.PI / 2, 0.8);
-    if (Math.abs(head.z) > sys.view.h * 0.7) addDangerArc(danger, n, head.z > 0 ? Math.PI / 2 : -Math.PI / 2, Math.PI / 2, 0.8);
+    if (Math.abs(head.x) > sys.view.w * 0.7) this.writeArc(danger, head.x > 0 ? 0 : Math.PI, Math.PI / 2, 0.8);
+    if (Math.abs(head.z) > sys.view.h * 0.7) this.writeArc(danger, head.z > 0 ? Math.PI / 2 : -Math.PI / 2, Math.PI / 2, 0.8);
 
     const flockR = e.length;
     // Two loops rather than a concat: this runs per eel per tick and the array would be garbage.
@@ -620,7 +636,7 @@ class Braincell {
       const dx = s.x - head.x, dz = s.z - head.z;
       const d = Math.hypot(dx, dz);
       if (d < 1e-4 || d > look + 1.5) continue;
-      addDanger(danger, n, Math.atan2(dz, dx), Math.asin(Math.min(1, 0.6 / Math.max(d, 0.6))), 0.2);
+      this.writeField(danger, Math.atan2(dz, dx), Math.asin(Math.min(1, 0.6 / Math.max(d, 0.6))), SIDE_EYE_DANGER);
     }
     return st;
   }
@@ -638,7 +654,14 @@ class Braincell {
       if (d < bd) { bd = d; bx = p.x; bz = p.z; }
     }
     if (bd > flockR || bd < 1e-4) return;
-    addDanger(danger, this.slots, Math.atan2(bz - head.z, bx - head.x), Math.asin(Math.min(1, (o.radius + e.radius) / bd)), 0.25);
+    this.writeField(danger, Math.atan2(bz - head.z, bx - head.x), Math.asin(Math.min(1, (o.radius + e.radius) / bd)), 0.25);
+  }
+
+  // Pooled records rather than a fresh object per writer: this runs ~25 times per eel per tick.
+  record(ang, alpha, S, hard, flat) {
+    const rec = this.obst[this.obstAt] ?? (this.obst[this.obstAt] = { ang: 0, alpha: 0, S: 0, hard: true, flat: false });
+    rec.ang = ang; rec.alpha = alpha; rec.S = S; rec.hard = hard; rec.flat = flat;
+    this.obstAt++;
   }
 
   /* One obstacle: the skirted silhouette on the ring, plus its two tangent directions as candidates.
@@ -646,12 +669,21 @@ class Braincell {
      the nudge past it has to stay far under one slot or a gap narrower than a slot is stepped over. */
   writeObstacle(danger, thetaC, alpha, S, skip) {
     addDanger(danger, this.slots, thetaC, alpha, S, skip);
-    // Pooled records rather than a fresh object per writer: this runs ~25 times per eel per tick.
-    const rec = this.obst[this.obstAt] ?? (this.obst[this.obstAt] = { ang: 0, alpha: 0, S: 0 });
-    rec.ang = thetaC; rec.alpha = alpha; rec.S = S;
-    this.obstAt++;
+    this.record(thetaC, alpha, S, true, false);
     const out = alpha + TANGENT_EPS;
     this.candidates.push(thetaC + out, thetaC - out);
+  }
+
+  /* A skirted writer that is not a silhouette, so it spawns no tangent of its own but still masks
+     anybody else's: feared bodies, neighbors, and the side-eye's berth. */
+  writeField(danger, thetaC, alpha, S) {
+    addDanger(danger, this.slots, thetaC, alpha, S);
+    this.record(thetaC, alpha, S, false, false);
+  }
+
+  writeArc(danger, thetaC, half, S) {
+    addDangerArc(danger, this.slots, thetaC, half, S);
+    this.record(thetaC, half, S, false, true);
   }
 
   /* The log this eel's run belongs to; startTunnel keeps the mouths, so match on them. */
@@ -773,13 +805,16 @@ class Braincell {
         if (p.x * p.x + p.z * p.z > 1e-8) { st.ctx = Math.atan2(p.z, p.x); return st.ctx; }
       }
     } else { st.boxedFor = 0; st.boxedSide = 0; }
-    // The side-eye's bounded yaw proposal, applied to the one heading the tick solves for.
+    // Every bounded yaw proposal lands here, so one validated nudge covers the side-eye's gaze and
+    // Q-C's spin wobble alike rather than each reopening the legality boundary behind the solve.
+    let nudge = 0;
     if (st.gaze) {
       const want = Math.atan2(st.gaze.z - e.head.z, st.gaze.x - e.head.x);
       const off = wrapPi(want - res.heading);
-      return res.heading + Math.max(-SIDE_EYE_YAW, Math.min(SIDE_EYE_YAW, off)) * st.gaze.w;
+      nudge = Math.max(-SIDE_EYE_YAW, Math.min(SIDE_EYE_YAW, off)) * st.gaze.w;
     }
-    return res.heading;
+    nudge += sys.stim?.yawProposal?.(e) ?? 0;
+    return res.heading + legalNudge(res.score, this.slots, res.heading, res.limit, nudge);
   }
 
   startEscape(sys, e, st, now) {
@@ -874,8 +909,8 @@ function focusOf(sys, e, now) {
   const asleep = deep && e.census?.twoAM === 'asleep' && !e.tunnel && !e.food && !e.restPose?.kind;
   const wake = e.buried ? 0 : asleep ? 0 : deep ? 0.1 : holding ? 0.3 : 1;
   const panic = clamp01(sys.fear?.panic?.(e) ?? 0);
-  // Q-D's food-drunk multiplier lands here, on this one line, when Chunk 4 arrives.
-  return clamp01(e.wits * wake * (1 - 0.6 * panic));
+  // Q-D's food-drunk multiplier, on this one line and nowhere else, so nothing compounds it.
+  return clamp01(e.wits * wake * (1 - 0.6 * panic) * (foodDrunk(e) ? FOOD_DRUNK.focus : 1));
 }
 
 function segNearest(px, pz, l) {
@@ -894,6 +929,22 @@ function segPoint(px, pz, ax, az, bx, bz) {
   const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9;
   const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / l2));
   return Math.hypot(px - ax - dx * t, pz - az - dz * t);
+}
+
+/* Closest approach of two 2D segments: zero if they cross, otherwise an endpoint, which is where the
+   minimum has to sit once they do not. */
+function segSegDist(ax, az, bx, bz, cx, cz, dx, dz) {
+  const ux = bx - ax, uz = bz - az, vx = dx - cx, vz = dz - cz;
+  const den = ux * vz - uz * vx;
+  if (Math.abs(den) > 1e-12) {
+    const wx = cx - ax, wz = cz - az;
+    const t = (wx * vz - wz * vx) / den, s = (wx * uz - wz * ux) / den;
+    if (t >= 0 && t <= 1 && s >= 0 && s <= 1) return 0;
+  }
+  return Math.min(
+    segPoint(ax, az, cx, cz, dx, dz), segPoint(bx, bz, cx, cz, dx, dz),
+    segPoint(cx, cz, ax, az, bx, bz), segPoint(dx, dz, ax, az, bx, bz),
+  );
 }
 
 /* Box-Muller off the eel's own brain stream; the pair's second value is kept for the next draw. */

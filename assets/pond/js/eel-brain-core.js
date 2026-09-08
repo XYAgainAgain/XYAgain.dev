@@ -24,6 +24,18 @@ export function ringAt(ring, n, a) {
   return ring[k % n] * (1 - t) + ring[(k + 1) % n] * t;
 }
 
+/* A bounded yaw proposal, not a second write: the offer is halved until it lands on a heading the
+   solve's own legality test already passed, so nothing can steer the head back inside a routed shape. */
+export function legalNudge(score, n, heading, limit, nudge) {
+  if (!score || !(nudge !== 0)) return 0;
+  let k = nudge;
+  for (let i = 0; i < 3; i++) {
+    if (ringAt(score, n, heading + k) <= limit) return k;
+    k *= 0.5;
+  }
+  return 0;
+}
+
 export function makeRings(n) {
   return { n, interest: new Float64Array(n), danger: new Float64Array(n), blurred: new Float64Array(n), scratch: new Float64Array(n) };
 }
@@ -36,7 +48,24 @@ export function hardAt(obstacles, a, count = obstacles.length) {
   let m = 0;
   for (let i = 0; i < count; i++) {
     const o = obstacles[i];
+    if (o.hard === false) continue;
     if (angDelta(a, o.ang) <= o.alpha && o.S > m) m = o.S;
+  }
+  return m;
+}
+
+/* The writers that are not obstacle silhouettes, at one angle, skirt included. A tangent candidate is
+   a fit test against the rocks, but a neighbor, a feared body, or the view boundary still vetoes it. */
+export function softAt(writers, a, count = writers.length) {
+  let m = 0;
+  for (let i = 0; i < count; i++) {
+    const o = writers[i];
+    if (o.hard !== false) continue;
+    const d = angDelta(a, o.ang);
+    let v = 0;
+    if (d <= o.alpha) v = o.S;
+    else if (!o.flat && d < o.alpha + SKIRT) v = o.S * Math.cos(2 * (d - o.alpha));
+    if (v > m) m = v;
   }
   return m;
 }
@@ -103,11 +132,13 @@ function sweepScores(out, blurred, n, from, dir) {
 function scoreAtAngle(score, n, a) { return ringAt(score, n, a); }
 
 // One reused record: adapt() runs once per eel per tick and a fresh object each time is pure garbage.
-const RESULT = { heading: 0, routing: false, boxed: false, min: 0, limit: 0, slot: -1, side: 0, candidate: false };
+const RESULT = { heading: 0, routing: false, boxed: false, min: 0, limit: 0, slot: -1, side: 0, candidate: false, score: null };
 
-function result(heading, routing, boxed, min, limit, slot, side, candidate) {
+// `score` is the ring the legality test actually used, so a caller can re-check its own proposal on it.
+function result(heading, routing, boxed, min, limit, slot, side, candidate, score) {
   RESULT.heading = heading; RESULT.routing = routing; RESULT.boxed = boxed;
   RESULT.min = min; RESULT.limit = limit; RESULT.slot = slot; RESULT.side = side; RESULT.candidate = candidate;
+  RESULT.score = score;
   return RESULT;
 }
 
@@ -140,7 +171,7 @@ export function adapt(cfg) {
   // keeps the exact vector it computes today. Boxed in, the emergency branch outranks the bypass.
   const openAhead = swept === null ? danger[fSlot] : swept[fSlot];
   if (!boxed && openAhead <= bypassLimit) {
-    return result(forceAng, false, false, min, bypassLimit, fSlot, 0, false);
+    return result(forceAng, false, false, min, bypassLimit, fSlot, 0, false, swept ?? danger);
   }
 
   blurRing(danger, blurred, n, blurRadius);
@@ -161,7 +192,7 @@ export function adapt(cfg) {
     if (bestK < 0) for (let k = 0; k < n; k++) if (score[k] < best) { best = score[k]; bestK = k; }
     const want = slotAngle(bestK, n);
     const side = Math.sign(wrapPi(want - prevHeading)) || stickySide;
-    return result(blend(prevHeading, want, blendA, score, n, limit), true, true, min, limit, bestK, side, false);
+    return result(blend(prevHeading, want, blendA, score, n, limit), true, true, min, limit, bestK, side, false, score);
   }
 
   // Goal fallback: only when the resultant's own cone is fully blocked does the live target get a say.
@@ -184,6 +215,10 @@ export function adapt(cfg) {
       // Same threshold the slots are masked with, applied to the hard field: a candidate is legal when
       // what physically blocks it is no worse than the best the ring can offer anywhere.
       if (hardAt(obstacles, a, nObst) > limit) continue;
+      // A gap between two silhouettes is a fit question, but everything that is not a silhouette still
+      // masks a tangent, and a one-sided eel has to survive the whole sweep to reach it.
+      if (softAt(obstacles, a, nObst) > limit) continue;
+      if (sweepFrom !== null && ringAt(score, n, a) > limit) continue;
       const v = ringAt(interest, n, a);
       if (v > best) { best = v; candAng = a; }
     }
@@ -208,7 +243,7 @@ export function adapt(cfg) {
       }
     }
   }
-  return result(blend(prevHeading, want, blendA, score, n, limit), true, false, min, limit, bestK, 0, candAng !== null);
+  return result(blend(prevHeading, want, blendA, score, n, limit), true, false, min, limit, bestK, 0, candAng !== null, score);
 }
 
 function leastOnSweep(swept, n) {

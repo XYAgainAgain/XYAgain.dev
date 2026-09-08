@@ -314,7 +314,7 @@ export function floorHeightAt(x, z) {
   return -DEPTH + 0.06 * lumpNoise(x, 0, z, duneF, dunePh) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, duneF, dunePh);
 }
 
-// 64 x 64 of the sand albedo, linearized once at boot; the average stands in until it exists.
+// 64 × 64 of the sand albedo, linearized once at boot; the average stands in until it exists.
 let sandPix = null;
 let sandTiling = 1;
 const sandAvg = [0.42, 0.38, 0.32];
@@ -325,7 +325,7 @@ function srgbToLinear(u) {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-/* One 64 x 64 draw of the already-decoded bitmap: no second fetch, no GPU readback. Any failure
+/* One 64 × 64 draw of the already-decoded bitmap: no second fetch, no GPU readback. Any failure
    (no manifest, no canvas) leaves the average in place rather than throwing at boot. */
 function bakeSandSamples(set, tilingWorld) {
   sandTiling = tilingWorld;

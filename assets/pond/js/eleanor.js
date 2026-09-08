@@ -26,6 +26,8 @@ export function attachEleanor(sys, seed) {
   const id = IDENTITIES.find((i) => i.name === 'Eleanor');
   const e = new Eel(6, seed, sys.extent, sys.colliders, sys.view, id);
   e.brain = brain;
+  // Q-D is a resident's crumb-spam wobble; a guest is born past the line and is not drunk, just big.
+  e.drunkAt = Infinity;
   e.checkAt = 0;
   e.stateAt = 0;
   e.coolAt = 0;
@@ -174,6 +176,16 @@ function brain(sys, e, dt) {
   if (e.state === 'lair' || e.state === 'offstage') {
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 4);
     paceWave(e, dt, true);
+    // Q-A, the guest form: the module proposes, her controller applies. A tail flick and a small
+    // heading wobble are the only two that fit a body already folded inside its log.
+    const fidget = e.state === 'lair' ? sys.stim?.lairStim(sys, e) : null;
+    if (fidget) {
+      if (fidget.ampMul !== null) e.ampMul = fidget.ampMul;
+      if (fidget.yaw) {
+        const c = Math.cos(fidget.yaw * dt), s = Math.sin(fidget.yaw * dt);
+        e.heading.set(e.heading.x * c - e.heading.z * s, 0, e.heading.x * s + e.heading.z * c);
+      }
+    }
     if (now > e.checkAt) {
       e.checkAt = now + 1;
       const fromLair = e.state === 'lair';
@@ -314,9 +326,8 @@ function brain(sys, e, dt) {
       return;
     }
   } else {
-    // A feed spree does not depend on her short nose. She heads for the commotion, and only once she
-    // is on top of it does she pick out individual crumbs by smell; smelling none on the way over is
-    // never a reason to swim home.
+    // A feed spree does not depend on her short nose: she heads for the commotion, and only once she is
+    // on top of it does smell pick out individual crumbs. Smelling none en route is never a reason to go home.
     const spot = sys.commotion;
     if (spot) { e.table = e.table ?? { x: 0, z: 0 }; e.table.x = spot.x; e.table.z = spot.z; }
     // No table at all is a different thing from a table she cannot smell yet: the first is a wasted

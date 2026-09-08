@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { DEPTH, EEL_POINTS } from './config.js';
 import { segDist, retreatAlongTrail, growEel } from './eel-physics.js';
+import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
 
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 
@@ -177,12 +178,12 @@ function routeCrossesLog(e, log) {
   return false;
 }
 
-/* Every path that abandons surface cover early (a scare, a crumb, a scatter) goes through here, so a
-   ridge claim never outlives its coverSpot. */
+/* Every path that abandons cover early (a scare, a crumb, a scatter) goes through here, so a ridge
+   claim never outlives its coverSpot and a crevice nobody is heading for stops counting as taken. */
 export function dropCover(sys, e) {
   const t = e.coverSpot?.type;
   if (t === 'ridge') sys.habitat?.release(e.coverSpot.id);
-  if (t === 'pad' || t === 'ridge') e.coverSpot = null;
+  if (t === 'pad' || t === 'ridge' || t === 'rock') e.coverSpot = null;
 }
 
 /* B6's scored crevice pick. The random angle past one rock's radius survives as the fallback for a
@@ -357,6 +358,14 @@ export function claimTick(e, tier, name) {
   e.tick.tier = tier;
   e.tick.owner = name ?? tier;
   return true;
+}
+
+/* Whether a tier above the caller's already holds the eel. A module that lost the tick may keep its
+   clocks running, but it may not write the target. */
+export function tickHeldAbove(e, tier) {
+  const rank = TIER_RANK.get(tier);
+  if (rank === undefined || e.tick.tier === null) return false;
+  return TIER_RANK.get(e.tick.tier) < rank;
 }
 
 /* Tick Contract step 5. The blocks above compute the defaults, the tick's owner overrides only what
@@ -575,15 +584,28 @@ export function steer(sys, e, dt) {
   sys.braincell?.preSteer(sys, e, dt, force);
   // F6's one deliberate reaction. It yields to a scatter, a contest, and a slurp, and the tiers above
   // it own the tick outright, so it can never cancel a run or a recovery.
-  const telling = !scatter && !contest && (sys.fear?.tellTick(sys, e, dt) ?? false);
+  const telling = !scatter && !contest && (sys.fear?.tellTick(sys, e, dt, tickHeldAbove(e, 'voluntary')) ?? false);
   if (telling) claimTick(e, 'voluntary', 'overit');
+  // Q-A. Below every tier that can own the eel outright, so only an idle hold lets a fidget start.
+  // The tier is passed in rather than imported, so eel-quirks.js stays free of a cycle with this file.
+  const stimming = !scatter && !contest && !telling
+    && (sys.stim?.tick(sys, e, dt, tickHeldAbove(e, 'voluntary')) ?? false);
+  if (stimming) claimTick(e, 'voluntary', 'stim');
+  // V8's approach is a voluntary trip rather than a committed air state, so it arbitrates down here:
+  // anything holding the eel, or a crumb it can already smell, cancels the swim to the reflection.
+  let biting = false;
+  if (sys.air?.approaching(e)) {
+    if (!tickHeldAbove(e, 'voluntary') && !(sys.braincell?.hasSensedFood(e) ?? false)) biting = sys.air.approachTick(sys, e, dt);
+    else sys.air.cancelApproach(e);
+  }
+  if (biting) return;
   const memHold = e.coverSpot?.type === 'memory' && now < (e.coverSpot.holdUntil ?? 0);
   // A quirk holding the target this tick blocks the retarget exactly the way a pad loiter does.
   // Gait-driven state is read one tick late: updateGait runs below, where its rng stream already lives.
   const looping = e.gait === 'loop' && now < e.gaitUntil && !e.tunnel && !e.food;
   const snug = e.snuggle.with && now < e.snuggle.until && e.snuggle.with.gait === 'hold' && !e.snuggle.with.slurpedBy ? e.snuggle.with : null;
   if (!snug) e.snuggle.with = null;
-  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling;
+  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming;
   // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
   // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
   const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
@@ -608,8 +630,9 @@ export function steer(sys, e, dt) {
   else if (memHold) claimTick(e, 'voluntary', 'memory');
 
   // Quirk targets, in the order they outrank each other; each parks e.target for this tick only. A
-  // contest owns both parties outright, so these blocks stand down for it exactly as for a run or a flee.
-  const busy = !!e.tunnel || now < e.fleeUntil || !!contest;
+  // scatter or a contest owns the eel outright, so these blocks stand down for it exactly as for a
+  // run or a flee: the food block's separate pull is the one documented co-drive.
+  const busy = !!e.tunnel || now < e.fleeUntil || !!contest || !!scatter;
   let rescuing = false, butting = false;
   if (poseTick(e, dt, now, !busy)) { claimTick(e, 'social', 'pose'); }
   else if (looping && !busy) {
@@ -670,7 +693,7 @@ export function steer(sys, e, dt) {
   if (now < e.buttBurst) { speedMul = Math.max(speedMul, 1.6); excite = 1; }
   // Snuggling: curl up along the napper's flank; the approach is the only travel a hold allows.
   let snugFar = false;
-  if (snug) {
+  if (snug && !busy) {
     claimTick(e, 'social', 'snuggle');
     const sx = -snug.heading.z, sz = snug.heading.x, off = (e.radius + snug.radius) * 1.3;
     const side = (e.index & 1) ? 1 : -1;
@@ -681,7 +704,7 @@ export function steer(sys, e, dt) {
   // Bee's table stays set after the crumbs are gone: she circles the spot she last ate at.
   if (now < e.snack.until) {
     if (e.food) e.snack.until = 0;
-    else {
+    else if (!busy) {
       claimTick(e, 'social', 'snack');
       e.snack.ang += (e.prowlBL * e.length / Math.max(0.3, e.snack.r)) * dt;
       e.target.set(e.snack.x + Math.cos(e.snack.ang) * e.snack.r, 0, e.snack.z + Math.sin(e.snack.ang) * e.snack.r);
@@ -809,12 +832,16 @@ export function steer(sys, e, dt) {
         g.dir.lerp(tmpB, Math.min(1, dt * 1.5)).normalize();
         g.guide.addScaledVector(g.dir, lead.prowlBL * lead.length * 0.9 * dt);
       }
-      claimTick(e, 'social', 'twine');
-      const th = TWINE_OMEGA * (now - g.t0) + e.twinePhase;
-      const lx = -g.dir.z, lz = g.dir.x;
-      e.target.set(g.guide.x + g.dir.x * 0.5 + lx * Math.sin(th) * TWINE_R, 0, g.guide.z + g.dir.z * 0.5 + lz * Math.sin(th) * TWINE_R);
-      e.targetY = Math.max(-DEPTH + e.radius * 2.2, Math.min(-e.radius * 1.6, -DEPTH * 0.5 + Math.cos(th) * TWINE_RY));
-      e.retargetYAt = now + 1;
+      // The braid keeps its clock through a scatter or a contest, but stops steering: whoever owns the
+      // tick is the only thing writing this eel's target.
+      if (!busy) {
+        claimTick(e, 'social', 'twine');
+        const th = TWINE_OMEGA * (now - g.t0) + e.twinePhase;
+        const lx = -g.dir.z, lz = g.dir.x;
+        e.target.set(g.guide.x + g.dir.x * 0.5 + lx * Math.sin(th) * TWINE_R, 0, g.guide.z + g.dir.z * 0.5 + lz * Math.sin(th) * TWINE_R);
+        e.targetY = Math.max(-DEPTH + e.radius * 2.2, Math.min(-e.radius * 1.6, -DEPTH * 0.5 + Math.cos(th) * TWINE_RY));
+        e.retargetYAt = now + 1;
+      }
     }
   }
 
@@ -825,10 +852,13 @@ export function steer(sys, e, dt) {
   e.foodDist = Infinity;
   // B3: what this eel can actually smell right now, built for the whole pond back in the prepass.
   const smelled = e.sensedFoods ?? sys.foods;
+  // A contest outranks a meal, so nothing below acquires, bites, spins, or drops cover under one; the
+  // crumb keeps its claim and resumes after. A bore run is out of this test: it is how a hunt gets in.
+  const mealBlocked = !!contest;
   if (e.quirks.herbivore) {
     // Crumbs are off the herbivore's menu entirely, claims included; a gourmet grazes and hunts both.
     if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
-  } else if (smelled.length && !scatter && (sys.braincell?.mayHunt(e) ?? true)) {
+  } else if (smelled.length && !scatter && !mealBlocked && (sys.braincell?.mayHunt(e) ?? true)) {
     const log = sys.colliders.logs[0];
     const fits = log ? logFits(e, log) : false;
     // Doordash: dinner is whatever drifts into her face. Anything farther out does not exist.
@@ -849,7 +879,16 @@ export function steer(sys, e, dt) {
       if (score < bestScore) { bestScore = score; best = f; }
     }
     if (e.food && e.food !== best) e.food.claims = Math.max(0, e.food.claims - 1);
-    if (best && e.food !== best) best.claims++;
+    // A second claimant marks the crumb for good: the gratitude roll counts meals nobody argued over.
+    // claims is live occupancy and falls back to zero, so the first claimant is stamped instead.
+    if (best && e.food !== best) {
+      best.claims++;
+      // An identity, not a body: a hot-swap reuses the eel object, so the name and its swap generation
+      // are what tell the newcomer's claim apart from the one the eel who left made.
+      const by = best.claimedBy;
+      if (by && (by.name !== e.name || by.gen !== e.gen)) best.contested = true;
+      else if (!by) best.claimedBy = { name: e.name, gen: e.gen };
+    }
     e.food = best;
     if (best) dropCover(sys, e);
     if (best) {
@@ -870,7 +909,9 @@ export function steer(sys, e, dt) {
         if (e.bonkFood !== best) { e.bonkFood = best; e.stalkUntil = now + rng.range(2, 4); e.bonkUntil = 0; }
         else if (now >= e.stalkUntil && e.bonkUntil === 0) {
           e.bonkUntil = now + 1;
-          e.bonkAng = rng.range(15, 25) * (Math.PI / 180) * (rng.chance(0.5) ? 1 : -1);
+          // Q-B: a hard thing beside the crumb is a better miss than a random one, when there is one.
+          const aim = sys.stim?.bonkAim(sys, e, best) ?? null;
+          e.bonkAng = aim ?? rng.range(15, 25) * (Math.PI / 180) * (rng.chance(0.5) ? 1 : -1);
         }
         bonking = now < e.bonkUntil;
         if (bonking && d < 0.5 && d >= 0.35) {
@@ -919,7 +960,9 @@ export function steer(sys, e, dt) {
       e.retargetYAt = now + 0.5;
       e.foodDist = d;
       if (d < 0.35) {
-        const bite = Math.min(best.amount, dt * 0.6 * biteMul);
+        // Q-C: a whole treat is worth spinning for, and a spinning eel tears at twice the rate.
+        if (best.size === 1) sys.stim?.trySpin(sys, e, best);
+        const bite = Math.min(best.amount, dt * 0.6 * biteMul * (sys.stim?.biteMul(e, best) ?? 1));
         best.amount -= bite;
         growEel(e, bite * (best.growPerAmt || 0));
         excite = Math.max(excite, 0.5);
@@ -927,14 +970,18 @@ export function steer(sys, e, dt) {
         if (best.amount <= 0) { sys.emit('eat', e, best); }
       }
     }
-  } else if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
+  } else if (e.food && !mealBlocked) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
   // B5's give-up clock, before the other meal modules so a crumb it has quit on stops blocking them.
   sys.braincell?.tick(sys, e, dt);
   // Grazing is another builder's module and may not be wired yet; everything here works without it.
-  if (e.quirks.graze && sys.graze) { sys.graze.tick(sys, e, dt); if (e.coverSpot?.type === 'graze') claimTick(e, 'meal', 'graze'); }
-  if (e.quirks.tea && sys.tea) { sys.tea.tick(sys, e, dt); if (e.coverSpot?.type === 'tea') claimTick(e, 'meal', 'tea'); }
-  // The table clears and Bee keeps circling it for a while.
-  if (e.census.party === 'snacks' && hadFood && !e.food) {
+  if (e.quirks.graze && sys.graze && !mealBlocked) { sys.graze.tick(sys, e, dt); if (e.coverSpot?.type === 'graze') claimTick(e, 'meal', 'graze'); }
+  if (e.quirks.tea && sys.tea && !mealBlocked) { sys.tea.tick(sys, e, dt); if (e.coverSpot?.type === 'tea') claimTick(e, 'meal', 'tea'); }
+  // F6's tell had already written its pose when a meal or a graze claimed above it; the higher owner
+  // takes those slots back rather than wearing the tell's speed for the rest of the reaction.
+  if (telling && tickHeldAbove(e, 'voluntary')) { e.pose.speed = null; e.pose.squash = null; }
+  // The table clears and Bee keeps circling it for a while. Only an emptied crumb sets the table:
+  // giving up on an unreachable one also clears e.food, and orbiting that for 20 s is a sulk, not a party.
+  if (e.census.party === 'snacks' && hadFood && !e.food && hadFood.amount <= 0) {
     e.snack.x = hadFood.x; e.snack.z = hadFood.z;
     e.snack.r = rng.range(1, 2) * e.length;
     e.snack.ang = rng.range(0, Math.PI * 2);
@@ -1072,11 +1119,15 @@ export function steer(sys, e, dt) {
   if (crowd > 0.3 && gait === 'hold') gaitBL = Math.max(gaitBL, e.prowlBL * 0.6);   // shuffle out of a pile
   if (crowd > 0.6 && e.gait === 'hold' && !snug) { e.gaitUntil = Math.min(e.gaitUntil, now); }   // a real shove wakes a napper
   const stim = Math.max(0, e.speedMul - 1);
-  const wantBL = Math.min(gaitBL + stim * e.cruiseBL, e.cruiseBL * 1.5) * (sys.motion.reduced ? 0.35 : 1);
+  // Q-D on the voluntary rate only, before the clamp: a food-drunk eel is slower, never a slower eel.
+  const drunk = foodDrunk(e);
+  const wantBL = Math.min(gaitBL + stim * e.cruiseBL, e.cruiseBL * 1.5) * (sys.motion.reduced ? 0.35 : 1) * (drunk ? FOOD_DRUNK.want : 1);
   // Voluntary accel ~1.3 L/s²; stopping is quicker (eels do not coast), startle quicker still.
   const rate = wantBL > e.speedBL ? (stim > 0.5 ? 6 : 1.3) : 2.5;
   e.speedBL += Math.max(-rate * dt, Math.min(rate * dt, wantBL - e.speedBL));
-  e.squash += ((1 + (e.speedMul - 1) * 0.18) - e.squash) * Math.min(1, dt * 5);
+  // The squash half of Q-D is a default with the lowest priority there is: a real pose override wins.
+  const squashTo = 1 + (e.speedMul - 1) * 0.18;
+  e.squash += ((drunk ? Math.max(squashTo, FOOD_DRUNK.squash) : squashTo) - e.squash) * Math.min(1, dt * 5);
 
   const f = paceWave(e, dt, gait === 'hold');
   // Whatever did not claim the tick was a wander, which is the honest label for the default.
@@ -1089,7 +1140,7 @@ export function steer(sys, e, dt) {
   // Snout yaw as the derivative of its lateral sine, so the head stays in phase with the body wave.
   head.addScaledVector(side, Math.cos(e.wavePhase) * e.ampTail * 0.2 * e.anterior * Math.PI * 2 * f * dt);
   // A slow bob while moving, so a straight cruise still rises and dips a little through the column.
-  const bob = gait === 'hold' ? 0 : 0.07 * Math.sin(now * 0.6 + e.index * 1.3);
+  const bob = gait === 'hold' ? 0 : 0.07 * (drunk ? FOOD_DRUNK.bob : 1) * Math.sin(now * 0.6 + e.index * 1.3);
   head.y += (e.targetY + bob - head.y) * Math.min(1, dt * 1.5);
 
   // Sickle rest colors him: skin to yellow, glow to red. Anyone whose tints are off white eases back,

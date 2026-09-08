@@ -26,6 +26,7 @@ const RECOVER_EXTRA = 3;      // the defined fallback: one body length deeper at
 const FLOP_SPEED = 1.2;       // times prowl
 const FLOP_SCARE = 1.6;
 const FLOP_GIVEUP = 12;
+const FLOP_EXIT = 3;          // hard cap on the timeout's run for the far side, so it always reaches recovery
 const CLIMB_RATE = 2;         // world units a second the flop's head may climb; well over the crest's own slope
 const FLOP_STUCK_WINDOW = 20; // a second stuck event against the same log inside this flops anyway
 const FLOP_COOL = 8;          // a drowned crest never breaks the film, so it earns no air cooldown
@@ -34,10 +35,14 @@ const LEAP_AMP = 0.4;         // a leaping body is stiff
 const BELLY_AMP = 1.3;
 const BELLY_RING = 1.6;
 const DIG_ONE = 1.5, DIG_TWO = 1;
+const DIG_ONE_MAX = 6;        // dig1 is a goal now, so this is only the give-up deadline
+const DIG_HALO = 0.15;        // the additive shell blooms through the sand as a bright ball
+const DIG_TRICKLE = 0.8;      // seconds between the buried hold's idle billows
+const SILT_TINT = [0.85, 1.0, 1.35];   // silt catching moonlight, not the sand it came from
 const DIG_SLOPE = 20 * Math.PI / 180;
 const DIG_YAW1 = 25 * Math.PI / 180, DIG_HZ1 = 4;
 const DIG_YAW2 = 15 * Math.PI / 180, DIG_HZ2 = 2;
-const DIG_BUDGET = { one: [20, 12], two: [6, 4], wake: [6, 4] };
+const DIG_BUDGET = { one: [20, 24], two: [6, 4], wake: [6, 16] };
 const BITE_COOL = 300;
 const BITE_TIMEOUT = 12;
 const BITE_REACH = 0.4;
@@ -90,6 +95,7 @@ export class AirStates {
     e.floorY = this.defaultFloor(e);
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
+    e.burrowing = 0;
     const rng = createRng(deriveSeed(this.seed, AIR_SALT + (e.index ?? 0)));
     this.map.set(e, {
       rng,
@@ -104,7 +110,7 @@ export class AirStates {
     });
   }
 
-  // ---- the pond-wide clocks ----
+  // The pond-wide clocks
 
   prepass(sys, dt) {
     const now = sys.time;
@@ -149,6 +155,9 @@ export class AirStates {
       if (st.ringDown > 0.5) sys.emit('splash', e, { size: e.length, detail: { bellyflop: !!st.belly } });
     }
     st.above = above;
+    // The bite approach is the one state steer can decline to reach (a freeze, a nope, an escape all
+    // return above it), so its abort tests run here rather than waiting on a tick that may not come.
+    if (st.state === 'bite' && this.biteStale(sys, e, st)) this.cancelApproach(e);
     if (st.state === null && !e.slurpedBy) this.fingerPeek(sys, e, st, now);
   }
 
@@ -164,7 +173,7 @@ export class AirStates {
     this.tryPeek(e, 'finger', 0.3 * (e.traits?.curious ?? 1) * mul);
   }
 
-  // ---- moon mood (V2) ----
+  // Moon mood (V2)
 
   moonBright(e) {
     const st = this.map.get(e);
@@ -182,7 +191,7 @@ export class AirStates {
   travelMul(e) { return Math.max(0.1, 1 - 0.2 * this.moonBright(e) * this.kMoon()); }
   airMul(e) { return Math.max(0, 1 - 0.5 * this.moonBright(e) * this.kMoon()); }
 
-  // ---- shared gates ----
+  // Shared gates
 
   /* An exemption is open, which is also "this module owns the tick": eel-fear.js already calls the
      second name, so both are here rather than one of them being a near-miss. */
@@ -207,13 +216,16 @@ export class AirStates {
   ready(e, needStamina = true) {
     const sys = this.sys, st = this.map.get(e);
     if (!st || st.state || e.slurpedBy || !this.allows(e)) return null;
+    // A refuge contest owns both parties' ticks; starting an air state under one would run two
+    // controllers on the same eel and pause the contest with its locks still held.
+    if (sys.fear?.contesting?.(e)) return null;
     if (sys.time < st.coolUntil) return null;
     if (needStamina && st.airFor > AIR_CAP * 0.5) return null;
     if (this.scared(sys, e)) return null;
     return st;
   }
 
-  // ---- V3 peek ----
+  // V3 peek
 
   /* Reasons carry their own odds; a bare call from force() skips the roll entirely. The moon term
      and knobs.air.peek multiply everything, per the trigger table. */
@@ -275,7 +287,7 @@ export class AirStates {
     });
   }
 
-  // ---- V4 the log flop ----
+  // V4 the log flop
 
   logFits(e, log) { return log.rInner >= e.radius * 1.15 + 0.02; }
 
@@ -301,7 +313,9 @@ export class AirStates {
     st.state = 'flop'; st.phase = 'approach'; st.t0 = sys.time; st.flop = path; st.flopLast = path;
     st.flopUntil = sys.time + FLOP_COOL;
     st.ringUp = 0.4; st.ringDown = 0.4; st.belly = false;
-    e.ceilingY = path.crestY + e.radius + 0.15;
+    // An exemption may only ever open the bound: a drowned crest sits below the default ceiling, and
+    // clamping the whole chain down to it crushes the body before the head has climbed anywhere.
+    e.ceilingY = Math.max(this.defaultCeil(e), path.crestY + e.radius + 0.15);
     st.exempt = true;
     e.tunnel = null;
     return true;
@@ -351,9 +365,14 @@ export class AirStates {
     const scare = this.scared(sys, e);
     const speed = e.prowlBL * FLOP_SPEED * (scare ? FLOP_SCARE : 1);
     const flank = crestHeight(f.rOuter, f.rOuter, f.crestY, e.radius);   // the path's value at the tangent
-    if (now - st.t0 > FLOP_GIVEUP) {
+    if (st.phase !== 'giveup' && now - st.t0 > FLOP_GIVEUP) { st.phase = 'giveup'; st.giveUpAt = now; }
+    // The fallback parks it on the far side rather than handing a half-crossed body to recovery, which
+    // derives its own route from the heading and would close the ceiling on the near flank.
+    if (st.phase === 'giveup') {
       e.target.set(f.exit.x, 0, f.exit.z);
-      this.startRecover(sys, e, st, 'air');
+      const there = Math.hypot(head.x - f.exit.x, head.z - f.exit.z) < 0.4;
+      if (there || now - st.giveUpAt > FLOP_EXIT) { this.startRecover(sys, e, st, 'air'); return; }
+      this.drive(sys, e, dt, { tx: f.exit.x, tz: f.exit.z, speedBL: speed, targetY: flank });
       return;
     }
     if (st.phase === 'approach') {
@@ -393,11 +412,11 @@ export class AirStates {
     const now = sys.time;
     const repeat = st.stuckLog === log && now - st.stuckLogAt < FLOP_STUCK_WINDOW;
     st.stuckLog = log; st.stuckLogAt = now;
-    if (!repeat) return false;
+    if (!repeat || sys.fear?.contesting?.(e)) return false;
     return this.tryFlop(e, log, e.target, true);
   }
 
-  // ---- V5 the leap ----
+  // V5 the leap
 
   /* The spontaneous roll: excited, cruising, in open water, off cooldown. Rate is per second, so the
      caller passes its own dt. */
@@ -427,7 +446,11 @@ export class AirStates {
     const dist = leapDistance(e.length, form.formDistance);
     let ang = Math.atan2(e.heading.z, e.heading.x);
     if (target) ang = Math.atan2(target.z - e.head.z, target.x - e.head.x);
-    else if (forced) ang = this.clearHeading(e, dist, ang);
+    else if (forced) {
+      const clear = this.clearHeading(e, dist, ang);
+      if (clear === null) return false;   // the force API still owes its physical preconditions
+      ang = clear;
+    }
     if (!forced && !target && !this.landingOk(e, ang, dist)) return false;
     st.state = 'leap'; st.phase = 'launch'; st.t0 = sys.time;
     st.leap = { form, arc, dist, ang, y0, from: e.head.y, bt: 0, forced, aim: !!(target || forced) };
@@ -439,7 +462,8 @@ export class AirStates {
   }
 
   /* Sixteen headings, first clear landing wins: a forced leap has to actually go somewhere, and the
-     spontaneous roll still refuses rather than steering. */
+     spontaneous roll still refuses rather than steering. Null when all sixteen are blocked, because
+     handing back the original heading would launch at a landing landingClear() already rejected. */
   clearHeading(e, dist, from) {
     const sys = this.sys;
     const limX = sys.view.w * 0.7, limZ = sys.view.h * 0.7;
@@ -448,7 +472,7 @@ export class AirStates {
       const x = e.head.x + Math.cos(a) * dist, z = e.head.z + Math.sin(a) * dist;
       if (landingClear(x, z, e.radius, sys.colliders.spheres, sys.colliders.logs, limX, limZ)) return a;
     }
-    return from;
+    return null;
   }
 
   landingOk(e, ang, dist) {
@@ -469,8 +493,9 @@ export class AirStates {
       // Cruise carries the head a couple of units during the approach, so the clearance can be lost
       // under it. A forced leap re-aims; a spontaneous one gives up, which is the plan's "no cost".
       if (!this.landingOk(e, L.ang, L.dist)) {
-        if (!L.forced) { this.abort(sys, e, st, 'landing'); return; }
-        L.ang = this.clearHeading(e, L.dist, L.ang);
+        const clear = L.forced ? this.clearHeading(e, L.dist, L.ang) : null;
+        if (clear === null) { this.abort(sys, e, st, 'landing'); return; }
+        L.ang = clear;
       }
       const aimX = head.x + Math.cos(L.ang) * L.dist, aimZ = head.z + Math.sin(L.ang) * L.dist;
       this.drive(sys, e, dt, { tx: L.aim ? aimX : undefined, tz: aimZ, holdHeading: !L.aim, speedBL: e.cruiseBL, ySet: y, excite: 0.7 });
@@ -479,8 +504,9 @@ export class AirStates {
       // from where the roll happened; a forced leap is allowed one more search for a clear line.
       L.ang = Math.atan2(e.heading.z, e.heading.x);
       if (!this.landingOk(e, L.ang, L.dist)) {
-        if (!L.forced) { this.abort(sys, e, st, 'landing'); return; }
-        L.ang = this.clearHeading(e, L.dist, L.ang);
+        const clear = L.forced ? this.clearHeading(e, L.dist, L.ang) : null;
+        if (clear === null) { this.abort(sys, e, st, 'landing'); return; }
+        L.ang = clear;
       }
       st.phase = 'air'; L.bt = 0;
       e.ceilingY = L.arc.apexY + e.radius + 0.2;
@@ -518,7 +544,7 @@ export class AirStates {
     st.abortedBy = why;
   }
 
-  // ---- V6 burrow ----
+  // V6 burrow
 
   /* Open sand only: no rock within 3 r, nothing overhead, and not in the bore, or the dig would push
      the body through something solid on its way down. */
@@ -545,10 +571,10 @@ export class AirStates {
     // One dig per hold bout, the way the coil and the sickle work: the asleep hold asks every tick,
     // and without this the eel climbs out and immediately digs back in for the whole bout.
     if (!force && st.burrowBout === e.gaitFrom) return false;
-    if (!force && !this.canBurrow(e)) return false;
+    if (!force && (sys.fear?.contesting?.(e) || !this.canBurrow(e))) return false;
     st.burrowBout = e.gaitFrom;
     st.state = 'burrow'; st.phase = 'dig1'; st.t0 = sys.time;
-    st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0 };
+    st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0 };
     st.exempt = true;
     sys.emit('dig', e, { size: e.length, detail: { phase: 'in' } });
     return true;
@@ -558,8 +584,13 @@ export class AirStates {
     const now = sys.time, d = st.dig, head = e.head;
     const sand = floorHeightAt(head.x, head.z);
     e.floorY = sand - 1.2 * e.radius;
+    const el = now - st.t0;
+    // The press ramps in over dig1 so the body slides under instead of snapping there, holds through
+    // the buried hold, and lets go at wake; the halo follows it down and back up.
+    const press = st.phase === 'dig1' ? Math.min(1, el / DIG_ONE) : st.phase === 'wake' ? 0 : 1;
+    e.burrowing = press;
+    this.dimHalo(e, st, press, dt);
     if (st.phase === 'dig1') {
-      const el = now - st.t0;
       const sink = e.prowlBL * e.length * Math.sin(DIG_SLOPE);
       this.puffBudget(e, st, el / DIG_ONE, DIG_BUDGET.one);
       this.drive(sys, e, dt, {
@@ -567,11 +598,13 @@ export class AirStates {
         speedBL: e.prowlBL * Math.cos(DIG_SLOPE),
         ySet: head.y - sink * dt, ampMul: 1.2,
       });
-      if (el >= DIG_ONE) { st.phase = 'dig2'; st.t0 = now; d.grains = 0; d.silt = 0; }
+      // The mirror of finishRecover's test: dig1 ends on a buried chain, not on a stopwatch, so a
+      // long slow eel simply takes longer to get all of itself down there.
+      const under = maxY(e) <= sand - e.radius;
+      if (el >= DIG_ONE && (under || el >= DIG_ONE_MAX)) { st.phase = 'dig2'; st.t0 = now; d.grains = 0; d.silt = 0; }
       return;
     }
     if (st.phase === 'dig2') {
-      const el = now - st.t0;
       this.puffBudget(e, st, el / DIG_TWO, DIG_BUDGET.two);
       this.drive(sys, e, dt, {
         heading: d.ang + DIG_YAW2 * Math.sin(el * DIG_HZ2 * Math.PI * 2),
@@ -583,11 +616,14 @@ export class AirStates {
     if (st.phase === 'buried') {
       // The hold owns the clock: the bout ending, a scare, or a quorum wake all lift the head out.
       if (now >= e.gaitUntil || this.scared(sys, e)) { this.startWake(sys, e, st); return; }
+      if (now >= (d.puffAt ?? 0)) {
+        this.trickle(e);
+        d.puffAt = now + this.puffRng.range(0.75, 1.25) * knob(this.sys.knobs?.air?.puffTrickle, DIG_TRICKLE);
+      }
       this.drive(sys, e, dt, { heading: d.ang, speedBL: 0, ySet: head.y, ampMul: 0.15, resting: true });
       return;
     }
     // Waking is the dig in reverse: rise into the floor band and swim out along the trail.
-    const el = now - st.t0;
     this.puffBudget(e, st, el / 0.8, DIG_BUDGET.wake);
     const want = this.defaultFloor(e) + e.radius * 1.2;
     const rise = e.prowlBL * e.length * Math.sin(DIG_SLOPE) * dt;
@@ -598,6 +634,7 @@ export class AirStates {
   startWake(sys, e, st) {
     st.phase = 'wake'; st.t0 = sys.time;
     e.buried = false;
+    e.burrowing = 0;
     st.dig.grains = 0; st.dig.silt = 0;
     sys.emit('dig', e, { size: e.length, detail: { phase: 'out' } });
   }
@@ -611,7 +648,25 @@ export class AirStates {
     return true;
   }
 
-  // ---- the sediment ----
+  // The sediment
+
+  haloBase(e) { return e.jelly ? knob(this.sys.knobs?.jelly?.halo?.value, 1) : 1; }
+
+  /* A buried eel keeps the influence field's sand glow, which reads as light through sand, but not
+     the 2.4x additive shell, which blooms over the floor as a bright ball. */
+  dimHalo(e, st, want, dt) {
+    st.dim = (st.dim ?? 0) + (want - (st.dim ?? 0)) * Math.min(1, dt * 4);
+    if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e) * (1 - (1 - DIG_HALO) * st.dim);
+  }
+
+  /* The buried hold's idle cloud, a radius or two off the snout. Skipped while the pool is busy, so
+     several dug-in eels can never starve a live dig-in burst of slots. */
+  trickle(e) {
+    const pool = this.sys.sediment;
+    if (!pool || pool.live() > pool.pool * 0.7) return;
+    const a = this.puffRng.range(0, Math.PI * 2), rr = this.puffRng.range(1, 2) * e.radius;
+    this.puff(e.head.x + Math.cos(a) * rr, e.head.z + Math.sin(a) * rr, 'silt', 1);
+  }
 
   /* Fixed budget per phase, paid out across the phase's shake cycles rather than per tick, so the
      count is the same at 60 and 240 Hz. */
@@ -634,10 +689,12 @@ export class AirStates {
     const y0 = floorHeightAt(x, z) + 0.01;
     const sx = sweep ? -sweep.z : 1, sz = sweep ? sweep.x : 0;
     sandColorAt(x, z, sandRGB);
-    // Sand-colored sand is nearly invisible against sand, which is the plan's intent and also a
-    // taste call: knobs.air.puff lifts both kinds together without touching the sampled hue.
-    const tint = (kind === 'grain' ? 0.85 : 1.1) * this.k('puff');
-    const color = [sandRGB[0] * tint, sandRGB[1] * tint, sandRGB[2] * tint];
+    // Sand-colored silt over sand is invisible by construction, so a billow reads as sand lifted into
+    // the moonlight: lifted and cooled. Grains stay the sand's own hue, only brighter.
+    const gain = this.k('puff');
+    const color = kind === 'grain'
+      ? [sandRGB[0] * 2 * gain, sandRGB[1] * 2 * gain, sandRGB[2] * 2 * gain]
+      : [sandRGB[0] * SILT_TINT[0] * 5 * gain, sandRGB[1] * SILT_TINT[1] * 5 * gain, sandRGB[2] * SILT_TINT[2] * 5 * gain];
     let made = 0;
     for (let i = 0; i < n; i++) {
       const a = rng.range(0, Math.PI * 2);
@@ -647,16 +704,19 @@ export class AirStates {
         const sp = rng.range(0.15, 0.4);
         const vx = (sx * side + Math.cos(a) * 0.4) * sp, vz = (sz * side + Math.sin(a) * 0.4) * sp;
         const vy = rng.range(0.05, 0.18);
-        // Landing height is stored per instance: predict the return-to-launch time, then ask the sand.
+        // Landing height is stored per instance: predict the return-to-launch time, ask the sand, then
+        // re-ask at the column the real touchdown reaches, since sand below launch height lands later.
         const tf = 2 * vy / 0.6;
-        const landY = floorHeightAt(x + jx + vx * tf, z + jz + vz * tf) + 0.01;
+        let landY = floorHeightAt(x + jx + vx * tf, z + jz + vz * tf) + 0.01;
+        const ts = (vy + Math.sqrt(Math.max(0, vy * vy + 1.2 * (y0 - landY)))) / 0.6;
+        landY = floorHeightAt(x + jx + vx * ts, z + jz + vz * ts) + 0.01;
         pool.spawn(x + jx, y0, z + jz, 'grain', {
           vx, vy, vz, landY, size: rng.range(0.012, 0.025), life: rng.range(2, 4), color,
         });
       } else {
         pool.spawn(x + jx, y0, z + jz, 'silt', {
           vx: rng.range(-0.02, 0.02), vy: rng.range(0.03, 0.08), vz: rng.range(-0.02, 0.02),
-          size: rng.range(0.026, 0.034), life: rng.range(3, 6), color,
+          size: rng.range(0.05, 0.07) * this.k('puffSize'), life: rng.range(3, 6), color,
         });
       }
       made++;
@@ -664,7 +724,7 @@ export class AirStates {
     return made;
   }
 
-  // ---- V8 the moon bite ----
+  // V8 the moon bite
 
   /* Checked at the trigger and again on every approach tick: the anchor in view, over open water,
      out of the rain, and the eel still interruptible. */
@@ -707,12 +767,15 @@ export class AirStates {
     return true;
   }
 
+  biteStale(sys, e, st) {
+    return sys.time - st.t0 > BITE_TIMEOUT || !this.bitePreconditions(e) || this.scared(sys, e);
+  }
+
   biteTick(sys, e, st, dt) {
-    const now = sys.time, a = this.anchor;
-    if (now - st.t0 > BITE_TIMEOUT || !this.bitePreconditions(e) || this.scared(sys, e)) {
-      st.state = null; st.phase = ''; st.bite = false;
-      return;
-    }
+    const a = this.anchor;
+    // Every approach tick parked the target on the reflection, and cancelApproach clears the plan so
+    // a dropped bite does not leave the eel swimming at it until its retarget clock comes round.
+    if (this.biteStale(sys, e, st)) { this.cancelApproach(e); return; }
     e.target.set(a.x, 0, a.z);
     if (Math.hypot(e.head.x - a.x, e.head.z - a.z) < BITE_REACH) {
       // Inside the reach the peek is requested directly: no second V3 roll, no second cooldown test.
@@ -728,12 +791,13 @@ export class AirStates {
     st.bite = false; st.bitten = true;
     st.biteAt = now;   // the five-minute cooldown is spent on the bite, not on the trigger
     st.huffUntil = now + 2;
+    e.retargetAt = 0;   // the anchor is not a plan: pick a fresh one the tick the eel is steering again
     sys.sim?.addDrop(e.head.x, e.head.z, 0.5, 0.03);
     sys.emit('moonbite', e, { size: e.length });
     sys.stim?.shuffle?.(e);
   }
 
-  // ---- V1 recovery ----
+  // V1 recovery
 
   /* The body phase. The head is already home; this drains the rest of the chain out of the extreme
      before the bound closes, because collide() clamps every point at once. */
@@ -767,6 +831,9 @@ export class AirStates {
     e.floorY = this.defaultFloor(e);
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
+    e.burrowing = 0;
+    st.dim = 0;
+    if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
     if (st.deferNope) { st.deferNope = false; e.nopeUntil = Math.max(e.nopeUntil, this.sys.time + 1.1); }
     st.state = null; st.phase = ''; st.exempt = false;
     st.recover = null; st.flop = null; st.leap = null; st.dig = null; st.bite = false;
@@ -803,26 +870,54 @@ export class AirStates {
     });
   }
 
-  // ---- the tick ----
+  // The tick
 
   /* Returns true when this module owned the eel's movement; steer() returns straight away then, the
      way it already does for the freeze and the nope. */
   tick(sys, e, dt) {
     const st = this.map.get(e);
     if (!st || !st.state || e.slurpedBy) return false;
-    claimTick(e, st.state === 'bite' && st.phase === 'approach' ? 'voluntary' : 'air', st.state);
+    // The bite's swim out to the reflection is uncommitted and voluntary, so steer runs it from the
+    // voluntary section below the meal and social arbitration instead of from this early return.
+    if (st.state === 'bite') return false;
+    claimTick(e, 'air', st.state);
     e.reverse = false;
     switch (st.state) {
       case 'peek': this.peekTick(sys, e, st, dt); break;
       case 'flop': this.flopTick(sys, e, st, dt); break;
       case 'leap': this.leapTick(sys, e, st, dt); break;
       case 'burrow': this.digTick(sys, e, st, dt); break;
-      case 'bite': this.biteTick(sys, e, st, dt); break;
       case 'recover': this.recoverTick(sys, e, st, dt); break;
       default: return false;
     }
     // A state that ended inside its own tick without moving anything hands the tick straight back.
     return st.state !== null || st.moved === sys.ticks;
+  }
+
+  approaching(e) {
+    const st = this.map.get(e);
+    return !!st && st.state === 'bite' && !e.slurpedBy;
+  }
+
+  /* V8's voluntary half, called from steer's voluntary section. It owns the tick the same way the
+     committed states do once it wins one; arriving hands over to the peek, which does not. */
+  approachTick(sys, e, dt) {
+    const st = this.map.get(e);
+    if (!st || st.state !== 'bite' || e.slurpedBy) return false;
+    claimTick(e, 'voluntary', 'moonbite');
+    e.reverse = false;
+    this.biteTick(sys, e, st, dt);
+    return st.state !== null || st.moved === sys.ticks;
+  }
+
+  /* The approach lost the tick to a higher owner or to a crumb the eel can smell. Dropped quietly:
+     no cooldown spent, and the reflection stops being the target the way a cancelled bite does. */
+  cancelApproach(e) {
+    const st = this.map.get(e);
+    if (!st || st.state !== 'bite') return false;
+    st.state = null; st.phase = ''; st.bite = false;
+    e.retargetAt = 0;
+    return true;
   }
 
   /* Slurp acquisition cancels the controller outright: the slurp owns the pose from that tick on.
@@ -841,11 +936,13 @@ export class AirStates {
     e.floorY = this.defaultFloor(e);
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
-    if (st) { st.state = null; st.phase = ''; st.exempt = false; st.airFor = 0; st.above = e.head.y > 0; }
+    e.burrowing = 0;
+    if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
+    if (st) { st.state = null; st.phase = ''; st.exempt = false; st.airFor = 0; st.above = e.head.y > 0; st.dim = 0; }
     return true;
   }
 
-  // ---- locomotion ----
+  // Locomotion
 
   /* The owner's own move, in the shape steer() uses: one heading solve, the pose commit, then the
      head advance. Nothing after commitPose touches the committed fields. */
@@ -894,7 +991,7 @@ export class AirStates {
     if (st) st.moved = sys.ticks;
   }
 
-  // ---- debug ----
+  // Debug
 
   /* pond.eels.air.force(i, 'leap'): every state on demand, odds and cooldowns bypassed, physical
      preconditions kept where skipping one would push a body through scenery. */
@@ -934,7 +1031,8 @@ export class AirStates {
       cooldown: Math.max(0, +(st.coolUntil - this.sys.time).toFixed(2)),
       moonBright: +this.moonBright(e).toFixed(4), moonOff: +st.moonOff.toFixed(4),
       floorY: +e.floorY.toFixed(4), ceilingY: +e.ceilingY.toFixed(4),
-      buried: !!e.buried, exempt: st.exempt, abortedBy: st.abortedBy ?? '',
+      buried: !!e.buried, burrowing: +(e.burrowing ?? 0).toFixed(3),
+      exempt: st.exempt, abortedBy: st.abortedBy ?? '',
     };
   }
 }

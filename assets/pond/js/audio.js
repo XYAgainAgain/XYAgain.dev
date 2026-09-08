@@ -367,6 +367,14 @@ export class PondAudio {
   // Snapping at the reflection and getting water: the plip, four semitones up.
   moonbite({ pan = null } = {}) { this.pick('plips', 'plip', { jitter: 0.2, rate: st(4), pan }); }
 
+  // Tearing a mouthful off a whole treat: tiny-bubs scheduled across the spin, two a revolution.
+  spin({ pan = null, revs = 3 } = {}) {
+    const n = Math.max(2, Math.min(12, Math.round(revs * 2)));
+    // Spaced across the roll rather than at a fixed half second, so a capped shot count still fits it.
+    const gap = revs / n;
+    for (let i = 0; i < n; i++) this.pick('tinyBubs', 'tinyBub', { db: -2, jitter: 0.35, delay: i * gap, pan });
+  }
+
   /* The shower envelope (0–1) from rain.js. Gain is squared so the build feels gradual rather than
      arriving all at once, and the lowpass opens as the rain gets closer. */
   setRain(env) {

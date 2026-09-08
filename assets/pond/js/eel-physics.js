@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { EEL_POINTS, DEPTH } from './config.js';
+import { floorHeightAt } from './floor.js';
 
 export const TICK = 1 / 90;
 export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
@@ -116,6 +117,12 @@ export function rememberPushes(e) {
   for (let i = 1; i < e.pts.length; i++) { tmpA.copy(e.pts[i]).sub(e.prev[i]); e.offsets[i].addScaledVector(tmpA, 0.5); }
 }
 
+/* Q-B's bonk detector. eels.js stamps prev[] immediately before collide() and constrain() never moves
+   point 0, so the head's displacement across that pass is exactly what the eel ran into. */
+export function headPush(e) {
+  return e.pts[0].distanceTo(e.prev[0]);
+}
+
 export function collide(eels, colliders) {
   const floorY = -DEPTH;
   const { spheres, logs } = colliders;
@@ -139,6 +146,9 @@ export function collide(eels, colliders) {
     // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
     // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
     const slip = ea.slip ?? 1;
+    // A burrow needs a ceiling as well as a floor, and a per-point one: the dune over the tail is not
+    // the dune over the snout, so eel-air ramps this fraction in over dig1 and drops it at wake.
+    const bury = Math.min(1, ea.burrowing ?? 0);
     // Decide the pair cull once per eel, outside the 24×24 point loop it gates.
     for (let b = a + 1; b < eels.length; b++) {
       const eb = eels[b];
@@ -153,6 +163,10 @@ export function collide(eels, colliders) {
       const sink = (1 - glance) * r * 0.35;
       if (p.y < bFloor) p.y = bFloor;
       if (p.y > bCeil) p.y = bCeil;
+      if (bury > 0) {
+        const cap = floorHeightAt(p.x, p.z) - r * 0.9;
+        if (p.y > cap) p.y += (cap - p.y) * bury;
+      }
       for (const s of spheres) {
         // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
         // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.

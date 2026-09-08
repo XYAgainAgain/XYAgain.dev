@@ -5,7 +5,6 @@ import { nope, affection, dropCover } from './eel-behavior.js';
    eel does about it. Mounted as sys.fear; everything keys by name or kind, never by "eel" or a guest. */
 
 const FEAR_SALT = 3000;
-const TAU = Math.PI * 2;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const hasKey = (o, k) => k !== null && k !== undefined && Object.prototype.hasOwnProperty.call(o, k);
 
@@ -39,7 +38,7 @@ const METERS = {
 const POKE_CAUSES = new Set(['poke', 'swish', 'finger-fast']);
 const FAM_DEAF = 0.7;   // past this the hand is a friend: it stops feeding the spook meter entirely
 const ROLL_FOR = 1.5, ROLL_BACK = 1, DEADPAN_FOR = 3, DIZZY_FOR = 1.5, RETREAT_FOR = 15;
-const DRAG_REACH = 2;   // pointer capsule overlaps the body within radius x this
+const DRAG_REACH = 2;   // pointer capsule overlaps the body within radius × this
 const DRAG_BUCKET = 0.25;   // contact accrues into quarter-second entries, not one record a tick
 // The comfort stop puts back exactly what the appearance rolls wrote, nothing else on the eel.
 const APPEARANCE = [
@@ -566,11 +565,14 @@ class FearSystem {
       if (e.slurpedBy) continue;
       const st = this.stateFor(e);
       if (st.contest || st.scatter || now - st.contestAt < perOccupant) continue;
+      // An air state owns its eel's tick outright, so neither side of a contest may be in one: the two
+      // machines would otherwise run at once and air's early return would pause the contest mid-lock.
+      if (sys.air?.owns(e)) continue;
       const refuge = this.refugeOf(sys, e, now);
-      if (!refuge || this.locked(refuge, e.length)) continue;
+      if (!refuge || this.locked(refuge)) continue;
       const reach = e.length;
       for (const v of sys.eels) {
-        if (v === e || v.slurpedBy) continue;
+        if (v === e || v.slurpedBy || sys.air?.owns(v)) continue;
         const vs = this.stateFor(v);
         if (vs.contest || vs.scatter) continue;
         if (Math.hypot(v.head.x - refuge.x, v.head.z - refuge.z) > reach) continue;
@@ -584,16 +586,18 @@ class FearSystem {
   }
 
   /* One contest per hole, and two nearby names for the same hole are one hole: the claim region is
-     1.2 body lengths of whoever is sitting in it. */
-  locked(refuge, length) {
+     1.2 body lengths of whoever is sitting in it, so each lock carries its own holder's radius. */
+  locked(refuge) {
     if (this.refugeLocks.has(refuge.id)) return true;
-    const r = CLAIM_R * (length || 1);
-    for (const l of this.refugeLocks.values()) if (Math.hypot(l.x - refuge.x, l.z - refuge.z) <= r) return true;
+    for (const l of this.refugeLocks.values()) if (Math.hypot(l.x - refuge.x, l.z - refuge.z) <= l.r) return true;
     return false;
   }
 
+  /* The public "this eel is mid-contest" test, so air states can refuse to start on top of one. */
+  contesting(e) { return !!this.state.get(e)?.contest; }
+
   startContest(sys, occupant, visitor, st, vs, refuge, pk, now) {
-    this.refugeLocks.set(refuge.id, { who: occupant, x: refuge.x, z: refuge.z });
+    this.refugeLocks.set(refuge.id, { who: occupant, x: refuge.x, z: refuge.z, r: CLAIM_R * (occupant.length || 1) });
     this.pairLocks.set(pk, occupant);
     this.contests.push(now);
     st.contestAt = now;
@@ -784,7 +788,6 @@ class FearSystem {
   meterStep(e, st, now) {
     const t = st.tell;
     if (!t || now < t.until) return;
-    if (t.kind === 'roll' || t.kind === 'belly') e.roll = t.from;
     if (t.meter === 'recolor' && st.snap) { restore(e, st.snap); this.sys.renderer.applyAppearance(e); st.snap = null; }
     st.tell = null;
   }
@@ -795,7 +798,10 @@ class FearSystem {
       : meter === 'recolor' ? (st.rng.chance(0.5) ? 'loop' : 'belly')
         : 'retreat';
     const dur = kind === 'roll' ? ROLL_FOR + ROLL_BACK : kind === 'deadpan' ? DEADPAN_FOR : kind === 'retreat' ? RETREAT_FOR : DIZZY_FOR;
-    st.tell = { kind, meter, from: e.roll ?? 0, at: now, until: now + dur };
+    st.tell = { kind, meter, at: now, until: now + dur };
+    // Q-C owns every roll in the pond, this one included; what stays here is which meter fired.
+    if (kind === 'roll') sys.stim?.rollStart(e, 'lazy');
+    if (kind === 'belly') sys.stim?.rollStart(e, 'dizzy');
     if (kind === 'loop') { e.gait = 'loop'; e.gaitUntil = now + DIZZY_FOR; }
     if (kind === 'retreat') {
       const hw = e.view.w * 0.45, hh = e.view.h * 0.45;
@@ -807,27 +813,23 @@ class FearSystem {
 
   /* The tell owns the target and the pose for its one reaction. It yields to a scatter and a slurp
      and never interrupts a run: those tiers claim the tick above it. */
-  tellTick(sys, e, dt) {
+  tellTick(sys, e, dt, held = false) {
     const st = this.state.get(e);
     const t = st?.tell;
     if (!t) return false;
     // Yields to a scatter and a slurp; a run, a reverse escape, and an air state all outrank it, so
     // it stops overriding rather than cancelling anything.
-    if (st.scatter || e.slurpedBy || e.tunnel || sys.air?.owns?.(e)) return false;
+    if (held || st.scatter || e.slurpedBy || e.tunnel || sys.air?.owns?.(e)) return false;
+    // A committed meal or a social hold outranks a tell too: the reaction waits it out on its own
+    // clock rather than pulling a feeding, sipping, twined, or snuggled eel off what it is doing.
+    if (e.food || e.restPose?.kind || e.twine) return false;
+    if (e.coverSpot?.type === 'tea' || e.coverSpot?.type === 'graze') return false;
+    if (e.snuggle?.with && sys.time < e.snuggle.until) return false;
     const now = sys.time;
-    const age = now - t.at;
-    if (t.kind === 'roll') {
-      // A lazy full turn: Chunk 4 owns the roll family proper and replaces this with its own owner.
-      const u = clamp01(age / ROLL_FOR);
-      e.pose.roll = t.from + TAU * (u * u * (3 - 2 * u));
-      e.pose.speed = e.prowlBL * 0.6;
-      return true;
-    }
-    if (t.kind === 'belly') {
-      e.pose.roll = t.from + Math.PI * clamp01(age / 0.4);
-      e.pose.speed = e.prowlBL * 0.4;
-      return true;
-    }
+    // The roll itself belongs to Q-C's controller, which is already turning the eel in the prepass;
+    // the lazy turn and the comfort stop's belly-up supply only the speed that goes with them.
+    if (t.kind === 'roll') { e.pose.speed = e.prowlBL * 0.6; return true; }
+    if (t.kind === 'belly') { e.pose.speed = e.prowlBL * 0.4; return true; }
     if (t.kind === 'deadpan') {
       e.pose.speed = e.prowlBL * 0.5;
       e.pose.squash = 1.2;
