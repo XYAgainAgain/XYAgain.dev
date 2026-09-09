@@ -145,7 +145,8 @@ export class EelSystem {
       fear: 1.5, stim: 1, spin: 1, moon: 1,
       // buriedEvict multiplies the spook line a buried eel is dug out by; buriedGrace is the seconds of
       // lesser pressure it sits through first. 1 and 0 restore the old evict-on-any-scare behavior.
-      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8 },
+      // relief scales the dig's dent in the sand, lean and shade together; 1 is the default depth, 0 is flat.
+      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1 },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
@@ -180,7 +181,7 @@ export class EelSystem {
     this.braincell = null;         // eel-brain.js; sense, the context maps, memory, the tells
     this.fear = null;              // eel-fear.js; the fear map, scatter, refuge contests, alarm and calm
     this.stim = null;              // eel-quirks.js; stimming, bonks, spin feeding, the one roll owner
-    this.headingAdapter = null;    // Chunk 1's context steering: (sys, e, force, dt) -> desired heading angle
+    this.headingAdapter = null;    // Chunk 1's context steering: (sys, e, force, dt) → desired heading angle
     // Everything smellable, keyed by kind. Crumbs register themselves in feed(); a fish school or a
     // dipping firefly registers the same shape with its own plume growth and plop radius.
     this.scents = [];
@@ -611,6 +612,7 @@ export class EelSystem {
     collide(all, this.colliders);
     for (const e of all) if (!e.slurpedBy) constrain(e);
     for (const e of all) if (!e.slurpedBy) rememberPushes(e);
+    this.surfaceContact(all, dt);
     if (this.debug) this.sweepNaN(all);
     // Food sinks slowly, then rests on the sand; spent crumbs disappear.
     for (let i = this.foods.length - 1; i >= 0; i--) {
@@ -626,6 +628,31 @@ export class EelSystem {
     expire(this.spooks, this.time, 1.6);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
+  }
+
+  /* Every animal breaks the film for real: any spine point that crossed the water plane since last tick
+     rings the sim where it crossed, whatever behavior moved it. One ring per eel per tick, at the centroid. */
+  surfaceContact(all, dt) {
+    const sim = this.sim;
+    if (!sim) return;
+    const reduce = this.motion?.reduced ? 0.5 : 1;
+    for (const e of all) {
+      if (e.slurpedBy) continue;
+      let n = 0, sx = 0, sz = 0, vy = 0;
+      // The air module rings every tracked head itself (peek and leap sizes), guests included; the body is ours.
+      for (let i = this.air ? 1 : 0; i < EEL_POINTS; i++) {
+        const y0 = e.pose0[i].y, y1 = e.pts[i].y;
+        const dy = Math.abs(y1 - y0);
+        // A teleport (a park, a swap) is not a splash.
+        if ((y0 < 0) === (y1 < 0) || dy > 0.5) continue;
+        n++; sx += e.pts[i].x; sz += e.pts[i].z; vy = Math.max(vy, dy / dt);
+      }
+      if (!n) continue;
+      // A body sliding over a crest crosses at a crawl, so the floor is the old flop ring; only the
+      // vertical speed above that scales it up, to the leap's landing slap.
+      const s = Math.min(0.06, 0.02 + 0.02 * vy) * Math.min(2, 1 + (n - 1) * 0.25) * reduce;
+      sim.addDrop(sx / n, sz / n, 0.4 + e.radius * (1 + Math.min(3, n - 1) * 0.3), s);
+    }
   }
 
   /* Debug-only tripwire: a NaN anywhere in a chain spreads through constrain() and the eel simply

@@ -1,8 +1,9 @@
 import * as THREE from 'three/webgpu';
 import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, cross, mat3, mat4, PI } from 'three/tsl';
-import { DEPTH, WAKE_RES, MOON_COLOR } from './config.js';
+import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
+import { RELIEF_MID, RELIEF_DECODE } from './relief-core.js';
 
 /* Floor, rocks, and the hollow log. Textures come from assets/pond/textures/manifest.json when present;
    each missing map falls back to a procedural placeholder so nothing blocks on art. */
@@ -125,7 +126,7 @@ export async function setTextureSize(textures, size) {
 
 /* Builds a NodeMaterial that writes (lit color, depthFrac) for the underwater RT. Planar (floor) or
    triplanar (rocks, log) mapping; algaeGain 0 leaves the algae term out of the shader entirely (the bore). */
-function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar = false, cylinder = null, algaeGain = 0) {
+function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar = false, cylinder = null, algaeGain = 0, relief = false) {
   const U = shading.U;
   const uTiling = uniform(tilingWorld);
   // cylinder: { inv: Matrix4 world→log-local, rot: Matrix3 local→world rotation } for bark mapping.
@@ -141,6 +142,11 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
   const uAlgaeRot = uniform(new THREE.Vector2(Math.cos(0.6), Math.sin(0.6)));
   const uAlgaeGrainScale = uniform(new THREE.Vector2(6, 22));   // stretched along z: filaments, not blotches
   const uAlgaeBlur = uniform(0.75 / WAKE_RES);                   // four diagonal taps: the field's steps read as a mosaic otherwise
+  // Dig relief: how hard the height's slope leans the normal, and how much a trough darkens.
+  const uReliefBump = uniform(2.5);
+  const uReliefShade = uniform(0.8);
+  const uReliefMax = uniform(RELIEF_MAX);
+  const withRelief = relief && !!U.reliefTex;
   const mat = new THREE.NodeMaterial();
 
   // Height-map slope on one projection plane: (dh/du, dh/dv) over two texels.
@@ -210,6 +216,19 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       } else {
         n = placeholder.normal(p, geomN);
       }
+    }
+
+    // Dig relief. Straight down through an ortho camera a real height change shows only in the
+    // lighting, so the height's central difference leans the normal and its sign shades the sand.
+    if (withRelief) {
+      const rc = p.xz.div(U.reliefExtent).add(0.5);
+      const o = U.reliefTexel;
+      const hn = (d) => U.reliefTex.sample(rc.add(d)).r.sub(RELIEF_MID).mul(RELIEF_DECODE);
+      const gx = hn(vec2(o, 0)).sub(hn(vec2(o.negate(), 0)));
+      const gz = hn(vec2(0, o)).sub(hn(vec2(0, o.negate())));
+      const lean = U.reliefStrength.mul(uReliefBump).mul(uReliefMax).div(U.reliefStep);
+      n = normalize(n.add(vec3(gx.negate(), 0, gz.negate()).mul(lean)));
+      albedo = albedo.mul(hn(vec2(0, 0)).mul(U.reliefStrength.mul(uReliefShade)).add(1).clamp(0.4, 1.5));
     }
 
     // Algae cover, cached in the wake buffer's B channel: four taps, two noise octaves, no texture set.
@@ -306,12 +325,20 @@ function segPointDist(px, py, pz, ax, ay, az, bx, by, bz) {
 // The floor mesh's own dune parameters, captured in buildFloor so the CPU can evaluate the same
 // surface. Null until a floor is built; floorHeightAt then reads a flat -DEPTH, which is honest.
 let duneF = null, dunePh = null;
+// main.js hands the dig relief over before the floor builds; null leaves the sand as it was cast.
+let reliefField = null;
+export function setRelief(field) { reliefField = field ?? null; }
 
-/* The CPU twin of the floor's vertex displacement. Anything that has to sit on, sink into, or land
-   on the sand asks here: -DEPTH alone buries a grain behind the opaque mesh. */
+/* The CPU twin of the floor's vertex displacement: what the eels sink into and are capped against.
+   Relief-free on purpose: the relief heals on the frame clock, and a chain that read it would drift. */
 export function floorHeightAt(x, z) {
   if (!duneF) return -DEPTH;
   return -DEPTH + 0.06 * lumpNoise(x, 0, z, duneF, dunePh) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, duneF, dunePh);
+}
+
+/* The sand as drawn, dig relief included: where a grain spawns and lands. Decoration only. */
+export function floorSurfaceAt(x, z) {
+  return floorHeightAt(x, z) + (reliefField ? reliefField.heightAt(x, z) : 0);
 }
 
 // 64 × 64 of the sand albedo, linearized once at boot; the average stands in until it exists.
@@ -350,9 +377,9 @@ function bakeSandSamples(set, tilingWorld) {
   } catch { sandPix = null; }
 }
 
-/* Moonlit sand albedo at a world point, sampled through the floor's own tiling. Writes into `out`
-   so a per-grain spawn allocates nothing. */
-export function sandColorAt(x, z, out = [0, 0, 0]) {
+/* Raw linear sand albedo at a world point, sampled through the floor's own tiling. Writes into `out`
+   so a per-grain spawn allocates nothing; a pebble takes this and is lit in the shader instead. */
+export function sandAlbedoAt(x, z, out = [0, 0, 0]) {
   let r = sandAvg[0], g = sandAvg[1], b = sandAvg[2];
   if (sandPix) {
     const u = x * sandTiling, v = z * sandTiling;
@@ -361,9 +388,16 @@ export function sandColorAt(x, z, out = [0, 0, 0]) {
     const o = (iv * 64 + iu) * 3;
     r = sandPix[o]; g = sandPix[o + 1]; b = sandPix[o + 2];
   }
-  out[0] = r * MOON_COLOR[0] * MOONLIT;
-  out[1] = g * MOON_COLOR[1] * MOONLIT;
-  out[2] = b * MOON_COLOR[2] * MOONLIT;
+  out[0] = r; out[1] = g; out[2] = b;
+  return out;
+}
+
+/* The same albedo under the floor's moonlit term, for anything that ships a finished color. */
+export function sandColorAt(x, z, out = [0, 0, 0]) {
+  sandAlbedoAt(x, z, out);
+  out[0] *= MOON_COLOR[0] * MOONLIT;
+  out[1] *= MOON_COLOR[1] * MOONLIT;
+  out[2] *= MOON_COLOR[2] * MOONLIT;
   return out;
 }
 
@@ -435,7 +469,7 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   }
   floorGeo.computeVertexNormals();
   // Sand greens well short of the stone and bark, which have something for the filaments to grip.
-  const floor = new THREE.Mesh(floorGeo, makeSurfaceMaterial(shading, sand, placeholders.sand, 0.16 * sand.tiling, false, null, 0.45));
+  const floor = new THREE.Mesh(floorGeo, makeSurfaceMaterial(shading, sand, placeholders.sand, 0.16 * sand.tiling, false, null, 0.45, true));
   floor.position.y = -DEPTH;
   floor.frustumCulled = false;
   group.add(floor);

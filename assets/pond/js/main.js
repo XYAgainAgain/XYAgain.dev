@@ -5,8 +5,9 @@ import { seedFromUrl, deriveSeed, createRng } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
-import { buildFloor, setTextureSize } from './floor.js';
+import { buildFloor, setTextureSize, setRelief } from './floor.js';
 import { WakeBuffer } from './wake.js';
+import { ReliefField } from './relief.js';
 import { Habitat } from './cover.js';
 import { EelSystem } from './eels.js';
 import { attachBraincell } from './eel-brain.js';
@@ -100,6 +101,15 @@ async function boot() {
   // Published before buildFloor so the floor, rocks, and bark can read the algae cover out of channel B.
   U.wakeTex = wake.read;
   U.wakeExtent.value = wake.extent;
+  // The dig relief, on the wake buffer's footprint. Published before buildFloor so the sand material
+  // can read it, and handed to floor.js so floorSurfaceAt sits on the same sand the shader draws.
+  const relief = new ReliefField(extent);
+  U.reliefTex = relief.read;
+  U.reliefExtent = relief.uExtent;
+  U.reliefTexel = relief.uTexel;
+  U.reliefStep = relief.uStep;
+  U.reliefStrength = relief.uStrength;
+  setRelief(relief);
   const habitat = new Habitat();
 
   // ?tier=0–8 pins a rung for testing; otherwise the ladder resumes where the last session settled.
@@ -123,6 +133,7 @@ async function boot() {
   // ?brain= and ?moon= pin a 0–1 scalar for testing; a bare or junk value is no pin at all.
   const pin = (name) => { const raw = params.get(name); return raw === null || raw.trim() === '' ? null : finite01(Number(raw), null); };
   eels.pins = { brain: pin('brain'), moon: pin('moon') };
+  eels.relief = relief;
   const eleanor = attachEleanor(eels, seed);
   // After Eleanor, so addModule's init hook reaches the guest too: she gets wits and module state at
   // attach time even though her controller never runs steer. Fear registers first, because the
@@ -134,7 +145,9 @@ async function boot() {
   eels.effects = effects;
   // Sediment is a second instance rather than more slots: premultiplied, so a dig puff occludes the
   // sand instead of glowing over it, on its own seeded stream so puff counts never move a decision.
-  const sediment = new UnderwaterEffectsPool({ pool: SEDIMENT_POOL, blend: 'premultiplied', rng: createRng(deriveSeed(seed, 3171)) });
+  const sediment = new UnderwaterEffectsPool({ pool: SEDIMENT_POOL, blend: 'premultiplied', rng: createRng(deriveSeed(seed, 3171)), shading });
+  // The floor's own albedo and uv scale, so a flying grain is a chip of the sand it came out of.
+  sediment.setSubstrate(textures.sand?.albedo, 0.16 * (textures.sand?.tiling ?? 1));
   underScene.add(sediment.mesh);
   eels.sediment = sediment;
   // Last of the three, so its initEel sees the wits and fear state the other two already installed.
@@ -635,6 +648,8 @@ async function boot() {
     }
     // After eels.update wrote this frame's influence slots, before anything samples the field.
     wake.update(dt);
+    // Costs nothing on a frame with no dig and no sand still settling back.
+    relief.update(dt);
 
     renderer.setRenderTarget(underRT);
     renderer.setClearColor(0x000000, 1);
@@ -706,7 +721,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

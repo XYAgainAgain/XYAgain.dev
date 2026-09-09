@@ -824,8 +824,13 @@ export function steer(sys, e, dt) {
     }
   }
 
-  tmpB.subVectors(e.target, head); tmpB.y = 0; tmpB.normalize();
-  force.addScaledVector(tmpB, hiding ? 0 : e.tunnel ? 1.4 : 0.6);
+  tmpB.subVectors(e.target, head); tmpB.y = 0;
+  // A hold that has reached its spot stops pulling and (below) stops creeping: at creep speed the turn
+  // radius is a hair, so a target under the snout spins the head in place and winds the body into a ball.
+  const settled = e.gait === 'hold' && now < e.gaitUntil && !e.food && !busy && !memHold
+    && (snug ? !snugFar : !quirkTarget && tmpB.length() < 0.6);
+  tmpB.normalize();
+  force.addScaledVector(tmpB, hiding || settled ? 0 : e.tunnel ? 1.4 : 0.6);
 
   // Spooks: strong, short-lived push away, with a speed burst.
   const startle = e.census.startle;
@@ -1221,7 +1226,7 @@ export function steer(sys, e, dt) {
   }
 
   // Stimuli raise the speed floor rather than multiply it, so a spooked resting eel still bolts.
-  let gaitBL = gait === 'hold' ? 0.05 : (gait === 'prowl' || gait === 'loop') ? e.prowlBL : e.cruiseBL;
+  let gaitBL = gait === 'hold' ? (settled ? 0 : 0.05) : (gait === 'prowl' || gait === 'loop') ? e.prowlBL : e.cruiseBL;
   // Threading a gap is slower work, in proportion to how far the maps had to bend the heading. Only
   // the voluntary rate: the spook, scatter, and burst floors below are instinct and are never braked.
   if (sys.braincell) gaitBL *= sys.braincell.brakeFor(e);

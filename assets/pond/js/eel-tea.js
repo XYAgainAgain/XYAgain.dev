@@ -114,7 +114,7 @@ export class TeaTime {
     if (st.sipUntil) {
       if (now >= st.sipUntil) { this.finish(sys, e, st, now); return; }
       // Mid-cup: parked under the notch on a slurp cadence, each sip dimpling the surface. The re-aim
-      // keeps the slow hold drift orbiting the notch instead of coasting past the pad.
+      // keeps the hold's spot on the notch as the pad drifts.
       this.aim(e, s);
       e.gait = 'hold';
       e.gaitUntil = Math.max(e.gaitUntil, st.sipUntil);

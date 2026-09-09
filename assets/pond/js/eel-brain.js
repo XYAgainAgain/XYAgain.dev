@@ -73,9 +73,9 @@ class Braincell {
       memory: [],
       anchor: 'unresolved',
       anchorAt: 0,
-      sulk: new Map(),          // dropId -> until; keyed by id so a deleted crumb cannot pin an object
-      seen: new Map(),          // dropId -> { x, z, y }, last known position of everything it smelled
-      notice: new Map(),        // dropId -> t, quorum detections
+      sulk: new Map(),          // dropId → until; keyed by id so a deleted crumb cannot pin an object
+      seen: new Map(),          // dropId → { x, z, y }, last known position of everything it smelled
+      notice: new Map(),        // dropId → t, quorum detections
       lastFood: null,
       noProgressFor: 0,
       progressAt: 0,

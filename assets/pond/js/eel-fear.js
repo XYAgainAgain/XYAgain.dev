@@ -69,8 +69,8 @@ class FearSystem {
     this.hand = { name: 'finger', kind: 'finger', length: 0, cruiseBL: 0, x: 0, z: 0, active: false, dragging: false, speed: 0, familiarity: 0, stillFor: 0 };
     this.handPrev = { x: 0, z: 0, has: false };
     this.guestSet = new Set();
-    this.refugeLocks = new Map();   // refuge id -> { who, x, z }; the point resolves near-duplicates
-    this.pairLocks = new Map();     // "a|b" -> occupant
+    this.refugeLocks = new Map();   // refuge id → { who, x, z }; the point resolves near-duplicates
+    this.pairLocks = new Map();     // "a|b" → occupant
     this.contests = [];             // pond-wide start times, for the three-a-minute cap
     this.fastAt = 0;
     this.near = { x: 0, z: 0, d: 0 };
@@ -91,9 +91,9 @@ class FearSystem {
   fresh(e) {
     return {
       rng: createRng(deriveSeed(this.seed, FEAR_SALT + (e.index ?? 0))),
-      trust: new Map(),        // name -> 0..TRUST_MAX
-      spike: new Map(),        // name -> { amount, until }, the witnessed-slurp bonus
-      lastD: new Map(),        // name -> last distance, for the closing speed
+      trust: new Map(),        // name → 0..TRUST_MAX
+      spike: new Map(),        // name → { amount, until }, the witnessed-slurp bonus
+      lastD: new Map(),        // name → last distance, for the closing speed
       panic: 0, panicName: null, panicKind: null, panicX: 0, panicZ: 0,
       out: [], pool: [],       // the danger writers handed to the braincell
       alarmAt: -1, alarmW: [], alarmPool: [], localAlarm: 0, alarmX: 0, alarmZ: 0, alarmHas: false,
@@ -101,7 +101,7 @@ class FearSystem {
       scatter: null,
       contest: null, contestAt: -1e9, pending: null,
       meters: { poke: { events: [], refractoryUntil: 0 }, recolor: { events: [], refractoryUntil: 0 }, drag: { events: [], refractoryUntil: 0 } },
-      seen: new Map(),         // spook id -> t, so one stimulus counts once per eel
+      seen: new Map(),         // spook id → t, so one stimulus counts once per eel
       tell: null,
       snap: null,
     };
@@ -136,7 +136,7 @@ class FearSystem {
     return clamp01(base + bonus + this.sizeTerm(e, o, kind) - (st.trust.get(nameKey) ?? 0));
   }
 
-  /* The dominance rule: about 1.15x length at equal girth is the 1.5 mass ratio that makes one eel
+  /* The dominance rule: about 1.15× length at equal girth is the 1.5 mass ratio that makes one eel
      step aside at the crumb. Guests are their own thing (a guest is scary by threat, not by ratio). */
   sizeTerm(e, o, kind) {
     if (kind !== 'eel' || !e.length || !o.length) return 0;
@@ -223,7 +223,7 @@ class FearSystem {
   /* Chunk 1's hook. Feared bodies and cached alarm marks are the same shape to the danger ring. */
   dangerWriters(e) { return this.state.get(e)?.out ?? null; }
 
-  // F5's calm grid, in seconds of rest per cell, exposed 0-1.
+  // F5's calm grid, in seconds of rest per cell, exposed 0–1.
   calmAt(x, z) {
     const i = this.cellOf(x, z);
     return i < 0 ? 0 : clamp01(this.calm[i] / CALM_CAP);

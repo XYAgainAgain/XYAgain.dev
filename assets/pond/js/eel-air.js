@@ -2,7 +2,8 @@ import * as THREE from 'three/webgpu';
 import { DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { paceWave, commitPose, claimTick } from './eel-behavior.js';
-import { floorHeightAt, sandColorAt } from './floor.js';
+import { floorHeightAt, floorSurfaceAt, sandColorAt, sandAlbedoAt } from './floor.js';
+import { RELIEF_HEAL_TAU } from './relief-core.js';
 import { moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01 } from './eel-air-core.js';
 
 /* Verticality: every state that leaves the water column's comfort band. Peek, log flop, ballistic
@@ -43,6 +44,13 @@ const DIG_SLOPE = 20 * Math.PI / 180;
 const DIG_YAW1 = 25 * Math.PI / 180, DIG_HZ1 = 4;
 const DIG_YAW2 = 15 * Math.PI / 180, DIG_HZ2 = 2;
 const DIG_BUDGET = { one: [20, 24], two: [6, 4], wake: [6, 16] };
+// The sand relief. RELIEF_R is one spine stamp's Gaussian radius in world units, RELIEF_RIDGE the
+// mound's height in body radii, RELIEF_TROUGH what the exit leaves as a fraction of that mound.
+const RELIEF_R = 0.45, RELIEF_RIDGE = 0.5, RELIEF_TROUGH = 0.6;
+const RELIEF_TICK = 0.1;      // restamp cadence; the heal over one of these is under a thousandth
+const TROUGH_PUFF = 1.6;      // seconds between trickle puffs at full depth, stretching as it fills
+const TROUGH_DONE = 0.1;      // remaining depth at which a trough stops earning silt
+const TROUGH_MAX = 4;         // healing troughs followed at once
 const SCARE_R = 3.5, SCARE_AT = 0.35;   // the open-water spook test: reach, and the intensity that turns an eel scared
 // Sand is cover. A buried eel needs a spook this many times over that line to be dug out on the spot,
 // or that much pressure sustained; one poke lives 1.6 s, so a lone distant one leaves it where it is.
@@ -74,6 +82,7 @@ export class AirStates {
     this.map = new Map();
     this.puffRng = createRng(deriveSeed(seed, SEDIMENT_SALT));
     this.anchor = { x: 0, z: 0, ok: false };
+    this.troughs = [];      // { trail, t0, puffAt } per exit, so the silt can follow the sand closing
     this.recoveries = [];   // { name, took, hitDeadline }, kept only under ?debug=1
   }
 
@@ -119,6 +128,8 @@ export class AirStates {
   prepass(sys, dt) {
     const now = sys.time;
     this.readAnchor();
+    sys.relief?.setStrength(this.k('relief'));
+    this.troughTick();
     for (const e of sys.eels) this.advance(sys, e, dt, now);
     for (const g of sys.guests) this.advance(sys, g, dt, now);
   }
@@ -414,10 +425,6 @@ export class AirStates {
       this.drive(sys, e, dt, { tx: f.approach.x, tz: f.approach.z, speedBL: e.prowlBL, targetY: flank });
       return;
     }
-    if (!f.entered && s > -f.rOuter) {
-      f.entered = true;
-      sys.sim?.addDrop(f.approach.x, f.approach.z, 0.4 + e.radius, 0.02);
-    }
     // A rate limit, not a chase: an exponential chase lags below the semicircle by enough to sit
     // inside the log's envelope, and the collider's sideways push then stalls the crossing outright.
     const yWant = crestHeight(s, f.rOuter, f.crestY, e.radius);
@@ -428,7 +435,7 @@ export class AirStates {
       ySet: head.y + Math.max(-step, Math.min(step, yWant - head.y)),
     });
     if (done) {
-      sys.sim?.addDrop(f.exit.x, f.exit.z, 0.4 + e.radius, 0.02);
+      // The rings come from eels.js's surface contact, point by point where the body breaks the film.
       sys.emit('splash', e, { size: e.length, detail: { flop: true } });
       e.target.set(f.exit.x, 0, f.exit.z);
       this.startRecover(sys, e, st, 'air');
@@ -621,6 +628,7 @@ export class AirStates {
     const press = st.phase === 'dig1' ? Math.min(1, el / DIG_ONE) : st.phase === 'wake' ? 0 : 1;
     e.burrowing = press;
     this.dimHalo(e, st, press, dt);
+    this.stampRelief(e, st, dt, press);
     if (st.phase === 'dig1') {
       const sink = e.prowlBL * e.length * Math.sin(DIG_SLOPE);
       this.puffBudget(e, st, el / DIG_ONE, DIG_BUDGET.one);
@@ -663,6 +671,7 @@ export class AirStates {
   }
 
   startWake(sys, e, st) {
+    this.collapseRelief(e, st);
     st.phase = 'wake'; st.t0 = sys.time;
     e.buried = false;
     e.burrowing = 0;
@@ -679,12 +688,67 @@ export class AirStates {
     return true;
   }
 
+  // The sand relief
+
+  /* The dig's mark: sand heaved up along the buried part of the body. Stamped toward a height, not
+     added, on a coarse clock, so a long hold keeps its mound against the heal for free. */
+  stampRelief(e, st, dt, press) {
+    const field = this.sys.relief;
+    const d = st.dig;
+    if (!field || !d) return;
+    d.reliefAt = (d.reliefAt ?? 0) - dt;
+    if (d.reliefAt > 0) return;
+    d.reliefAt = RELIEF_TICK;
+    const h = RELIEF_RIDGE * e.radius * Math.max(0, Math.min(1, press));
+    if (!(h > 0)) return;
+    for (let i = 0; i < e.pts.length; i += 3) {
+      const p = e.pts[i];
+      if (p.y > floorHeightAt(p.x, p.z)) continue;
+      field.stamp(p.x, p.z, RELIEF_R, h);
+    }
+  }
+
+  /* The exit: the ridge falls in on itself, and the trail is kept so silt can trickle up out of the
+     trough while it fills, which is what hides the healing. */
+  collapseRelief(e, st) {
+    const field = this.sys.relief;
+    if (!field || st.phase === 'wake') return;
+    const h = -RELIEF_TROUGH * RELIEF_RIDGE * e.radius;
+    const trail = [];
+    for (let i = 0; i < e.pts.length; i += 3) {
+      const p = e.pts[i];
+      if (p.y > floorHeightAt(p.x, p.z)) continue;
+      field.stamp(p.x, p.z, RELIEF_R, h);
+      trail.push(p.x, p.z);
+    }
+    if (trail.length < 2) return;
+    this.troughs.push({ trail, t0: this.sys.time, puffAt: this.sys.time + TROUGH_PUFF });
+    if (this.troughs.length > TROUGH_MAX) this.troughs.shift();
+  }
+
+  /* Silt drifting up off a trough as the sand closes over it, thinning with the depth that is left.
+     Every draw is the decorative puff stream, so a filling trough can never move a decision. */
+  troughTick() {
+    if (!this.troughs.length) return;
+    const sys = this.sys, now = sys.time, pool = sys.sediment;
+    for (let i = this.troughs.length - 1; i >= 0; i--) {
+      const tr = this.troughs[i];
+      const left = Math.exp(-(now - tr.t0) / RELIEF_HEAL_TAU);
+      if (left < TROUGH_DONE) { this.troughs.splice(i, 1); continue; }
+      if (now < tr.puffAt) continue;
+      tr.puffAt = now + (this.puffRng.range(0.7, 1.3) * TROUGH_PUFF) / left;
+      if (!pool || pool.live() > pool.pool * 0.7) continue;
+      const k = this.puffRng.int(0, tr.trail.length / 2 - 1) * 2;
+      this.puff(tr.trail[k], tr.trail[k + 1], 'silt', 1);
+    }
+  }
+
   // The sediment
 
   haloBase(e) { return e.jelly ? knob(this.sys.knobs?.jelly?.halo?.value, 1) : 1; }
 
   /* A buried eel keeps the influence field's sand glow, which reads as light through sand, but not
-     the 2.4x additive shell, which blooms over the floor as a bright ball. */
+     the 2.4× additive shell, which blooms over the floor as a bright ball. */
   dimHalo(e, st, want, dt) {
     st.dim = (st.dim ?? 0) + (want - (st.dim ?? 0)) * Math.min(1, dt * 4);
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e) * (1 - (1 - DIG_HALO) * st.dim);
@@ -717,15 +781,21 @@ export class AirStates {
     if (!pool || n <= 0) return 0;
     if (kind === 'grain' && sys.motion?.reduced) return 0;
     const rng = this.puffRng;
-    const y0 = floorHeightAt(x, z) + 0.01;
+    const y0 = floorSurfaceAt(x, z) + 0.01;
     const sx = sweep ? -sweep.z : 1, sz = sweep ? sweep.x : 0;
-    sandColorAt(x, z, sandRGB);
     // Sand-colored silt over sand is invisible by construction, so a billow reads as sand lifted into
-    // the moonlight: lifted and cooled. Grains stay the sand's own hue, only brighter.
+    // the moonlight: lifted and cooled. A grain is a pebble instead, so it ships the raw albedo and
+    // the pool lights it the way the floor beside it is lit.
     const gain = this.k('puff');
-    const color = kind === 'grain'
-      ? [sandRGB[0] * 2 * gain, sandRGB[1] * 2 * gain, sandRGB[2] * 2 * gain]
-      : [sandRGB[0] * SILT_TINT[0] * 5 * gain, sandRGB[1] * SILT_TINT[1] * 5 * gain, sandRGB[2] * SILT_TINT[2] * 5 * gain];
+    let color;
+    if (kind === 'grain') {
+      sandAlbedoAt(x, z, sandRGB);
+      color = [sandRGB[0] * gain, sandRGB[1] * gain, sandRGB[2] * gain];
+      if (pool.uSubGain) pool.uSubGain.value = gain;
+    } else {
+      sandColorAt(x, z, sandRGB);
+      color = [sandRGB[0] * SILT_TINT[0] * 5 * gain, sandRGB[1] * SILT_TINT[1] * 5 * gain, sandRGB[2] * SILT_TINT[2] * 5 * gain];
+    }
     let made = 0;
     for (let i = 0; i < n; i++) {
       const a = rng.range(0, Math.PI * 2);
@@ -738,11 +808,11 @@ export class AirStates {
         // Landing height is stored per instance: predict the return-to-launch time, ask the sand, then
         // re-ask at the column the real touchdown reaches, since sand below launch height lands later.
         const tf = 2 * vy / 0.6;
-        let landY = floorHeightAt(x + jx + vx * tf, z + jz + vz * tf) + 0.01;
+        let landY = floorSurfaceAt(x + jx + vx * tf, z + jz + vz * tf) + 0.01;
         const ts = (vy + Math.sqrt(Math.max(0, vy * vy + 1.2 * (y0 - landY)))) / 0.6;
-        landY = floorHeightAt(x + jx + vx * ts, z + jz + vz * ts) + 0.01;
+        landY = floorSurfaceAt(x + jx + vx * ts, z + jz + vz * ts) + 0.01;
         pool.spawn(x + jx, y0, z + jz, 'grain', {
-          vx, vy, vz, landY, size: rng.range(0.012, 0.025), life: rng.range(2, 4), color,
+          vx, vy, vz, landY, size: rng.range(0.035, 0.07) * this.k('grainSize'), life: rng.range(2, 4), color,
         });
       } else {
         pool.spawn(x + jx, y0, z + jz, 'silt', {

@@ -69,9 +69,8 @@ export function landingClear(x, z, r, spheres = [], logs = [], limX = Infinity, 
 }
 
 /* The flop's semicircle, read off the signed crossing coordinate s. The radius is rOuter + r rather
-   than rOuter: at the crest they agree (crestY + r), but the wider circle keeps the head outside the
-   collider on the way in. A path that only starts climbing at |s| = rOuter is walled out by the
-   envelope before it ever gets there, and the crossing stalls on the near flank. */
+   than rOuter (they agree at the crest) because the wider circle keeps the head outside the collider
+   on the way in; a path that only starts climbing at |s| = rOuter stalls on the near flank. */
 export function crestHeight(s, rOuter, crestY, r) {
   const R = rOuter + r;
   const a = Math.min(Math.abs(s), R);

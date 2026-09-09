@@ -24,6 +24,10 @@ export const SEDIMENT_POOL = 128;
 // Wake memory + algae cover field, RGBA16F ping-pong over the whole pool. 256 halves the texel to
 // ~0.14 units, which is what stops the algae edges reading as a mosaic; the pass is still trivial.
 export const WAKE_RES = 256;
+// Dig relief, on the wake buffer's footprint. A texel is ~0.14 units, which a body-width mound spans
+// several of once the bilinear filter rounds it off; RELIEF_MAX is one byte's world range either way.
+export const RELIEF_RES = 256;
+export const RELIEF_MAX = 0.12;
 export const COVER_DISCS = 48;       // surface-cover bake (mask G): up to 26 pads and 16 duckweed clumps
 export const COVER_CAPS = 48;        // surface-cover bake (mask G): rush stems as shadow capsules
 export const MAX_PIXELS = 2.6e6;     // internal render budget before DPR gets clamped

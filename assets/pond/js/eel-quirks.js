@@ -63,7 +63,7 @@ export class Quirks {
     return st?.spin && st.roll ? Math.sin(phaseOf(e)) * SPIN_YAW : 0;
   }
 
-  // Live knobs, read every call so the console can tune mid-night.
+  // Live knob accessor, the same shape as eel-air.js's.
   kStim() { return num(this.sys.knobs?.stim, 1); }
   kSpin() { return num(this.sys.knobs?.spin, 1); }
   q(name) { return num(this.sys.knobs?.quirks?.[name], DIALS[name]); }
