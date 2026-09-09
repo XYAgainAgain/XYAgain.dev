@@ -1,7 +1,7 @@
 import { BRAIN_SLOTS, DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { retreatAlongTrail } from './eel-physics.js';
-import { tickHeldAbove } from './eel-behavior.js';
+import { tickHeldAbove, tunnelLog } from './eel-behavior.js';
 import { makeRings, clearRings, addInterest, addDanger, addDangerArc, adapt, wrapPi, slotAngle, legalNudge, TAU } from './eel-brain-core.js';
 import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
 
@@ -24,6 +24,7 @@ const ANCHOR_REFRESH = [240, 480];
 const WAVE_WRAP = Math.PI * 2 * 1000;   // same phase wrap the swim wave uses, so a long escape cannot drift
 const BRAKE = 0.7, BRAKE_ANGLE = 30;   // fallbacks; pond.eels.knobs.brake and .brakeAngle are the live dials
 const BRAIN_FLOOR = 0.2;         // fallback when the knob is missing; pond.eels.knobs.brainFloor is the live dial
+const BORE_REACH = 2.5;          // fallback carve reach; pond.eels.knobs.tunnel.carve is the live dial
 const TANGENT_EPS = 1e-6;        // just clear of the silhouette, never a whole slot: a passable gap is often narrower
 const DEFAULT_EATS = { crumb: 1 };
 
@@ -86,6 +87,7 @@ class Braincell {
       ctx: null, routing: false, boxed: false, boxedFor: 0, boxedSide: 0, deflect: 0,
       escape: null,
       ringsTick: -1, look: 0, tolerance: 0, floor: 0, blur: 0, dbgI: null, dbgD: null,
+      score: null, limit: 0, scoreTick: -1,   // the solve's own legality ring, borrowed by Jaz's snap
       drops: [], phantom: null, misses: 0, gesture: -1, lastDrop: 0,
       crevice: null, creviceAt: -1,
       senseW: new Map(), sensePlume: new Map(),
@@ -688,13 +690,7 @@ class Braincell {
 
   /* The log this eel's run belongs to; startTunnel keeps the mouths, so match on them. */
   boreLog(sys, e) {
-    const t = e.tunnel;
-    if (!t) return null;
-    for (const l of sys.colliders.logs) {
-      if (l.rInner <= 0) continue;
-      if (l.a.distanceTo(t.entry) < 1e-3 || l.b.distanceTo(t.entry) < 1e-3) return l;
-    }
-    return sys.colliders.logs[0] ?? null;
+    return e.tunnel ? tunnelLog(sys.colliders, e.tunnel) : null;
   }
 
   boreCarve(e, l, look) {
@@ -703,29 +699,25 @@ class Braincell {
     const n = this.slots, head = e.head;
     const inner = l.rInner - e.radius;
     if (inner <= 0) return null;
+    // Two reaches: the near one clears the corridor once the head is in it, the far one clears the
+    // approach arc while the eel is still lining up, which is where an oblique run got pushed off.
+    const far = Math.min(look, this.sys.knobs.tunnel?.carve ?? BORE_REACH), near = Math.min(look, 1.5);
     for (let k = 0; k < n; k++) {
-      const a = slotAngle(k, n);
-      const px = head.x + Math.cos(a) * Math.min(look, 1.5), pz = head.z + Math.sin(a) * Math.min(look, 1.5);
-      if (segDist2(px, pz, l) < inner) carve[k] = 1;
+      const a = slotAngle(k, n), cx = Math.cos(a), cz = Math.sin(a);
+      if (segDist2(head.x + cx * near, head.z + cz * near, l) < inner
+        || segDist2(head.x + cx * far, head.z + cz * far, l) < inner) carve[k] = 1;
     }
     return carve;
   }
 
-  /* Jaz's cardinals are masked with the same test as everyone else's slots, never interest minus danger. */
-  legal(e, ang) {
-    const st = this.buildDanger(this.sys, e, 0);
-    const n = this.slots, danger = this.rings.danger;
-    let min = Infinity;
-    for (let k = 0; k < n; k++) if (danger[k] < min) min = danger[k];
-    const k = ((Math.round(ang / TAU * n) % n) + n) % n;
-    return danger[k] <= Math.max(min + st.tolerance, st.floor);
-  }
-
-  dangerAt(e, ang) {
-    this.buildDanger(this.sys, e, 0);
-    const n = this.slots;
-    const k = ((Math.round(ang / TAU * n) % n) + n) % n;
-    return this.rings.danger[k];
+  /* Jaz's cardinal snap, validated the way every other bounded yaw proposal is: on the very ring the
+     solve routed on, so the grid can never step across a boundary the adapter already rejected. */
+  snapLegal(e, heading, ang) {
+    const st = this.stateFor(e);
+    // The score ring is the solve's own scratch, shared with every other eel once this tick is over.
+    if (!st.score || st.scoreTick !== this.sys.ticks) return true;
+    const off = wrapPi(ang - heading);
+    return legalNudge(st.score, this.slots, heading, st.limit, off) === off;
   }
 
   routing(e) { return this.stateFor(e).routing; }
@@ -734,22 +726,17 @@ class Braincell {
 
   deflection(e) { return this.stateFor(e).deflect; }
 
-  /* Jaz's grid never reaches the adapter, so it files its own decision here: without this the brake
-     and the overlay keep replaying whatever reroute her last non-Snake tick happened to make. */
+  /* Jaz's grid quantizes the solve rather than replacing it, so this files the committed cardinal and
+     the extra deflection it cost. The boxed timer is the adapter's and stays untouched: clearing it
+     here is what left a snake eel with no reverse escape at all. */
   reportHeading(e, heading, forceAng, routed) {
     const st = this.stateFor(e);
     st.ctx = heading;
-    st.routing = !!routed;
-    st.deflect = routed ? Math.abs(wrapPi(heading - forceAng)) : 0;
-    st.boxed = false;
-    st.boxedFor = 0;
-    st.boxedSide = 0;
-    if (this.keepRings) {
-      const n = this.slots;
-      if (!st.dbgI || st.dbgI.length !== n) { st.dbgI = new Float64Array(n); st.dbgD = new Float64Array(n); }
-      st.dbgI.fill(0);
-      st.dbgD.set(this.rings.danger);
-    }
+    if (!routed) return;
+    st.routing = true;
+    // Four cardinals can never sit closer than a half-quadrant to an arbitrary pull, so only the
+    // excess over that is a reroute the brake should charge for.
+    st.deflect = Math.max(st.deflect, Math.max(0, Math.abs(wrapPi(heading - forceAng)) - Math.PI / 4));
   }
 
   /* The voluntary gait multiplier, tapered by how hard the reroute actually was: a bypassed or
@@ -787,6 +774,8 @@ class Braincell {
     st.ctx = res.heading;
     st.routing = res.routing;
     st.boxed = res.boxed;
+    // Kept for the grid's own snap, which quantizes this same solve a few lines later in steer.
+    st.score = res.score; st.limit = res.limit; st.scoreTick = sys.ticks;
     // How far the maps actually moved the heading, not just whether they decided something: three
     // quarters of a cluttered pond's ticks route, but half of those barely turn at all.
     st.deflect = res.routing ? Math.abs(wrapPi(res.heading - forceAng)) : 0;

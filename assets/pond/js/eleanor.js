@@ -31,6 +31,8 @@ export function attachEleanor(sys, seed) {
   e.checkAt = 0;
   e.stateAt = 0;
   e.coolAt = 0;
+  e.forceParkAt = null;
+  e.revPush = 0;
   e.nopePulse = 0;
   e.rescued = false;
   e.stuckStrikes = 0;
@@ -82,7 +84,15 @@ function setExit(e, mode) {
   e.exitFor = 0;
   e.revJam = 0;
   e.revNudged = false;
+  e.revPush = 0;
   e.revX = e.head.x; e.revZ = e.head.z;
+}
+
+/* Any spine point inside the view plus the hot-swap margin: the test for whether a chain move would be seen. */
+function onStage(sys, e) {
+  const hw = sys.view.w * 0.5 + e.radius * 2.5, hh = sys.view.h * 0.5 + e.radius * 2.5;
+  for (const p of e.pts) if (Math.abs(p.x) <= hw && Math.abs(p.z) <= hh) return true;
+  return false;
 }
 
 function resetProgress(e) {
@@ -92,6 +102,7 @@ function resetProgress(e) {
 }
 
 function park(sys, e) {
+  if (sys.debug && e.body?.visible && onStage(sys, e)) console.warn(`[eleanor] parked from on stage in ${e.state} (t=${sys.time.toFixed(2)})`);
   e.parkAng = e.rng.range(0, Math.PI * 2);
   setExit(e, null);
   e.nopePulse = 0;
@@ -125,6 +136,7 @@ function pickExit(sys, e) {
 function begin(e, state, now) {
   e.state = state;
   e.stateAt = now;
+  e.forceParkAt = null;
   e.rescued = false;
   e.stuckStrikes = 0;
   resetProgress(e);
@@ -140,17 +152,30 @@ function goHome(sys, e, now) {
   else e.state = 'depart';
 }
 
-/* The surrender: spit anything held (never park with someone in her jaws), vanish offstage, try
-   again in a while. Both the visit-cap ladder and the give-up below end here. */
+/* The surrender: spit anything held (never park with someone in her jaws), swim off, rest a while.
+   Both the visit-cap ladder and the give-up below end here. A hard park is the teleport a viewer sees,
+   so on stage it becomes a depart; the park itself waits until she is off frame or overdue. */
 function parkOffstage(sys, e, now) {
   if (e.prey && e.prey.slurpedBy === e) spit(sys, e, now);
   e.prey = null;
-  e.state = 'offstage';
-  park(sys, e);
-  setVisible(e, false);
   e.rescued = false;
   e.homeFails = 0;
   e.nextSwimBy = now + e.rng.range(40, 80);
+  // Without this the next tick picked a fresh visit: hunt and graze read nothing but coolAt.
+  e.coolAt = Math.max(e.coolAt, now + e.rng.range(40, 80));
+  if (onStage(sys, e) && now < (e.forceParkAt ?? Infinity)) {
+    if (e.forceParkAt === null) e.forceParkAt = now + 15;
+    e.parkAng = Math.atan2(e.head.z, e.head.x);   // straight out the nearest rim, not across the pond
+    e.state = 'depart'; e.stateAt = now;
+    e.stuckStrikes = 0;
+    resetProgress(e);
+    setExit(e, null);
+    return;
+  }
+  e.forceParkAt = null;
+  e.state = 'offstage';
+  park(sys, e);
+  setVisible(e, false);
 }
 
 /* Obstacle push, written into the module scratch so the steering loops allocate nothing. Squared
@@ -191,7 +216,7 @@ function brain(sys, e, dt) {
       const fromLair = e.state === 'lair';
       // A hot pond empties even the lair; otherwise: repossessions first, then dinner, then a lap.
       if (fromLair && sys.perfHot) { begin(e, 'depart', now); setExit(e, pickExit(sys, e)); return; }
-      if (!sys.perfHot) {
+      if (!sys.perfHot && now > e.coolAt) {
         const gnarly = sys.eels.filter((r) => r.length > SLURP_AT && !r.slurpedBy);
         if (gnarly.length) {
           gnarly.sort((a, b) => b.length - a.length);
@@ -208,7 +233,8 @@ function brain(sys, e, dt) {
           setExit(e, fromLair ? pickExit(sys, e) : null);
           e.swimbyX = e.rng.range(-sys.view.w * 0.35, sys.view.w * 0.35);
           e.swimbyZ = e.rng.range(-sys.view.h * 0.35, sys.view.h * 0.35);
-        } else if (e.state === 'offstage' && e.lair && now > e.coolAt) {
+          e.swimbyBest = Infinity; e.swimbyBestAt = now;
+        } else if (e.state === 'offstage' && e.lair) {
           begin(e, 'return', now);
           e.returnLeg = 0;
         }
@@ -254,7 +280,9 @@ function brain(sys, e, dt) {
     e.reverse = true;
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
     paceWave(e, dt, false);
-    retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
+    // The jam shove is spent over 0.2 s at the retreat's own pace; as one pop it moved her snout 0.1 L in a tick.
+    if (now < e.revPush) e.head.addScaledVector(e.heading, e.length * 0.5 * dt);
+    else retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
     const behind = (e.head.x - e.lair.a.x) * e.lairDir.x + (e.head.z - e.lair.a.z) * e.lairDir.z;
     if (behind < -0.8) { setExit(e, null); return; }
     // A reverse eats the path it walks, so it can jam on the bore or simply run out of history. One
@@ -264,8 +292,8 @@ function brain(sys, e, dt) {
       e.revJam = 0; e.revX = e.head.x; e.revZ = e.head.z;
     } else if ((e.revJam += dt) > REV_JAM) {
       if (e.revNudged) { setExit(e, 'turn'); return; }
-      e.head.addScaledVector(e.heading, e.length * 0.1);
-      e.revJam = 0; e.revNudged = true; e.revX = e.head.x; e.revZ = e.head.z;
+      e.revPush = now + 0.2;
+      e.revJam = 0; e.revNudged = true;
     }
     return;
   }
@@ -280,6 +308,8 @@ function brain(sys, e, dt) {
   } else if (e.state === 'depart') {
     const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
     tx = Math.cos(e.parkAng) * d; tz = Math.sin(e.parkAng) * d;
+    // A surrender parks the moment the whole body is out of frame, or at its deadline if the swim-out jams.
+    if (e.forceParkAt !== null && (now > e.forceParkAt || !onStage(sys, e))) { parkOffstage(sys, e, now); return; }
     if (Math.hypot(tx - e.head.x, tz - e.head.z) < 1.5) {
       e.state = 'offstage';
       park(sys, e);
@@ -303,7 +333,12 @@ function brain(sys, e, dt) {
   } else if (e.state === 'swimby') {
     // Shallow crossing on purpose: the surface furrow is the whole show.
     tx = e.swimbyX; tz = e.swimbyZ; ty = -e.radius * 1.3;
-    if (Math.hypot(tx - e.head.x, tz - e.head.z) < 1.2) { goHome(sys, e, now); return; }
+    const dSwim = Math.hypot(tx - e.head.x, tz - e.head.z);
+    if (dSwim < 1.2) { goHome(sys, e, now); return; }
+    // An orbit around the point never trips the progress watch, so closing distance is the test here:
+    // 5 s without gaining ground ends the lap the ordinary way instead of at the 50 s surrender.
+    if (dSwim < e.swimbyBest - 0.3) { e.swimbyBest = dSwim; e.swimbyBestAt = now; }
+    else if (now - e.swimbyBestAt > 5) { goHome(sys, e, now); return; }
   } else if (e.state === 'hunt') {
     const p = e.prey;
     if (!p || p.length <= SLURP_AT || now - e.stateAt > 25) { e.prey = null; goHome(sys, e, now); return; }
@@ -434,7 +469,7 @@ function brain(sys, e, dt) {
           e.stuckStrikes = 0;
           // The old rescue for a jammed return was another return, and goHome resets the visit clock,
           // so the hard park never fired. A second failed trip home now surrenders the visit instead.
-          if (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2) parkOffstage(sys, e, now);
+          if (e.forceParkAt !== null || (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2)) parkOffstage(sys, e, now);
           else goHome(sys, e, now);
         }
         else { e.nopePulse = now + 1.3; sys.emit('startle', e); }

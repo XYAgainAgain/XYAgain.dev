@@ -17,6 +17,11 @@ const NIBBLE = [0.5, 1.1];
 const CHEW = 0.6, NOPE = 0.45;
 const EXCITE_FEED = 0.35, EXCITE_BITE = 0.7;
 const TUFT_REACH = 0.35;         // 3D, to the holdfast
+// Long enough to cross the last body length at graze speed; the crumb path's one second is a lunge
+// from a stalk, and a grazer swims the whole way in.
+const BONK_FOR = 6;
+const BONK_ARM = 1.2;            // bonkAim's own reach: inside it the mouthful and the hard thing are both ahead
+const BONK_BAND = [0.35, 0.5];   // the crumb hunter's own recoil window, measured to the mouthful
 const ARC_MAX = 2.2;             // rad; the lead angle at a tight radius, so the arc cannot double back
 const ARC_MIN_R = 0.75;          // an eel sitting on the clump center still gets a target outside 0.6
 
@@ -33,7 +38,7 @@ export class Grazing {
   stateFor(e) {
     let st = this.state.get(e);
     if (!st) {
-      st = { startedAt: 0, until: 0, arrived: 0, carveAcc: 0, nibbleAt: 0, tuftFreeAt: 0, padFreeAt: 0 };
+      st = { startedAt: 0, until: 0, arrived: 0, carveAcc: 0, nibbleAt: 0, tuftFreeAt: 0, padFreeAt: 0, bonkAng: 0, bonkUntil: 0 };
       this.state.set(e, st);
     }
     return st;
@@ -76,6 +81,9 @@ export class Grazing {
     st.until = 0;
     st.carveAcc = 0;
     st.nibbleAt = 0;
+    // Q-B's aimed miss, frozen once per mouthful the way the crumb path freezes it at commit.
+    st.bonkAng = e.census?.hunt === 'bonk' ? (sys.stim?.bonkAim(sys, e, choice) ?? 0) : 0;
+    st.bonkUntil = 0;
     return true;
   }
 
@@ -174,13 +182,36 @@ export class Grazing {
     const dx = item.x - head.x, dz = item.z - head.z;
     const d = Math.hypot(dx, dz);
     const inv = d > 1e-4 ? 1 / d : 0;
-    e.target.set(item.x + dx * inv * LEAD, 0, item.z + dz * inv * LEAD);
+    let tx = item.x + dx * inv * LEAD, tz = item.z + dz * inv * LEAD;
+    const bonk = this.bonkStep(e, st, spot, d, now);
+    if (bonk) {
+      const c = Math.cos(bonk), s = Math.sin(bonk);
+      const ox = tx - head.x, oz = tz - head.z;
+      tx = head.x + ox * c - oz * s; tz = head.z + ox * s + oz * c;
+    }
+    e.target.set(tx, 0, tz);
     e.retargetAt = now + GIVE_UP * 3;
     if (!st.arrived && now - st.startedAt > GIVE_UP) { this.done(sys, e, st, false); return; }
 
     if (spot.kind === 'duckweed') { this.grazeMat(sys, e, dt, st, item, now); return; }
     if (spot.kind === 'algae') { this.biteTuft(sys, e, st, item, d, now); return; }
     this.eatPad(sys, e, st, spot.idx, item, d, now);
+  }
+
+  /* Q-B for the herbivore: the same aimed miss the crumb hunters get, on the last stretch only, so the
+     lunge line runs through the rock she was about to bite off. Zero means steer straight at the food. */
+  bonkStep(e, st, spot, d, now) {
+    // A plowed furrow cannot take a rotated lead: grazeMat owns the target from arrival on.
+    if (!st.bonkAng || (spot.kind === 'duckweed' && st.arrived)) return 0;
+    if (!st.bonkUntil) {
+      if (d >= BONK_ARM) return 0;   // still swimming in; the aim waits for lunge range
+      st.bonkUntil = now + BONK_FOR;
+    }
+    // Committed for a beat, then dropped either way, so a miss that never reaches the band costs one
+    // second rather than orbiting the mouthful until the give-up clock takes it.
+    if (d < BONK_BAND[0] || now >= st.bonkUntil) { st.bonkAng = 0; return 0; }
+    if (d < BONK_BAND[1]) { st.bonkAng = 0; e.nopeUntil = now + NOPE; return 0; }
+    return st.bonkAng;
   }
 
   /* Duckweed: a furrow plowed the way Eleanor plows and the finger parts, on a slow arc through the mat. */
@@ -263,5 +294,7 @@ export class Grazing {
     e.retargetAt = sys.time;
     st.arrived = 0;
     st.until = 0;
+    st.bonkAng = 0;
+    st.bonkUntil = 0;
   }
 }

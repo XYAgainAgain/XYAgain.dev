@@ -61,6 +61,7 @@ export class Eel {
     this.rippleAt = 0;
     this.food = null;
     this.tunnel = null;
+    this.boreAt = -1e9;   // last run's start; the cooldown reads it, so a fresh eel is never on one
     this.targetY = y;
     this.retargetYAt = 0;
     this.gait = 'prowl';
@@ -142,13 +143,19 @@ export class EelSystem {
       // scatter line, and the dinner table never empties.
       // puffSize scales the silt billow's half-size, puffTrickle is seconds between buried puffs.
       fear: 1.5, stim: 1, spin: 1, moon: 1,
-      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, puffTrickle: 0.8 },
+      // buriedEvict multiplies the spook line a buried eel is dug out by; buriedGrace is the seconds of
+      // lesser pressure it sits through first. 1 and 0 restore the old evict-on-any-scare behavior.
+      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8 },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
       // Q-A to Q-C's taste dials. stim and spin above stay plain multipliers, as Part Five declares
       // them, so a primitive cannot carry these: bonk push in radii, its rate limit and aim, the meals.
       quirks: { bonkPush: 0.6, bonkEvery: 2, bonkNear: 1.2, bonkAngle: Math.PI / 3, gratitude: 3 },
+      // The bore run: seconds without progress before a run gives up, the per-eel gap between runs
+      // (snakeCool multiplies it for the grid swimmer), the odds per unit of cover, the crowding divisor,
+      // and how far ahead the bore carve samples.
+      tunnel: { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, carve: 2.5, snakeCool: 2 },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
     // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt) and initEel(sys, e).

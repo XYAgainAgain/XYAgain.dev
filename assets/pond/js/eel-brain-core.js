@@ -4,7 +4,12 @@
 export const TAU = Math.PI * 2;
 const SKIRT = Math.PI / 4;
 
-export function wrapPi(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+/* Arithmetic rather than atan2(sin, cos): this runs per slot per writer per eel per tick and was a
+   sixth of the whole sim's CPU time as trig. */
+export function wrapPi(a) {
+  a %= TAU;
+  return a > Math.PI ? a - TAU : a < -Math.PI ? a + TAU : a;
+}
 
 /* Wrapped angular distance, always in [0, pi]: a skirt measured on the raw difference grows a second
    lobe behind the eel. */

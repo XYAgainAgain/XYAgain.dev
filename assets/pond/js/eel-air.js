@@ -43,6 +43,10 @@ const DIG_SLOPE = 20 * Math.PI / 180;
 const DIG_YAW1 = 25 * Math.PI / 180, DIG_HZ1 = 4;
 const DIG_YAW2 = 15 * Math.PI / 180, DIG_HZ2 = 2;
 const DIG_BUDGET = { one: [20, 24], two: [6, 4], wake: [6, 16] };
+const SCARE_R = 3.5, SCARE_AT = 0.35;   // the open-water spook test: reach, and the intensity that turns an eel scared
+// Sand is cover. A buried eel needs a spook this many times over that line to be dug out on the spot,
+// or that much pressure sustained; one poke lives 1.6 s, so a lone distant one leaves it where it is.
+const BURIED_EVICT = 2.5, BURIED_GRACE = 1.8;
 const BITE_COOL = 300;
 const BITE_TIMEOUT = 12;
 const BITE_REACH = 0.4;
@@ -54,7 +58,7 @@ const sandRGB = [0, 0, 0];
 
 function maxY(e) { let m = -Infinity; for (const p of e.pts) if (p.y > m) m = p.y; return m; }
 function minY(e) { let m = Infinity; for (const p of e.pts) if (p.y < m) m = p.y; return m; }
-function wrapPi(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+function wrapPi(a) { a %= Math.PI * 2; return a > Math.PI ? a - Math.PI * 2 : a < -Math.PI ? a + Math.PI * 2 : a; }
 
 export function attachAir(sys, seed) {
   const air = new AirStates(sys, seed);
@@ -206,9 +210,36 @@ export class AirStates {
       if (s.except === e || (s.only && s.only !== e)) continue;
       if (now - s.t > 1.6) continue;
       const d = Math.hypot(e.head.x - s.x, e.head.z - s.z);
-      if (d < 3.5 && (1 - d / 3.5) * s.strength * (e.traits?.spookMul ?? 1) > 0.35) return true;
+      if (d < SCARE_R && (1 - d / SCARE_R) * s.strength * (e.traits?.spookMul ?? 1) > SCARE_AT) return true;
     }
     return false;
+  }
+
+  /* The buried grace. Half of §3's point is that the sand is safety, so the spook that ends a dig has
+     to be nearer or louder than the one that turns a swimming eel, or keep at it. */
+  buriedScared(sys, e, st, dt) {
+    const now = sys.time;
+    // Already-committed fear, not a fresh ripple: a scatter decided in the prepass digs the eel out at once,
+    // which is how Eleanor's hunt still reaches an eel under the sand.
+    if (now < e.freezeUntil || now < e.nopeUntil || now < e.fleeUntil) return true;
+    if (sys.fear?.pendingScatter?.(e)) return true;
+    const mul = e.traits?.spookMul ?? 1;
+    let worst = 0;
+    for (const s of sys.spooks) {
+      if (s.except === e || (s.only && s.only !== e)) continue;
+      if (now - s.t > 1.6) continue;
+      const d = Math.hypot(e.head.x - s.x, e.head.z - s.z);
+      if (d >= SCARE_R) continue;
+      const k = (1 - d / SCARE_R) * s.strength * mul;
+      if (k > worst) worst = k;
+    }
+    const d0 = st.dig;
+    if (worst >= SCARE_AT * Math.max(1, knob(this.sys.knobs?.air?.buriedEvict, BURIED_EVICT))) return true;
+    // Drains at half the fill rate, so successive pokes stack toward the grace instead of each one
+    // starting over, and a single expired one bleeds off in a couple of seconds.
+    if (worst <= SCARE_AT) { d0.scareFor = Math.max(0, (d0.scareFor ?? 0) - dt * 0.5); return false; }
+    d0.scareFor = (d0.scareFor ?? 0) + dt;
+    return d0.scareFor >= knob(this.sys.knobs?.air?.buriedGrace, BURIED_GRACE);
   }
 
   /* Everything a voluntary air state needs before it may begin: an open exemption anywhere refuses,
@@ -574,7 +605,7 @@ export class AirStates {
     if (!force && (sys.fear?.contesting?.(e) || !this.canBurrow(e))) return false;
     st.burrowBout = e.gaitFrom;
     st.state = 'burrow'; st.phase = 'dig1'; st.t0 = sys.time;
-    st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0 };
+    st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0, scareFor: 0 };
     st.exempt = true;
     sys.emit('dig', e, { size: e.length, detail: { phase: 'in' } });
     return true;
@@ -615,7 +646,7 @@ export class AirStates {
     }
     if (st.phase === 'buried') {
       // The hold owns the clock: the bout ending, a scare, or a quorum wake all lift the head out.
-      if (now >= e.gaitUntil || this.scared(sys, e)) { this.startWake(sys, e, st); return; }
+      if (now >= e.gaitUntil || this.buriedScared(sys, e, st, dt)) { this.startWake(sys, e, st); return; }
       if (now >= (d.puffAt ?? 0)) {
         this.trickle(e);
         d.puffAt = now + this.puffRng.range(0.75, 1.25) * knob(this.sys.knobs?.air?.puffTrickle, DIG_TRICKLE);

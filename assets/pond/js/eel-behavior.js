@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { DEPTH, EEL_POINTS } from './config.js';
 import { segDist, retreatAlongTrail, growEel } from './eel-physics.js';
 import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
+import { wrapPi } from './eel-brain-core.js';
 
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 
@@ -19,6 +20,12 @@ const NAP_REACH = 3.5, NAP_GAIN = 0.3, NAP_CAP = 0.6, NAP_DEEP = 1.5, NAP_LONG =
 // a double helix, three a challah. The guide crawls toward the leader's own wander target.
 const TWINE_R = 0.24, TWINE_RY = 0.15, TWINE_OMEGA = Math.PI * 2 / 3.2, TWINE_LEN = [8, 16], TWINE_REACH = 1.6, TWINE_CHANCE = 0.1;
 const SICKLE_SKIN = new THREE.Color(1, 0.85, 0.2), SICKLE_GLOW = new THREE.Color(1, 0.2, 0.15);
+const TUNNEL_DIALS = { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, snakeCool: 2 };   // fallback; pond.eels.knobs.tunnel is the live copy
+const tunnelDial = (sys, key) => sys?.knobs?.tunnel?.[key] ?? TUNNEL_DIALS[key];
+const RUNOUT_STEPS = 8;
+// A hold bout the eel is actually holding. The nominal gait alone is not a rest: grazing and the tea
+// ritual both write one while the eel is still travelling.
+const HOLD_STILL = 0.2;
 
 /* Every field a census knob or quirk owns, wiped whenever the eel wearing them changes. A hot-swap
    re-runs applyIdentity and drops the plan, but it cannot know about state invented out here. */
@@ -69,15 +76,70 @@ function slipFor(u) {
 // Fit test before committing to the bore; a too-fat eel never enters, it only shelters beside rocks.
 function logFits(e, log) { return log.rInner >= e.radius * 1.15 + 0.02; }
 
-export function startTunnel(e, entry, exit, now) {
+const isMouth = (l, p) => l.a.distanceTo(p) < 1e-3 || l.b.distanceTo(p) < 1e-3;
+
+/* The log a run belongs to; startTunnel keeps the mouths, so match on them. */
+export function tunnelLog(colliders, t) {
+  if (!t) return null;
+  for (const l of colliders.logs) if (isMouth(l, t.entry) || isMouth(l, t.exit)) return l;
+  return colliders.logs[0] ?? null;
+}
+
+function runoutClear(e, pt, bore) {
+  for (const o of e.colliders.spheres) {
+    if (Math.hypot(pt.x - o.x, pt.z - o.z) < (o.rHit ?? o.r) + e.radius) return false;
+  }
+  for (const l of e.colliders.logs) {
+    if (l === bore) continue;
+    if (segDist(pt.x, pt.z, l.a.x, l.a.z, l.b.x, l.b.z) < l.rOuter + e.radius) return false;
+  }
+  return true;
+}
+
+/* The run-out has to be water the eel can actually reach, corridor included: walk out from the far
+   mouth along the axis and keep the last sample before anything blocks the way. A run-out buried in
+   a rock stalled the run for good; one on the far side of a rock would do the same. */
+function clearRunout(e, entry, exit, axis) {
+  const bore = e.colliders.logs.find((l) => isMouth(l, entry) || isMouth(l, exit)) ?? null;
+  const full = e.length + 0.6, pt = new THREE.Vector3(), last = exit.clone();
+  for (let i = 1; i <= RUNOUT_STEPS; i++) {
+    pt.copy(exit).addScaledVector(axis, full * i / RUNOUT_STEPS);
+    if (!runoutClear(e, pt, bore)) break;
+    last.copy(pt);
+  }
+  return last;
+}
+
+/* False when the far side has no room for the whole body to clear the wood before the head arrives,
+   unless forced: an eel already inside the bore has to run somewhere. */
+export function startTunnel(e, entry, exit, now, force = false) {
   // Line up on the axis two units out from the mouth first, so the head enters the bore straight.
   const axis = new THREE.Vector3().subVectors(exit, entry).normalize();
   const approach = entry.clone().addScaledVector(axis, -2.0);
   // Run-out past the far mouth keeps the tail from being dragged through the rim when the head turns away.
-  const runout = exit.clone().addScaledVector(axis, e.length + 0.6);
-  e.tunnel = { approach, entry, exit, runout, stage: 0 };
+  const runout = clearRunout(e, entry, exit, axis);
+  if (!force && runout.distanceTo(exit) < e.length) { e.boreRefusedAt = now; return false; }
+  e.tunnel = { approach, entry, exit, runout, stage: 0, bestD: Infinity, noProg: 0 };
   e.target.copy(approach);
   e.retargetAt = now + 30;
+  e.boreAt = now;
+  return true;
+}
+
+/* A forced run's run-out may sit right at the mouth, so the head arriving is not the end of it. */
+function tailClear(e) {
+  const l = tunnelLog(e.colliders, e.tunnel);
+  if (!l) return true;
+  const p = e.pts[e.pts.length - 1];
+  return segDist(p.x, p.z, l.a.x, l.a.z, l.b.x, l.b.z) > l.rOuter;
+}
+
+/* Is the head inside the bore this run belongs to? A run abandoned there turns the body through the
+   log wall, so it is the one place the retarget gate may not fire. */
+function headInBore(e) {
+  const l = tunnelLog(e.colliders, e.tunnel);
+  if (!l) return false;
+  return segDist(e.head.x, e.head.z, l.a.x, l.a.z, l.b.x, l.b.z) < l.rInner;
 }
 
 export function pickTarget(sys, e, now) {
@@ -96,13 +158,22 @@ export function pickTarget(sys, e, now) {
   // Crowded cover loses its appeal, and a laired guest closes the log to everyone but her admirer.
   const log = e.colliders.logs[0];
   const lairBlocked = !!(sys?.lairGuest && e.quirks.follows !== sys.lairGuest.name);
-  if (log && !lairBlocked && e.tunnel === null && logFits(e, log)) {
-    const logClaims = flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'log' ? 1 : 0), 0);
-    if (rng.chance(Math.min(0.85, 0.4 * e.traits.cover / act) / (1 + logClaims))) {
+  const moonCover = sys.air?.coverMul(e) ?? 1;
+  // The bore is the one stretch a snake cannot swim on cardinals, so Jaz waits longer between runs.
+  const cooldown = tunnelDial(sys, 'cooldown') * (e.quirks.snake ? tunnelDial(sys, 'snakeCool') : 1);
+  if (log && !lairBlocked && e.tunnel === null && logFits(e, log) && now - e.boreAt > cooldown) {
+    // Crowding counts live runs rather than the coverSpot label, which one eel drops the moment its
+    // own run ends; the moon reweights the bore the way it already reweights every other cover branch.
+    const logClaims = flock.reduce((n, o) => n + (o !== e && o.tunnel ? 1 : 0), 0);
+    const odds = Math.min(0.85, tunnelDial(sys, 'odds') * e.traits.cover / act) * moonCover;
+    if (rng.chance(odds / (1 + tunnelDial(sys, 'crowd') * logClaims))) {
       const fromA = rng.chance(0.5);
-      startTunnel(e, fromA ? log.a : log.b, fromA ? log.b : log.a, now);
-      e.coverSpot = { type: 'log', idx: 0 };
-      return;
+      const m0 = fromA ? log.a : log.b, m1 = fromA ? log.b : log.a;
+      // The other direction may have the room this one lacks; neither means the log is off the menu.
+      if (startTunnel(e, m0, m1, now) || startTunnel(e, m1, m0, now)) {
+        e.coverSpot = { type: 'log', idx: 0 };
+        return;
+      }
     }
   }
   e.tunnel = null;
@@ -113,7 +184,6 @@ export function pickTarget(sys, e, now) {
   const pads = sys?.habitat?.pads ?? [];
   const rocks = e.colliders.spheres;
   let covered = false;
-  const moonCover = sys.air?.coverMul(e) ?? 1;
   if (pads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act) * moonCover)) {
     const claims = pads.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'pad' && o.coverSpot.idx === i ? 1 : 0), 0));
     const least = Math.min(...claims);
@@ -360,6 +430,12 @@ export function claimTick(e, tier, name) {
   return true;
 }
 
+/* The one un-claim: an owner that ended its own reason for holding the eel mid-tick hands the tick back. */
+export function releaseTick(e, tier) {
+  if (e.tick.tier !== tier) return;
+  e.tick.tier = null; e.tick.owner = null;
+}
+
 /* Whether a tier above the caller's already holds the eel. A module that lost the tick may keep its
    clocks running, but it may not write the target. */
 export function tickHeldAbove(e, tier) {
@@ -382,54 +458,75 @@ export function commitPose(e) {
   if (e.uRoll) e.uRoll.value = ((e.roll % FULL_TURN) + FULL_TURN) % FULL_TURN;
 }
 
+/* Every owner that takes Jaz's grid off, in one place. Air states and the reverse escape return from
+   steer long before the solve, so they never reach this test. A tunnel run only owns the heading from
+   the last unit before its approach point through the wood: the open-water swim to it stays on the grid. */
+function gridOff(e, now) {
+  const t = e.tunnel;
+  const axisBound = !!t && (t.stage > 0 || Math.hypot(t.approach.x - e.head.x, t.approach.z - e.head.z) < 1.0);
+  return axisBound || now <= e.fleeUntil || !!e.restPose.kind
+    || (e.gait === 'hold' && now < e.gaitUntil && !e.food && e.speedBL < HOLD_STILL);
+}
+
+const cardX = (q) => Math.round(Math.cos(q * HALF_PI));
+const cardZ = (q) => Math.round(Math.sin(q * HALF_PI));
+
+/* Keeps a fresh or swapped-in Jaz on the grid, and hands back the cardinal they are on. */
+function snapCardinal(e) {
+  const q = ((Math.round(Math.atan2(e.heading.z, e.heading.x) / HALF_PI) % 4) + 4) % 4;
+  const cx = cardX(q), cz = cardZ(q);
+  if (cx !== e.heading.x || cz !== e.heading.z) e.heading.set(cx, 0, cz);
+  return q;
+}
+
+/* Snake rules for Jaz, as the solve's quantizer rather than a second solve: the adapter answers for
+   them like everyone else, and the grid takes the legal cardinal nearest that answer. Never the
+   reverse, never through their own body, and a short dwell against diagonal stutter. */
+function gridHeading(sys, e, want, forceAng, now) {
+  const brain = sys.braincell;
+  const q0 = snapCardinal(e);
+  let qc = q0;
+  if (now >= e.snapAt || snakeBlocked(e, cardX(q0), cardZ(q0))) {
+    let bestOff = Infinity, anyOff = Infinity, pick = -1, open = -1;
+    for (let q = 0; q < 4; q++) {
+      if (q === (q0 + 2) % 4 || snakeBlocked(e, cardX(q), cardZ(q))) continue;
+      const off = Math.abs(wrapPi(q * HALF_PI - want));
+      if (off < anyOff) { anyOff = off; open = q; }
+      if (brain && !brain.snapLegal(e, want, q * HALF_PI)) continue;
+      if (off < bestOff) { bestOff = off; pick = q; }
+    }
+    // Nothing legal: still the cardinal closest to the solved heading. A danger-only fallback is what
+    // used to leave them committed to a direction their own pull was pointing away from.
+    if (pick >= 0) qc = pick;
+    else if (open >= 0) qc = open;
+  }
+  if (cardX(qc) !== e.heading.x || cardZ(qc) !== e.heading.z) {
+    e.heading.set(cardX(qc), 0, cardZ(qc));
+    e.snapAt = now + 0.4;
+  }
+  // Routed only when the grid took something other than the cardinal nearest the pull, on the wrapped
+  // angle: rounded quadrant indices call -2 and +2 two different directions.
+  const qn = ((Math.round(forceAng / HALF_PI) % 4) + 4) % 4;
+  brain?.reportHeading(e, qc * HALF_PI, forceAng, qc !== qn);
+}
+
 /* Tick Contract step 4: the one place a resident's heading turns. sys.headingAdapter replaces the
    desired angle (Chunk 1's context steering) and the clamps still apply to whatever it hands back. */
-function solveHeading(sys, e, force, dt, asleep, resting) {
+function solveHeading(sys, e, force, dt, asleep) {
   const now = sys.time;
   const forced = force.x * force.x + force.z * force.z > 1e-6;
   if (asleep) return;   // half-buried on the floor: the heading is locked until the bout ends
-  if (e.quirks.snake && !e.tunnel && now > e.fleeUntil && !resting) {
-    // Snake rules: four legal headings, never the reverse or through their own body, with a short dwell
-    // against diagonal stutter; the cardinal-snap keeps a fresh or swapped-in Jaz's no-reverse check honest.
-    const q0 = Math.round(Math.atan2(e.heading.z, e.heading.x) / HALF_PI);
-    const cx = Math.round(Math.cos(q0 * HALF_PI)), cz = Math.round(Math.sin(q0 * HALF_PI));
-    if (cx !== e.heading.x || cz !== e.heading.z) e.heading.set(cx, 0, cz);
-    const brain = sys.braincell;
-    let bx = cx, bz = cz;
-    if (forced && (now >= e.snapAt || snakeBlocked(e, cx, cz))) {
-      // The maps mask her cardinals with everyone else's min + tolerance test; the winner is still the
-      // best interest among the survivors, never interest minus danger (the two are on different scales).
-      let best = -Infinity, survived = false;
-      for (let q = 0; q < 4; q++) {
-        const hx = Math.round(Math.cos(q * HALF_PI)), hz = Math.round(Math.sin(q * HALF_PI));
-        if ((hx === -cx && hz === -cz) || snakeBlocked(e, hx, hz)) continue;
-        if (brain && !brain.legal(e, q * HALF_PI)) continue;
-        survived = true;
-        const score = hx * force.x + hz * force.z;
-        if (score > best) { best = score; bx = hx; bz = hz; }
-      }
-      // The fallback keeps her body out of its own way: a cardinal she would swim into is no answer,
-      // and with nothing left at all she holds the heading she has rather than turning into herself.
-      if (!survived && brain) {
-        let low = Infinity;
-        for (let q = 0; q < 4; q++) {
-          const hx = Math.round(Math.cos(q * HALF_PI)), hz = Math.round(Math.sin(q * HALF_PI));
-          if ((hx === -cx && hz === -cz) || snakeBlocked(e, hx, hz)) continue;
-          const d = brain.dangerAt(e, q * HALF_PI);
-          if (d < low) { low = d; bx = hx; bz = hz; }
-        }
-      }
-      if (bx !== e.heading.x || bz !== e.heading.z) { e.heading.set(bx, 0, bz); e.snapAt = now + 0.4; }
-    }
-    // Her grid bypasses the adapter, so it files its own decision or the brake replays a stale reroute.
-    if (brain) {
-      const fa = forced ? Math.atan2(force.z, force.x) : Math.atan2(bz, bx);
-      brain.reportHeading(e, Math.atan2(bz, bx), fa, forced && Math.round(fa / HALF_PI) !== Math.round(Math.atan2(bz, bx) / HALF_PI));
+  const grid = e.quirks.snake && !gridOff(e, now);
+  if (!forced) {
+    // Nothing pulling: hold the heading, but a snake eel still holds a cardinal one.
+    if (grid) {
+      const a = snapCardinal(e) * HALF_PI;
+      sys.braincell?.reportHeading(e, a, a, false);
     }
     return;
   }
-  if (!forced) return;
   const want = sys.headingAdapter ? sys.headingAdapter(sys, e, force, dt) : Math.atan2(force.z, force.x);
+  if (grid) { gridHeading(sys, e, want, Math.atan2(force.z, force.x), now); return; }
   let diff = want - Math.atan2(e.heading.z, e.heading.x);
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));
   // +yaw carries +x toward +z, which is screen-right toward screen-down: clockwise. So left is
@@ -456,7 +553,7 @@ export function nope(sys, e, s, now, opts = null) {
     if (!e.tunnel) {
       const da = Math.hypot(log.a.x - s.x, log.a.z - s.z), db = Math.hypot(log.b.x - s.x, log.b.z - s.z);
       const exit = da > db ? log.a : log.b;   // continue toward the mouth farther from the threat
-      startTunnel(e, exit === log.a ? log.b : log.a, exit, now);
+      startTunnel(e, exit === log.a ? log.b : log.a, exit, now, true);
       e.tunnel.stage = 1;
       e.target.copy(exit);
     }
@@ -475,9 +572,10 @@ export function nope(sys, e, s, now, opts = null) {
     const da = Math.hypot(log.a.x - head.x, log.a.z - head.z), db = Math.hypot(log.b.x - head.x, log.b.z - head.z);
     if (Math.min(da, db) < e.length * 2.5) {
       const nearA = da < db;
-      startTunnel(e, nearA ? log.a : log.b, nearA ? log.b : log.a, now);
-      e.tunnel.wantHide = true;   // hold begins a beat after entering the bore, not at the mouth
-      e.coverSpot = { type: 'log', idx: 0 };
+      if (startTunnel(e, nearA ? log.a : log.b, nearA ? log.b : log.a, now)) {
+        e.tunnel.wantHide = true;   // hold begins a beat after entering the bore, not at the mouth
+        e.coverSpot = { type: 'log', idx: 0 };
+      }
     }
   }
 }
@@ -566,19 +664,28 @@ export function steer(sys, e, dt) {
   const berthed = !!(sys.lairGuest && e.quirks.follows !== sys.lairGuest.name);
   const hiding = !!(e.tunnel && e.tunnel.hideUntil && now > e.tunnel.hideFrom && now < e.tunnel.hideUntil);
   if (e.tunnel && e.tunnel.hideUntil && now >= e.tunnel.hideUntil) e.tunnel.hideUntil = 0;
-  if (e.tunnel) claimTick(e, 'tunnel', hiding ? 'hide' : 'tunnel');
 
   // Inside a tunnel run: reach the mouth, then aim straight through to the far mouth, holding axis height.
+  let stalled = false;
   if (e.tunnel && !hiding) {
+    const t = e.tunnel, from = t.stage;
     const dxz = Math.hypot(e.target.x - head.x, e.target.z - head.z);
-    if (e.tunnel.stage === 0 && dxz < 0.5) {
-      e.tunnel.stage = 1; e.target.copy(e.tunnel.exit);
-      if (e.tunnel.wantHide) { e.tunnel.wantHide = false; e.tunnel.hideFrom = now + 0.6; e.tunnel.hideUntil = now + 0.6 + rng.range(3, 8); }
+    // Progress clock, one per stage: a run that stops closing on its own stage target has stalled, and
+    // the retarget gate below frees it. Elapsed rather than wall-clock, so a hide or a scare that
+    // freezes the run does not spend the allowance. Stage 1 had no give-up clock at all.
+    if (dxz < t.bestD - 0.05) { t.bestD = dxz; t.noProg = 0; } else if (!scatter && !contest) t.noProg += dt;
+    if (t.stage === 0 && dxz < 0.5) {
+      t.stage = 1; e.target.copy(t.exit);
+      if (t.wantHide) { t.wantHide = false; t.hideFrom = now + 0.6; t.hideUntil = now + 0.6 + rng.range(3, 8); }
     }
-    else if (e.tunnel.stage === 1 && dxz < 0.4) { e.tunnel.stage = 2; e.target.copy(e.tunnel.runout); }
-    else if (e.tunnel.stage === 2 && dxz < 0.5) { e.tunnel = null; pickTarget(sys, e, now); }
+    else if (t.stage === 1 && dxz < 0.4) { t.stage = 2; e.target.copy(t.runout); }
+    else if (t.stage === 2 && dxz < 0.5 && tailClear(e)) { e.tunnel = null; pickTarget(sys, e, now); }
+    else stalled = t.noProg > tunnelDial(sys, 'stall');
+    if (e.tunnel === t && t.stage !== from) { t.bestD = Infinity; t.noProg = 0; }
     if (e.tunnel) { e.targetY = e.tunnel.entry.y; e.retargetYAt = now + 2; }
   }
+  // The claim waits for the stage machine: a run that finished or gave up this tick is a wander now.
+  if (e.tunnel) claimTick(e, 'tunnel', hiding ? 'hide' : 'tunnel');
   // The braincell's own target work: the memory sniff hold, the side-eye's gaze, and B7's phantom,
   // which is an ordinary force term. Before the retarget test, so an arrival lands the same tick.
   sys.braincell?.preSteer(sys, e, dt, force);
@@ -623,8 +730,14 @@ export function steer(sys, e, dt) {
     e.coverSpot.peeked = true;
     sys.air?.tryPeek(e, 'ridge');
   }
-  // Never abandon a run mid-bore: turning around inside the log drags the body through its wall.
-  else if (!padHolding && !memHold && !quirkTarget && ((now > e.retargetAt && e.tunnel?.stage !== 1) || (!e.tunnel && head.distanceTo(e.target) < 0.6))) pickTarget(sys, e, now);
+  // Never abandon a run mid-bore: turning around inside the log drags the body through its wall. Out
+  // in the water a run is ordinary again, so a stall or the attention span can end one.
+  else if (!padHolding && !memHold && !quirkTarget && !(e.tunnel && headInBore(e))
+    && (now > e.retargetAt || stalled || (!e.tunnel && head.distanceTo(e.target) < 0.6))) {
+    pickTarget(sys, e, now);
+    // A run that gave up here is a wander now, and the claim above must not keep labeling it tunnel-owned.
+    if (!e.tunnel) releaseTick(e, 'tunnel');
+  }
 
   if (padHolding) claimTick(e, 'voluntary', 'pad');
   else if (memHold) claimTick(e, 'voluntary', 'memory');
@@ -926,7 +1039,7 @@ export function steer(sys, e, dt) {
       // bore do the steering until the head is actually inside.
       let pull = 4.0 * hunger;
       if (log && segDist(best.x, best.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rOuter) {
-        if (!e.tunnel && fits && !berthed) {
+        if (!e.tunnel && fits && !berthed && now - (e.boreRefusedAt ?? 0) > 3) {
           const nearA = Math.hypot(log.a.x - head.x, log.a.z - head.z) < Math.hypot(log.b.x - head.x, log.b.z - head.z);
           startTunnel(e, nearA ? log.a : log.b, nearA ? log.b : log.a, now);
         }
@@ -1069,9 +1182,7 @@ export function steer(sys, e, dt) {
   const deepHold = e.gait === 'hold' && now < e.gaitUntil && e.gaitUntil - e.gaitFrom > 5;
   // A long sip parks him in a hold too, but tea is drunk at the surface, never half-buried.
   const asleep = deepHold && e.census.twoAM === 'asleep' && !e.tunnel && !e.food && !e.restPose.kind && e.coverSpot?.type !== 'tea';
-  // At rest the grid comes off, so the coil can be a real spiral instead of a staircase.
-  const resting = (e.gait === 'hold' && !e.food && !(snug && snugFar)) || !!e.restPose.kind;
-  solveHeading(sys, e, force, dt, asleep, resting);
+  solveHeading(sys, e, force, dt, asleep);
   e.speedMul += (speedMul - e.speedMul) * Math.min(1, dt * 4);
   e.uExcite.value += (excite - e.uExcite.value) * Math.min(1, dt * 3);
 

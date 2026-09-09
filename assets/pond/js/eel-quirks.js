@@ -11,8 +11,13 @@ const DECOR_SALT = 3299;      // the spin's bubbles, so a quality rung can never
 const TAU = Math.PI * 2;
 
 const STIM_EVERY = [3, 8];    // seconds per unit of stim; a stim of 0 never rolls at all
-const SHUFFLE_FOR = 0.4, SHUFFLE_YAW = 30 * Math.PI / 180, SHUFFLE_BL = 0.5;
-const FLICK_FOR = 0.35, FLICK_AMP = 0.7;
+// A 50 degree yaw on a three-unit eel is about half a body length of head travel from directly above,
+// which is the smallest offset that reads as deliberate rather than as steering noise.
+const SHUFFLE_FOR = 0.7, SHUFFLE_YAW = 50 * Math.PI / 180, SHUFFLE_BL = 0.5;
+// A flick that raises the wave amplitude is legible; one that lowers it just looks like slowing down.
+const FLICK_FOR = 0.5, FLICK_AMP = 1.45;
+const SLOW_PROWL = 1.2;       // times prowl: an unhurried wander is idle enough to fidget in
+const DEEP_EDGE = 3;          // a deep sleeper fidgets this far into a hold and this far from its end
 const PROBE_REACH = 0.5;      // body lengths to a rock rim or an open log mouth worth nosing
 const PROBE_SQUASH = 1.15, PROBE_BACK = 0.2, PROBE_CAP = 4, PROBE_OUT = 1.2;
 const LAIR_WOBBLE = 10 * Math.PI / 180, LAIR_WOBBLE_FOR = 1.2;
@@ -335,8 +340,11 @@ export class Quirks {
   }
 
   idleHold(sys, e, now) {
-    if (e.gait !== 'hold' || now >= e.gaitUntil) return false;
-    if (e.gaitUntil - e.gaitFrom > 5 && e.census?.twoAM === 'asleep') return false;
+    const held = e.gait === 'hold' && now < e.gaitUntil;
+    if (!held && !(e.gait === 'prowl' && e.speedBL < e.prowlBL * SLOW_PROWL)) return false;
+    // Gated on the middle of the bout, not on the identity: a deep sleeper still fidgets as it settles
+    // and as it wakes, which is the only window the pond's three biggest holders ever get.
+    if (held && e.census?.twoAM === 'asleep' && now - e.gaitFrom > DEEP_EDGE && e.gaitUntil - now > DEEP_EDGE) return false;
     return this.boutFree(sys, e);
   }
 
