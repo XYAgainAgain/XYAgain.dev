@@ -33,6 +33,8 @@ const FLOP_STUCK_WINDOW = 20; // a second stuck event against the same log insid
 const FLOP_COOL = 8;          // a drowned crest never breaks the film, so it earns no air cooldown
 const LEAP_LAUNCH = 0.8;
 const LEAP_AMP = 0.4;         // a leaping body is stiff
+const SPIN_LEAP = 60;          // knobs.air.spinLeap default: the zoomies multiplier on the leap odds
+const ZOOMIE_MUL = 1.3;       // speedMul at or above this is a burst, not ordinary swimming
 const BELLY_AMP = 1.3;
 const BELLY_RING = 1.6;
 const DIG_ONE = 1.5, DIG_TWO = 1;
@@ -462,9 +464,15 @@ export class AirStates {
     const sys = this.sys;
     const st = this.ready(e);
     if (!st || sys.motion?.reduced) return false;
-    if (e.tunnel || e.twine || e.food || sys.time < e.fleeUntil) return false;
-    if ((e.uExcite?.value ?? 0) <= 0.5) return false;
-    const rate = 0.004 * clamp01(e.leap ?? 0) * this.airMul(e) * this.k('leap');
+    // An eel already throwing itself around is the one that leaves the water: a spin, a loop, or a
+    // burst. Spin feeding is a meal, so the food gate yields to it; a leap can never start in a tunnel.
+    const zoomies = sys.stim?.rolling?.(e) === 'spin' || (e.speedMul ?? 0) >= ZOOMIE_MUL || e.gait === 'loop';
+    if (e.tunnel || e.twine || (e.food && !zoomies) || sys.time < e.fleeUntil) return false;
+    if (!zoomies && (e.uExcite?.value ?? 0) <= 0.5) return false;
+    // A zoomy eel of any temperament is at least a half-hearted leaper; a 0 stays 0 by the census.
+    const leap = zoomies && (e.leap ?? 0) > 0 ? Math.max(0.5, e.leap) : clamp01(e.leap ?? 0);
+    const rate = 0.004 * leap * this.airMul(e) * this.k('leap')
+      * (zoomies ? knob(this.sys.knobs?.air?.spinLeap, SPIN_LEAP) || 1 : 1);
     if (!(rate > 0) || !st.rng.chance(rate * dt)) return false;
     return this.startLeap(e, st, null);
   }

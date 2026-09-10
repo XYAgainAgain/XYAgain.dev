@@ -345,7 +345,7 @@ function startPose(e, kind, now) {
 
 /* Snake rules for Jaz: a cardinal is blocked when their own body lies across the next stretch of it.
    The neck is skipped, since the first few points always trail right behind the head. */
-function snakeBlocked(e, hx, hz) {
+export function snakeBlocked(e, hx, hz) {
   const head = e.head, look = Math.max(0.6, e.length * 0.4), lane = e.radius * 2.5 + 0.05;
   for (let i = 4; i < e.pts.length; i++) {
     const p = e.pts[i];
@@ -367,8 +367,10 @@ export function affection(e, o, now) {
   return 0;
 }
 
-function twineFree(o, now) {
-  return !o.slurpedBy && !o.tunnel && !o.food && !o.twine && o.gait !== 'hold' && now > o.fleeUntil && !o.restPose?.kind;
+// A crusher is spoken for: whichever social bout started first wins, and a braid recruiting one
+// mid-bout would overwrite the lane target under a claim the crush already holds.
+function twineFree(sys, o, now) {
+  return !o.slurpedBy && !o.tunnel && !o.food && !o.twine && o.gait !== 'hold' && now > o.fleeUntil && !o.restPose?.kind && !sys.crush?.active(o);
 }
 
 function endTwine(g) {
@@ -712,7 +714,7 @@ export function steer(sys, e, dt) {
   const looping = e.gait === 'loop' && now < e.gaitUntil && !e.tunnel && !e.food;
   const snug = e.snuggle.with && now < e.snuggle.until && e.snuggle.with.gait === 'hold' && !e.snuggle.with.slurpedBy ? e.snuggle.with : null;
   if (!snug) e.snuggle.with = null;
-  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming;
+  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e);
   // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
   // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
   const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
@@ -823,6 +825,9 @@ export function steer(sys, e, dt) {
       e.target.set(e.snack.x + Math.cos(e.snack.ang) * e.snack.r, 0, e.snack.z + Math.sin(e.snack.ang) * e.snack.r);
     }
   }
+  // The crush gag (eel-crush.js) parks its lane point here: social tier, a target write and nothing
+  // else, so the turn-rate clamp is what makes the follower miss Jaz's corners.
+  if (!busy) { const m = sys.crush?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
 
   tmpB.subVectors(e.target, head); tmpB.y = 0;
   // A hold that has reached its spot stops pulling and (below) stops creeping: at creep speed the turn
@@ -912,7 +917,7 @@ export function steer(sys, e, dt) {
     e.partner = pick;
   }
   // Bonded following: drift toward the partner when the gap opens; never overrides a run or a meal.
-  if (e.partner && !e.tunnel && !e.food) {
+  if (e.partner && !e.tunnel && !e.food && !sys.crush?.snubbed(e, now)) {
     const dx = e.partner.head.x - head.x, dz = e.partner.head.z - head.z;
     const d = Math.hypot(dx, dz);
     if (d > e.length * 1.2 && d < 8) {
@@ -922,10 +927,10 @@ export function steer(sys, e, dt) {
   }
 
   // Twining. The leader starts it: fond eels swimming alongside get pulled into a braid for a while.
-  if (!e.twine && twineFree(e, now) && rng.chance(TWINE_CHANCE * dt)) {
+  if (!e.twine && twineFree(sys, e, now) && rng.chance(TWINE_CHANCE * dt)) {
     let members = null;
     for (const o of e.flock) {
-      if (o === e || !twineFree(o, now) || affection(e, o, now) < 0.6) continue;
+      if (o === e || !twineFree(sys, o, now) || affection(e, o, now) < 0.6) continue;
       const d = Math.hypot(o.head.x - head.x, o.head.z - head.z);
       if (d > TWINE_REACH * e.length || o.heading.dot(e.heading) < 0.3) continue;
       (members ??= [e]).push(o);
@@ -992,7 +997,9 @@ export function steer(sys, e, dt) {
       // Bore food is invisible to an eel that cannot fit through the mouth, or dares not enter.
       if ((!fits || berthed) && log && segDist(f.x, f.z, log.a.x, log.a.z, log.b.x, log.b.z) < log.rInner) continue;
       const d = Math.hypot(f.x - head.x, f.z - head.z);
-      if (d > reach) continue;
+      // Doordash is about what lands in front of her; a crumb still falling or parked on a pad is fair
+      // to anticipate from anywhere.
+      if (d > reach && !f.airborne && !f.onPad) continue;
       const score = d + f.claims * 2.2 * (1 + e.traits.yield * 2) - (e.food === f && !skipPersist ? e.traits.persistence : 0);
       if (score < bestScore) { bestScore = score; best = f; }
     }
@@ -1069,7 +1076,9 @@ export function steer(sys, e, dt) {
         const rx = ax * bc - az * bs, rz = ax * bs + az * bc;
         ax = rx; az = rz;
       }
-      force.x += (ax / (d + 0.01)) * pull; force.z += (az / (d + 0.01)) * pull;
+      // Inside bite range the pull lets go: a target under the snout at brake speed winds the body into a ball.
+      const over = d < 0.35 ? 0 : 1;
+      force.x += (ax / (d + 0.01)) * pull * over; force.z += (az / (d + 0.01)) * pull * over;
       // Brake on approach: a full-speed turning circle is wider than the crumb, which reads as orbiting.
       if (!stalking) speedMul = Math.max(speedMul, 1 + 0.5 * hunger * Math.min(1, d / 1.5));
       if (bonking || (hunt === 'lunge' && d < e.length * 3)) speedMul = Math.max(speedMul, 1.6);
@@ -1077,7 +1086,8 @@ export function steer(sys, e, dt) {
       e.targetY = Math.max(-DEPTH + e.radius * 2.2, Math.min(-e.radius * 1.6, best.y + e.radius * 1.2 + 0.12 * Math.sin(ringA * 2)));
       e.retargetYAt = now + 0.5;
       e.foodDist = d;
-      if (d < 0.35) {
+      // No bite on a crumb that is still in the air or resting on a pad: it is smelled, not eaten, yet.
+      if (d < 0.35 && !best.airborne && !best.onPad) {
         // Q-C: a whole treat is worth spinning for, and a spinning eel tears at twice the rate.
         if (best.size === 1) sys.stim?.trySpin(sys, e, best);
         const bite = Math.min(best.amount, dt * 0.6 * biteMul * (sys.stim?.biteMul(e, best) ?? 1));
@@ -1189,9 +1199,13 @@ export function steer(sys, e, dt) {
   const asleep = deepHold && e.census.twoAM === 'asleep' && !e.tunnel && !e.food && !e.restPose.kind && e.coverSpot?.type !== 'tea';
   solveHeading(sys, e, force, dt, asleep);
   e.speedMul += (speedMul - e.speedMul) * Math.min(1, dt * 4);
+  // The crush's fluster rides on top of whatever this tick decided: a lift, never a level.
+  excite = Math.min(1, excite + (sys.crush?.exciteLift(e) ?? 0));
   e.uExcite.value += (excite - e.uExcite.value) * Math.min(1, dt * 3);
 
-  updateGait(sys, e, now, (1 + 0.35 * rainEnv) * (sys.air?.travelMul(e) ?? 1));
+  // A crush member is committed to moving: the cadence roll waits until the bout lets go, or a
+  // random hold would sit them down mid-chase and read as giving up for no reason.
+  if (!sys.crush?.active(e)) updateGait(sys, e, now, (1 + 0.35 * rainEnv) * (sys.air?.travelMul(e) ?? 1));
   // A long hold bout is where the coil and the sickle start, one per bout.
   if (e.gait === 'hold' && e.gaitUntil - e.gaitFrom > 5 && e.poseBout !== e.gaitFrom) {
     e.poseBout = e.gaitFrom;

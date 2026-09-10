@@ -219,6 +219,12 @@ export class Quirks {
     return true;
   }
 
+  /* Which roll is turning, for anyone who cares that an eel is currently throwing itself around. The
+     unwind keeps its kind, so a spin reads as a spin until the body is level again. */
+  rolling(e) {
+    return this.map.get(e)?.roll?.kind ?? null;
+  }
+
   rollBusy(e) {
     const r = this.map.get(e)?.roll;
     return !!r && !r.easing;

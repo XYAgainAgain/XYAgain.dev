@@ -21,6 +21,9 @@ const DRIP_STRENGTH = 0.02, DRIP_RADIUS = 3;
 const BEAD_FLOW = 0.12, BEAD_LIFT_ROLL = 0.8, BEAD_SWING_ROLL = 0.6, BEAD_RUN = 1.1, ROLL_CAP = 6;
 // Beads shed off a disturbed pad as a short burst of small drops, biased to the side they roll toward.
 const SHED_TIME = 0.7, SHED_RATE = 9, SHED_STRENGTH = 0.012, SHED_RADIUS = 2.5, SHED_THRESHOLD = 0.35;
+// How hard a shove has to be to count on p.shoveSeq. treats.js overwrites this.shoveMin from
+// knobs.treat.padShedThreshold, so the live dial wins wherever the treats module is attached.
+const SHOVE_MIN = 0.35;
 const MASS_RADIUS = 0.1;   // a resident's radius: a stalk shove scales by body radius over this, capped at 4×
 // Grazing: a small pad goes whole over EAT_FALL and comes back through the emerging class over one
 // orbit; a big one just loses a mouthful of rim. The fragment's bite mask only opens past age 0.8.
@@ -163,7 +166,7 @@ export class PadSystem {
         notchHalf, notchDepth: rng.range(0.35, 0.5), curl, seed: rng.range(0, 100),
         biteSeed: cls === 'old' ? rng.range(1, 100) : 0, restY: 0, liftGain: 1, raised: false,
         wet: 0, swingX: 0, swingZ: 0, swingVX: 0, swingVZ: 0, lastLift: 0, lastPlop: 0, lastPush: 0, cooldownAt: 0, flower: null,
-        shedUntil: 0, shedDir: 0, disturbed: 0, rollX: 0, rollZ: 0, rollS: 0,
+        shedUntil: 0, shedDir: 0, disturbed: 0, shoveSeq: 0, rollX: 0, rollZ: 0, rollS: 0,
         idx: this.pads.length, graze: null,
       };
       // A pad whose center falls under an earlier pad rides on top: raised, stiff, and deaf to the eels.
@@ -855,7 +858,11 @@ export class PadSystem {
       p.lastPush = pushMag;
       // A wet pad that gets shoved sheds its beads: a short burst of randomized small drops off the rim,
       // thrown the way the pad tipped (or away from the push), and the pad reads dry until it rains again.
+      // Every term is a body or a finger (rain only touches p.wet), so a parked crumb reads the same signal.
       const disturb = Math.max(lift, pushMag * 0.5, p.disturbed);
+      // A counter, not a level: this runs per render frame while a resting crumb reads on the 90 Hz tick,
+      // so a level could be set and cleared between reads; each reader keeps the count it last saw.
+      if (disturb > (this.shoveMin ?? SHOVE_MIN)) p.shoveSeq++;
       if (p.wet > 0.15 && disturb > SHED_THRESHOLD && now > p.shedUntil + 1.0) {
         p.shedUntil = now + SHED_TIME;
         p.wet = Math.max(0, p.wet - 0.35);
@@ -897,6 +904,18 @@ export class PadSystem {
     if (plopBest > 0 && now > this.plopAt) { this.plopAt = now + 1; this.events?.settle?.(plopX, plopZ); }
     if (drops.length && injector?.available) injector.inject(drops);
     this.updateLilies(dt, now, env);
+  }
+
+  /* The pad a point physically lands on, or null. Unlike habitat.padAt this hands back the live pad
+     object (swing, shed heading, the shove signal) and tests the real rim, not the cover margin. */
+  padAt(x, z, margin = 0) {
+    let hit = null;
+    for (const p of this.pads) {
+      if (p.r <= 0.01 || Math.hypot(x - p.x, z - p.z) > p.r + margin) continue;
+      // A pad lying over another rides on top, so it is the one anything falling actually meets.
+      if (!hit || (p.raised && !hit.raised)) hit = p;
+    }
+    return hit;
   }
 
   /* A hand (or anything the CPU knows about) brushing a pad: its beads fling off on the next update. */

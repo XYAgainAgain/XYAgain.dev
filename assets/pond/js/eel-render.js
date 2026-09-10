@@ -3,6 +3,7 @@ import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, flo
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2 } from './shading.js';
 import { makeRampTexture, bakeRamp } from './eel-palette.js';
+import { crumbScale } from './treats-core.js';
 
 const RINGS = 48, SIDES = 12;
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
@@ -442,8 +443,9 @@ export class EelRenderer {
       if (e.body.visible) this.writeSlot(e.index, e); else this.clearSlot(e.index);
     }
     for (const f of foods) {
-      f.mesh.position.set(f.x, f.y, f.z);
-      f.mesh.scale.setScalar(Math.max(0.2, Math.min(1, f.amount)));
+      // mx/mz carry the sinking flutter; x/z stay the anchor the eels aim at.
+      f.mesh.position.set(f.mx ?? f.x, f.y, f.mz ?? f.z);
+      f.mesh.scale.setScalar(crumbScale(f.amount));
     }
   }
 

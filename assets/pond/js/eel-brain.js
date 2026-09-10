@@ -168,6 +168,28 @@ class Braincell {
     return out;
   }
 
+  /* A crumb that stopped existing without being eaten: a treat thrown off the pool, or a cap eviction.
+     unfeed() clears the eels' own fields; these holders are the braincell's alone, and a stale one
+     keeps a notice in the nap quorum or turns a vanished point into a food-memory trip. */
+  forget(crumb) {
+    if (!crumb) return;
+    const id = crumb.dropId;
+    for (const [e, st] of this.state) {
+      if (id !== undefined) {
+        st.seen.delete(id);
+        st.notice.delete(id);
+        st.sulk.delete(id);
+        for (let i = st.drops.length - 1; i >= 0; i--) if (st.drops[i].dropId === id) st.drops.splice(i, 1);
+      }
+      if (st.lastFood === crumb) st.lastFood = null;
+      if (st.giveUpOn === crumb) { st.giveUpOn = null; st.noProgressFor = 0; st.progressD = Infinity; st.episodes = 0; }
+      st.senseW.delete(crumb);
+      st.sensePlume.delete(crumb);
+      const sf = e.sensedFoods;
+      if (sf) { const i = sf.indexOf(crumb); if (i >= 0) sf.splice(i, 1); }
+    }
+  }
+
   hasSensedFood(e) { return !!e.sensedFoods?.length; }
 
   senseWeight(e, f) { return this.stateFor(e).senseW.get(f) ?? 1; }

@@ -373,7 +373,8 @@ function brain(sys, e, dt) {
     let best = null, bd = 1e9;
     if (arrived) {
       for (const f of (sys.braincell?.sense(e) ?? sys.foods)) {
-        if (f.amount <= 0) continue;
+        // A crumb still falling or parked on a pad is smelled, not eaten; the sensed set carries both.
+        if (f.amount <= 0 || f.airborne || f.onPad) continue;
         const d = Math.hypot(f.x - e.head.x, f.z - e.head.z);
         if (d < bd) { bd = d; best = f; }
       }

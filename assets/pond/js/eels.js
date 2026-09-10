@@ -5,6 +5,7 @@ import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, re
 import { expire, pickTarget, steer } from './eel-behavior.js';
 import { EelRenderer } from './eel-render.js';
 import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPattern, rollNickname } from './eel-identity.js';
+import { pushFingerSample, seedFingerHistory, tumbleFor } from './treats-core.js';
 
 export class Eel {
   constructor(index, seed, extent, colliders, view, identity) {
@@ -110,6 +111,7 @@ export class Eel {
 const EVENT_TYPES = [
   'startle', 'eat', 'slurp', 'nibble', 'swap', 'sing', 'headbutt', 'rescue', 'graze', 'tea', 'drop',
   'peek', 'splash', 'dig', 'bonk', 'gape', 'lunge', 'spin', 'scatter', 'moonbite', 'overit',
+  'toss', 'void', 'huff',
 ];
 // Held-feed cadence: 250 BPM on the simulation clock, so the crumb stream is the same at 60 and 240 Hz.
 const CRUMB_S = 60 / 250;
@@ -146,7 +148,7 @@ export class EelSystem {
       // buriedEvict multiplies the spook line a buried eel is dug out by; buriedGrace is the seconds of
       // lesser pressure it sits through first. 1 and 0 restore the old evict-on-any-scare behavior.
       // relief scales the dig's dent in the sand, lean and shade together; 1 is the default depth, 0 is flat.
-      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1 },
+      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60 },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
@@ -157,13 +159,33 @@ export class EelSystem {
       // (snakeCool multiplies it for the grid swimmer), the odds per unit of cover, the crowding divisor,
       // and how far ahead the bore carve samples.
       tunnel: { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, carve: 2.5, snakeCool: 2 },
+      // The falling crumb (treats.js). Gravity is slowed because the real number reads as a teleport at
+      // pond scale; toss takes no cap, and the pad thresholds are horizontal speeds in units/s.
+      treat: {
+        height: 1, gravity: 4.5, toss: 0.35, vHistTicks: 6, tell: 2.2, tellNorm: 2, tellRecent: 0.5,
+        shadow: 0.35, scale: 1.2, airborneMax: 8, restMax: 8, maxFoods: 48,
+        padBounceV: 1.2, padRestV: 0.3, padShedThreshold: 0.35,
+        // Seconds a landed crumb rides the film before it starts down, by size bucket. A whole treat
+        // has enough surface tension under it to sit there; a speck goes straight to the bottom.
+        floatBig: 5, floatMid: 1.5,
+        // The flutter's half-width in units and the seconds it eases in, so letting go is not a jump.
+        sway: 0.09, swayIn: 1.2,
+      },
+      // The crush gag (eel-crush.js): roll odds, the join-in radius and its boost, the lane gap in body
+      // lengths per member, the miss tolerance, fluster per miss, and the bout's clocks in seconds.
+      crush: {
+        odds: 1, joinRadius: 5, joinBoost: 1.6, gap: 1.0, laneTol: 0.6, flusterPer: 0.34,
+        boutMax: 25, huff: 3, snub: 8, cool: 120, exitStagger: [0.3, 0.8], bonk: 1,
+      },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
     // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt) and initEel(sys, e).
     this.modules = [];
     // One pond-wide input snapshot, written by main from the pointer events and advanced on the
     // simulation clock in the prepass, so nothing about it follows the frame rate.
-    this.finger = { mode: 'none', gestureId: 0, x: 0, z: 0, vx: 0, vz: 0, speed: 0, stillFor: 0, heldFor: 0, releasedAt: -1e9, familiarity: 0, moveSeq: 0, vAge: 0 };
+    // vHist is a short position history on the sim clock: input.js zeroes vx/vz at a press, so a throw
+    // reading those would drop the first crumb of every click straight down.
+    this.finger = { mode: 'none', gestureId: 0, x: 0, z: 0, vx: 0, vz: 0, speed: 0, stillFor: 0, heldFor: 0, releasedAt: -1e9, familiarity: 0, moveSeq: 0, vAge: 0, vHist: [] };
     this.held = null;              // live right-hold feed: { x, z, gestureId, next }
     this.inputHandlers = null;     // main's own pointer handlers, so a recorded script makes real side effects
     this.script = null;
@@ -181,6 +203,8 @@ export class EelSystem {
     this.braincell = null;         // eel-brain.js; sense, the context maps, memory, the tells
     this.fear = null;              // eel-fear.js; the fear map, scatter, refuge contests, alarm and calm
     this.stim = null;              // eel-quirks.js; stimming, bonks, spin feeding, the one roll owner
+    this.treats = null;            // treats.js; the airborne crumb, its shadow, and the landing
+    this.crush = null;             // eel-crush.js; the followers' failed attempts at Jaz's grid
     this.headingAdapter = null;    // Chunk 1's context steering: (sys, e, force, dt) → desired heading angle
     // Everything smellable, keyed by kind. Crumbs register themselves in feed(); a fish school or a
     // dipping firefly registers the same shape with its own plume growth and plop radius.
@@ -290,6 +314,10 @@ export class EelSystem {
   setEnabled(on) {
     this.enabled = on;
     this.renderer.setEnabled(on);
+    // Simulation time keeps running while the eels are off, and a crumb left hanging over an empty
+    // pond is a bug report: every flight resolves to its impact instead of freezing.
+    if (!on) this.treats?.resolveAll();
+    for (const m of this.modules) m.onEnabled?.(this, on);
     if (!on) for (const e of this.eels) {
       // Time keeps running while disabled, so an open exemption would resume mid-air after a long gap.
       this.air?.cancel(e);
@@ -323,29 +351,93 @@ export class EelSystem {
       const nx = d > 1e-4 ? dx / d : 1, nz = d > 1e-4 ? dz / d : 0;
       x = o.x + nx * want; z = o.z + nz * want;
     }
-    const mesh = this.renderer.createFoodMesh();
-    mesh.position.set(x, -0.05, z);
-    this.group.add(mesh);
+    // An airborne crumb is smelled, not eaten: it holds a scent entry and no mesh until land() runs.
+    const air = opts?.air ?? null;
+    const mesh = air ? null : this.renderer.createFoodMesh();
+    if (mesh) { mesh.position.set(x, -0.05, z); this.group.add(mesh); }
     // Size bucket picks the eel-eat-* variant when the crumb finishes: 1 big, 2 crumb, 3 tiny.
     const size = amount >= 0.75 ? 1 : amount >= 0.3 ? 2 : 3;
     // The drop stream: a rhythm reader needs to know which crumb this was, which gesture made it,
     // and when it actually landed in simulation time rather than when a frame noticed it.
+    const dropId = ++this.dropId;
     const crumb = {
-      x, z, y: -0.05, amount, size, mesh, claims: 0, claimedBy: null, contested: false, vy: 0, growPerAmt: 0.02,
-      dropId: ++this.dropId,
+      x, z, y: air ? air.y : -0.05, amount, size, mesh, claims: 0, claimedBy: null, contested: false, vy: 0, growPerAmt: 0.02,
+      airborne: !!air, onPad: null,
+      // mx/mz are where the mesh is drawn: the sinking flutter sways those and leaves x/z alone, so
+      // the eels keep aiming at one anchor. sway is the flutter's heading, hashed off the id.
+      mx: x, mz: z, sway: tumbleFor(dropId).phase, landedAt: opts?.t ?? this.time,
+      dropId,
       gestureId: opts?.gestureId ?? this.finger.gestureId,
       origin: opts?.origin ?? 'click',
       t: opts?.t ?? this.time,
       // The scent fields: a crumb is its own registry entry, so a claim stays global on one object.
       kind: 'crumb', plop: 3.5,
     };
-    this.foods.push(crumb);
+    if (!air) this.foods.push(crumb);
     this.scents.push(crumb);
+    // The spree meter is what the airborne tell's recency reads, so it counts at the throw. Eleanor's
+    // commotion centroid is about food that actually arrived, so a treat joins it at the splash.
     this.feedRecent += amount;
-    this.drops20.push({ x, z, amount, t: this.time });
-    this.recomputeCommotion();
-    if (this.foods.length > 24) { const f = this.foods.shift(); this.group.remove(f.mesh); this.unscent(f); }
+    if (!air) this.noteDrop(crumb);
+    this.capFoods();
     return crumb;
+  }
+
+  noteDrop(crumb) {
+    this.drops20.push({ x: crumb.x, z: crumb.z, amount: crumb.amount, t: this.time });
+    this.recomputeCommotion();
+  }
+
+  /* Nothing that reads foods sees a crumb still in the air, which is the whole point: the eels smell
+     it coming and cannot eat it. This is where it becomes real, and where the splash finally fires. */
+  land(crumb) {
+    if (!crumb || (!crumb.airborne && !crumb.onPad)) return crumb;
+    crumb.airborne = false;
+    crumb.onPad = null;
+    crumb.y = -0.05;
+    crumb.t = this.time;
+    crumb.landedAt = this.time;   // the float-then-sink clock starts at the splash, not at the throw
+    crumb.mx = crumb.x; crumb.mz = crumb.z;
+    crumb.plop = 3.5;   // the pressure wave arrives for real; sense() runs its window from here
+    if (!crumb.mesh) crumb.mesh = this.renderer.createFoodMesh();
+    crumb.mesh.position.set(crumb.x, crumb.y, crumb.z);
+    if (!crumb.mesh.parent) this.group.add(crumb.mesh);
+    if (!this.foods.includes(crumb)) this.foods.push(crumb);
+    if (!this.scents.includes(crumb)) this.scents.push(crumb);
+    this.noteDrop(crumb);
+    this.capFoods();
+    this.emitAt('drop', crumb.x, crumb.y, crumb.z, {
+      detail: { amount: crumb.amount, held: crumb.origin === 'held', tossed: true },
+      dropId: crumb.dropId, t: crumb.t,
+    });
+    return crumb;
+  }
+
+  /* The void path: a crumb thrown clean off the pool never lands, so nobody may be left holding it. */
+  unfeed(crumb) {
+    if (!crumb) return;
+    this.unscent(crumb);
+    // The braincell holds this crumb in maps and per-eel arrays the scent registry knows nothing about.
+    this.braincell?.forget(crumb);
+    const i = this.foods.indexOf(crumb);
+    if (i >= 0) this.foods.splice(i, 1);
+    if (crumb.mesh) { this.group.remove(crumb.mesh); crumb.mesh = null; }
+    crumb.amount = 0;
+    crumb.airborne = false;
+    crumb.onPad = null;
+    crumb.claims = 0;
+    crumb.claimedBy = null;
+    for (const e of this.eels.concat(this.guests)) {
+      if (e.food === crumb) e.food = null;
+      if (e.bonkFood === crumb) e.bonkFood = null;
+    }
+  }
+
+  /* The food cap goes out through the full removal path: an evicted crumb left claimed keeps its
+     claimants circling a target that no longer exists, and a contest alive on nothing at all. */
+  capFoods() {
+    const cap = Math.max(1, (this.knobs.treat?.maxFoods | 0) || 48);
+    while (this.foods.length > cap) this.unfeed(this.foods[0]);
   }
 
   /* Where the food is coming from: one amount-weighted point over the last twenty seconds, for a guest
@@ -461,7 +553,11 @@ export class EelSystem {
     // anchoring on the current count collapses recorded ticks 0 and 1 onto the same prepass.
     this.scriptFrom = this.ticks + 1;
     this.scriptPrev = null;
+    this.replaying = !!this.script;  // sticks after the last event, so the fixture's tail stays clean
     this.pokeRelease = null;
+    // Replay owns the cursor history from here: whatever the live hand was doing must not become the
+    // launch velocity of the fixture's first toss.
+    this.finger.vHist.length = 0;
     return !!this.script;
   }
 
@@ -514,6 +610,34 @@ export class EelSystem {
     this.pokeRelease = ev.type === 'poke' ? this.ticks + 1 : null;
     f.mode = mode;
     if (mode !== 'none') { f.x = x; f.z = z; f.stillFor = 0; f.moveSeq++; }
+    // The throw's history, written before the handler that reads it. A gesture start wipes the window
+    // so the launch cannot inherit anything from before the replay; an entry may name its own vx/vz,
+    // which is the only way a recorded fast click reproduces (the vocabulary has no hover sample).
+    if (starting) f.vHist.length = 0;
+    if (Number.isFinite(ev.vx) && Number.isFinite(ev.vz)) {
+      seedFingerHistory(f.vHist, f.x, f.z, ev.vx, ev.vz, this.time, (this.vHistTicks - 1) * TICK);
+      f.vx = ev.vx; f.vz = ev.vz; f.speed = Math.hypot(ev.vx, ev.vz);
+    } else this.sampleFinger();
+  }
+
+  get vHistTicks() { return Math.max(2, Math.min(32, (this.knobs.treat?.vHistTicks | 0) || 6)); }
+
+  /* A hand over the water with no button down. Position only: mode, gestureId, and the press clocks
+     all belong to a real gesture, but the next tick's sample has to see the hand actually moving or
+     a fast click inherits nothing. A replay owns the cursor outright, so it ignores the live one. */
+  hoverFinger(x, z, gap = false) {
+    if (this.replaying || !Number.isFinite(x) || !Number.isFinite(z)) return;
+    // A cursor back from outside the window teleported; its old samples would read as a throw.
+    if (gap) this.finger.vHist.length = 0;
+    this.finger.x = x;
+    this.finger.z = z;
+  }
+
+  /* Sampled on the tick rather than on pointer events, and regardless of press state. runScript()
+     runs after this, so a scripted move corrects the sample this tick already took. */
+  sampleFinger() {
+    const f = this.finger;
+    pushFingerSample(f.vHist, f.x, f.z, this.time, this.vHistTicks);
   }
 
   /* F2a's finger clock. Familiarity rises while the hand is in the water, holds through a short
@@ -525,6 +649,7 @@ export class EelSystem {
     // flick forever and later read as a fast finger.
     f.vAge += dt;
     if (f.vAge > FINGER_V_AGE) { f.vx = 0; f.vz = 0; f.speed = 0; }
+    this.sampleFinger();
     const k = this.knobs.familiarity ?? null;
     const full = k?.full > 0 ? k.full : 12, grace = k?.grace ?? FINGER_GRACE, forget = k?.forget > 0 ? k.forget : 25;
     // Over the water, not merely down: a mouse dragged off the pond keeps the gesture alive, and time
@@ -546,8 +671,14 @@ export class EelSystem {
     const h = this.held;
     if (!h) return;
     while (h.next <= this.time) {
-      const crumb = this.feed(h.x, h.z, 0.35, { origin: 'held', gestureId: h.gestureId, t: h.next });
-      this.emitAt('drop', crumb.x, crumb.y, crumb.z, { detail: { held: true, amount: 0.35 }, dropId: crumb.dropId, t: crumb.t });
+      const opts = { origin: 'held', gestureId: h.gestureId, held: true, t0: h.next };
+      // With treats attached the ring and the plop come from the landing instead; without it the
+      // stream keeps the old shape, so a pond built without the module still feeds.
+      if (this.treats) this.treats.toss(h.x, h.z, 0.35, opts);
+      else {
+        const crumb = this.feed(h.x, h.z, 0.35, { origin: 'held', gestureId: h.gestureId, t: h.next });
+        this.emitAt('drop', crumb.x, crumb.y, crumb.z, { detail: { held: true, amount: 0.35 }, dropId: crumb.dropId, t: crumb.t });
+      }
       h.next += CRUMB_S;
     }
   }
@@ -614,10 +745,9 @@ export class EelSystem {
     for (const e of all) if (!e.slurpedBy) rememberPushes(e);
     this.surfaceContact(all, dt);
     if (this.debug) this.sweepNaN(all);
-    // Food sinks slowly, then rests on the sand; spent crumbs disappear.
     for (let i = this.foods.length - 1; i >= 0; i--) {
       const f = this.foods[i];
-      f.y = Math.max(-DEPTH + 0.05, f.y - dt * 0.12);
+      this.sinkFood(f, dt);
       if (f.amount <= 0) { this.group.remove(f.mesh); this.foods.splice(i, 1); this.unscent(f); }
     }
     this.feedRecent *= Math.exp(-dt / 6);
@@ -628,6 +758,28 @@ export class EelSystem {
     expire(this.spooks, this.time, 1.6);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
+  }
+
+  /* A whole treat has enough surface tension under it to ride the film for a while; a speck goes
+     straight down. Once it lets go it flutters rather than dropping on a rail: the sway is the mesh's
+     alone (mx/mz), because x/z is the anchor every eel aims at and a 3 cm wobble on that jitters the
+     approach vector, the claim scores, and B5's no-progress clock. */
+  sinkFood(f, dt) {
+    const k = this.knobs.treat;
+    const hold = f.size === 1 ? (k?.floatBig ?? 5) : f.size === 2 ? (k?.floatMid ?? 1.5) : 0;
+    const since = this.time - (f.landedAt ?? this.time);
+    if (since < hold) {
+      f.y = -0.05 + Math.sin(this.time * 1.4 + f.sway) * 0.012;
+      f.mx = f.x; f.mz = f.z;
+      return;
+    }
+    f.y = Math.max(-DEPTH + 0.05, f.y - dt * 0.12);
+    // Eased in from the let-go and gone by the floor, so it lands where the eels were told.
+    const fadeIn = Math.min(1, (since - hold) / Math.max(0.05, k?.swayIn ?? 1.2));
+    const amp = (k?.sway ?? 0.09) * fadeIn * fadeIn * (3 - 2 * fadeIn) * Math.max(0, Math.min(1, (f.y + DEPTH - 0.05) / DEPTH));
+    const s = Math.sin(this.time * 1.4 + f.sway) * amp;
+    f.mx = f.x + Math.cos(f.sway) * s;
+    f.mz = f.z + Math.sin(f.sway) * s;
   }
 
   /* Every animal breaks the film for real: any spine point that crossed the water plane since last tick

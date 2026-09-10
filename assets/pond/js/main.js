@@ -14,6 +14,8 @@ import { attachBraincell } from './eel-brain.js';
 import { attachFear } from './eel-fear.js';
 import { attachAir } from './eel-air.js';
 import { attachQuirks } from './eel-quirks.js';
+import { attachCrush } from './eel-crush.js';
+import { attachTreats } from './treats.js';
 import { attachEleanor } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
 import { TeaTime } from './eel-tea.js';
@@ -158,6 +160,8 @@ async function boot() {
   // Last of the four: its heading adapter wraps the braincell's, and its bonk watch reads the head
   // push the physics pass left behind.
   const quirks = attachQuirks(eels, seed);
+  // After quirks: the crush's punchline emits a bonk, and its huff leans on the stim shuffle.
+  const crush = attachCrush(eels, seed);
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -253,8 +257,19 @@ async function boot() {
   // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
   eels.on('startle', (ev) => { ev.kind === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
   eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.kind === 'eleanor' ? 0.5 : 1 }));
-  // Every held-feed crumb announces itself; the dimple and the little plop are subscribers now.
-  eels.on('drop', (ev) => { sim.addDrop(ev.x, ev.z, 0.14, 0.006); audio.plop('smol', ev.pan); });
+  // Every crumb announces itself at the splash, click and held stream alike: the dimple and the plop
+  // are subscribers, so the ring and the sound arrive with the crumb instead of with the button.
+  eels.on('drop', (ev) => {
+    // A crumb tapping a lily pad is a sound off a leaf, not a hole in the water.
+    if (ev.detail?.pad) { audio.plop('smol', ev.pan); return; }
+    const big = (ev.detail?.amount ?? 0.35) >= 0.75;
+    sim.addDrop(ev.x, ev.z, big ? 0.18 : 0.14, big ? 0.012 : 0.006);
+    audio.plop(big ? 'big' : 'smol', ev.pan);
+  });
+  // Thrown clean off the pool: one distant plip, and the pond never knew it existed.
+  eels.on('void', (ev) => audio.plip(0.35, toPan(ev.x)));
+  // The toss itself stays quiet: a whoosh on every held crumb at 250 BPM would be unbearable.
+  eels.on('toss', () => {});
   eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
   eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
   eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
@@ -268,6 +283,7 @@ async function boot() {
   eels.on('gape', silent);
   eels.on('lunge', silent);
   eels.on('overit', silent);
+  eels.on('huff', silent);
   // A soft bonk (Q-A's snout probe) stays silent forever; the hard one waits on the thup.
   eels.on('bonk', silent);
   eels.on('spin', (ev) => audio.spin({ pan: ev.pan, revs: ev.detail?.revs ?? 3 }));
@@ -302,6 +318,8 @@ async function boot() {
   });
   // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
+  // After the pads, which the landing has to query, and before hand.feed, which is now a throw.
+  const treats = attachTreats(eels, { overScene, pads, view, motion, U });
   eels.graze = new Grazing({ floaters, algae, pads, habitat });
   eels.tea = new TeaTime({ pads });
   eels.knobs.tea = eels.tea.knobs;   // pond.eels.knobs.tea.<dial>, tuned live
@@ -341,10 +359,12 @@ async function boot() {
         U.algaeDetail.value = 0;
         U.coverWobble.value = 0;
         setFloaters({ detile: false });
+        treats.setQuality({ shadow: false });
       },
       off: () => {
         algae.setQuality({ tuftFraction: 1 });
         pads.setQuality({ lilyFraction: 1 });
+        treats.setQuality({ shadow: true });
         U.algaeDetail.value = uRestore.algaeDetail;
         U.coverWobble.value = uRestore.coverWobble;
         setFloaters({ detile: true });
@@ -426,10 +446,10 @@ async function boot() {
       finger.at = -1;
       for (const p of path.slice(-6)) eels.lure(p.x, p.z);
     },
+    // The crumb is born a pond depth up and the splash comes with it; the ring and the plop moved to
+    // the drop listener so the click and the held stream both announce themselves at the landing.
     feed: (x, z) => {
-      eels.feed(x, z, 1, { origin: 'click' });
-      sim.addDrop(x, z, 0.18, 0.012);
-      audio.plop('big', toPan(x));
+      treats.toss(x, z, 1, { origin: 'click' });
       eels.holdFeed(x, z);
     },
     feedDragMove: (x, z) => eels.moveFeed(x, z),
@@ -439,6 +459,8 @@ async function boot() {
       if (loop) { eels.vortex(loop.x, loop.z, loop.radius); audio.crackle('med', { pan: toPan(loop.x) }); }
     },
     recolor: () => { eels.endFeed(); eels.recolor(); audio.crackle('lil'); },
+    // A hand over the water with no button down: the cursor moves, nothing else does.
+    hover: (x, z, gap) => eels.hoverFinger(x, z, gap),
     // sys.finger is the eels' copy of the snapshot; the prepass advances its clocks from here.
     input: (s) => {
       const f = eels.finger;
@@ -605,6 +627,8 @@ async function boot() {
     strayBubbles(t);
     popBubbles(t);
     eels.update(dt);
+    // Past the fixed tick by the leftover accumulator, so a hard-flicked crumb does not step at 90 Hz.
+    treats.setTime(eels.time + (eels.acc ?? 0));
     names.update(eels);
     brainOverlay?.update(eels);
     // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
@@ -721,7 +745,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

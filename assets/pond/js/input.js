@@ -16,6 +16,7 @@ export class PondInput {
     this.touchTimer = null;
     this.touchStart = null;
     this.stillAcc = 0;
+    this.hoverAt = 0;
     // The published snapshot. gestureId counts presses so a rhythm reader can tell one hold from the
     // next, and speed is deliberately uncapped: the flora's 3 units/s clamp stays local to the flora.
     this.snapshot = { mode: 'none', gestureId: 0, x: 0, z: 0, vx: 0, vz: 0, speed: 0, moveSeq: 0 };
@@ -95,8 +96,22 @@ export class PondInput {
     s.speed = Math.hypot(s.vx, s.vz);
   }
 
+  /* A hand over the water with no button down. Position only: no gesture, no path, no speed measured.
+     Without it the cursor reads as parked wherever the last gesture ended, and a throw at the moment
+     of a click has no recent hand movement to inherit. Faster than the 40 ms handler throttle on
+     purpose: the throw's velocity window is only about 56 ms, and 40 ms quantizes it badly. */
+  hover(e) {
+    if (this.mode || e.pointerType === 'touch') return;
+    const now = performance.now();
+    if (now - this.hoverAt < 16) return;
+    const gap = now - this.hoverAt > 200;
+    this.hoverAt = now;
+    const [x, z] = this.toWorld(e.clientX, e.clientY);
+    this.h.hover?.(x, z, gap);
+  }
+
   onMove(e) {
-    if (!this.pointers.has(e.pointerId)) return;
+    if (!this.pointers.has(e.pointerId)) return this.hover(e);
     this.h.activity?.();
     const p = this.pointers.get(e.pointerId);
     p.x = e.clientX; p.y = e.clientY;
