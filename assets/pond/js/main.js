@@ -253,7 +253,7 @@ async function boot() {
   for (const k of document.querySelectorAll('.legend jelly-kbd')) { k.tabIndex = -1; k.removeAttribute('role'); }
   setupIdleFade(root);
   // World x → stereo pan; 0.8 keeps even edge-huggers a little off the speaker wall.
-  const toPan = (x) => Math.max(-1, Math.min(1, x / (viewSize().w / 2))) * 0.8;
+  const toPan = (x) => Math.max(-1, Math.min(1, x / (view.w / 2))) * 0.8;
   // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
   eels.on('startle', (ev) => { ev.kind === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
   eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.kind === 'eleanor' ? 0.5 : 1 }));
@@ -268,8 +268,8 @@ async function boot() {
   });
   // Thrown clean off the pool: one distant plip, and the pond never knew it existed.
   eels.on('void', (ev) => audio.plip(0.35, toPan(ev.x)));
-  // The toss itself stays quiet: a whoosh on every held crumb at 250 BPM would be unbearable.
-  eels.on('toss', () => {});
+  // The toss itself stays quiet: a whoosh on every held crumb at 250 BPM would be unbearable, and an
+  // empty listener would still cost a payload per throw, so there is deliberately no subscriber.
   eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
   eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
   eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
@@ -571,6 +571,7 @@ async function boot() {
   document.getElementById('backend').textContent = backendName;
   document.getElementById('backend2').textContent = backendName;
   let fpsFrames = 0, fpsSince = 0, fpsLastLog = 0;
+  const FRAME_SAMPLES = 20000;   // ~83 s at 240 Hz, ~5.5 min at 60 Hz: the right window for a percentile
   const frameTimes = [];
   const fpsStats = () => {
     const s = frameTimes.slice().sort((a, b) => a - b);
@@ -587,6 +588,8 @@ async function boot() {
     }
     if (!debug || t < 3) return;
     frameTimes.push(rawDt);
+    // Left unbounded, the once-per-10-second sort would itself become the spike the instrument is measuring.
+    if (frameTimes.length > FRAME_SAMPLES) frameTimes.splice(0, frameTimes.length - FRAME_SAMPLES);
     if (now - fpsLastLog >= 10) { fpsLastLog = now; console.log('Pond fps', JSON.stringify(fpsStats())); }
   }
 

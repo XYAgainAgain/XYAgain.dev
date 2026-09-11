@@ -1,5 +1,7 @@
 import { createRng, deriveSeed } from './rng.js';
 import { nope, affection, dropCover } from './eel-behavior.js';
+import { SPOOK_LIFE } from './eels.js';
+import { TICK } from './eel-physics.js';
 
 /* Fear (Part Two, F1-F6): who scares whom, how scary they are being right now, and what a frightened
    eel does about it. Mounted as sys.fear; everything keys by name or kind, never by "eel" or a guest. */
@@ -66,7 +68,7 @@ class FearSystem {
     this.alarmHead = 0;
     this.calm = new Float32Array(CALM_N * CALM_N);
     // The hand as an ordinary feared body, so F1 and F3 need no special case for it.
-    this.hand = { name: 'finger', kind: 'finger', length: 0, cruiseBL: 0, x: 0, z: 0, active: false, dragging: false, speed: 0, familiarity: 0, stillFor: 0 };
+    this.hand = { name: 'finger', nameKey: 'finger', kind: 'finger', length: 0, cruiseBL: 0, x: 0, z: 0, active: false, dragging: false, speed: 0, familiarity: 0, stillFor: 0 };
     this.handPrev = { x: 0, z: 0, has: false };
     this.guestSet = new Set();
     this.refugeLocks = new Map();   // refuge id → { who, x, z }; the point resolves near-duplicates
@@ -125,7 +127,7 @@ class FearSystem {
 
   fearOf(e, o) {
     if (!o || o === e) return 0;
-    const nameKey = o.name ? String(o.name).toLowerCase() : null;
+    const nameKey = o.nameKey ?? null;
     const kind = o.kind ?? 'eel';
     const { base, immune } = this.baseFear(e, nameKey, kind);
     if (immune) return 0;
@@ -197,7 +199,7 @@ class FearSystem {
   // F3. Fear x how scary x how close x how fast it is closing, all measured to that nearest sample.
   panicOf(e, o, dt) {
     const st = this.stateFor(e);
-    const nameKey = o.name ? String(o.name).toLowerCase() : null;
+    const nameKey = o.nameKey ?? null;
     const fear = this.fearOf(e, o);
     if (fear <= 0) { st.lastD.delete(nameKey); return 0; }
     const near = this.nearestOf(e, o);
@@ -294,7 +296,9 @@ class FearSystem {
       if (w <= 0) st.trust.delete(k); else st.trust.set(k, w);
     }
     for (const [k, s] of st.spike) if (now > s.until) st.spike.delete(k);
-    for (const [id, t] of st.seen) if (now - t > 60) st.seen.delete(id);
+    // An id that nothing can re-observe anymore has no duplicate left to suppress, so it ages out along
+    // with the spook itself. The extra tick is slack: eels.js only expires the list after this prepass has already run.
+    for (const [id, t] of st.seen) if (now - t > SPOOK_LIFE + TICK) st.seen.delete(id);
   }
 
   /* One pass over everything this eel could be afraid of: the panic scalar, and the danger writers
@@ -315,7 +319,7 @@ class FearSystem {
         best = p;
         // Lowercase, because every downstream lookup (the fears table, the lair test, the alarm
         // mark's source) is keyed the way the identity tables are.
-        bestName = o.name ? String(o.name).toLowerCase() : null;
+        bestName = o.nameKey ?? null;
         bestKind = o.kind ?? 'eel';
         bestX = rec.x; bestZ = rec.z;
       }
@@ -334,7 +338,7 @@ class FearSystem {
     const bump = (o) => {
       if (o === e || o.slurpedBy || !o.name) return;
       if (Math.hypot(o.head.x - e.head.x, o.head.z - e.head.z) > TRUST_NEAR) return;
-      const k = String(o.name).toLowerCase();
+      const k = o.nameKey;
       st.trust.set(k, Math.min(TRUST_MAX, (st.trust.get(k) ?? 0) + TRUST_GAIN * dt));
     };
     for (const o of sys.eels) bump(o);
@@ -344,7 +348,7 @@ class FearSystem {
   /* F1's other half: seeing the queen eat a friend costs her every second of trust she had earned,
      and buys her two minutes of extra fear on top. */
   witnessSlurp(sys, predator, prey) {
-    const key = predator.name ? String(predator.name).toLowerCase() : null;
+    const key = predator.nameKey ?? null;
     if (!key) return;
     const now = sys.time;
     for (const o of sys.eels) {
@@ -372,7 +376,7 @@ class FearSystem {
     if (st.gx === undefined) { st.gx = g.head.x; st.gz = g.head.z; return; }
     if (Math.hypot(g.head.x - st.gx, g.head.z - st.gz) < ALARM_STEP) return;
     st.gx = g.head.x; st.gz = g.head.z;
-    const key = g.name ? String(g.name).toLowerCase() : null;
+    const key = g.nameKey ?? null;
     this.deposit(g.head.x, g.head.z, threat, key, key, g.kind ?? 'guest', now);
   }
 
@@ -381,7 +385,7 @@ class FearSystem {
   sampleAlarm(e, st, now) {
     st.alarmAt = now;
     st.alarmW.length = 0;
-    const mine = e.name ? String(e.name).toLowerCase() : null;
+    const mine = e.nameKey ?? null;
     // The sum runs over sources, not marks: a guest laying a mark every half unit of travel would
     // otherwise pin every reader at 1 for as long as she is out, and a pond that never sleeps.
     const perSource = this.bySource;
@@ -452,7 +456,7 @@ class FearSystem {
   }
 
   startScatter(sys, e, st, now, src, kind, x, z, strength, fromAlarm) {
-    const mine = e.name ? String(e.name).toLowerCase() : null;
+    const mine = e.nameKey ?? null;
     const until = now + st.rng.range(SCATTER_LEN[0], SCATTER_LEN[1]);
     st.scatter = { until, src, kind, mine, strength, quiet: fromAlarm, lastX: e.head.x, lastZ: e.head.z, depositAt: 0 };
     // Naps, braids, meals, and loiters all end here; fleeUntil is what the social blocks already read.
@@ -477,7 +481,7 @@ class FearSystem {
 
   lairOf(sys, src) {
     if (!src) return null;
-    for (const g of sys.guests) if (g.lair && String(g.name).toLowerCase() === src) return g.lair;
+    for (const g of sys.guests) if (g.lair && g.nameKey === src) return g.lair;
     return null;
   }
 

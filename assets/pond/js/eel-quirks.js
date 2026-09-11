@@ -249,7 +249,7 @@ export class Quirks {
   /* Any tier that owns the eel outright. The roll does not fight it, it unwinds underneath it. */
   interrupted(sys, e, now) {
     return !!(sys.fear?.scattering(e) || sys.air?.owns?.(e) || e.tunnel
-      || now < e.nopeUntil || now < e.freezeUntil);
+      || now < e.nopeUntil || now < e.freezeUntil || now < e.fleeUntil);
   }
 
   /* The committed phase is the truth, never a private copy. A tick that never reaches commitPose (a
@@ -281,7 +281,8 @@ export class Quirks {
   }
 
   speedFree(sys, e) {
-    if (e.food || e.tunnel) return false;
+    // A flee burst outranks the gratitude crawl, or the eel that just ate by the finger creeps away from it.
+    if (e.food || e.tunnel || sys.time < e.fleeUntil) return false;
     if (e.coverSpot?.type === 'tea' || e.coverSpot?.type === 'graze') return false;
     return !(sys.fear?.contesting?.(e));
   }
@@ -342,7 +343,7 @@ export class Quirks {
     if (e.tunnel || e.food || e.buried || e.restPose?.kind) return false;
     // Tea and a graze are meals holding still, not an animal with nothing to do.
     if (e.coverSpot?.type === 'tea' || e.coverSpot?.type === 'graze') return false;
-    return !(sys.air?.busy?.(e));
+    return !(sys.air?.busy?.(e)) && !(sys.crush?.active?.(e));
   }
 
   idleHold(sys, e, now) {

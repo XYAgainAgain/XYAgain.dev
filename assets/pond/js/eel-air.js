@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
-import { paceWave, commitPose, claimTick } from './eel-behavior.js';
+import { paceWave, commitPose, claimTick, releaseTick } from './eel-behavior.js';
 import { floorHeightAt, floorSurfaceAt, sandColorAt, sandAlbedoAt } from './floor.js';
 import { RELIEF_HEAL_TAU } from './relief-core.js';
 import { moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01 } from './eel-air-core.js';
@@ -33,6 +33,10 @@ const FLOP_STUCK_WINDOW = 20; // a second stuck event against the same log insid
 const FLOP_COOL = 8;          // a drowned crest never breaks the film, so it earns no air cooldown
 const LEAP_LAUNCH = 0.8;
 const LEAP_AMP = 0.4;         // a leaping body is stiff
+// The landing has to stay on screen: 0.7 was the wander leash, and it let half the leaps land past
+// the frame edge where nobody saw them. 0.45 matches the inset that rain and Eleanor's stage already use.
+const LEAP_INSET = 0.45;
+const LEAP_EXCITE = 0.2;      // knobs.air.leapExcite default; the old 0.5 opened on 0.03% of ticks
 const SPIN_LEAP = 60;          // knobs.air.spinLeap default: the zoomies multiplier on the leap odds
 const ZOOMIE_MUL = 1.3;       // speedMul at or above this is a burst, not ordinary swimming
 const BELLY_AMP = 1.3;
@@ -299,9 +303,10 @@ export class AirStates {
     const now = sys.time;
     const rise = PEEK_BL * e.length * (sys.motion?.reduced ? 0.5 : 1);
     const ceil = this.defaultCeil(e);
-    if (st.phase !== 'down' && (this.scared(sys, e) || st.airFor >= AIR_CAP * this.k('stamina'))) {
-      st.phase = 'down';
-      st.scared = this.scared(sys, e);
+    if (st.phase !== 'down') {
+      // One spook scan feeds both the test and the record; scared() walks every live spook.
+      const sc = this.scared(sys, e);
+      if (sc || st.airFor >= AIR_CAP * this.k('stamina')) { st.phase = 'down'; st.scared = sc; }
     }
     if (st.phase === 'rise') {
       st.yWant = Math.min(st.riseTo, st.yWant + rise * dt);
@@ -468,7 +473,7 @@ export class AirStates {
     // burst. Spin feeding is a meal, so the food gate yields to it; a leap can never start in a tunnel.
     const zoomies = sys.stim?.rolling?.(e) === 'spin' || (e.speedMul ?? 0) >= ZOOMIE_MUL || e.gait === 'loop';
     if (e.tunnel || e.twine || (e.food && !zoomies) || sys.time < e.fleeUntil) return false;
-    if (!zoomies && (e.uExcite?.value ?? 0) <= 0.5) return false;
+    if (!zoomies && (e.uExcite?.value ?? 0) <= knob(this.sys.knobs?.air?.leapExcite, LEAP_EXCITE)) return false;
     // A zoomy eel of any temperament is at least a half-hearted leaper; a 0 stays 0 by the census.
     const leap = zoomies && (e.leap ?? 0) > 0 ? Math.max(0.5, e.leap) : clamp01(e.leap ?? 0);
     const rate = 0.004 * leap * this.airMul(e) * this.k('leap')
@@ -491,15 +496,17 @@ export class AirStates {
     const arc = leapArc(e.leap ?? 0, form.formHeight, y0);
     const dist = leapDistance(e.length, form.formDistance);
     let ang = Math.atan2(e.heading.z, e.heading.x);
+    let reaim = false;
     if (target) ang = Math.atan2(target.z - e.head.z, target.x - e.head.x);
-    else if (forced) {
+    // A looping eel orbits the same rock all loop, so refusing any leap whose straight line was blocked
+    // killed nearly every one. Blocked leaps now search sixteen headings; a forced leap goes straight there.
+    else if (forced || !this.landingOk(e, ang, dist)) {
       const clear = this.clearHeading(e, dist, ang);
-      if (clear === null) return false;   // the force API still owes its physical preconditions
-      ang = clear;
+      if (clear === null) return false;
+      reaim = clear !== ang; ang = clear;
     }
-    if (!forced && !target && !this.landingOk(e, ang, dist)) return false;
     st.state = 'leap'; st.phase = 'launch'; st.t0 = sys.time;
-    st.leap = { form, arc, dist, ang, y0, from: e.head.y, bt: 0, forced, aim: !!(target || forced) };
+    st.leap = { form, arc, dist, ang, y0, from: e.head.y, bt: 0, target: !!target, aim: !!(target || forced || reaim) };
     st.ringUp = 0.4;
     st.ringDown = 0.6 * (form.belly ? BELLY_RING : 1);
     st.belly = form.belly;
@@ -507,12 +514,11 @@ export class AirStates {
     return true;
   }
 
-  /* Sixteen headings, first clear landing wins: a forced leap has to actually go somewhere, and the
-     spontaneous roll still refuses rather than steering. Null when all sixteen are blocked, because
-     handing back the original heading would launch at a landing landingClear() already rejected. */
+  /* Tries sixteen headings and returns the first with a clear landing. Returns null when all sixteen are
+     blocked, because handing back the original heading would launch into a landing landingClear() already rejected. */
   clearHeading(e, dist, from) {
     const sys = this.sys;
-    const limX = sys.view.w * 0.7, limZ = sys.view.h * 0.7;
+    const limX = sys.view.w * LEAP_INSET, limZ = sys.view.h * LEAP_INSET;
     for (let i = 0; i < 16; i++) {
       const a = from + (i === 0 ? 0 : (i % 2 ? 1 : -1) * Math.ceil(i / 2) * (Math.PI / 8));
       const x = e.head.x + Math.cos(a) * dist, z = e.head.z + Math.sin(a) * dist;
@@ -525,7 +531,7 @@ export class AirStates {
     const sys = this.sys;
     return landingClear(
       e.head.x + Math.cos(ang) * dist, e.head.z + Math.sin(ang) * dist, e.radius,
-      sys.colliders.spheres, sys.colliders.logs, sys.view.w * 0.7, sys.view.h * 0.7,
+      sys.colliders.spheres, sys.colliders.logs, sys.view.w * LEAP_INSET, sys.view.h * LEAP_INSET,
     );
   }
 
@@ -537,20 +543,20 @@ export class AirStates {
       const y = L.from + (L.y0 - L.from) * t;
       if (this.scared(sys, e) || e.tunnel) { this.abort(sys, e, st, this.scared(sys, e) ? 'scared' : 'tunnel'); return; }
       // Cruise carries the head a couple of units during the approach, so the clearance can be lost
-      // under it. A forced leap re-aims; a spontaneous one gives up, which is the plan's "no cost".
+      // under it. Anything but a targeted leap re-aims; a firefly hunt has to keep its firefly or give up.
       if (!this.landingOk(e, L.ang, L.dist)) {
-        const clear = L.forced ? this.clearHeading(e, L.dist, L.ang) : null;
+        const clear = L.target ? null : this.clearHeading(e, L.dist, L.ang);
         if (clear === null) { this.abort(sys, e, st, 'landing'); return; }
-        L.ang = clear;
+        L.ang = clear; L.aim = true;
       }
       const aimX = head.x + Math.cos(L.ang) * L.dist, aimZ = head.z + Math.sin(L.ang) * L.dist;
       this.drive(sys, e, dt, { tx: L.aim ? aimX : undefined, tz: aimZ, holdHeading: !L.aim, speedBL: e.cruiseBL, ySet: y, excite: 0.7 });
       if (t < 1 || Math.abs(head.y - L.y0) >= 0.01) return;
       // The landing is computed from the position and heading the approach actually reached, never
-      // from where the roll happened; a forced leap is allowed one more search for a clear line.
+      // from where the roll happened; an untargeted leap is allowed one more search for a clear line.
       L.ang = Math.atan2(e.heading.z, e.heading.x);
       if (!this.landingOk(e, L.ang, L.dist)) {
-        const clear = L.forced ? this.clearHeading(e, L.dist, L.ang) : null;
+        const clear = L.target ? null : this.clearHeading(e, L.dist, L.ang);
         if (clear === null) { this.abort(sys, e, st, 'landing'); return; }
         L.ang = clear;
       }
@@ -587,6 +593,8 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.floorY = this.defaultFloor(e);
     st.state = null; st.phase = ''; st.exempt = false; st.leap = null;
+    // Left armed, a cancelled belly leap fires its flop splash on the next film crossing, whatever caused it.
+    st.ringUp = 0.4; st.ringDown = 0.4; st.belly = false;
     st.abortedBy = why;
   }
 
@@ -617,7 +625,9 @@ export class AirStates {
     // One dig per hold bout, the way the coil and the sickle work: the asleep hold asks every tick,
     // and without this the eel climbs out and immediately digs back in for the whole bout.
     if (!force && st.burrowBout === e.gaitFrom) return false;
-    if (!force && (sys.fear?.contesting?.(e) || !this.canBurrow(e))) return false;
+    // Force skips the contest, never the placement test: a dig under a pad or a log is a body in scenery.
+    if (!force && sys.fear?.contesting?.(e)) return false;
+    if (!this.canBurrow(e)) return false;
     st.burrowBout = e.gaitFrom;
     st.state = 'burrow'; st.phase = 'dig1'; st.t0 = sys.time;
     st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0, scareFor: 0 };
@@ -919,10 +929,10 @@ export class AirStates {
 
   /* Completion is evaluated here, at the top of the eel's tick, which is after the previous tick's
      collide() and constrain(): the only place the chain's real extremes are known. */
-  finishRecover(sys, e, st) {
+  finishRecover(sys, e, st, val = st.phase === 'burrow' ? minY(e) : maxY(e)) {
     const done = st.phase === 'burrow'
-      ? minY(e) >= this.defaultFloor(e) - RECOVER_TOL
-      : maxY(e) <= this.defaultCeil(e) + RECOVER_TOL;
+      ? val >= this.defaultFloor(e) - RECOVER_TOL
+      : val <= this.defaultCeil(e) + RECOVER_TOL;
     if (!done) return false;
     this.logRecovery(sys, e, sys.time - st.t0, false);
     this.release(e, st);
@@ -945,16 +955,18 @@ export class AirStates {
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
     if (st.deferNope) { st.deferNope = false; e.nopeUntil = Math.max(e.nopeUntil, this.sys.time + 1.1); }
     st.state = null; st.phase = ''; st.exempt = false;
+    st.ringUp = 0.4; st.ringDown = 0.4; st.belly = false;
     st.recover = null; st.flop = null; st.leap = null; st.dig = null; st.bite = false;
     return true;
   }
 
   recoverTick(sys, e, st, dt) {
     const now = sys.time, R = st.recover, burrow = st.phase === 'burrow';
-    if (this.finishRecover(sys, e, st)) return;
-    const el = now - st.t0;
-    // Watchdog: no progress in the offending extreme for 1.5 s nudges the route 30 degrees.
+    // Watchdog: no progress in the offending extreme for 1.5 s nudges the route 30 degrees. One scan
+    // feeds both the completion test and the watchdog; they read the same extreme.
     const val = burrow ? minY(e) : maxY(e);
+    if (this.finishRecover(sys, e, st, val)) return;
+    const el = now - st.t0;
     const better = burrow ? val > R.watchVal + 1e-3 : val < R.watchVal - 1e-3;
     if (better) { R.watchVal = val; R.watchAt = now; }
     else if (now - R.watchAt > RECOVER_WATCH) { R.nudge += Math.PI / 6; R.watchAt = now; }
@@ -999,8 +1011,11 @@ export class AirStates {
       case 'recover': this.recoverTick(sys, e, st, dt); break;
       default: return false;
     }
-    // A state that ended inside its own tick without moving anything hands the tick straight back.
-    return st.state !== null || st.moved === sys.ticks;
+    // A state that ended inside its own tick without moving anything hands the tick straight back,
+    // claim included, or the lower tiers see an 'air' owner on a tick nobody is driving.
+    const kept = st.state !== null || st.moved === sys.ticks;
+    if (!kept) releaseTick(e, 'air');
+    return kept;
   }
 
   approaching(e) {
@@ -1016,7 +1031,9 @@ export class AirStates {
     claimTick(e, 'voluntary', 'moonbite');
     e.reverse = false;
     this.biteTick(sys, e, st, dt);
-    return st.state !== null || st.moved === sys.ticks;
+    const kept = st.state !== null || st.moved === sys.ticks;
+    if (!kept && e.tick.owner === 'moonbite') releaseTick(e, 'voluntary');
+    return kept;
   }
 
   /* The approach lost the tick to a higher owner or to a crumb the eel can smell. Dropped quietly:
@@ -1047,7 +1064,12 @@ export class AirStates {
     e.buried = false;
     e.burrowing = 0;
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
-    if (st) { st.state = null; st.phase = ''; st.exempt = false; st.airFor = 0; st.above = e.head.y > 0; st.dim = 0; }
+    // Parity with release(): a deferred nope left armed here fires at the end of an unrelated later state.
+    if (st) {
+      st.state = null; st.phase = ''; st.exempt = false; st.airFor = 0; st.above = e.head.y > 0; st.dim = 0;
+      st.deferNope = false; st.bite = false;
+      st.recover = null; st.flop = null; st.leap = null; st.dig = null;
+    }
     return true;
   }
 

@@ -114,7 +114,21 @@ export class PondAudio {
     };
     this.swishPanner = new Tone.Panner(0).connect(this.buses.env);
     this.loadAll();
+    this.watchVisibility();
     this.onState?.();
+  }
+
+  /* Web Audio runs off the render loop, so a hidden tab keeps looping the beds (and any swish left
+     on by a drag) until it is revisited. Suspending the raw context freezes every playhead in place. */
+  watchVisibility() {
+    document.addEventListener('visibilitychange', () => {
+      if (!this.unlocked) return;
+      const ctx = Tone.getContext()?.rawContext;
+      if (!ctx?.suspend) return;
+      // A browser can refuse to resume without a fresh gesture; the next unlock gesture retries.
+      if (document.hidden) { if (ctx.state === 'running') ctx.suspend().catch(() => {}); }
+      else if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    });
   }
 
   loadAll() {

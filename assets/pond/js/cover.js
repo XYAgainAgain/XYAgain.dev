@@ -42,7 +42,12 @@ export class Habitat {
 
   /* Pads never move on the CPU side; the margin covers the GPU wander (0.1) plus the stalk-bump swing (0.2). */
   padAt(x, z, margin = 0.3) {
-    for (const p of this.pads) if (Math.hypot(x - p.x, z - p.z) <= p.r + margin) return p;
+    // Squared distances, not Math.hypot: the radius is never negative, so the square root changes
+    // nothing here, and graze and tea scan every pad every tick, so skipping it saves real work.
+    for (const p of this.pads) {
+      const dx = x - p.x, dz = z - p.z, rr = p.r + margin;
+      if (dx * dx + dz * dz <= rr * rr) return p;
+    }
     return null;
   }
 
@@ -54,8 +59,8 @@ export class Habitat {
     if (this.duckweedField) return this.duckweedField(x, z);
     for (const c of this.clumps) {
       const dx = x - c.x - c.dx, dz = z - c.z - c.dz;
-      const d = Math.hypot(dx, dz);
-      if (d <= c.r * c.growth * c.warp(Math.atan2(dz, dx))) return c;
+      const rr = c.r * c.growth * c.warp(Math.atan2(dz, dx));
+      if (dx * dx + dz * dz <= rr * rr) return c;
     }
     return null;
   }
@@ -80,7 +85,7 @@ export class Habitat {
     for (const p of this.perches) {
       if (type && p.type !== type) continue;
       if (freeOnly && this.claims.has(p.id)) continue;
-      const d = Math.hypot(x - p.x, z - p.z);
+      const dx = x - p.x, dz = z - p.z, d = dx * dx + dz * dz;   // squaring preserves order, so the winner is the same
       if (d < bestD) { bestD = d; best = p; }
     }
     return best;

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, cross, mat3, mat4, PI } from 'three/tsl';
+import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, PI } from 'three/tsl';
 import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
@@ -31,8 +31,10 @@ async function decodeBitmap(url, size) {
   if (!(size > 0) || natural <= size) return { bitmap: full, natural };
   // Resampling the decoded bitmap, never a second decode; a source already under the target is left alone.
   const h = Math.max(1, Math.round(full.height * size / natural));
-  const small = await createImageBitmap(full, { resizeWidth: size, resizeHeight: h, resizeQuality: 'high' });
-  full.close();
+  let small;
+  // loadTex swallows the throw, so the full bitmap would leak on a failed resize.
+  try { small = await createImageBitmap(full, { resizeWidth: size, resizeHeight: h, resizeQuality: 'high' }); }
+  finally { full.close(); }
   return { bitmap: small, natural };
 }
 

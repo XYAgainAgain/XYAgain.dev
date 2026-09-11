@@ -31,6 +31,8 @@ export class QualityGovernor {
     this._ema = 8;                 // a plausible warm start, so the first samples never read as hot
     this._hot = 0;
     this._cool = 0;
+    this._spiked = false;
+    this._floor = 1e9;             // best frame time seen, so the cool gate can clear a vsync-locked panel
     this._sinceChange = 0;
     this._warmup = BOOT_WARMUP_S;
     // Boot applies the persisted rungs as one walk from 0, so onChange's rung walk never double-applies.
@@ -42,14 +44,22 @@ export class QualityGovernor {
 
   /* Once per rendered frame, raw (unclamped) frame time in ms. */
   update(frameMs) {
-    if (!(frameMs > 0) || frameMs > SPIKE_MS) return;   // tab switches and window drags are not the pond's fault
+    if (!(frameMs > 0)) return;
+    // One isolated stall is a tab switch or a window drag; a stream of them is the pond, and dropping
+    // those left the governor blind at exactly the frame rates it exists to rescue.
+    if (frameMs > SPIKE_MS) { if (!this._spiked) { this._spiked = true; return; } frameMs = SPIKE_MS; }
+    else this._spiked = false;
     const dt = frameMs / 1000;
     this._sinceChange += dt;
     if (this._warmup > 0) { this._warmup -= dt; return; }
+    if (frameMs < this._floor) this._floor = frameMs;
+    // A 60 Hz panel's flawless 16.67 ms clears a fixed 18 ms by too little to survive its own jitter, so
+    // the cool gate rides the observed floor; its cap under the hot gate stops a 30 Hz floor see-sawing the top.
+    const coolAt = Math.min(HOT_MS - 3, Math.max(COOL_MS, this._floor * 1.35));
     this._ema += (frameMs - this._ema) * EMA_ALPHA;
     if (this.pinned) return;
     this._hot = this._ema > HOT_MS ? this._hot + dt : 0;
-    this._cool = this._ema < COOL_MS ? this._cool + dt : 0;
+    this._cool = this._ema < coolAt ? this._cool + dt : 0;
     if (this._sinceChange < DWELL_S) return;
     if (this._hot >= PROMOTE_S && this._rung < MAX_RUNG) this._move(this._rung + 1, true);
     else if (this._cool >= RECOVER_S && this._rung > 0) this._move(this._rung - 1, true);

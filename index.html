@@ -33,9 +33,9 @@
         <canvas id="pond" role="img" aria-label="A moonlit pond seen from above, with eels."></canvas>
 
         <div id="fallback" class="fallback" aria-hidden="true">
-            <video class="fallback-video" autoplay muted loop playsinline preload="metadata" poster="assets/pond/pond-poster.webp">
-                <source src="assets/pond/pond-loop.webm" type="video/webm">
-            </video>
+            <!-- Placeholder for the baked loop (pond-loop.webm + pond-poster.webp); sourceless on
+                 purpose so nothing is requested. The pond.css gradient is the fallback today. -->
+            <video class="fallback-video" muted loop playsinline preload="none"></video>
         </div>
 
         <dialog id="gate" class="gate" aria-labelledby="gate-title">

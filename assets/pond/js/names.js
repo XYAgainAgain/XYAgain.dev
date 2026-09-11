@@ -20,11 +20,13 @@ export class NameLabels {
   update(eels) {
     if (!this.enabled) return;
     const live = eels.enabled;
-    for (const e of eels.eels) this.place(e, live);
-    for (const e of eels.guests) this.place(e, live);
+    // Read once per frame, not four times per label: every tag maps into the same viewport.
+    const iw = innerWidth, ih = innerHeight;
+    for (const e of eels.eels) this.place(e, live, iw, ih);
+    for (const e of eels.guests) this.place(e, live, iw, ih);
   }
 
-  place(e, live) {
+  place(e, live, iw = innerWidth, ih = innerHeight) {
     let el = this.labels.get(e);
     if (!el) {
       el = document.createElement('span');
@@ -35,18 +37,21 @@ export class NameLabels {
     }
     if (!live || !e.body?.visible) { el.hidden = true; return; }
     const h = e.head;
-    const x = (h.x / this.view.w + 0.5) * innerWidth;
-    const y = ((h.z - NAME_LIFT) / this.view.h + 0.5) * innerHeight;
+    const x = (h.x / this.view.w + 0.5) * iw;
+    const y = ((h.z - NAME_LIFT) / this.view.h + 0.5) * ih;
     // A tenth of the viewport of slack, so a tag only pops once its eel is well clear of the frame.
-    const mx = innerWidth * 0.1, my = innerHeight * 0.1;
+    const mx = iw * 0.1, my = ih * 0.1;
     // The NaN check ends the haunting: a poisoned eel once vanished but left its frozen tag on screen.
-    if (!Number.isFinite(x + y) || x < -mx || x > innerWidth + mx || y < -my || y > innerHeight + my) { el.hidden = true; return; }
+    if (!Number.isFinite(x + y) || x < -mx || x > iw + mx || y < -my || y > ih + my) { el.hidden = true; return; }
     // A nickname wins when one has been rolled; comparing each frame catches rerolls and hot-swaps alike.
     const label = e.nick ?? e.name, pro = e.pronouns ?? '';
     if (el.firstChild.textContent !== label) el.firstChild.textContent = label;
     if (el.lastChild.textContent !== pro) el.lastChild.textContent = pro;
     if (e.nameStyle && el.dataset.tint !== e.nameStyle) { el.dataset.tint = e.nameStyle; el.style.color = e.nameStyle; }
-    el.style.transform = `translate(-50%, -100%) translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+    const tf = `translate(-50%, -100%) translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+    // A resting eel holds the same rounded pixel for many frames, so the last transform string is cached
+    // on the element itself: a dataset attribute write would cost about what the style write does.
+    if (el.lastTf !== tf) { el.lastTf = tf; el.style.transform = tf; }
     el.hidden = false;
   }
 }

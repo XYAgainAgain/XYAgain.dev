@@ -207,11 +207,6 @@ export const IDENTITIES = [
   },
 ];
 
-export function identityFor(index) {
-  const active = IDENTITIES.filter((i) => i.active !== false);
-  return active[index % active.length];
-}
-
 const activePool = () => IDENTITIES.filter((i) => i.active !== false);
 
 /* Tickets, not a flat pick: `draw` (default 1) is how many an identity holds, so a ×2 shows up twice as often. */
@@ -265,6 +260,8 @@ export function applyIdentity(e, id, rng) {
   const t = { ...DEFAULT_TRAITS, ...id.traits };
   const b = { ...DEFAULT_BUILD, ...id.build };
   e.name = id.name;
+  // Every fear/trust/alarm table is keyed lowercase, and those lookups run in an O(n²) per-tick loop.
+  e.nameKey = id.name.toLowerCase();
   e.length = rng.range(b.length[0], b.length[1]);
   e.radius = rng.range(b.radius[0], b.radius[1]);
   e.prowlBL = rng.range(t.prowl[0], t.prowl[1]);

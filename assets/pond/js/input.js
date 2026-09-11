@@ -45,11 +45,15 @@ export class PondInput {
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (e.pointerType === 'touch') {
       const n = this.pointers.size;
+      // A second finger voids the pending tap, so releasing a feed can never fake a poke.
+      if (n > 1) this.touchStart = null;
       if (n === 1) {
         this.touchStart = { x: e.clientX, y: e.clientY, t: performance.now() };
         clearTimeout(this.touchTimer);
         this.touchTimer = setTimeout(() => {
-          if (this.pointers.size === 1 && !this.mode) this.begin('left', this.touchStart.x, this.touchStart.y);
+          const t = this.touchStart;
+          this.touchStart = null;
+          if (t && this.pointers.size === 1 && !this.mode) this.begin('left', t.x, t.y);
         }, 140);
       } else if (n === 2 && !this.mode) {
         clearTimeout(this.touchTimer);
@@ -173,11 +177,18 @@ export class PondInput {
       // A one-finger drag waits for the last finger, but a two-finger feed is over the moment it
       // stops being two: waiting left the hold live and it kept dropping crumbs.
       if (this.pointers.size > 0 && this.mode !== 'right') return;
+      // A tap released inside the hold-off never reached begin(), so fire it here or it is eaten.
+      if (!this.mode && this.touchStart && this.pointers.size === 0) {
+        const t = this.touchStart;
+        this.touchStart = null;
+        this.begin('left', t.x, t.y);
+      }
     }
     this.endMode();
   }
 
-  cancelMode() { this.mode = null; this.path = []; this.release(); }
+  // The three-finger cancel still has to end the gesture, or a live feed hold drops crumbs forever.
+  cancelMode() { this.path = []; if (this.mode) this.endMode(); else this.release(); }
 
   endMode() {
     if (!this.mode) return;

@@ -345,7 +345,7 @@ export class EelRenderer {
       e.body.material = want;
       e.body.renderOrder = e.jelly ? 2 : 0;
     }
-    if (e.jellyDepth) e.jellyDepth.visible = !!e.jelly;
+    if (e.jellyDepth) e.jellyDepth.visible = !!e.jelly && e.body.visible;
     // The 2.4× additive shell screams "lamp"; a jelly keeps only a whisper of it.
     if (e.uHaloMul) e.uHaloMul.value = e.jelly ? this.jellyU.halo.value : 1;
   }
@@ -466,7 +466,11 @@ export class EelRenderer {
 
   dispose(eels) {
     this.geometry.dispose();
-    for (const e of eels) { e.matBody.dispose(); e.matJelly?.dispose(); e.matJellyDepth?.dispose(); e.halo.material.dispose(); e.rampTex.dispose(); }
+    for (const e of eels) {
+      e.matBody.dispose(); e.matJelly?.dispose(); e.matJellyDepth?.dispose(); e.halo.material.dispose(); e.rampTex.dispose();
+      // Both eyes share one geometry and one material, so dispose through the first eye only.
+      e.eyes?.[0]?.geometry.dispose(); e.eyes?.[0]?.material.dispose();
+    }
     this.foodGeo.dispose(); this.foodMat.dispose();
   }
 }

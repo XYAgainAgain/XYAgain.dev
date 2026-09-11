@@ -290,7 +290,6 @@ class TreatSystem {
     tr.crumb.x = pad.x + pad.swingX + tr.padDX;
     tr.crumb.z = pad.z + pad.swingZ + tr.padDZ;
     tr.x0 = tr.crumb.x; tr.z0 = tr.crumb.z;
-    tr.t0 = now; tr.tEnd = now + 60;
     if (pad.shoveSeq !== tr.shoveSeq) this.release(tr, now);
   }
 
@@ -406,6 +405,9 @@ class TreatSystem {
     tr.padDX = crumb.x - pad.x - pad.swingX;
     tr.padDZ = crumb.z - pad.z - pad.swingZ;
     tr.g = 0; tr.vx = 0; tr.vz = 0; tr.y0 = PAD_Y;
+    // With no velocity and no gravity the vertex age is inert, so the clock is set once here rather
+    // than rewritten on every tick of the rest.
+    tr.t0 = this.sys.time; tr.tEnd = tr.t0 + 60;
     this.writeSlot(tr);
   }
 
@@ -428,7 +430,17 @@ class TreatSystem {
 
   /* Only a parked crumb moves between ticks on the CPU; every other slot's launch state was written
      once and the vertex stage integrates the rest, so nothing else needs re-uploading. */
-  writeAll() { for (const tr of this.live) if (tr.state === 'rest') this.writeSlot(tr); }
+  writeAll() { for (const tr of this.live) if (tr.state === 'rest') this.writeRest(tr); }
+
+  /* The pad swing only moves a parked crumb's origin: velocity, gravity, clock, size, tumble, and state
+     were all frozen by park, so re-uploading B and C would just write back the bytes already there. */
+  writeRest(tr) {
+    const i = tr.slot;
+    if (i < 0 || i >= this.pool) return;
+    const o = i * 4;
+    this.aA[o] = tr.x0; this.aA[o + 1] = tr.y0; this.aA[o + 2] = tr.z0; this.aA[o + 3] = tr.t0;
+    this.bA.needsUpdate = true;
+  }
 
   writeSlot(tr) {
     const i = tr.slot;

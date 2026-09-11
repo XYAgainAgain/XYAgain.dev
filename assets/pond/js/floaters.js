@@ -258,6 +258,33 @@ export class FloaterSystem {
       const l = trunks.find((t) => segDist(o.ax, o.az, t.a.x, t.a.z, t.b.x, t.b.z) < 1e-3 && segDist(o.bx, o.bz, t.a.x, t.a.z, t.b.x, t.b.z) < 1e-3);
       return l ? this.buildLogProfile(l) : null;
     });
+    this.buildObsBox();
+  }
+
+  /* Padded union of every waterline collider. A speck outside this box cannot satisfy any inside test, so
+     four compares replace both obstacle loops, plus the bark interpolation that a capsule needs before it can reject. */
+  buildObsBox() {
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    const grow = (x, z, r) => {
+      if (x - r < x0) x0 = x - r; if (x + r > x1) x1 = x + r;
+      if (z - r < z0) z0 = z - r; if (z + r > z1) z1 = z + r;
+    };
+    const d = this.obsDisc, c = this.obsCap;
+    for (let i = 0; i < d.length; i += 3) grow(d[i], d[i + 1], d[i + 2] + OBS_SKIN);
+    for (let i = 0, k = 0; i < c.length; i += 5, k++) {
+      const pr = this.obsProfile[k];
+      if (!pr) {
+        grow(c[i], c[i + 1], c[i + 4] + OBS_SKIN);
+        grow(c[i + 2], c[i + 3], c[i + 4] + OBS_SKIN);
+        continue;
+      }
+      let mw = 0;
+      for (let q = 0; q < pr.w.length; q++) if (pr.w[q] > mw) mw = pr.w[q];
+      const r = mw + OBS_SKIN;
+      grow(pr.ax, pr.az, r);
+      grow(pr.ax + pr.ux * pr.len, pr.az + pr.uz * pr.len, r);
+    }
+    this.obsBox = x1 >= x0 ? { x0, x1, z0, z1 } : null;
   }
 
   /* Half-widths of the chord where a trunk's bark crosses y = 0, per station and per flank, in the axis
@@ -869,18 +896,21 @@ export class FloaterSystem {
     const { x0, x1, z0, z1 } = this.carveBox;
     const N = this.scar.res, work = this.scar.work, bytes = this.scar.bytes;
     const keep = Math.exp(-el / CARVE_HEAL_TAU);
-    let live = false;
+    let live = false, dirty = false;
     for (let iz = z0; iz <= z1; iz++) {
       const row = iz * N;
       for (let ix = x0; ix <= x1; ix++) {
         const i = row + ix, v = work[i];
         if (v > 0.4) { work[i] = v * keep; live = true; }
         else if (v !== 0) work[i] = 0;
+        // Compare after the store, so the Uint8 truncation is the thing being compared, not the float.
+        const was = bytes[i];
         bytes[i] = work[i] + 0.5;
+        if (bytes[i] !== was) dirty = true;
       }
     }
     if (!live) this.carveBox = null;
-    this.scar.tex.needsUpdate = true;
+    if (dirty) this.scar.tex.needsUpdate = true;
   }
 
   /* The shared current, CPU side: the same curl-of-a-potential the shader evaluates, for the handful
@@ -977,6 +1007,9 @@ export class FloaterSystem {
     const act = this.sActive, frac = this.sFrac, cl = this.sClump, grow = this.growF, out = this.forceOut;
     const loose = this.sLoose;
     const dA = this.obsDisc, cA = this.obsCap, prof = this.obsProfile;
+    const ob = this.obsBox;
+    const ox0 = ob ? ob.x0 : 1, ox1 = ob ? ob.x1 : -1;   // an empty pond: the compare can never pass
+    const oz0 = ob ? ob.z0 : 1, oz1 = ob ? ob.z1 : -1;
     const px0 = pk.x0 - POKE_OUTER, px1 = pk.x1 + POKE_OUTER, pz0 = pk.z0 - POKE_OUTER, pz1 = pk.z1 + POKE_OUTER;
     for (let i = 0; i < n; i++) {
       const ci = cl[i];
@@ -1022,53 +1055,58 @@ export class FloaterSystem {
       px = hx + ox; pz = hz + oz;
       // Held at the waterline: the inward velocity dies so wind and wakes pile duckweed against the
       // log and the taller stones instead of sliding it through them.
-      for (let j = 0; j < dA.length; j += 3) {
-        const dx = px - dA[j], dz = pz - dA[j + 1], rr = dA[j + 2] + OBS_SKIN;
-        const d2 = dx * dx + dz * dz;
-        if (d2 >= rr * rr) continue;
-        const d = Math.sqrt(d2);
-        const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
-        px = dA[j] + nx * rr; pz = dA[j + 1] + nz * rr;
-        const vn = vx * nx + vz * nz;
-        if (vn < 0) { vx -= vn * nx; vz -= vn * nz; }
-      }
-      for (let j = 0, k = 0; j < cA.length; j += 5, k++) {
-        const pr = prof[k];
-        if (pr) {
-          const rx = px - pr.ax, rz = pz - pr.az;
-          const s = rx * pr.ux + rz * pr.uz;
-          if (s < 0 || s > pr.len) continue;   // the mouths are open annuli: no cap juts past either end
-          const perp = rx * -pr.uz + rz * pr.ux;
-          const ap = perp < 0 ? -perp : perp;
-          const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + OBS_SKIN;
-          if (ap >= rw) continue;
-          // Out through whichever face is nearer, so a speck that drifted in past a mouth leaves by the
-          // mouth instead of being shouldered the whole width of the trunk.
-          const near0 = s * 2 <= pr.len, endGap = near0 ? s : pr.len - s;
-          let nlx, nlz, push;
-          if (endGap < rw - ap) { const g = near0 ? -1 : 1; nlx = pr.ux * g; nlz = pr.uz * g; push = endGap + 1e-3; }
-          else { const g = perp >= 0 ? 1 : -1; nlx = -pr.uz * g; nlz = pr.ux * g; push = rw - ap; }
-          px += nlx * push; pz += nlz * push;
-          const vnl = vx * nlx + vz * nlz;
-          if (vnl < 0) { vx -= vnl * nlx; vz -= vnl * nlz; }
-          continue;
+      if (px >= ox0 && px <= ox1 && pz >= oz0 && pz <= oz1) {
+        for (let j = 0; j < dA.length; j += 3) {
+          const dx = px - dA[j], dz = pz - dA[j + 1], rr = dA[j + 2] + OBS_SKIN;
+          const d2 = dx * dx + dz * dz;
+          if (d2 >= rr * rr) continue;
+          const d = Math.sqrt(d2);
+          const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
+          px = dA[j] + nx * rr; pz = dA[j + 1] + nz * rr;
+          const vn = vx * nx + vz * nz;
+          if (vn < 0) { vx -= vn * nx; vz -= vn * nz; }
         }
-        // Squared compare in the hot path: segDist's hypot would run 20,000 times a frame for nothing.
-        const rr = cA[j + 4] + OBS_SKIN;
-        const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
-        const t = Math.max(0, Math.min(1, ((px - ax) * bx + (pz - az) * bz) / (bx * bx + bz * bz || 1e-9)));
-        const qx = ax + bx * t, qz = az + bz * t;
-        const dx = px - qx, dz = pz - qz, dd = dx * dx + dz * dz;
-        if (dd >= rr * rr) continue;
-        const d = Math.sqrt(dd);
-        const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
-        px = qx + nx * rr; pz = qz + nz * rr;
-        const vn = vx * nx + vz * nz;
-        if (vn < 0) { vx -= vn * nx; vz -= vn * nz; }
+        for (let j = 0, k = 0; j < cA.length; j += 5, k++) {
+          const pr = prof[k];
+          if (pr) {
+            const rx = px - pr.ax, rz = pz - pr.az;
+            const s = rx * pr.ux + rz * pr.uz;
+            if (s < 0 || s > pr.len) continue;   // the mouths are open annuli: no cap juts past either end
+            const perp = rx * -pr.uz + rz * pr.ux;
+            const ap = perp < 0 ? -perp : perp;
+            const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + OBS_SKIN;
+            if (ap >= rw) continue;
+            // Out through whichever face is nearer, so a speck that drifted in past a mouth leaves by the
+            // mouth instead of being shouldered the whole width of the trunk.
+            const near0 = s * 2 <= pr.len, endGap = near0 ? s : pr.len - s;
+            let nlx, nlz, push;
+            if (endGap < rw - ap) { const g = near0 ? -1 : 1; nlx = pr.ux * g; nlz = pr.uz * g; push = endGap + 1e-3; }
+            else { const g = perp >= 0 ? 1 : -1; nlx = -pr.uz * g; nlz = pr.ux * g; push = rw - ap; }
+            px += nlx * push; pz += nlz * push;
+            const vnl = vx * nlx + vz * nlz;
+            if (vnl < 0) { vx -= vnl * nlx; vz -= vnl * nlz; }
+            continue;
+          }
+          // Squared compare in the hot path: segDist's hypot would run 20,000 times a frame for nothing.
+          const rr = cA[j + 4] + OBS_SKIN;
+          const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
+          const t = Math.max(0, Math.min(1, ((px - ax) * bx + (pz - az) * bz) / (bx * bx + bz * bz || 1e-9)));
+          const qx = ax + bx * t, qz = az + bz * t;
+          const dx = px - qx, dz = pz - qz, dd = dx * dx + dz * dz;
+          if (dd >= rr * rr) continue;
+          const d = Math.sqrt(dd);
+          const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
+          px = qx + nx * rr; pz = qz + nz * rr;
+          const vn = vx * nx + vz * nz;
+          if (vn < 0) { vx -= vn * nx; vz -= vn * nz; }
+        }
       }
       off[i2] = px - hx; off[i2 + 1] = pz - hz;
       vel[i2] = vx; vel[i2 + 1] = vz;
     }
+    // Only [0, n) is ever written; the tail past the live count has not changed since the last upload.
+    this.aOff.clearUpdateRanges();
+    this.aOff.addUpdateRange(0, n * 2);
     this.aOff.needsUpdate = true;
     pk.n = 0;
   }

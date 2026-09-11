@@ -803,9 +803,10 @@ export class PadSystem {
       if (env > p.wet) p.wet = Math.min(env, p.wet + 0.5 * dt);
       else p.wet = Math.max(0, p.wet - dt / 40 * (1 + gust * 0.5));
 
-      // Lift at the center and four rim points; the lowest rim point is where the water runs off.
+      // Lift at four rim points; the lowest rim point is where the water runs off. A raised pad's lift is
+      // zeroed by liftGain, and every value derived from it goes with it, so the whole solve is skipped.
       let lift = 0, low = 0, lowLift = Infinity, speed = 0;
-      for (let k = 0; k < 4; k++) {
+      if (p.liftGain !== 0) for (let k = 0; k < 4; k++) {
         const px = p.x + RIM_TAPS[k][0] * p.r * 0.85, pz = p.z + RIM_TAPS[k][1] * p.r * 0.85;
         let wsum = 0;
         for (let s = 0; s < INF_SLOTS; s++) {
@@ -817,7 +818,6 @@ export class PadSystem {
         if (wsum > lift) lift = wsum;
         if (wsum < lowLift) { lowLift = wsum; low = k; }
       }
-      if (p.liftGain === 0) lift = 0;
       const thr = p.wet > 0.2 ? 0.5 : 0.8;
       if (lift > thr && p.lastLift <= thr && now > p.cooldownAt && this.dripBudget >= 1) {
         this.dripBudget -= 1;
@@ -911,7 +911,8 @@ export class PadSystem {
   padAt(x, z, margin = 0) {
     let hit = null;
     for (const p of this.pads) {
-      if (p.r <= 0.01 || Math.hypot(x - p.x, z - p.z) > p.r + margin) continue;
+      const dx = x - p.x, dz = z - p.z, rr = p.r + margin;
+      if (p.r <= 0.01 || dx * dx + dz * dz > rr * rr) continue;
       // A pad lying over another rides on top, so it is the one anything falling actually meets.
       if (!hit || (p.raised && !hit.raised)) hit = p;
     }
@@ -920,7 +921,10 @@ export class PadSystem {
 
   /* A hand (or anything the CPU knows about) brushing a pad: its beads fling off on the next update. */
   disturb(x, z, r = 0.3) {
-    for (const p of this.pads) if (Math.hypot(x - p.x, z - p.z) < p.r + r) p.disturbed = 1;
+    for (const p of this.pads) {
+      const dx = x - p.x, dz = z - p.z, rr = p.r + r;
+      if (dx * dx + dz * dz < rr * rr) p.disturbed = 1;
+    }
   }
 
   updateLilies(dt, now, env) {

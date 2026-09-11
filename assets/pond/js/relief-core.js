@@ -93,7 +93,7 @@ export function heal(g, dt, tau = RELIEF_HEAL_TAU) {
   const N = g.res, work = g.work, bytes = g.bytes;
   const el = Number.isFinite(dt) && dt > 0 ? dt : 0;
   const keep = Math.exp(-el / (Number.isFinite(tau) && tau > 1e-3 ? tau : RELIEF_HEAL_TAU));
-  let nx0 = x1, nx1 = x0, nz0 = z1, nz1 = z0, live = false;
+  let nx0 = x1, nx1 = x0, nz0 = z1, nz1 = z0, live = false, changed = false;
   for (let iz = z0; iz <= z1; iz++) {
     const row = iz * N;
     for (let ix = x0; ix <= x1; ix++) {
@@ -108,10 +108,13 @@ export function heal(g, dt, tau = RELIEF_HEAL_TAU) {
         if (iz > nz1) nz1 = iz;
       }
       work[i] = v;
-      bytes[i] = encode(v);
+      // A slow decay often moves the float less than one byte step, and re-uploading an identical
+      // texture is the cost this return value exists to spare the caller.
+      const b = encode(v);
+      if (b !== bytes[i]) { bytes[i] = b; changed = true; }
     }
   }
   g.box = live ? { x0: nx0, x1: nx1, z0: nz0, z1: nz1 } : null;
   g.live = live;
-  return true;
+  return changed;
 }

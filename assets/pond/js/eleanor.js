@@ -75,6 +75,9 @@ export function attachEleanor(sys, seed) {
 function setVisible(e, v) {
   if (!e.body) return;
   e.body.visible = e.halo.visible = v;
+  // The jelly companion writes depth into the channel the refraction pass reads, so a swallowed jelly eel
+  // would keep occluding from inside her mouth. The e.jelly gate matches the rule in syncBodyMaterial.
+  if (e.jellyDepth) e.jellyDepth.visible = v && !!e.jelly;
   e.eyes.forEach((m) => { m.visible = v; });
 }
 
@@ -315,6 +318,8 @@ function brain(sys, e, dt) {
       park(sys, e);
       setVisible(e, false);
       e.nextSwimBy = now + e.rng.range(40, 80);
+      // The offstage check reads coolAt, not nextSwimBy: without this a feeding spree pulls her straight back.
+      e.coolAt = Math.max(e.coolAt, e.nextSwimBy);
       return;
     }
   } else if (e.state === 'return') {
@@ -372,7 +377,8 @@ function brain(sys, e, dt) {
     const arrived = far <= COMMOTION_NEAR;
     let best = null, bd = 1e9;
     if (arrived) {
-      for (const f of (sys.braincell?.sense(e) ?? sys.foods)) {
+      // The brain prepass already sensed for her this tick; sense() only rebuilds and returns this list.
+      for (const f of (sys.braincell ? e.sensedFoods : sys.foods)) {
         // A crumb still falling or parked on a pad is smelled, not eaten; the sensed set carries both.
         if (f.amount <= 0 || f.airborne || f.onPad) continue;
         const d = Math.hypot(f.x - e.head.x, f.z - e.head.z);

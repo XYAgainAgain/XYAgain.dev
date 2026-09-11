@@ -8,6 +8,7 @@ const OFF_DECAY = Math.exp(-2.5 * TICK);
 const SLIP_POINTS = 4;   // how far back the head's slip reaches; behind it the body takes full pushes
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 let near = new Uint8Array(0);   // per-tick pair cull scratch, grown to the cast size
+const hitS = [], hitL = [];   // per-eel scenery cull scratch; reused so the broad-phase never allocates
 
 export function segDist(px, pz, ax, az, bx, bz) {
   const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9;
@@ -127,6 +128,11 @@ export function collide(eels, colliders) {
   const floorY = -DEPTH;
   const { spheres, logs } = colliders;
   if (near.length < eels.length) near = new Uint8Array(eels.length);
+  // Log endpoints never move, so the axis is loop-invariant across every point of every eel.
+  for (const l of logs) {
+    (l.axis ??= new THREE.Vector3()).subVectors(l.b, l.a);
+    l.axisLen2 = l.axis.lengthSq();
+  }
   // Bounding sphere per eel so distant pairs skip the 24×24 point test.
   for (const e of eels) {
     const c = e.pts[EEL_POINTS >> 1];
@@ -149,7 +155,22 @@ export function collide(eels, colliders) {
     // A burrow needs a ceiling as well as a floor, and a per-point one: the dune over the tail is not
     // the dune over the snout, so eel-air ramps this fraction in over dig1 and drops it at wake.
     const bury = Math.min(1, ea.burrowing ?? 0);
-    // Decide the pair cull once per eel, outside the 24×24 point loop it gates.
+    // Decide the pair cull once per eel, outside the 24×24 point loop it gates. Scenery gets the same
+    // treatment: a collider that the body's whole bounding sphere clears cannot push any of its 24 points.
+    const pad = ea.boundR + 0.6;   // margin: pair pushes earlier in this pass can move a point up to a radius or so
+    let nS = 0, nL = 0;
+    for (const s of spheres) {
+      const sr = s.rHit ?? s.r, ry = s.ryHit ?? sr;
+      // A rock in the surface band pushes sideways only, so its reach is an unbounded vertical column.
+      const flat = s.y + sr > -r * 2;
+      const reach = (flat ? sr + r : (sr + r) * Math.max(1, ry / sr)) + pad;
+      const dx = ca.x - s.x, dy = flat ? 0 : ca.y - s.y, dz = ca.z - s.z;
+      if (dx * dx + dy * dy + dz * dz <= reach * reach) hitS[nS++] = s;
+    }
+    for (const l of logs) {
+      // xz distance to the axis underestimates the 3D one, so this cull can only ever be too generous.
+      if (segDist(ca.x, ca.z, l.a.x, l.a.z, l.b.x, l.b.z) <= l.rOuter + pad) hitL[nL++] = l;
+    }
     for (let b = a + 1; b < eels.length; b++) {
       const eb = eels[b];
       near[b] = !eb.slurpedBy && ca.distanceTo(eb.pts[EEL_POINTS >> 1]) <= ea.boundR + eb.boundR ? 1 : 0;
@@ -167,7 +188,8 @@ export function collide(eels, colliders) {
         const cap = floorHeightAt(p.x, p.z) - r * 0.9;
         if (p.y > cap) p.y += (cap - p.y) * bury;
       }
-      for (const s of spheres) {
+      for (let si = 0; si < nS; si++) {
+        const s = hitS[si];
         // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
         // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
         const sr = s.rHit ?? s.r, ky = sr / (s.ryHit ?? sr);
@@ -175,12 +197,12 @@ export function collide(eels, colliders) {
         const d = Math.hypot(dx, dy, dz), min = sr + r - sink;
         if (d < min && d > 1e-5) { const k = (min - d) / d * soft * glance; p.x += dx * k; p.y += dy * k / ky; p.z += dz * k; }
       }
-      for (const l of logs) {
+      for (let li = 0; li < nL; li++) {
+        const l = hitL[li];
         // Distance to the log's axis segment; inside the bore is fine, the wall is not.
-        tmpA.subVectors(l.b, l.a); const len2 = tmpA.lengthSq();
         tmpB.subVectors(p, l.a);
-        const t = Math.max(0, Math.min(1, tmpB.dot(tmpA) / len2));
-        tmpC.copy(l.a).addScaledVector(tmpA, t);
+        const t = Math.max(0, Math.min(1, tmpB.dot(l.axis) / l.axisLen2));
+        tmpC.copy(l.a).addScaledVector(l.axis, t);
         const dx = p.x - tmpC.x, dy = p.y - tmpC.y, dz = p.z - tmpC.z;
         const d = Math.hypot(dx, dy, dz);
         // Hollow logs have open mouths; a solid stub (rInner 0) keeps its tip as a sphere cap.

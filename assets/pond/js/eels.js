@@ -7,6 +7,10 @@ import { EelRenderer } from './eel-render.js';
 import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPattern, rollNickname } from './eel-identity.js';
 import { pushFingerSample, seedFingerHistory, tumbleFor } from './treats-core.js';
 
+// How long a spook stays in sys.spooks. eel-fear.js ages its per-eel "already counted" ids on the same
+// clock, because an id that nothing can re-observe anymore has no duplicate left to suppress.
+export const SPOOK_LIFE = 1.6;
+
 export class Eel {
   constructor(index, seed, extent, colliders, view, identity) {
     this.view = view;
@@ -148,7 +152,7 @@ export class EelSystem {
       // buriedEvict multiplies the spook line a buried eel is dug out by; buriedGrace is the seconds of
       // lesser pressure it sits through first. 1 and 0 restore the old evict-on-any-scare behavior.
       // relief scales the dig's dent in the sand, lean and shade together; 1 is the default depth, 0 is flat.
-      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60 },
+      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60, leapExcite: 0.2 },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
@@ -195,6 +199,8 @@ export class EelSystem {
     this.dropId = 0;
     this.eels = [];
     this.guests = [];              // Eleanor-class residents: own brain, shared physics and renderer
+    this.allCast = this.eels;      // residents then guests, cached; see allOfCast()
+    this.allCastN = -1;
     this.perfHot = false;          // set by main's frame-time watcher; gates guest visits
     this.rain = null;              // the shower scheduler, one shared reference: behavior reads its envelope
     this.habitat = null;           // the cover registry; pads become loiter targets once it is set
@@ -502,6 +508,10 @@ export class EelSystem {
     growEel(e, want - oldLen);
     e.baseLength = e.length;
     e.uRadius.value = e.radius;
+    // The clamp band is a function of the radius that just changed. eel-air.js rewrites these with the
+    // same numbers in the initEel loop below, but a pond without it would keep the old eel's floor.
+    e.floorY = -DEPTH + e.radius + 0.08;
+    e.ceilingY = -e.radius * 0.5;
     for (const m of e.eyes) m.scale.setScalar(e.radius * 0.2);
     e.rollColors(e.rng);
     e.rollPattern(e.rng);
@@ -722,10 +732,21 @@ export class EelSystem {
     for (const m of this.modules) m.prepass?.(this, dt);
   }
 
+  /* Nobody ever leaves either roster, so a length change is the only way the joined cast can differ.
+     Eleanor is parked rather than removed, so the old per-tick concat ran forever once she arrived. */
+  allOfCast() {
+    const n = this.eels.length + this.guests.length;
+    if (this.allCastN !== n) {
+      this.allCast = this.guests.length ? this.eels.concat(this.guests) : this.eels;
+      this.allCastN = n;
+    }
+    return this.allCast;
+  }
+
   tick(dt) {
     this.time += dt;
     this.ticks++;
-    const all = this.guests.length ? this.eels.concat(this.guests) : this.eels;
+    const all = this.allOfCast();
     this.prepass(dt, all);
     for (const e of all) if (!e.slurpedBy) (e.brain || steer)(this, e, dt);
     // The cast rotates where nobody is looking: every spine point (halo included) past the view rectangle.
@@ -755,7 +776,7 @@ export class EelSystem {
       while (this.drops20.length && this.time - this.drops20[0].t > COMMOTION_FOR) this.drops20.shift();
       this.recomputeCommotion();
     }
-    expire(this.spooks, this.time, 1.6);
+    expire(this.spooks, this.time, SPOOK_LIFE);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
   }

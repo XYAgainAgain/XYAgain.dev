@@ -14,6 +14,7 @@ export class BrainOverlay {
     document.body.appendChild(this.canvas);
     this.ctx = this.canvas.getContext('2d');
     this.w = 0; this.h = 0;
+    this.brain = null;   // armed once we see one, so dispose() can hand the ring copies back
   }
 
   fit() {
@@ -35,6 +36,7 @@ export class BrainOverlay {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, innerWidth, innerHeight);
     if (!brain || !sys.enabled) return;
+    if (this.brain !== brain) { this.brain = brain; brain.setKeepRings(true); }
     for (const e of sys.eels) {
       const d = brain.debug(e);
       if (!d) continue;
@@ -85,5 +87,5 @@ export class BrainOverlay {
     ctx.fill();
   }
 
-  dispose() { this.canvas.remove(); }
+  dispose() { this.brain?.setKeepRings(false); this.brain = null; this.canvas.remove(); }
 }

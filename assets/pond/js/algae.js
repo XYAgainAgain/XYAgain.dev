@@ -489,11 +489,14 @@ export class AlgaeTufts {
 
   build(U, shading, wake, current) {
     const geo = makeStrandGeometry();
-    const A = new Float32Array(STRAND_POOL * 4), B = new Float32Array(STRAND_POOL * 4);
-    const C = new Float32Array(STRAND_POOL * 4), D = new Float32Array(STRAND_POOL * 4);
-    const E = new Float32Array(STRAND_POOL * 4);
-    this.bendArr = new Float32Array(STRAND_POOL * 4);
-    this.bend = new Float32Array(TUFT_POOL * 2);
+    // layout() is done, so the counts are final for the life of the page and the pool caps are only a
+    // worst case; sizing to them would re-upload ~half a buffer of padding every frame. Never zero-length.
+    const ns = Math.max(1, this.strandCount);
+    const A = new Float32Array(ns * 4), B = new Float32Array(ns * 4);
+    const C = new Float32Array(ns * 4), D = new Float32Array(ns * 4);
+    const E = new Float32Array(ns * 4);
+    this.bendArr = new Float32Array(ns * 4);
+    this.bend = new Float32Array(Math.max(1, this.tufts.length) * 2);
     for (const tf of this.tufts) {
       tf.strands.forEach((s, i) => {
         const o = (tf.start + i) * 4;
@@ -623,8 +626,9 @@ export class AlgaeTufts {
      so an eel that lays the threads over drags the cloud with them. */
   buildCloud(U, shading, current) {
     const geo = makeCloudGeometry();
-    const A = new Float32Array(TUFT_POOL * 4), B = new Float32Array(TUFT_POOL * 4);
-    this.cloudBendArr = new Float32Array(TUFT_POOL * 4);
+    const nt = Math.max(1, this.tufts.length);
+    const A = new Float32Array(nt * 4), B = new Float32Array(nt * 4);
+    this.cloudBendArr = new Float32Array(nt * 4);
     this.tufts.forEach((tf, i) => {
       const c = tf.cloud, o = i * 4;
       A.set([tf.cloudX, tf.cloudY, tf.cloudZ, c.r], o);

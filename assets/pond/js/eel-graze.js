@@ -37,8 +37,9 @@ export class Grazing {
 
   stateFor(e) {
     let st = this.state.get(e);
-    if (!st) {
-      st = { startedAt: 0, until: 0, arrived: 0, carveAcc: 0, nibbleAt: 0, tuftFreeAt: 0, padFreeAt: 0, bonkAng: 0, bonkUntil: 0 };
+    // The body is reused across a hot-swap; a fresh generation must not inherit the last diner's food bans.
+    if (!st || st.gen !== e.gen) {
+      st = { gen: e.gen, startedAt: 0, until: 0, arrived: 0, carveAcc: 0, nibbleAt: 0, tuftFreeAt: 0, padFreeAt: 0, bonkAng: 0, bonkUntil: 0 };
       this.state.set(e, st);
     }
     return st;
@@ -207,8 +208,8 @@ export class Grazing {
       if (d >= BONK_ARM) return 0;   // still swimming in; the aim waits for lunge range
       st.bonkUntil = now + BONK_FOR;
     }
-    // Committed for a beat, then dropped either way, so a miss that never reaches the band costs one
-    // second rather than orbiting the mouthful until the give-up clock takes it.
+    // Committed for a beat, then dropped either way, so a miss that never reaches the band costs
+    // BONK_FOR seconds rather than orbiting the mouthful until the give-up clock takes it.
     if (d < BONK_BAND[0] || now >= st.bonkUntil) { st.bonkAng = 0; return 0; }
     if (d < BONK_BAND[1]) { st.bonkAng = 0; e.nopeUntil = now + NOPE; return 0; }
     return st.bonkAng;

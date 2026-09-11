@@ -112,7 +112,6 @@ class Braincell {
   prepass(sys, dt) {
     this.resize(sys.knobs.slots ?? BRAIN_SLOTS);
     const now = sys.time;
-    const all = sys.guests.length ? sys.eels.concat(sys.guests) : sys.eels;
     // Residents then guests, no concat: this runs every tick and the joined array would be garbage.
     for (const e of sys.eels) this.think(sys, e, dt, now);
     for (const g of sys.guests) this.think(sys, g, dt, now);
@@ -891,10 +890,16 @@ class Braincell {
     return out;
   }
 
+  /* The overlay arms the ring copies and disarms them when it goes away; latching the flag inside
+     debug() left heading() copying two Float64Arrays per eel per tick for the life of the page. */
+  setKeepRings(on) {
+    this.keepRings = !!on;
+    if (!on) for (const st of this.state.values()) { st.dbgI = null; st.dbgD = null; }
+  }
+
   /* Read-only view for ?overlay=brain. The overlay draws, it never decides; the ring copies only
      exist once the flag has asked for them. */
   debug(e) {
-    this.keepRings = true;
     const st = this.state.get(e);
     if (!st || !st.dbgI) return null;
     return {

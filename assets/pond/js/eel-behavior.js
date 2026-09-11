@@ -57,6 +57,13 @@ function initQuirkState(e) {
   e.snapAt = 0;
   e.shipAt = 0;
   e.stuckAt = NOT_STUCK;
+  // The escape and stuck accumulators outlive the eel who armed them, so a newcomer can inherit up to
+  // 1.1 s of reverse-swim and a queued zig. Off-screen by construction, but it is still the wrong eel.
+  e.nopeUntil = 0;
+  e.nopeZig = 0;
+  e.attnReset = false;
+  e.stuckFor = 0;
+  e.boreRefusedAt = 0;
   e.gaitFrom = e.gaitFrom ?? 0;
   if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
 }
@@ -612,6 +619,9 @@ export function steer(sys, e, dt) {
   // Morgan's filed-away scare comes due: the full reaction, from wherever she has drifted to since.
   if (e.laterAt && now >= e.laterAt) {
     e.laterAt = 0;
+    // nope() overwrites coverSpot with a log spot, and only a 'ridge' label releases the habitat claim on
+    // drop. The immediate startle path drops cover first too; skipping it here orphans a crest perch for good.
+    dropCover(sys, e);
     sys.emit('startle', e);
     const before = e.nopeUntil;
     nope(sys, e, e.laterSpook, now);
@@ -986,11 +996,14 @@ export function steer(sys, e, dt) {
     const fits = log ? logFits(e, log) : false;
     // Doordash: dinner is whatever drifts into her face. Anything farther out does not exist.
     const reach = hunt === 'doordash' ? e.length : Infinity;
-    let live = 0;
-    for (const f of smelled) if (f.amount > 0) live++;
-    // Gourmet: one scoring pass now and then forgets which crumb she was on, so she keeps sampling.
+    // Gourmet: a scoring pass sometimes forgets which crumb the eel was sampling, so it keeps sampling.
+    // Only three eels carry the quirk, so the live-crumb count runs inside that branch; both gates still apply.
     let skipPersist = false;
-    if (e.quirks.gourmet && live >= 2 && now > e.gourmetAt) { e.gourmetAt = now + rng.range(2, 4); skipPersist = true; }
+    if (e.quirks.gourmet && now > e.gourmetAt) {
+      let live = 0;
+      for (const f of smelled) if (f.amount > 0) live++;
+      if (live >= 2) { e.gourmetAt = now + rng.range(2, 4); skipPersist = true; }
+    }
     let best = null, bestScore = Infinity;
     for (const f of smelled) {
       if (f.amount <= 0) continue;

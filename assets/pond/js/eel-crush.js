@@ -405,7 +405,8 @@ export class Crush {
     if (st.bout) { console.log(`[crush] force(${e.name}) refused: already in bout ${st.bout.id}`); return false; }
     const why = this.tryForce(sys, e, st, now);
     if (!why) return true;
-    if (PERMANENT.has(why)) { console.log(`[crush] force(${e.name}) refused: ${why}`); return false; }
+    // resolve() prefixes Jaz's own failures, so test the bare reason and log the prefixed one.
+    if (PERMANENT.has(why.replace(/^jaz:/, ''))) { console.log(`[crush] force(${e.name}) refused: ${why}`); return false; }
     st.forceUntil = now + this.k('forceWait');
     console.log(`[crush] force(${e.name}) queued for ${this.k('forceWait')} s, waiting on: ${why}`);
     return 'queued';

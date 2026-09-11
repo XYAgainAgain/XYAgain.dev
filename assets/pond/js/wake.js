@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, texture, uv, vec2, vec3, vec4, float, length, pow, Loop, mix, smoothstep, select } from 'three/tsl';
+import { Fn, If, uniform, uniformArray, texture, uv, vec2, vec3, vec4, float, length, pow, Loop, mix, smoothstep, select } from 'three/tsl';
 import { WAKE_RES, INF_SLOTS } from './config.js';
 import { capsuleInfluence, closestOnSegment, fbm2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
@@ -59,6 +59,7 @@ export class WakeBuffer {
     this.uAlgaeRainCut = uniform(0.3);
     this.uAlgaeRate = uniform(0);
     this.uAlgaeRateDown = uniform(0);
+    this.uAlgaeOn = uniform(0);            // 1 only on a coarse tick; off-tick the whole target solve is dead work
     this.algaeAccum = 0;
     // Substrate: (x, z, radius, 0) discs and (ax, az, bx, bz) + (rOuter, 0, 0, 0) capsules. An empty slot
     // parks at radius -10, far enough negative that its falloff can never reach a texel.
@@ -130,16 +131,22 @@ export class WakeBuffer {
       const finger = prev.w.mul(this.uFingerDecay).max(fw);
       // Algae cover: the seeded FBM thickened against the substrate and stirred by the wake, thinned by
       // what floats overhead, by traffic, and by rain, then eased so 30 and 240 fps converge alike.
-      const stir = prev.xy.mul(this.uAlgaeStir).mul(U.motionScale);
-      const q = p.mul(this.uAlgaeScale).add(this.uAlgaeOffset).add(stir).add(this.uAlgaeScroll.mul(U.time));
-      const shadeG = U.coverTex.sample(p.div(U.maskExtent).add(0.5)).g;
-      const target = clingShape(q, p)
-        .mul(shadeG.mul(this.uAlgaeShadeCut).oneMinus())
-        .mul(length(prev.xy).mul(this.uAlgaeScour).oneMinus().clamp(0, 1))
-        .mul(U.rainEnv.mul(this.uAlgaeRainCut).oneMinus())
-        .clamp(this.uAlgaeFloor, this.uAlgaeCeil);
-      const rate = select(target.lessThan(prev.z), this.uAlgaeRateDown, this.uAlgaeRate);
-      return vec4(next, mix(prev.z, target, rate), finger);
+      const cover = prev.z.toVar();
+      // Off-tick, both rates are 0 and mix(prev.z, target, 0) is exactly prev.z, so skipping the solve is
+      // bit-identical. The branch below tests the uniform alone, the same shape as the detile switch in floaters.js.
+      If(this.uAlgaeOn.greaterThan(0), () => {
+        const stir = prev.xy.mul(this.uAlgaeStir).mul(U.motionScale);
+        const q = p.mul(this.uAlgaeScale).add(this.uAlgaeOffset).add(stir).add(this.uAlgaeScroll.mul(U.time));
+        const shadeG = U.coverTex.sample(p.div(U.maskExtent).add(0.5)).g;
+        const target = clingShape(q, p)
+          .mul(shadeG.mul(this.uAlgaeShadeCut).oneMinus())
+          .mul(length(prev.xy).mul(this.uAlgaeScour).oneMinus().clamp(0, 1))
+          .mul(U.rainEnv.mul(this.uAlgaeRainCut).oneMinus())
+          .clamp(this.uAlgaeFloor, this.uAlgaeCeil);
+        const rate = select(target.lessThan(prev.z), this.uAlgaeRateDown, this.uAlgaeRate);
+        cover.assign(mix(prev.z, target, rate));
+      });
+      return vec4(next, cover, finger);
     })();
     mat.blending = THREE.NoBlending;
     this.quad = new THREE.QuadMesh(mat);
@@ -212,6 +219,7 @@ export class WakeBuffer {
     // The rate carries the whole elapsed span, so the field converges the same at 30 and 240 fps.
     this.uAlgaeRate.value = algaeTick ? 1 - Math.exp(-this.algaeAccum / ALGAE_TAU) : 0;
     this.uAlgaeRateDown.value = algaeTick ? 1 - Math.exp(-this.algaeAccum / ALGAE_SCOUR_TAU) : 0;
+    this.uAlgaeOn.value = algaeTick ? 1 : 0;
     if (algaeTick) this.algaeAccum = 0;
     const r = this.renderer;
     r.setRenderTarget(this.rtB);
