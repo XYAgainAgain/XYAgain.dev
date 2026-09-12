@@ -1,9 +1,10 @@
 import * as THREE from 'three/webgpu';
 import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, PI } from 'three/tsl';
-import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX } from './config.js';
+import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX, SHOAL_MAX } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
 import { RELIEF_MID, RELIEF_DECODE } from './relief-core.js';
+import { shoalSum, shoalChordFrac, placeShoals } from './reeds-core.js';
 
 /* Floor, rocks, and the hollow log. Textures come from assets/pond/textures/manifest.json when present;
    each missing map falls back to a procedural placeholder so nothing blocks on art. */
@@ -327,15 +328,25 @@ function segPointDist(px, py, pz, ax, ay, az, bx, by, bz) {
 // The floor mesh's own dune parameters, captured in buildFloor so the CPU can evaluate the same
 // surface. Null until a floor is built; floorHeightAt then reads a flat -DEPTH, which is honest.
 let duneF = null, dunePh = null;
+// The shoal mounds, set inside buildFloor beside the dune parameters. Empty until a floor is built.
+let shoalList = [];
+const SHOAL_WALL_Y = -0.3;   // sand above this is a wall to a swimming body, not a bump it clears
 // main.js hands the dig relief over before the floor builds; null leaves the sand as it was cast.
 let reliefField = null;
 export function setRelief(field) { reliefField = field ?? null; }
+
+/* How far the shoals lift the sand at a point, alone. The eels' flat floor bound knows nothing about
+   a 0.7-unit mound, so eel-physics clamps each spine point against this on top of its own floor. */
+export function shoalHeightAt(x, z) {
+  return shoalList.length ? shoalSum(shoalList, x, z) : 0;
+}
 
 /* The CPU twin of the floor's vertex displacement: what the eels sink into and are capped against.
    Relief-free on purpose: the relief heals on the frame clock, and a chain that read it would drift. */
 export function floorHeightAt(x, z) {
   if (!duneF) return -DEPTH;
-  return -DEPTH + 0.06 * lumpNoise(x, 0, z, duneF, dunePh) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, duneF, dunePh);
+  return -DEPTH + 0.06 * lumpNoise(x, 0, z, duneF, dunePh) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, duneF, dunePh)
+    + shoalHeightAt(x, z);
 }
 
 /* The sand as drawn, dig relief included: where a grain spawns and lands. Decoration only. */
@@ -463,13 +474,15 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const ff = [rng.range(0.25, 0.5), rng.range(0.25, 0.5), rng.range(0.25, 0.5)];
   const fph = [rng.range(0, 6), rng.range(0, 6), rng.range(0, 6)];
   duneF = ff; dunePh = fph;
+  shoalList = [];
   bakeSandSamples(sand, 0.16 * sand.tiling);
   for (let v = 0; v < fpos.count; v++) {
     const x = fpos.getX(v), z = fpos.getZ(v);
     const y = 0.06 * lumpNoise(x, 0, z, ff, fph) + 0.025 * lumpNoise(x * 3.3, 1, z * 3.3, ff, fph);
     fpos.setY(v, y);
   }
-  floorGeo.computeVertexNormals();
+  // Normals wait for the shoal pass at the bottom of this function: the mounds have to avoid rocks and
+  // the log, so they cannot be cast until both exist, and computing normals twice would be waste.
   // Sand greens well short of the stone and bark, which have something for the filaments to grip.
   const floor = new THREE.Mesh(floorGeo, makeSurfaceMaterial(shading, sand, placeholders.sand, 0.16 * sand.tiling, false, null, 0.45, true));
   floor.position.y = -DEPTH;
@@ -803,6 +816,37 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const secondLog = createRng(deriveSeed(seed, 4260)).chance(0.5) ? buildLog(1, firstLog) : null;
   for (const c of [...firstLog.stubCaps, ...(secondLog ? secondLog.stubCaps : [])]) if (colliders.waterline.capsules.length < 4) colliders.waterline.capsules.push(c);
 
+  // Shoals: soft sediment mounds for the rushes to root in. Their own stream at salt 1701, so seed 42's
+  // rocks and log keep the draws the determinism trace was recorded against.
+  const shoals = placeShoals(createRng(deriveSeed(seed, 1701)), view, {
+    spheres: colliders.spheres,
+    logs: colliders.logs.map((l) => ({ ax: l.a.x, az: l.a.z, bx: l.b.x, bz: l.b.z, rOuter: l.rOuter })),
+  }, SHOAL_MAX);
+  shoalList = shoals;
+  colliders.shoals = shoals;   // the pads keep their crowns off the mounds, so rushes never grow up under one
+
+  for (let v = 0; v < fpos.count; v++) {
+    const x = fpos.getX(v), z = fpos.getZ(v);
+    const m = shoalSum(shoals, x, z);
+    if (m > 0) fpos.setY(v, fpos.getY(v) + m);
+  }
+  fpos.needsUpdate = true;
+  floorGeo.computeVertexNormals();
+
+  for (const s of shoals) {
+    if (!s.emergent) continue;   // a submerged mound is a speed bump; the floor clamp already owns it
+    // Only the cap above the film is a wall, so the sphere is the waterline chord, not the whole mound:
+    // every consumer flattens a surface-band sphere to a column of radius r, and the mound's own R is 3× that.
+    const rBar = (s.rx + s.rz) / 2;
+    const chord = shoalChordFrac(s.h, DEPTH) * rBar;
+    if (chord < 0.05) continue;
+    // Bodies hit the wall where the sand climbs past their bound, well below the film, so the collider
+    // is the chord at SHOAL_WALL_Y; the mask disc is the chord the water actually meets.
+    const wall = shoalChordFrac(s.h, DEPTH + SHOAL_WALL_Y) * rBar;
+    colliders.spheres.push({ x: s.x, y: s.crest - wall, z: s.z, r: wall, rHit: wall, ryHit: wall, top: s.crest, shoal: true });
+    colliders.waterline.discs.push({ x: s.x, z: s.z, r: chord });
+  }
+
   scene.add(group);
-  return { group, colliders, textures };
+  return { group, colliders, textures, shoals };
 }

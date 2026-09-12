@@ -169,10 +169,11 @@ export class AlgaeTufts {
 
     for (const s of colliders.spheres) {
       if (!inView(s.x, s.z)) continue;
+      // No colonies on a wet sand crest: filaments need something to grip, which sediment is not.
+      if (s.shoal) continue;
       // top - y recovers the vertical semi-axis the rock's squash left out of the collider, so a
       // holdfast lands on the stone instead of floating beside it.
       const ry = s.top - s.y;
-      // s.y below the floor is a shoal mound's buried sphere, not a rock; its flank is nowhere near the sand.
       if (!(ry > 0.02) || !(s.r > 0.05) || s.y <= -DEPTH) continue;
       const submerged = s.top < EMERGENT_TOP;
       if (submerged) {

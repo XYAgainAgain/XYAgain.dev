@@ -28,6 +28,10 @@ export const WAKE_RES = 256;
 // several of once the bilinear filter rounds it off; RELIEF_MAX is one byte's world range either way.
 export const RELIEF_RES = 256;
 export const RELIEF_MAX = 0.12;
+// Rushes: one instanced ribbon per stem, 40–72 alive over 5–8 shoals. Neither pool ever reallocates,
+// and eight shoals plus five dry rocks stay inside the mask's MAXD 24 waterline discs.
+export const RUSH_POOL = 80;
+export const SHOAL_MAX = 8;
 export const COVER_DISCS = 48;       // surface-cover bake (mask G): up to 26 pads and 16 duckweed clumps
 export const COVER_CAPS = 48;        // surface-cover bake (mask G): rush stems as shadow capsules
 export const MAX_PIXELS = 2.6e6;     // internal render budget before DPR gets clamped

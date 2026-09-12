@@ -179,7 +179,8 @@ export class WakeBuffer {
   /* What the algae can hold onto, from buildFloor's colliders: every rock as a disc, log trunks then
      branch stubs as capsules. Re-seeds once so a fresh tab opens with cover already on the substrate. */
   setSubstrate(colliders) {
-    const spheres = (colliders?.spheres ?? []).slice()
+    // Shoals are out: sand is not algae substrate, and the cling would green the mound.
+    const spheres = (colliders?.spheres ?? []).filter((s) => !s.shoal)
       .sort((a, b) => Math.hypot(a.x, a.z) - Math.hypot(b.x, b.z));
     const logs = colliders?.logs ?? [];
     const caps = [...logs.filter((l) => l.rInner > 0), ...logs.filter((l) => !(l.rInner > 0))];

@@ -132,6 +132,8 @@ export class Quirks {
     const reach = this.q('bonkNear');
     let bx = 0, bz = 0, bd = reach;
     for (const o of sys.colliders.spheres) {
+      // The gag is a snout off stone; sand takes the knock and gives nothing back.
+      if (o.shoal) continue;
       const r = o.rHit ?? o.r;
       const d = Math.hypot(crumb.x - o.x, crumb.z - o.z) - r;
       if (d >= bd) continue;
@@ -395,6 +397,8 @@ export class Quirks {
     const hx = e.head.x, hz = e.head.z;
     let best = null, bd = e.length * PROBE_REACH;
     for (const o of sys.colliders.spheres) {
+      // A seam is a rim between two hard things; a sand crest has no edge to nose along.
+      if (o.shoal) continue;
       const r = o.rHit ?? o.r;
       const dx = hx - o.x, dz = hz - o.z, d = Math.hypot(dx, dz);
       if (d < 1e-4 || d - r >= bd) continue;

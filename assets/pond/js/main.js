@@ -29,6 +29,7 @@ import { RainScheduler } from './rain.js';
 import { PadSystem } from './pads.js';
 import { FloaterSystem } from './floaters.js';
 import { AlgaeTufts } from './algae.js';
+import { Rushes } from './reeds.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle, bindJunk } from './ui.js';
@@ -127,7 +128,7 @@ async function boot() {
   const underScene = new THREE.Scene();
   // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
   const overScene = new THREE.Scene();
-  const { colliders, textures } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat, { textureSize: texSizeNow });
+  const { colliders, textures, shoals } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat, { textureSize: texSizeNow });
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   // ?cast=jim,shelley pins those residents in first and freezes the off-screen rotation for testing;
   // a bare ?cast= freezes the seeded draw as-is.
@@ -166,10 +167,11 @@ async function boot() {
   // After the crush: a crush bout outranks a life bond, and the fit test asks the crush directly.
   const bond = attachBond(eels, seed);
 
-  // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
+  // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 4, not 2,
+  // because the WebGPU backend rounds any count under four down to one (getSampleCount in r185).
   const underRT = new THREE.RenderTarget(1, 1, {
     type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: true, stencilBuffer: false,
-    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, samples: 2,
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, samples: 4,
   });
   const surface = new SurfacePass(renderer, sim, U, underRT, viewW, viewH);
 
@@ -322,6 +324,8 @@ async function boot() {
   });
   // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
+  // Rushes root in the shoals buildFloor just raised, and register their shadow proxies before the first bake.
+  const rushes = new Rushes({ underScene, overScene, U, shading, wake, seed, shoals, colliders, habitat, motion, view: { w: viewW, h: viewH } });
   // After the pads, which the landing has to query, and before hand.feed, which is now a throw.
   const treats = attachTreats(eels, { overScene, pads, view, motion, U });
   eels.graze = new Grazing({ floaters, algae, pads, habitat });
@@ -374,7 +378,10 @@ async function boot() {
         setFloaters({ detile: true });
       },
     },
-    5: { on: () => { qualityScale = 0.75; resize(); }, off: () => { qualityScale = 1; resize(); } },
+    5: {
+      on: () => { qualityScale = 0.75; resize(); rushes.setQuality({ pxFloor: 2.5 }); },
+      off: () => { qualityScale = 1; resize(); rushes.setQuality({ pxFloor: 0 }); },
+    },
     6: {
       on: () => { sim.setResolution(384); caustics.setResolution(512); setTex(texBase / 2); },
       off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); setTex(texBase); },
@@ -446,6 +453,7 @@ async function boot() {
         if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
         for (let k = Math.max(finger.idx, n - 1 - 16); k < n - 1; k++) floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
         wake.poke(a.x, a.z, b.x, b.z, vx, vz, 0.35, 16);
+        rushes.poke(a.x, a.z, b.x, b.z, vx, vz);
       }
       finger.at = -1;
       for (const p of path.slice(-6)) eels.lure(p.x, p.z);
@@ -642,6 +650,7 @@ async function boot() {
     pads.update(dt, t, rain, impulse);
     floaters.update(dt, t);
     algae.update(dt, t);
+    rushes.update(dt, t);
     if (t > coverBakeAt) { coverBakeAt = t + 2; habitat.composeCover(sim); }
     // Before sim.update, so this frame's drops are stepped by the water they landed in.
     rain.update(dt);
@@ -666,6 +675,7 @@ async function boot() {
       if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
       // A finger crosses a texel in one frame where a body lingers for many, so it pushes 16× as hard.
       wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz, 0.35, 16);
+      rushes.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
       pads.disturb(finger.x, finger.z);
       // The wake field gains nothing from sub-frame precision; the CPU speck sim and the noise carve do,
       // so they get every coalesced sample since the last frame, newest 16 at most.
@@ -752,7 +762,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

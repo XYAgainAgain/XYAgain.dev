@@ -421,7 +421,8 @@ class Braincell {
       const m = st.rng.chance(0.5) ? log.a : log.b;
       pick = { x: m.x, z: m.z };
     } else if (home === 'rock') {
-      const rocks = sys.colliders.spheres;
+      // A home is a landmark to hide by; a sand crest is neither, so the shoals sit this draw out.
+      const rocks = sys.colliders.spheres.filter((o) => !o.shoal);
       if (!rocks.length) return wait();
       // Vi takes the biggest stone in the pond; everyone else takes a seeded one.
       let o = rocks[Math.floor(st.rng.next() * rocks.length)];
@@ -491,12 +492,15 @@ class Braincell {
     const env = (o) => (o.rHit ?? o.r) + r * 1.15;
     for (let i = 0; i < rocks.length; i++) {
       const o = rocks[i], ring = (o.rHit ?? o.r) + r * 1.5;
+      // A crevice is a wall to tuck against; a shoal crest offers no shelter and no pair gap worth sitting in.
+      if (o.shoal) continue;
       for (let k = 0; k < 8; k++) {
         const a = k * TAU / 8;
         out.push({ x: o.x + Math.cos(a) * ring, z: o.z + Math.sin(a) * ring, nx: -Math.cos(a), nz: -Math.sin(a), idx: i, refuge: `rock:${i}` });
       }
       for (let j = i + 1; j < rocks.length; j++) {
         const p = rocks[j];
+        if (p.shoal) continue;
         const dx = p.x - o.x, dz = p.z - o.z, d = Math.hypot(dx, dz);
         const gap = d - env(o) - env(p);
         // The free gap, not the midpoint of the centers: overlapping piles have no midpoint worth sitting in.
@@ -546,11 +550,12 @@ class Braincell {
     return false;
   }
 
-  /* The floor always counts one; every rock or log wall within r × 3 counts another. */
+  /* The floor always counts one; every rock or log wall within r × 3 counts another. A shoal is sand,
+     so it scores nothing: a spot beside one is open water with a bump, not a sheltered corner. */
   hardness(sys, e, x, z) {
     const reach = e.radius * 3;
     let n = 1;
-    for (const o of sys.colliders.spheres) if (Math.hypot(x - o.x, z - o.z) - (o.rHit ?? o.r) < reach) n++;
+    for (const o of sys.colliders.spheres) if (!o.shoal && Math.hypot(x - o.x, z - o.z) - (o.rHit ?? o.r) < reach) n++;
     for (const l of sys.colliders.logs) if (segDist2(x, z, l) - l.rOuter < reach) n++;
     return n;
   }

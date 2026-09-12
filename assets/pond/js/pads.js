@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { Fn, attribute, uniform, varying, vec2, vec3, vec4, float, Loop, sin, cos, atan, mod, length, normalize, dot, smoothstep, mix, pow, abs, fract, floor, step, hash, fwidth, texture, sign, uv, positionGeometry, PI, TWO_PI, select } from 'three/tsl';
 import { DEPTH, INF_SLOTS, MOON_ORBIT_SECONDS } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
+import { shoalHeight } from './reeds-core.js';
 import { capsuleWeight, capsuleInfluence, capsuleWeightCPU, capsuleInfluenceCPU, makeSwell, makeCurrent, fbm2 } from './shading.js';
 import { segDist } from './eel-physics.js';
 
@@ -133,8 +134,10 @@ export class PadSystem {
   layout(seed, view, colliders) {
     const rng = createRng(deriveSeed(seed, 1100));
     const ex = view.w / 2 + 1, ez = view.h / 2 + 1;
+    // A crown on a shoal would put its pads over the rushes, and an emergent rush under a pad reads as squashed.
     const clear = (x, z) => colliders.spheres.every((o) => Math.hypot(x - o.x, z - o.z) > o.r + 0.3)
-      && colliders.logs.every((l) => segDist(x, z, l.a.x, l.a.z, l.b.x, l.b.z) > l.rOuter + 0.6);
+      && colliders.logs.every((l) => segDist(x, z, l.a.x, l.a.z, l.b.x, l.b.z) > l.rOuter + 0.6)
+      && (colliders.shoals ?? []).every((s) => shoalHeight(s, x, z) <= 0);
     const place = (minSep) => {
       for (let tries = 0; tries < 40; tries++) {
         const x = rng.range(-ex, ex), z = rng.range(-ez, ez);

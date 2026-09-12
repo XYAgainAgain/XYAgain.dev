@@ -268,8 +268,11 @@ export function dropCover(sys, e) {
 function rockCover(sys, e, rocks, flock, rng, now) {
   if (sys?.braincell) return sys.braincell.creviceSpot(e, now);
   const claims = rocks.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'rock' && o.coverSpot.idx === i ? 1 : 0), 0));
-  const least = Math.min(...claims);
-  const idx = rng.pick(rocks.map((_, i) => i).filter((i) => claims[i] === least));
+  // A shoal mound has no overhang to tuck under, so it is never a cover pick.
+  const open = rocks.map((_, i) => i).filter((i) => !rocks[i].shoal);
+  if (!open.length) return false;
+  const least = Math.min(...open.map((i) => claims[i]));
+  const idx = rng.pick(open.filter((i) => claims[i] === least));
   const o = rocks[idx];
   const a = rng.range(0, Math.PI * 2), d = o.r + rng.range(0.6, 1.6);
   e.target.set(o.x + Math.cos(a) * d, 0, o.z + Math.sin(a) * d);

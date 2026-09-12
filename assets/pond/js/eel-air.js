@@ -115,6 +115,7 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
     e.burrowing = 0;
+    e.sandBound = false;
     const rng = createRng(deriveSeed(this.seed, AIR_SALT + (e.index ?? 0)));
     this.map.set(e, {
       rng,
@@ -593,6 +594,7 @@ export class AirStates {
   abort(sys, e, st, why = '') {
     e.ceilingY = this.defaultCeil(e);
     e.floorY = this.defaultFloor(e);
+    e.sandBound = false;
     st.state = null; st.phase = ''; st.exempt = false; st.leap = null;
     // Left armed, a cancelled belly leap fires its flop splash on the next film crossing, whatever caused it.
     st.ringUp = 0.4; st.ringDown = 0.4; st.belly = false;
@@ -607,6 +609,7 @@ export class AirStates {
     const sys = this.sys, head = e.head, r3 = e.radius * 3;
     if (e.tunnel || !this.allows(e)) return false;
     for (const s of sys.colliders.spheres) {
+      // A submerged shoal has no sphere and invites a burrow; an emergent crest's wall is a wall.
       const rr = (s.rHit ?? s.r) + r3;
       if ((head.x - s.x) ** 2 + (head.z - s.z) ** 2 < rr * rr) return false;
     }
@@ -642,6 +645,7 @@ export class AirStates {
     const now = sys.time, d = st.dig, head = e.head;
     const sand = floorHeightAt(head.x, head.z);
     e.floorY = sand - 1.2 * e.radius;
+    e.sandBound = true;   // collide() must not lift this bound by the shoal a second time
     const el = now - st.t0;
     // The press ramps in over dig1 so the body slides under instead of snapping there, holds through
     // the buried hold, and lets go at wake; the halo follows it down and back up.
@@ -684,7 +688,8 @@ export class AirStates {
     }
     // Waking is the dig in reverse: rise into the floor band and swim out along the trail.
     this.puffBudget(e, st, el / 0.8, DIG_BUDGET.wake);
-    const want = this.defaultFloor(e) + e.radius * 1.2;
+    // Off the sand under the head, not the flat default: on a shoal the flat height is inside the mound.
+    const want = sand + e.radius * 2.2 + 0.08;
     const rise = e.prowlBL * e.length * Math.sin(DIG_SLOPE) * dt;
     this.drive(sys, e, dt, { heading: d.ang, speedBL: e.prowlBL, ySet: Math.min(want, head.y + rise), ampMul: 1 });
     if (head.y >= want - 0.01) this.startRecover(sys, e, st, 'burrow');
@@ -953,6 +958,7 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
     e.burrowing = 0;
+    e.sandBound = false;
     st.dim = 0;
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
     if (st.deferNope) { st.deferNope = false; e.nopeUntil = Math.max(e.nopeUntil, this.sys.time + 1.1); }

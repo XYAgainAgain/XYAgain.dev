@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { EEL_POINTS, DEPTH } from './config.js';
-import { floorHeightAt } from './floor.js';
+import { floorHeightAt, shoalHeightAt } from './floor.js';
 
 export const TICK = 1 / 90;
 export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
@@ -182,7 +182,18 @@ export function collide(eels, colliders) {
       // Rock and log colliders both sit proud of what they draw (the log's is a crest-plus-bend
       // envelope), so a slippery snout may take a small bite out of one before the push counts.
       const sink = (1 - glance) * r * 0.35;
-      if (p.y < bFloor) p.y = bFloor;
+      if (ea.sandBound) {
+        // A dig's bound is the sand under each point, not under the head: on a mound the tail lies
+        // lower than the head, and a head-based bound snaps it up the slope the moment the press lets go.
+        const fp = floorHeightAt(p.x, p.z) - r * 1.2;
+        if (p.y < fp) p.y = fp;
+      } else {
+        if (p.y < bFloor) p.y = bFloor;
+        // The flat floor bound knows nothing about a shoal, so each point rides its own mound, capped
+        // under the ceiling so a big body over a tall crest sinks in a little rather than pinning.
+        const mound = shoalHeightAt(p.x, p.z);
+        if (mound > 0 && p.y < bFloor + mound) p.y = Math.min(bFloor + mound, bCeil - r * 0.5);
+      }
       if (p.y > bCeil) p.y = bCeil;
       if (bury > 0) {
         const cap = floorHeightAt(p.x, p.z) - r * 0.9;
