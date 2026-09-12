@@ -5,6 +5,7 @@ import { createRng, deriveSeed } from './rng.js';
 import { shoalHeight } from './reeds-core.js';
 import { capsuleWeight, capsuleInfluence, capsuleWeightCPU, capsuleInfluenceCPU, makeSwell, makeCurrent, fbm2 } from './shading.js';
 import { segDist } from './eel-physics.js';
+import { puffCloudCount } from './pollen-core.js';
 
 /* Lily pads, their petioles, and the night lilies. One instanced draw each; every pad is the same
    parametric disc carved in the vertex shader, riding a footprint-sized sample of the water. */
@@ -30,6 +31,7 @@ const MASS_RADIUS = 0.1;   // a resident's radius: a stalk shove scales by body 
 // orbit; a big one just loses a mouthful of rim. The fragment's bite mask only opens past age 0.8.
 const EAT_FALL = 2.0, BITE_FALL = 0.4, GRAZE_REGROW = MOON_ORBIT_SECONDS, GRAZE_UPLOAD = 0.5;
 const BITE_AGE = 0.9, BITE_NOTCH_ADD = 12 * Math.PI / 180, BITE_NOTCH_MAX = 45 * Math.PI / 180;
+const PUFF_COOLDOWN = 8, LILY_Y = 0.2;   // about the flower's height; the over pass draws with depth off, so only sanity matters
 
 function makePadGeometry() {
   const geo = new THREE.InstancedBufferGeometry();
@@ -95,14 +97,20 @@ function makeLilyGeometry() {
 }
 
 export class PadSystem {
-  /* events: { drip(x, z), settle(x, z) }; main routes them into the audio. */
-  constructor({ underScene, overScene, U, shading, sim, wake, seed, view, colliders, habitat, leaf, motion, events }) {
+  /* events: { drip(x, z), settle(x, z) }; main routes them into the audio. puffs: the PuffCloud layer
+     the lilies exhale into, attached after construction (a PadSystem must work with none). */
+  constructor({ underScene, overScene, U, shading, sim, wake, seed, view, colliders, habitat, leaf, motion, events, puffs }) {
     this.U = U;
     this.sim = sim;
     this.wake = wake;
     this.habitat = habitat;
     this.motion = motion;
     this.events = events;
+    this.puffs = puffs ?? null;
+    this.floaters = null;   // set by main once the floaters exist: the puff seeds the film through it
+    this.seed = seed;
+    this.puffScale = 1;
+    this.puffCount = 0;
     this.pads = [];
     this.crowns = [];
     this.flowers = [];
@@ -215,6 +223,7 @@ export class PadSystem {
       const f = {
         pad: host, size: Math.min(lrng.range(0.55, 1.1), host.r * 1.5), offset: lrng.range(-0.08, 0.08), seed: lrng.range(0, 6.28),
         life, born: -lrng.range(0, life * 0.8), lifeScale: 1, bloom: 0, closeLevel: 1, heavyFor: 0, rng: lrng, active: true,
+        index: this.flowers.length, puffAt: 0, lifts: 0,
       };
       host.flower = f;
       this.flowers.push(f);
@@ -689,12 +698,25 @@ export class PadSystem {
 
   /* Quality ladder rung 4: the tail of the seeded flowers goes dark, pool and layout untouched, so
      restoring at 1 is the exact mirror. Pads, petioles, and crowns are structural and never cut. */
-  setQuality({ lilyFraction = 1 } = {}) {
+  setQuality({ lilyFraction = 1, puffScale = 1 } = {}) {
+    this.puffScale = puffScale;
     const n = Math.max(0, Math.min(this.flowers.length, Math.round(lilyFraction * this.flowers.length)));
     if (n === this.lilyMesh.geometry.instanceCount) return;
     this.lilyMesh.geometry.instanceCount = n;
     // The pad's contact shadow is the one thing a dark lily would still cast; update() reads active.
     this.flowers.forEach((f, i) => { f.active = i < n; });
+  }
+
+  /* The rim radius at a world angle, the CPU twin of the vertex shader's silhouette (undulation, the
+     notch V, an old pad's torn cut), for anything that has to hug the leaf's real edge, not its disc. */
+  rimAt(p, theta) {
+    let th = theta - p.rot;
+    th = Math.atan2(Math.sin(th), Math.cos(th));
+    const ss = (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / ((e1 - e0) || 1e-9))); return t * t * (3 - 2 * t); };
+    const tear = Math.sin(th * 37 + p.seed) * 0.06 * ss(0.8, 1.0, p.age);
+    const wedge = ss(p.notchHalf, p.notchHalf * 0.35, Math.abs(th) + tear);
+    const undulate = 1 + Math.sin(th * 9 + p.seed) * 0.012 + Math.sin(th * 23 + p.seed * 3) * 0.006;
+    return p.r * undulate * (1 - wedge * p.notchDepth);
   }
 
   /* Public: a creature climbing onto a pad transfers water onto it; drips fire when it leaves. */
@@ -822,7 +844,8 @@ export class PadSystem {
         if (wsum < lowLift) { lowLift = wsum; low = k; }
       }
       const thr = p.wet > 0.2 ? 0.5 : 0.8;
-      if (lift > thr && p.lastLift <= thr && now > p.cooldownAt && this.dripBudget >= 1) {
+      const rising = lift > thr && p.lastLift <= thr;
+      if (rising && now > p.cooldownAt && this.dripBudget >= 1) {
         this.dripBudget -= 1;
         p.cooldownAt = now + 1.5;
         p.wet = Math.max(0, p.wet - 0.15);
@@ -836,6 +859,8 @@ export class PadSystem {
         }
         this.events?.drip?.(dx, dz);
       }
+      // The puff never touches the drip budget or its cooldown: a lift the budget swallows still puffs.
+      if (rising && p.flower?.active && p.flower.bloom > 0.6 && p.flower.lifeScale > 0.5 && now > p.flower.puffAt) this.puff(p.flower, now);
       p.lastLift = lift;
       // Settle plop: the strongest speed × weight crossing this frame, one per second pond-wide.
       const plop = speed * Math.min(1, lift);
@@ -928,6 +953,23 @@ export class PadSystem {
       const dx = x - p.x, dz = z - p.z, rr = p.r + r;
       if (dx * dx + dz * dz < rr * rr) p.disturbed = 1;
     }
+  }
+
+  /* A flower's dusty exhale on a lift: seeded from its own identity and lift count so a puff
+     never touches the flower's next-life roll. */
+  puff(f, now) {
+    if (!this.puffs) return;
+    const p = f.pad;
+    f.puffAt = now + PUFF_COOLDOWN;
+    f.lifts += 1;
+    this.puffCount += 1;
+    const prng = createRng(deriveSeed(deriveSeed(this.seed, 1201), f.index * 1000 + f.lifts));
+    const x = p.x + p.swingX + Math.cos(p.rot) * p.r * 0.25;
+    const z = p.z + p.swingZ + Math.sin(p.rot) * p.r * 0.25;
+    const count = puffCloudCount(prng, this.puffScale, this.motion.reduced);
+    this.puffs.burst(x, z, { size: f.size, prng, count, y: LILY_Y });
+    // The same seeded stream, so the settled grains land where this puff's cloud went.
+    if (this.floaters?.addPollen) { const w = this.U.wind.value; this.floaters.addPollen(x, z, prng, Math.atan2(w.y, w.x), w.z); }
   }
 
   updateLilies(dt, now, env) {

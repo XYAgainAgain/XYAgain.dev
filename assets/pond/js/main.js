@@ -28,6 +28,7 @@ import { UnderwaterEffectsPool, KINDS as EFFECT_KINDS } from './effects.js';
 import { RainScheduler } from './rain.js';
 import { PadSystem } from './pads.js';
 import { FloaterSystem } from './floaters.js';
+import { PuffCloud } from './puff-cloud.js';
 import { AlgaeTufts } from './algae.js';
 import { Rushes } from './reeds.js';
 import { PondInput, detectLoop } from './input.js';
@@ -320,8 +321,13 @@ async function boot() {
   // Duckweed after the pads, so its speck seeding can exclude the pad discs already in the registry.
   const floaters = new FloaterSystem({
     overScene, U, sim, wake, shading, seed, view: { w: viewW, h: viewH }, colliders, habitat,
-    carpet: textures.duckweed, rain, motion,
+    carpet: textures.duckweed, rain, motion, pads,
   });
+  // The lily puffs, after the floaters: the cloud eddies on the film's own current and hides under the
+  // same mat silhouette, so it is built from those shared nodes and handed to the pads afterward.
+  const puffs = new PuffCloud({ overScene, U, sim, floaters });
+  pads.puffs = puffs;
+  pads.floaters = floaters;
   // Tufts root on the rocks and logs the floor just built; the CPU bend reads the influence slots each frame.
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
   // Rushes root in the shoals buildFloor just raised, and register their shadow proxies before the first bake.
@@ -344,7 +350,7 @@ async function boot() {
   // of its "on"; these restore values are read here, before any rung has had a chance to apply.
   const uRestore = { algaeDetail: U.algaeDetail.value, coverWobble: U.coverWobble.value };
   // setQuality resets any field it is not given, so the whole desired state goes over on every call.
-  const floaterQ = { speckFraction: 1, detile: true };
+  const floaterQ = { speckFraction: 1, detile: true, pollenFraction: 1, pollen: true };
   const setFloaters = (patch) => { Object.assign(floaterQ, patch); floaters.setQuality({ ...floaterQ }); };
   let texChain = Promise.resolve();
   const setTex = (size) => {
@@ -357,25 +363,25 @@ async function boot() {
   };
 
   const RUNGS = {
-    // 1 is reserved for cutting pollen, which is unbuilt; the rung stays in the order so the rest keep their numbers.
+    1: { on: () => setFloaters({ pollenFraction: 0.5 }), off: () => setFloaters({ pollenFraction: 1 }) },
     2: { on: () => rain.setCap(0.5), off: () => rain.setCap(1) },
     3: { on: () => setFloaters({ speckFraction: 0.4 }), off: () => setFloaters({ speckFraction: 1 }) },
     4: {
       on: () => {
         algae.setQuality({ tuftFraction: 0.5 });
-        pads.setQuality({ lilyFraction: 0.4 });
+        pads.setQuality({ lilyFraction: 0.4, puffScale: 0.5 });
         U.algaeDetail.value = 0;
         U.coverWobble.value = 0;
-        setFloaters({ detile: false });
+        setFloaters({ detile: false, pollen: false });
         treats.setQuality({ shadow: false });
       },
       off: () => {
         algae.setQuality({ tuftFraction: 1 });
-        pads.setQuality({ lilyFraction: 1 });
+        pads.setQuality({ lilyFraction: 1, puffScale: 1 });
         treats.setQuality({ shadow: true });
         U.algaeDetail.value = uRestore.algaeDetail;
         U.coverWobble.value = uRestore.coverWobble;
-        setFloaters({ detile: true });
+        setFloaters({ detile: true, pollen: true });
       },
     },
     5: {
@@ -427,6 +433,7 @@ async function boot() {
   const hand = {
     poke: (x, z) => {
       sim.addDrop(x, z, 0.5, motion.reduced ? 0.08 : 0.2);
+      floaters.tap(x, z);
       eels.spook(x, z, 1);
       audio.plip(1, toPan(x));
     },
@@ -632,6 +639,7 @@ async function boot() {
     // Ahead of anything that spawns, so this frame's effects are stamped with this frame's clock.
     effects.setTime(t);
     sediment.setTime(t);
+    puffs.setTime(t);
     for (let i = singBubs.length - 1; i >= 0; i--) {
       if (t < singBubs[i].at) continue;
       const q = singBubs[i];
@@ -762,7 +770,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, puffs, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

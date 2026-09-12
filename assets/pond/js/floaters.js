@@ -1,17 +1,19 @@
 import * as THREE from 'three/webgpu';
-import { Fn, If, attribute, uniform, uniformArray, varying, vec2, vec3, vec4, float, int, sin, cos, length, smoothstep, mix, pow, step, dot, normalize, texture, uv, fwidth, positionGeometry } from 'three/tsl';
+import { Fn, If, Loop, attribute, uniform, uniformArray, varying, vec2, vec3, vec4, float, int, sin, cos, atan, length, smoothstep, mix, pow, step, dot, normalize, texture, uv, fwidth, positionGeometry } from 'three/tsl';
 import { WAKE_RES, MOON_ORBIT_SECONDS, INF_SLOTS } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { segDist } from './eel-physics.js';
 import { makeCurrent, makeSwell, valueNoise2, capsuleInfluenceCPU } from './shading.js';
+import { layoutPollen, rainThinStep, pollenActive, upwindEdgeSpawn, adhesionBreaks, puffSettleSites, POLLEN_SIM, POLLEN_WASH, POLLEN_REFILL_BELOW, POLLEN_REFILL_N, POLLEN_EDGE_SHARE, POLLEN_MOTE_SHARE, POLLEN_MARGIN, POLLEN_RIM_SHARE, POLLEN_RIM_BAND } from './pollen-core.js';
 
 /* The surface-particle system: one config per layer, one InstancedBufferGeometry each. Phase 2 so far:
-   duckweed specks (CPU particle sim) + the mat decal that carries the frond texture. */
+   duckweed specks (CPU particle sim) + the mat decal that carries the frond texture, plus the pollen film. */
 
-/* Pollen (salt 1500, pool 4,000, last 200 slots for lily puffs) and floating leaves (salt 1600, 60)
-   drop in as further entries; nothing else here assumes duckweed is the only layer. */
+/* Two layers: the duckweed specks and the pollen film. Floating leaves belong to the detritus plan, so
+   nothing here assumes a third entry. */
 export const FLOATERS = {
   duckweed: { salt: 1400, pool: 8000, size: [0.035, 0.06], renderOrder: 10 },
+  pollen: { salt: 1500, pool: 4000, size: [0.008, 0.045], renderOrder: 12 },
 };
 
 export const SPECK_POOL = FLOATERS.duckweed.pool;
@@ -70,7 +72,9 @@ const SPECK_EEL_GAIN = 0.25, SPECK_WIND_GAIN = 0.12;
 const SPECK_BAND = 0.30, SPECK_CORE = 0.22;
 const SPECK_TAIL = 0.26, SPECK_TAIL_LEN = 1.7, SPECK_LOOSE = 0.045, SPECK_REACH = 3.4;
 const POKE_INNER = 0.06, POKE_OUTER = 0.18, POKE_GAIN = 0.18, POKE_VEL = 0.25;
-const OBS_SKIN = 0.06;                     // specks pile against the waterline, never inside it
+const SPECK_SKIN = 0.02;                   // a speck's edge touches the bark; its center sits a hair off it
+const POLLEN_SKIN = 0.0;                   // a grain sits on the waterline itself
+const RIM_N = 64;                          // stations around an emergent stone's real waterline
 const CLUMP_DRIFT = 0.016, CLUMP_DRIFT_CUR = 0.020;   // units/s downwind, plus a nudge from the current
 const CLUMP_STICK = 0.25;                  // a mat that reaches a rock or the log adheres and stops
 // Eleanor is the only body wide enough to plow the mat apart; the residents only warp it. She is
@@ -82,6 +86,10 @@ const CARVE_HEAL_TAU = 85;   // the furrow is ~95% closed in a little under four
 // deeper than parted, where dwelling in her path can. A grazer eats on the same terms.
 export const FINGER_CARVE_R = 0.085, FINGER_CARVE = 0.46;
 const POKE_MAX = 16;                       // sub-frame pointer samples honored per frame
+
+// The reserve: a temporary opacity notch along the finger's own wake channel, in case the RG push alone
+// doesn't read as a parting. Off by default so the default build pays no extra vertex fetch for it.
+const POLLEN_FINGER_NOTCH = false;
 
 function smoothstep01(e0, e1, x) {
   const t = Math.max(0, Math.min(1, (x - e0) / ((e1 - e0) || 1e-9)));
@@ -198,7 +206,8 @@ function makeCardGeometry() {
 }
 
 export class FloaterSystem {
-  constructor({ overScene, U, sim, wake, shading, seed, view, colliders, habitat, carpet, rain, motion }) {
+  constructor({ overScene, U, sim, wake, shading, seed, view, colliders, habitat, carpet, rain, motion, pads = null }) {
+    this.pads = pads;
     this.U = U;
     this.sim = sim;
     this.wake = wake;
@@ -215,6 +224,7 @@ export class FloaterSystem {
     this.scar = buildScarField(sim.extent);
     this.pokeSegs = new Float32Array(POKE_MAX * 4);
     this.poke0 = { n: 0, vx: 0, vz: 0, x0: 0, x1: 0, z0: 0, z1: 0 };
+    this.taps = [];
     this.forceOut = { x: 0, z: 0 };
     this.driftOut = { x: 0, z: 0 };
     this.slotBox = new Float32Array(INF_SLOTS * 5);
@@ -222,16 +232,65 @@ export class FloaterSystem {
     this.carveAcc = 0;
     this.carveBox = null;   // scar-texel AABB of everything plowed and not yet healed
     this.rect = { ex: view.w / 2 + CLUMP_MARGIN, ez: view.h / 2 + CLUMP_MARGIN };
+    // The real waterlines, sampled once: each emergent stone's lumpy rim around it (the disc's r is only
+    // the chord the waves keep) and the bark per station. Mask B and A, the mat, the specks, and the
+    // pollen all hug these, so nothing floating leaves a circle around a stone that is not round.
+    this.rimTable = colliders.waterline.discs.map((o) => {
+      if (!o.rimAt) return null;
+      const t = new Float32Array(RIM_N + 1);
+      for (let i = 0; i <= RIM_N; i++) t[i] = o.rimAt((i / RIM_N) * Math.PI * 2);
+      return t;
+    });
+    this.rimMax = colliders.waterline.discs.map((o, i) => (this.rimTable[i] ? Math.max(...this.rimTable[i]) : o.r));
     this.flattenColliders(colliders);
+    // The film floats on the surface, so only what breaks it holds pollen; a submerged stone is floor.
+    this.polDisc = this.obsDisc;
+    sim.setWaterlineProfiles(this.obsProfile, this.rimTable);
 
     this.layout(seed, view, colliders, rain.wind, sim.extent, habitat);
     // addClump stores a copy, so the registry's objects become ours: growth and drift then have one
     // home that the decal, the specks, and every cover query read.
     this.clumps = this.clumps.map((c) => habitat.addClump(c));
+    // this.memAt and this.insideObstacle both work now: the clumps are registered and the noise/scar
+    // fields were built above, before layout() ever ran.
+    // Rim homes deliberately sit inside the band the open-water class excludes, so rimAt seeds them with no margin.
+    const rims = [
+      ...habitat.pads.map((p) => ({ x: p.x, z: p.z, r: p.r })),
+      ...colliders.waterline.discs.map((o) => ({ x: o.x, z: o.z, r: o.r })),
+      ...colliders.waterline.capsules.map((o) => ({ ax: o.ax, az: o.az, bx: o.bx, bz: o.bz, r: o.r })),
+    ];
+    this.pollenPool = layoutPollen(createRng(deriveSeed(seed, FLOATERS.pollen.salt)), {
+      pool: FLOATERS.pollen.pool, edgeShare: POLLEN_EDGE_SHARE, moteShare: POLLEN_MOTE_SHARE,
+      rimShare: POLLEN_RIM_SHARE, rimBand: POLLEN_RIM_BAND, rims,
+      clumps: this.clumps, windAngle: Math.atan2(rain.wind.z, rain.wind.x),
+      rect: { ex: view.w / 2 + POLLEN_MARGIN, ez: view.h / 2 + POLLEN_MARGIN },
+      memT: (x, z) => this.memAt(x, z) / this.memBand,
+      blocked: (x, z) => this.pollenSolidAt(x, z, 0.05) || !!habitat.padAt(x, z, 0.1),
+      rimAt: (x, z, m) => this.pollenSolidAt(x, z, m) || !!habitat.padAt(x, z, m),
+    });
+    this.pollenFraction = 1;
+    this.pollen = true;
+    this.pollenRain = 1;
+    this.pollenRng = createRng(deriveSeed(seed, 1501));
+    this.pollenRect = { ex: view.w / 2 + POLLEN_MARGIN, ez: view.h / 2 + POLLEN_MARGIN };
+    this.stoneBox = null;
+    for (let i = 0; i < this.polDisc.length; i += 3) {
+      const x = this.polDisc[i], z = this.polDisc[i + 1], r = this.polDisc[i + 2] + 0.05;
+      const b = this.stoneBox || (this.stoneBox = { x0: x - r, x1: x + r, z0: z - r, z1: z + r });
+      if (x - r < b.x0) b.x0 = x - r; if (x + r > b.x1) b.x1 = x + r; if (z - r < b.z0) b.z0 = z - r; if (z + r > b.z1) b.z1 = z + r;
+    }
+    // Pads never move on the CPU beyond their capped swing, so one padded box rejects most grains at once.
+    this.padBox = null;
+    for (const p of habitat.pads) {
+      const r = p.r + 0.25;
+      const b = this.padBox || (this.padBox = { x0: p.x - r, x1: p.x + r, z0: p.z - r, z1: p.z + r });
+      if (p.x - r < b.x0) b.x0 = p.x - r; if (p.x + r > b.x1) b.x1 = p.x + r; if (p.z - r < b.z0) b.z0 = p.z - r; if (p.z + r > b.z1) b.z1 = p.z + r;
+    }
     this.buildShared(U, sim);
     this.buildCarpet(U, carpet);
     this.buildSpecks(U);
-    overScene.add(this.carpetMesh, this.speckMesh);
+    this.buildPollen(U);
+    overScene.add(this.carpetMesh, this.speckMesh, this.pollenMesh);
 
     // The one silhouette test, so a cover query can never disagree with what is drawn.
     habitat.setDuckweedField((x, z) => this.matAt(x, z));
@@ -270,17 +329,17 @@ export class FloaterSystem {
       if (z - r < z0) z0 = z - r; if (z + r > z1) z1 = z + r;
     };
     const d = this.obsDisc, c = this.obsCap;
-    for (let i = 0; i < d.length; i += 3) grow(d[i], d[i + 1], d[i + 2] + OBS_SKIN);
+    for (let i = 0, k = 0; i < d.length; i += 3, k++) grow(d[i], d[i + 1], (this.rimMax?.[k] ?? d[i + 2]) + SPECK_SKIN);
     for (let i = 0, k = 0; i < c.length; i += 5, k++) {
       const pr = this.obsProfile[k];
       if (!pr) {
-        grow(c[i], c[i + 1], c[i + 4] + OBS_SKIN);
-        grow(c[i + 2], c[i + 3], c[i + 4] + OBS_SKIN);
+        grow(c[i], c[i + 1], c[i + 4] + SPECK_SKIN);
+        grow(c[i + 2], c[i + 3], c[i + 4] + SPECK_SKIN);
         continue;
       }
       let mw = 0;
       for (let q = 0; q < pr.w.length; q++) if (pr.w[q] > mw) mw = pr.w[q];
-      const r = mw + OBS_SKIN;
+      const r = mw + SPECK_SKIN;
       grow(pr.ax, pr.az, r);
       grow(pr.ax + pr.ux * pr.len, pr.az + pr.uz * pr.len, r);
     }
@@ -304,7 +363,10 @@ export class FloaterSystem {
       w[i * 2] = wp || wn;
       w[i * 2 + 1] = wn || wp;
     }
-    return { ax, az, ux, uz, len, w };
+    // A hollow trunk's bore is water at the waterline: its chord there is where the pollen may float in.
+    const ay = ((l.a.y ?? 0) + (l.b.y ?? 0)) * 0.5, ri = l.rInner ?? 0;
+    const bore = ri > Math.abs(ay) ? Math.sqrt(ri * ri - ay * ay) : 0;
+    return { ax, az, ux, uz, len, w, bore };
   }
 
   /* Signed offset from the axis of the point where one flank meets the water, the same bracket algae.js
@@ -331,8 +393,10 @@ export class FloaterSystem {
 
   insideObstacle(x, z, margin = 0) {
     const d = this.obsDisc;
-    for (let i = 0; i < d.length; i += 3) {
-      const dx = x - d[i], dz = z - d[i + 1], r = d[i + 2] + margin;
+    for (let i = 0, k = 0; i < d.length; i += 3, k++) {
+      const dx = x - d[i], dz = z - d[i + 1], rm = this.rimMax[k] + margin;
+      if (dx * dx + dz * dz >= rm * rm) continue;
+      const r = this.rimR(k, Math.atan2(dz, dx)) + margin;
       if (dx * dx + dz * dz < r * r) return true;
     }
     const c = this.obsCap;
@@ -345,6 +409,39 @@ export class FloaterSystem {
       const rx = x - pr.ax, rz = z - pr.az;
       const s = rx * pr.ux + rz * pr.uz;
       if (s < 0 || s > pr.len) continue;   // both mouths are open annuli, so nothing juts past an end
+      const perp = rx * -pr.uz + rz * pr.ux;
+      if (Math.abs(perp) < this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + margin) return true;
+    }
+    return false;
+  }
+
+  /* A stone's waterline radius at a world angle, from its table; the plain chord when it has none. */
+  rimR(k, theta) {
+    const t = this.rimTable[k];
+    if (!t) return this.polDisc[k * 3 + 2];
+    const f = ((theta / (Math.PI * 2)) % 1 + 1) % 1 * RIM_N, i0 = Math.floor(f);
+    return t[i0] + (t[i0 + 1] - t[i0]) * (f - i0);
+  }
+
+  /* The pollen's solid: the emergent stones at their real waterline plus the log's bark. */
+  pollenSolidAt(x, z, margin = 0) {
+    const d = this.polDisc;
+    for (let i = 0, k = 0; i < d.length; i += 3, k++) {
+      const dx = x - d[i], dz = z - d[i + 1], rm = this.rimMax[k] + margin;
+      if (dx * dx + dz * dz >= rm * rm) continue;
+      const r = this.rimR(k, Math.atan2(dz, dx)) + margin;
+      if (dx * dx + dz * dz < r * r) return true;
+    }
+    const c = this.obsCap;
+    for (let i = 0, k = 0; i < c.length; i += 5, k++) {
+      const pr = this.obsProfile[k];
+      if (!pr) {
+        if (segDist(x, z, c[i], c[i + 1], c[i + 2], c[i + 3]) < c[i + 4] + margin) return true;
+        continue;
+      }
+      const rx = x - pr.ax, rz = z - pr.az;
+      const s = rx * pr.ux + rz * pr.uz;
+      if (s < 0 || s > pr.len) continue;
       const perp = rx * -pr.uz + rz * pr.ux;
       if (Math.abs(perp) < this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + margin) return true;
     }
@@ -536,6 +633,25 @@ export class FloaterSystem {
     this.clumps.forEach((c, i) => { this.growthArr[i].x = c.growth; this.growF[i] = c.growth; });
     this.uWeedGrowth = uniformArray(this.growthArr);
 
+    // Hoisted out of buildCarpet so the pollen's collapse reads the exact scalar the mat is cut on,
+    // never a second copy that could drift from it; knobs.memEdge/memSlope/memNoise/scarK still point here.
+    this.uMemEdge = uniform(MEM_EDGE);
+    this.uMemSlope = uniform(MEM_SLOPE);
+    this.uMemNoise = uniform(MEM_NOISE);
+    this.uMemMid = uniform(NOISE_MID);
+    this.uScarK = uniform(SCAR_K);
+
+    // Clump center, radius, and warp phase as uniform-array mirrors of the CPU records: matEdgeAt loops
+    // every clump per pollen vertex, where the carpet's own per-instance attributes don't reach.
+    this.clumpArr = Array.from({ length: CLUMP_POOL }, () => new THREE.Vector4(0, 0, 0, 0));
+    this.phaseArr = Array.from({ length: CLUMP_POOL }, () => new THREE.Vector4(0, 0, 0, 0));
+    this.clumps.forEach((c, i) => {
+      this.clumpArr[i].set(c.x, c.z, c.r, 0);
+      this.phaseArr[i].set(c.phases[0], c.phases[1], c.phases[2], c.phases[3]);
+    });
+    this.uWeedClump = uniformArray(this.clumpArr);
+    this.uWeedPhase = uniformArray(this.phaseArr);
+
     this.warpAt = Fn(([theta, ph]) => {
       const h = this.uWeedWarpHarm, a = this.uWeedWarpAmp;
       const s = sin(theta.mul(h.x).add(ph.x)).mul(a.x)
@@ -553,6 +669,32 @@ export class FloaterSystem {
       const g = vec2(sw.y, sw.z).mul(this.uWeedSwellTilt).toVar();
       g.assign(g.mul(this.uWeedTiltMax.div(length(g).max(1e-5)).min(1)));
       return vec3(h.add(sw.x), g.x, g.y);
+    });
+
+    // The mat's silhouette at any world point, for the pollen's collapse: the winner is the clump with the
+    // smallest normalized radius, and the noise is read once, in that winner's own drifted frame.
+    this.matEdgeAt = Fn(([xz]) => {
+      const best = float(99).toVar();
+      const bestLocal = vec2(0, 0).toVar();
+      Loop(CLUMP_POOL, ({ i }) => {
+        const g = this.uWeedGrowth.element(i);
+        const c = this.uWeedClump.element(i);
+        const ph = this.uWeedPhase.element(i);
+        const l = xz.sub(g.yz);
+        const d = l.sub(c.xy);
+        const rn = float(99).toVar();
+        If(c.z.greaterThan(0), () => {
+          const denom = c.z.mul(g.x).mul(this.warpAt(atan(d.y, d.x), ph)).max(1e-4);
+          rn.assign(length(d).div(denom));
+        });
+        If(rn.lessThan(best), () => {
+          best.assign(rn);
+          bestLocal.assign(l);
+        });
+      });
+      const nz = this.noiseTex.sample(bestLocal.div(this.uWeedExtent).add(0.5)).r;
+      const sc = this.scarTex.sample(xz.div(this.uWeedExtent).add(0.5)).r;
+      return this.uMemEdge.sub(best).mul(this.uMemSlope).add(nz.sub(this.uMemMid).mul(this.uMemNoise)).sub(sc.mul(this.uScarK));
     });
   }
 
@@ -581,10 +723,11 @@ export class FloaterSystem {
     const uCarpetWakeWarp = uniform(0.07);         // an eel under the mat scrunches the fronds, never tears them
     const uCarpetWakeTilt = uniform(0.35);
     const uCarpetTearLo = uniform(0.30), uCarpetTearHi = uniform(0.60), uCarpetTearAmt = uniform(3.2);
-    const uCarpetSpan = uniform(MEM_SPAN), uCarpetMemEdge = uniform(MEM_EDGE);
-    const uCarpetMemSlope = uniform(MEM_SLOPE), uCarpetMemNoise = uniform(MEM_NOISE);
-    const uCarpetMemMid = uniform(NOISE_MID);
-    const uCarpetScarK = uniform(SCAR_K);
+    const uCarpetSpan = uniform(MEM_SPAN);
+    // Hoisted to buildShared so the pollen's collapse can never disagree with the mat it collapses under.
+    const uCarpetMemEdge = this.uMemEdge, uCarpetMemSlope = this.uMemSlope;
+    const uCarpetMemNoise = this.uMemNoise, uCarpetMemMid = this.uMemMid;
+    const uCarpetScarK = this.uScarK;
     // Push-aside: the fronds slide off the finger's line instead of only vanishing along it.
     const uCarpetPart = uniform(0.09), uCarpetPartStep = uniform(this.sim.extent * 1.2 / WAKE_RES);
     const uCarpetPartLo = uniform(0.02), uCarpetPartHi = uniform(0.30);
@@ -679,7 +822,7 @@ export class FloaterSystem {
       const dens = uCarpetMemEdge.sub(rr.mul(uCarpetSpan)).mul(uCarpetMemSlope);
       const nz = this.noiseTex.sample(src.div(this.uWeedExtent).add(0.5)).r;
       const tear = smoothstep(uCarpetTearLo, uCarpetTearHi, fa).mul(uCarpetTearAmt);
-      const solid = this.sim.mask.sample(c).r;
+      const solid = this.sim.mask.sample(c).b;
       // The scar reads at the fragment's world position while the noise reads in the clump's frame: a
       // furrow stays where it was plowed instead of riding a drifting mat across the pond.
       const scar = this.scarTex.sample(c).r;
@@ -817,11 +960,145 @@ export class FloaterSystem {
     this.knobs.colA = uWeedColA; this.knobs.colB = uWeedColB; this.knobs.speckGain = uWeedGain;
   }
 
+  /* The ambient pollen film: additive pinpricks that go where the wind, the current, the eels, and the
+     finger take them, stick to whatever they touch, and get knocked off; the seeded layout is only frame one. */
+  buildPollen(U) {
+    const geo = makeCardGeometry();
+    const n = this.pollenPool.length;
+    this.pollenPos = new Float32Array(n * 2);
+    this.pollenVel = new Float32Array(n * 2);
+    this.pollenStuck = new Uint8Array(n);
+    this.pollenFreeT = new Float32Array(n);   // no adhesion until this clock: a knocked-off grain has to get away first
+    this.pollenAttr = new Float32Array(n * 4);
+    this.pollenRespawned = 0;
+    this.pollenFrame = 0;
+    this.pollenK = { ...POLLEN_SIM };
+    this.pollenPool.forEach((p, i) => {
+      this.pollenPos.set([p.x, p.z], i * 2);
+      this.pollenAttr.set([p.clump, p.mote, p.alpha, p.seed], i * 4);
+    });
+    // Rim homes are born as the crust: snapped onto their wall and stuck, so the waterline is dense from frame one.
+    this.pollenPool.forEach((p, i) => { if (p.rim && p.alpha > 0) this.settlePollen(i); });
+    this.aPollenPos = new THREE.InstancedBufferAttribute(this.pollenPos, 2);
+    this.aPollenPos.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aPos', this.aPollenPos);
+    this.aPollenAttr = new THREE.InstancedBufferAttribute(this.pollenAttr, 4);
+    this.aPollenAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aPollen', this.aPollenAttr);
+    this.pollenAlive = this.pollenPool.reduce((n, p) => n + (p.alpha > 0 ? 1 : 0), 0);
+    this.pollenWashed = 0;
+    this.rainWas = false;
+    geo.instanceCount = pollenActive(FLOATERS.pollen.pool, this.pollenFraction, this.pollen, this.pollenRain);
+
+    const uPollenMatSoft = uniform(0.15);
+    const uPollenPinR = uniform(0.012), uPollenMoteR = uniform(0.035), uPollenFloat = uniform(0.008);
+    const uPollenMotePow = uniform(1.6), uPollenMoteA = uniform(0.35), uPollenPinA = uniform(0.9);
+    const uPollenSlopeK = uniform(12), uPollenSlopeMax = uniform(1.0);
+    const uPollenPeak = uniform(1.2), uPollenPinSparkle = uniform(1.8);
+    const uPollenColor = uniform(new THREE.Vector3(1.0, 0.86, 0.42));
+    const uPollenGain = uniform(1.0);
+    // Follows sim.setResolution (quality rung 6) the same way the carpet's own texel node does.
+    const uPollenTexel2 = this.sim.uTexel.mul(2);
+    let uPollenFingerNotch;
+    if (POLLEN_FINGER_NOTCH) uPollenFingerNotch = uniform(0.6);
+
+    const vPolPos = varying(vec2(0), 'vPolPos');
+    const vPolClass = varying(float(0), 'vPolClass');
+    const vPolAlpha = varying(float(0), 'vPolAlpha');
+    const vPolSeed = varying(float(0), 'vPolSeed');
+
+    const mat = new THREE.NodeMaterial();
+    mat.positionNode = Fn(() => {
+      const P = attribute('aPollen', 'vec4');
+      // The CPU owns every grain's motion (stepPollen); the shader only hides one under a frond or a wall.
+      const here = attribute('aPos', 'vec2').toVar();
+      const edge = this.matEdgeAt(here);
+      const matV = smoothstep(uPollenMatSoft.negate(), uPollenMatSoft, edge);
+      const solid = this.sim.mask.sample(here.div(this.uWeedExtent).add(0.5)).a;
+      const collapse = matV.oneMinus().mul(solid.oneMinus()).toVar();
+      if (POLLEN_FINGER_NOTCH) {
+        const notch = smoothstep(float(0.3), float(0.7), this.wake.fingerAt(here)).mul(uPollenFingerNotch);
+        collapse.mulAssign(notch.oneMinus());
+      }
+      // Landing on the size, not the alpha: a collapsed or dead (alpha 0) card is a degenerate quad,
+      // which costs no fragments instead of drawing full size over nothing.
+      const halfW = mix(uPollenPinR, uPollenMoteR, P.y).mul(P.w.mul(0.5).add(0.75)).mul(collapse).mul(step(float(0.01), P.z));
+      const q = positionGeometry.xy.mul(halfW);
+      vPolPos.assign(here);
+      vPolClass.assign(P.y);
+      vPolAlpha.assign(P.z);
+      vPolSeed.assign(P.w);
+      return vec3(here.x.add(q.x), uPollenFloat, here.y.add(q.y));
+    })();
+
+    mat.fragmentNode = Fn(() => {
+      const q = uv().sub(0.5).mul(2);
+      const r = length(q);
+      // A soft broad core for a mote, a hard-edged disc for a pinprick, mixed by class.
+      const soft = pow(r.oneMinus().max(0), uPollenMotePow).mul(uPollenMoteA);
+      const hard = smoothstep(1.0, 0.55, r).mul(uPollenPinA);
+      const shape = mix(hard, soft, vPolClass);
+      // The mat's own two-texel slope, reused: a passing wave brightens a ribbon of pollen, never a flash.
+      const c = vPolPos.div(this.uWeedExtent).add(0.5);
+      const hL = this.sim.read.sample(c.sub(vec2(uPollenTexel2, 0))).r, hR = this.sim.read.sample(c.add(vec2(uPollenTexel2, 0))).r;
+      const hD = this.sim.read.sample(c.sub(vec2(0, uPollenTexel2))).r, hU = this.sim.read.sample(c.add(vec2(0, uPollenTexel2))).r;
+      const slope = vec2(hL.sub(hR), hD.sub(hU)).mul(0.5);
+      const sparkle = length(slope).mul(uPollenSlopeK).clamp(0, uPollenSlopeMax);
+      const peak = step(0.92, vPolSeed).mul(vPolClass.oneMinus()).mul(uPollenPeak);
+      const bright = float(1).add(sparkle.mul(mix(1.0, uPollenPinSparkle, vPolClass.oneMinus()))).add(peak);
+      const col = uPollenColor.mul(U.moonColor).mul(U.moonStrength).mul(uPollenGain).mul(bright).mul(shape).mul(vPolAlpha);
+      return vec4(col, 0);
+    })();
+    mat.transparent = true;
+    mat.blending = THREE.CustomBlending;
+    mat.blendEquation = THREE.AddEquation;
+    mat.blendSrc = THREE.OneFactor;
+    mat.blendDst = THREE.OneFactor;
+    mat.blendSrcAlpha = THREE.ZeroFactor;
+    mat.blendDstAlpha = THREE.OneFactor;
+    mat.depthTest = false;
+    mat.depthWrite = false;
+    mat.side = THREE.DoubleSide;
+    mat.forceSinglePass = true;
+    this.pollenMaterial = mat;
+    this.pollenMesh = new THREE.Mesh(geo, mat);
+    this.pollenMesh.frustumCulled = false;
+    this.pollenMesh.renderOrder = FLOATERS.pollen.renderOrder;
+    this.knobs.pollen = {
+      sim: this.pollenK,
+      matSoft: uPollenMatSoft, pinR: uPollenPinR, moteR: uPollenMoteR, float: uPollenFloat,
+      motePow: uPollenMotePow, moteA: uPollenMoteA, pinA: uPollenPinA, slopeK: uPollenSlopeK,
+      slopeMax: uPollenSlopeMax, peak: uPollenPeak, pinSparkle: uPollenPinSparkle,
+      color: uPollenColor, gain: uPollenGain,
+    };
+    if (POLLEN_FINGER_NOTCH) this.knobs.pollen.fingerNotch = uPollenFingerNotch;
+  }
+
   /* Quality ladder: instance counts and uniforms only, never an allocation. The speck pool is
      shuffled, so cutting the tail thins every clump evenly. */
-  setQuality({ speckFraction = 1, detile = true } = {}) {
+  setQuality({ speckFraction = 1, detile = true, pollenFraction = 1, pollen = true } = {}) {
     this.speckMesh.geometry.instanceCount = Math.max(0, Math.min(this.speckCount, Math.round(this.speckCount * speckFraction)));
     this.uCarpetDetile.value = detile ? 1 : 0;
+    // The pollen count itself is applied in update(), because the rain-thinning factor moves every frame.
+    this.pollenFraction = pollenFraction;
+    this.pollen = pollen;
+  }
+
+  debug() {
+    let motes = 0, pins = 0, edge = 0, rim = 0, open = 0, dead = 0;
+    // Liveness comes from the attribute: washes and puff refills never touch the pool records.
+    const attr = this.pollenAttr;
+    for (let k = 0; k < this.pollenPool.length; k++) {
+      const p = this.pollenPool[k];
+      if (attr[k * 4 + 2] <= 0) { dead++; continue; }
+      if (p.clump >= 0) edge++; else if (p.rim) rim++; else open++;
+      if (p.mote) motes++; else pins++;
+    }
+    let stuck = 0;
+    const n = this.pollenMesh.geometry.instanceCount;
+    let onMat = 0;
+    for (let i = 0; i < n; i++) { if (this.pollenStuck[i]) stuck++; if (this.pollenStuck[i] === 2) onMat++; }
+    return { pollen: { pool: this.pollenPool.length, active: n, motes, pins, edge, rim, open, dead, alive: this.pollenAlive, washed: this.pollenWashed, stuck, onMat, respawned: this.pollenRespawned, rainK: this.pollenRain } };
   }
 
   /* One sub-frame segment of the finger's path, appended. main.js hands over every coalesced pointer
@@ -837,6 +1114,11 @@ export class FloaterSystem {
       p.z0 = Math.min(p.z0, az, bz); p.z1 = Math.max(p.z1, az, bz);
     }
     p.vx = vx; p.vz = vz; p.n++;
+  }
+
+  /* A tap on the film: one frame's radial burst on the pollen, consumed by the next update. */
+  tap(x, z) {
+    this.taps.push({ x, z });
   }
 
   /* One capsule bitten out of the world-space scar layer, once, whatever mats are over it. floorMode (the
@@ -951,7 +1233,16 @@ export class FloaterSystem {
     // Rain loosens the packing: the downwind bias eases off 30% while a shower is running.
     const target = this.rain?.envelope > 0.5 ? 0.7 : 1;
     this.windCalm += (target - this.windCalm) * Math.min(1, dt / 2);
-    this.stepSpecks(dt);
+    // Each shower washes a fifth of the film out of the pond for good; only the lilies bring it back.
+    const raining = (this.rain?.envelope ?? 0) > 0.3;
+    if (raining && !this.rainWas) this.washPollen(POLLEN_WASH);
+    this.rainWas = raining;
+    this.pollenRain = rainThinStep(this.pollenRain, this.rain?.envelope ?? 0, dt);
+    this.pollenMesh.geometry.instanceCount = pollenActive(this.pollenPool.length, this.pollenFraction, this.pollen, this.pollenRain);
+    this.stepSpecks(dt, true);
+    this.stepPollen(dt, now);
+    this.poke0.n = 0;
+    this.taps.length = 0;
   }
 
   /* Mats wander downwind a few centimeters a second, so a pond left running rearranges itself and islands
@@ -985,7 +1276,7 @@ export class FloaterSystem {
   stepSpecks(dt) {
     const pk = this.poke0, seg = this.pokeSegs;
     const n = Math.min(this.speckCount, this.speckMesh.geometry.instanceCount);
-    if (n <= 0) { pk.n = 0; return; }
+    if (n <= 0) return;
     const U = this.U, h = Math.min(dt, SPECK_DT_MAX), ms = U.motionScale.value;
     // Eels stay an event under reduced motion; the wind is idle motion and follows motionScale.
     const eelK = SPECK_EEL_GAIN * (0.5 + 0.5 * ms);
@@ -1056,9 +1347,11 @@ export class FloaterSystem {
       // Held at the waterline: the inward velocity dies so wind and wakes pile duckweed against the
       // log and the taller stones instead of sliding it through them.
       if (px >= ox0 && px <= ox1 && pz >= oz0 && pz <= oz1) {
-        for (let j = 0; j < dA.length; j += 3) {
-          const dx = px - dA[j], dz = pz - dA[j + 1], rr = dA[j + 2] + OBS_SKIN;
+        for (let j = 0, k = 0; j < dA.length; j += 3, k++) {
+          const dx = px - dA[j], dz = pz - dA[j + 1], rm = this.rimMax[k] + SPECK_SKIN;
           const d2 = dx * dx + dz * dz;
+          if (d2 >= rm * rm) continue;
+          const rr = this.rimR(k, Math.atan2(dz, dx)) + SPECK_SKIN;
           if (d2 >= rr * rr) continue;
           const d = Math.sqrt(d2);
           const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
@@ -1074,7 +1367,7 @@ export class FloaterSystem {
             if (s < 0 || s > pr.len) continue;   // the mouths are open annuli: no cap juts past either end
             const perp = rx * -pr.uz + rz * pr.ux;
             const ap = perp < 0 ? -perp : perp;
-            const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + OBS_SKIN;
+            const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + SPECK_SKIN;
             if (ap >= rw) continue;
             // Out through whichever face is nearer, so a speck that drifted in past a mouth leaves by the
             // mouth instead of being shouldered the whole width of the trunk.
@@ -1088,7 +1381,7 @@ export class FloaterSystem {
             continue;
           }
           // Squared compare in the hot path: segDist's hypot would run 20,000 times a frame for nothing.
-          const rr = cA[j + 4] + OBS_SKIN;
+          const rr = cA[j + 4] + SPECK_SKIN;
           const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
           const t = Math.max(0, Math.min(1, ((px - ax) * bx + (pz - az) * bz) / (bx * bx + bz * bz || 1e-9)));
           const qx = ax + bx * t, qz = az + bz * t;
@@ -1108,11 +1401,252 @@ export class FloaterSystem {
     this.aOff.clearUpdateRanges();
     this.aOff.addUpdateRange(0, n * 2);
     this.aOff.needsUpdate = true;
-    pk.n = 0;
+  }
+
+  washPollen(share) {
+    const attr = this.pollenAttr, n = this.pollenPool.length;
+    let want = Math.round(this.pollenAlive * share);
+    for (let tries = 0; tries < n * 4 && want > 0; tries++) {
+      const i = (this.pollenRng.next() * n) | 0;
+      if (attr[i * 4 + 2] <= 0) continue;
+      attr[i * 4 + 2] = 0; this.pollenStuck[i] = 0;
+      this.pollenAlive--; this.pollenWashed++; want--;
+    }
+    this.aPollenAttr.needsUpdate = true;
+  }
+
+  /* A lily's puff seeds the film again while the pond is under its allotment: dead slots come back
+     along the cloud's own path, so the new grains lie where the dust would have settled. */
+  addPollen(x, z, prng, windAngle, gust) {
+    const pool = this.pollenPool.length;
+    if (this.pollenAlive >= pool * POLLEN_REFILL_BELOW) return 0;
+    const count = POLLEN_REFILL_N[0] + Math.floor(prng.next() * (POLLEN_REFILL_N[1] - POLLEN_REFILL_N[0] + 1));
+    const sites = puffSettleSites(prng, { x, z, count, windAngle, gust, rect: this.pollenRect });
+    const attr = this.pollenAttr, pos = this.pollenPos;
+    let placed = 0, i = 0;
+    for (const s of sites) {
+      while (i < pool && attr[i * 4 + 2] > 0) i++;
+      if (i >= pool) break;
+      if (this.pollenSolidAt(s.x, s.z, 0) || this.habitat.padAt(s.x, s.z, 0)) continue;
+      pos[i * 2] = s.x; pos[i * 2 + 1] = s.z;
+      this.pollenVel[i * 2] = 0; this.pollenVel[i * 2 + 1] = 0;
+      this.pollenStuck[i] = 0; this.pollenFreeT[i] = 0;
+      attr[i * 4 + 2] = 0.55 + prng.next() * 0.45;
+      this.pollenAlive++; placed++; i++;
+    }
+    if (placed) { this.aPollenAttr.needsUpdate = true; this.aPollenPos.needsUpdate = true; }
+    return placed;
+  }
+
+  /* Project one grain onto the nearest wall it is inside of (rocks, the log's bark, the pads) with the
+     pollen skin; returns true when it touched one and leaves the outward normal in this.forceOut. */
+  projectPollen(i) {
+    const pos = this.pollenPos, i2 = i * 2, out = this.forceOut;
+    let px = pos[i2], pz = pos[i2 + 1], hit = false;
+    const dA = this.polDisc, cA = this.obsCap, prof = this.obsProfile;
+    for (let j = 0, k = 0; j < dA.length; j += 3, k++) {
+      const dx = px - dA[j], dz = pz - dA[j + 1], rm = this.rimMax[k] + POLLEN_SKIN;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= rm * rm) continue;
+      const rr = this.rimR(k, Math.atan2(dz, dx)) + POLLEN_SKIN;
+      if (d2 >= rr * rr) continue;
+      const d = Math.sqrt(d2);
+      const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
+      px = dA[j] + nx * rr; pz = dA[j + 1] + nz * rr;
+      out.x = nx; out.z = nz; hit = true;
+    }
+    // A pad by its real rim (the notch is water), at its live center: the cover disc would crust the cutout.
+    if (this.pads) for (const p of this.pads.pads) {
+      if (p.r <= 0.01) continue;
+      const cx = p.x + p.swingX, cz = p.z + p.swingZ;
+      const dx = px - cx, dz = pz - cz, d2 = dx * dx + dz * dz, rMax = p.r * 1.03 + POLLEN_SKIN;
+      if (d2 >= rMax * rMax) continue;
+      const d = Math.sqrt(d2), th = Math.atan2(dz, dx);
+      const rim = this.pads.rimAt(p, th) + POLLEN_SKIN;
+      if (d >= rim) continue;
+      const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
+      px = cx + nx * rim; pz = cz + nz * rim;
+      out.x = nx; out.z = nz; hit = true;
+    }
+    for (let j = 0, k = 0; j < cA.length; j += 5, k++) {
+      const pr = prof[k];
+      if (pr) {
+        const rx = px - pr.ax, rz = pz - pr.az;
+        const s = rx * pr.ux + rz * pr.uz;
+        if (s < 0 || s > pr.len) continue;
+        const perp = rx * -pr.uz + rz * pr.ux;
+        const ap = perp < 0 ? -perp : perp;
+        const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1) + POLLEN_SKIN;
+        const bore = pr.bore > 0 ? Math.max(0, pr.bore - POLLEN_SKIN) : 0;
+        if (ap >= rw || ap < bore) continue;   // outside the bark, or floating in the hollow's water
+        // Sideways only, to the bark or the bore wall: pushing out through a mouth lined the film up across it.
+        const toOuter = rw - ap, toBore = bore > 0 ? ap - bore : Infinity;
+        let nlx, nlz, push;
+        if (toBore < toOuter) { const g = perp >= 0 ? -1 : 1; nlx = -pr.uz * g; nlz = pr.ux * g; push = toBore + 1e-3; }
+        else { const g = perp >= 0 ? 1 : -1; nlx = -pr.uz * g; nlz = pr.ux * g; push = toOuter; }
+        px += nlx * push; pz += nlz * push;
+        out.x = nlx; out.z = nlz; hit = true;
+        continue;
+      }
+      const rr = cA[j + 4] + POLLEN_SKIN;
+      const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
+      const t = Math.max(0, Math.min(1, ((px - ax) * bx + (pz - az) * bz) / (bx * bx + bz * bz || 1e-9)));
+      const qx = ax + bx * t, qz = az + bz * t;
+      const dx = px - qx, dz = pz - qz, dd = dx * dx + dz * dz;
+      if (dd >= rr * rr) continue;
+      const d = Math.sqrt(dd);
+      const nx = d > 1e-5 ? dx / d : 1, nz = d > 1e-5 ? dz / d : 0;
+      px = qx + nx * rr; pz = qz + nz * rr;
+      out.x = nx; out.z = nz; hit = true;
+    }
+    pos[i2] = px; pos[i2 + 1] = pz;
+    return hit;
+  }
+
+  /* Seed-time only: a rim home is pulled onto its wall and glued, so the crust exists before any drift. */
+  settlePollen(i) {
+    const pos = this.pollenPos, i2 = i * 2, x = pos[i2], z = pos[i2 + 1];
+    // Nudge inward a little first so the projection has something to push back out to the waterline.
+    let best = -1, bd = Infinity;
+    const dA = this.polDisc;
+    for (let j = 0, k = 0; j < dA.length; j += 3, k++) {
+      const dx = x - dA[j], dz = z - dA[j + 1];
+      const d = Math.hypot(dx, dz) - this.rimR(k, Math.atan2(dz, dx));
+      if (d < bd) { bd = d; best = j; }
+    }
+    if (best >= 0 && bd < 0.2) {
+      const dx = x - dA[best], dz = z - dA[best + 1], d = Math.hypot(dx, dz) || 1e-6;
+      const rr = this.rimR(best / 3, Math.atan2(dz, dx)) + POLLEN_SKIN;
+      pos[i2] = dA[best] + dx / d * rr; pos[i2 + 1] = dA[best + 1] + dz / d * rr;
+      this.pollenStuck[i] = 1;
+      return;
+    }
+    if (this.pads) for (const p of this.pads.pads) {
+      const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz) || 1e-6;
+      if (p.r <= 0.01 || d > p.r + 0.2) continue;
+      const rim = this.pads.rimAt(p, Math.atan2(dz, dx)) + POLLEN_SKIN;
+      pos[i2] = p.x + dx / d * rim; pos[i2 + 1] = p.z + dz / d * rim;
+      this.pollenStuck[i] = 1;
+      return;
+    }
+    // Near the log: step toward the axis until the projection bites, then it is on the bark.
+    const cA = this.obsCap;
+    for (let j = 0; j < cA.length; j += 5) {
+      const ax = cA[j], az = cA[j + 1], bx = cA[j + 2] - ax, bz = cA[j + 3] - az;
+      const t = Math.max(0, Math.min(1, ((x - ax) * bx + (z - az) * bz) / (bx * bx + bz * bz || 1e-9)));
+      const qx = ax + bx * t, qz = az + bz * t, dx = x - qx, dz = z - qz, d = Math.hypot(dx, dz) || 1e-6;
+      if (d > cA[j + 4] + 0.5) continue;
+      for (let step = 0; step < 12; step++) {
+        pos[i2] = x - dx / d * (step * 0.03); pos[i2 + 1] = z - dz / d * (step * 0.03);
+        if (this.projectPollen(i)) { this.pollenStuck[i] = 1; return; }
+      }
+      pos[i2] = x; pos[i2 + 1] = z;
+    }
+  }
+
+  /* The film, free-floating: no home, no spring. A grain rides the wind, the current, an eel, and the
+     finger, glues itself to the first wall or frond it meets, and lets go when shoved harder than K.break. */
+  stepPollen(dt, now) {
+    const n = this.pollenMesh.geometry.instanceCount;
+    if (n <= 0) return;
+    const K = this.pollenK, U = this.U, h = Math.min(dt, SPECK_DT_MAX), ms = U.motionScale.value;
+    const pk = this.poke0, seg = this.pokeSegs, sb = this.slotBox;
+    let ns = 0;
+    for (let i = 0; i < INF_SLOTS; i++) if (U.infB.array[i].w > 0) ns++;
+    const w = U.wind.value, windX = w.x * w.z * K.wind * ms, windZ = w.y * w.z * K.wind * ms;
+    const eelK = K.eel * (0.5 + 0.5 * ms), curK = K.cur * ms;
+    const pos = this.pollenPos, vel = this.pollenVel, stuck = this.pollenStuck, freeT = this.pollenFreeT;
+    const out = this.forceOut, cur = this.driftOut, rect = this.pollenRect;
+    const ex = rect.ex + POLLEN_MARGIN, ez = rect.ez + POLLEN_MARGIN;
+    const px0 = pk.x0 - POKE_OUTER, px1 = pk.x1 + POKE_OUTER, pz0 = pk.z0 - POKE_OUTER, pz1 = pk.z1 + POKE_OUTER;
+    const ob = this.obsBox, pb = this.padBox;
+    const frame = this.pollenFrame++;
+    const brk = K.break, ease = Math.min(1, K.drag * h), relP = K.release * h, relM = K.matRelease * h;
+    const taps = this.taps, tapR = K.tapR, tapG = K.tap;
+    const attr = this.pollenAttr;
+    for (let i = 0; i < n; i++) {
+      if (attr[i * 4 + 2] <= 0) continue;   // washed out of the pond, or never placed
+      const i2 = i * 2;
+      let px = pos[i2], pz = pos[i2 + 1];
+      // The push at this grain: eels and the finger are events; the wind is a steady lean.
+      let fx = windX, fz = windZ;
+      for (let s = 0; s < ns; s++) {
+        const o = s * 5;
+        if (px < sb[o + 1] || px > sb[o + 2] || pz < sb[o + 3] || pz > sb[o + 4]) continue;
+        capsuleInfluenceCPU(U, px, 0, pz, sb[o], out);
+        fx += out.x * eelK; fz += out.z * eelK;
+      }
+      let sx = 0, sz = 0;
+      if (pk.n && px >= px0 && px <= px1 && pz >= pz0 && pz <= pz1) {
+        let bd = POKE_OUTER, brx = 0, brz = 0;
+        for (let s = 0; s < pk.n; s++) {
+          const o = s * 4, ax = seg[o], az = seg[o + 1], qx = seg[o + 2] - ax, qz = seg[o + 3] - az;
+          const t = Math.max(0, Math.min(1, ((px - ax) * qx + (pz - az) * qz) / (qx * qx + qz * qz || 1e-9)));
+          const rx = px - (ax + qx * t), rz = pz - (az + qz * t), d = Math.sqrt(rx * rx + rz * rz);
+          if (d < bd) { bd = d; brx = rx; brz = rz; }
+        }
+        if (bd < POKE_OUTER) {
+          // Dust on water rides with the finger: its own speed carries a grain along the drag and off a log's end.
+          const inv = 1 / Math.max(1e-4, bd), gk = smoothstep01(POKE_OUTER, POKE_INNER, bd);
+          sx = (brx * inv * K.pokeRadial + pk.vx * K.poke) * gk; sz = (brz * inv * K.pokeRadial + pk.vz * K.poke) * gk;
+        }
+      }
+      // A tap is a splash: one frame's radial shove past the break, so a crust bursts open in a ring.
+      for (let s = 0; s < taps.length; s++) {
+        const dx = px - taps[s].x, dz = pz - taps[s].z, d = Math.sqrt(dx * dx + dz * dz);
+        if (d >= tapR) continue;
+        const g = smoothstep01(tapR, tapR * 0.25, d) * tapG / Math.max(1e-4, d);
+        sx += dx * g; sz += dz * g;
+      }
+      if (stuck[i]) {
+        // Glued: only a shove past the break lets go, plus a slow random release so the crust breathes
+        // (quicker off a frond line than off bark, so the mats do not end up owning the whole pool).
+        const rel = stuck[i] === 2 ? relM : relP;
+        if (!adhesionBreaks(fx + sx, fz + sz, brk) && !(rel > 0 && this.pollenRng.next() < rel)) continue;
+        stuck[i] = 0;
+        freeT[i] = now + K.freeFor;
+        vel[i2] = fx + sx; vel[i2 + 1] = fz + sz;
+        if (this.projectPollen(i)) { px = pos[i2] + out.x * K.kick; pz = pos[i2 + 1] + out.z * K.kick; pos[i2] = px; pos[i2 + 1] = pz; }
+      }
+      this.currentAt(px, pz, now, cur);
+      // The field is a target speed the grain eases toward, so the wind never slings; the finger is an
+      // impulse on top, so a swish flings a grain a unit or two before the drag settles it.
+      const tx = fx + cur.x * curK, tz = fz + cur.z * curK;
+      let vx = vel[i2] + (tx - vel[i2]) * ease + sx, vz = vel[i2 + 1] + (tz - vel[i2 + 1]) * ease + sz;
+      const v2 = vx * vx + vz * vz;
+      if (v2 > K.vmax * K.vmax) { const s = K.vmax / Math.sqrt(v2); vx *= s; vz *= s; }
+      const ppx = px, ppz = pz;
+      px += vx * h; pz += vz * h;
+      pos[i2] = px; pos[i2 + 1] = pz;
+      // A wall: project, and glue unless the grain was just knocked loose.
+      const sb2 = this.stoneBox;
+      const inBox = (ob && px >= ob.x0 && px <= ob.x1 && pz >= ob.z0 && pz <= ob.z1) || (pb && px >= pb.x0 && px <= pb.x1 && pz >= pb.z0 && pz <= pb.z1) || (sb2 && px >= sb2.x0 && px <= sb2.x1 && pz >= sb2.z0 && pz <= sb2.z1);
+      if (inBox && this.projectPollen(i)) {
+        px = pos[i2]; pz = pos[i2 + 1];
+        if (now >= freeT[i]) { stuck[i] = 1; vel[i2] = 0; vel[i2 + 1] = 0; continue; }
+        const vn = vx * out.x + vz * out.z;
+        if (vn < 0) { vx -= vn * out.x; vz -= vn * out.z; }
+      } else if (((i + frame) & 3) === 0 && now >= freeT[i] && this.memAt(px, pz) > 0) {
+        // A frond line is a wall too: back up to the last free spot and glue there (checked every 4th frame per grain).
+        pos[i2] = ppx; pos[i2 + 1] = ppz;
+        stuck[i] = 2; vel[i2] = 0; vel[i2 + 1] = 0;
+        continue;
+      }
+      vel[i2] = vx; vel[i2 + 1] = vz;
+      // Off the frame: come back on the upwind edge, out of view, and drift in. Nothing regrows in place.
+      if (px < -ex || px > ex || pz < -ez || pz > ez) {
+        const s = upwindEdgeSpawn(this.pollenRng, { x: w.x, z: w.y }, rect, POLLEN_MARGIN * 0.5);
+        pos[i2] = s.x; pos[i2 + 1] = s.z; vel[i2] = 0; vel[i2 + 1] = 0; freeT[i] = now + 1;
+        this.pollenRespawned++;
+      }
+    }
+    this.aPollenPos.clearUpdateRanges();
+    this.aPollenPos.addUpdateRange(0, n * 2);
+    this.aPollenPos.needsUpdate = true;
   }
 
   dispose() {
-    for (const m of [this.carpetMesh, this.speckMesh]) { m.geometry.dispose(); m.material.dispose(); }
+    for (const m of [this.carpetMesh, this.speckMesh, this.pollenMesh]) { m.geometry.dispose(); m.material.dispose(); }
     this.noise.tex.dispose();
     this.scar.tex.dispose();
   }

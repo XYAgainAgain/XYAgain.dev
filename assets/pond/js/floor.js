@@ -535,7 +535,23 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
     // Chord of the rock at y = 0 is what the water sim treats as a wall; a dry top is a perch.
     if (top > 0) {
       const frac = Math.sqrt(Math.max(0, 1 - (m.position.y / ry) ** 2));
-      colliders.waterline.discs.push({ x: m.position.x, z: m.position.z, r: rc * frac });
+      // The stone's real waterline at a world angle, lumps and all, for the pollen crust; the disc's r is
+      // the inscribed chord the waves and the specks keep. The unit-sphere azimuth is solved from the
+      // squashed one, and the elevation where the surface meets y = 0 refined through the lump factor.
+      const rotY = m.rotation.y, py = m.position.y;
+      const rimAt = (theta) => {
+        const tl = theta + rotY;   // rotation.y turns local x toward −z, so a world angle is the local one minus it
+        const psi = Math.atan2(Math.sin(tl) / sq[2], Math.cos(tl) / sq[0]);
+        const cx = Math.cos(psi), cz = Math.sin(psi);
+        let phi = Math.asin(Math.max(-1, Math.min(1, -py / (r * sq[1])))), k = 1;
+        for (let it = 0; it < 3; it++) {
+          const ux = Math.cos(phi) * cx, uy = Math.sin(phi), uz = Math.cos(phi) * cz;
+          k = 1 + 0.16 * lumpNoise(ux, uy, uz, f, ph) + 0.05 * lumpNoise(ux * 3.1, uy * 3.1, uz * 3.1, f, ph);
+          phi = Math.asin(Math.max(-1, Math.min(1, -py / (k * r * sq[1]))));
+        }
+        return Math.cos(phi) * k * r * Math.hypot(sq[0] * cx, sq[2] * cz);
+      };
+      colliders.waterline.discs.push({ x: m.position.x, z: m.position.z, r: rc * frac, rimAt });
       habitat?.addPerch({ x: m.position.x, y: top, z: m.position.z, type: 'rock', radius: rc * 0.5 });
     }
   }
