@@ -15,6 +15,7 @@ import { attachFear } from './eel-fear.js';
 import { attachAir } from './eel-air.js';
 import { attachQuirks } from './eel-quirks.js';
 import { attachCrush } from './eel-crush.js';
+import { attachBond } from './eel-bond.js';
 import { attachTreats } from './treats.js';
 import { attachEleanor } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
@@ -162,6 +163,8 @@ async function boot() {
   const quirks = attachQuirks(eels, seed);
   // After quirks: the crush's punchline emits a bonk, and its huff leans on the stim shuffle.
   const crush = attachCrush(eels, seed);
+  // After the crush: a crush bout outranks a life bond, and the fit test asks the crush directly.
+  const bond = attachBond(eels, seed);
 
   // MSAA here is the scene's antialiasing: the canvas only ever shows a fullscreen quad. 2× is the budget.
   const underRT = new THREE.RenderTarget(1, 1, {
@@ -275,6 +278,7 @@ async function boot() {
   eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
   eels.on('headbutt', (ev) => audio.headbutt({ pan: ev.pan, length: ev.length }));
   eels.on('rescue', (ev) => audio.rescue({ pan: ev.pan }));
+  eels.on('boop', (ev) => audio.boop({ pan: ev.pan }));
   // A scatter is the startle heard from farther off: same voice, quieter, so a whole pond bolting
   // does not stack into noise.
   eels.on('scatter', (ev) => audio.startle({ pan: ev.pan, length: ev.length, db: -8 }));
@@ -748,7 +752,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, rain, wake, relief, habitat, moon, pads, floaters, algae, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

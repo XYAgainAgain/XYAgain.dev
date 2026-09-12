@@ -168,7 +168,7 @@ export function pickTarget(sys, e, now) {
   const moonCover = sys.air?.coverMul(e) ?? 1;
   // The bore is the one stretch a snake cannot swim on cardinals, so Jaz waits longer between runs.
   const cooldown = tunnelDial(sys, 'cooldown') * (e.quirks.snake ? tunnelDial(sys, 'snakeCool') : 1);
-  if (log && !lairBlocked && e.tunnel === null && logFits(e, log) && now - e.boreAt > cooldown) {
+  if (log && !lairBlocked && e.tunnel === null && logFits(e, log) && now - e.boreAt > cooldown && !sys?.bond?.inBout(e)) {
     // Crowding counts live runs rather than the coverSpot label, which one eel drops the moment its
     // own run ends; the moon reweights the bore the way it already reweights every other cover branch.
     const logClaims = flock.reduce((n, o) => n + (o !== e && o.tunnel ? 1 : 0), 0);
@@ -295,7 +295,7 @@ function updateGait(sys, e, now, act) {
     }
     // F5 bends both odds at once: a fresh alarm keeps everyone up, a well-slept corner invites the
     // next bout. The draw happens either way, so the rng stream never shifts with it.
-    const mood = sys.fear?.holdMul(e) ?? 1;
+    const mood = (sys.fear?.holdMul(e) ?? 1) * (sys.bond?.holdMul(e) ?? 1);
     const p = (t.holdChance / act) * mood, bonus = Math.min(NAP_CAP, nap * NAP_GAIN) * mood, u = rng.next();
     if (u < p || u < p + (1 - p) * bonus) {
       e.gait = 'hold'; e.gaitUntil = now + rng.range(t.holdTime[0], t.holdTime[1]);
@@ -377,11 +377,25 @@ export function affection(e, o, now) {
 // A crusher is spoken for: whichever social bout started first wins, and a braid recruiting one
 // mid-bout would overwrite the lane target under a claim the crush already holds.
 function twineFree(sys, o, now) {
-  return !o.slurpedBy && !o.tunnel && !o.food && !o.twine && o.gait !== 'hold' && now > o.fleeUntil && !o.restPose?.kind && !sys.crush?.active(o);
+  return !o.slurpedBy && !o.tunnel && !o.food && !o.twine && o.gait !== 'hold' && now > o.fleeUntil && !o.restPose?.kind && !sys.crush?.active(o) && !sys.bond?.twineLocked(o);
 }
 
-function endTwine(g) {
+export function endTwine(g) {
   for (const m of g.members) if (m.twine === g) m.twine = null;
+}
+
+/* One braid, whether the roll below started it or a module did. `len` is the span in seconds; null
+   rolls it off the leader's own stream, which is where that draw has always lived. */
+export function startTwine(sys, members, now, len = null) {
+  if (!Array.isArray(members) || members.length < 2) return null;
+  const lead = members[0];
+  const g = {
+    members, guide: new THREE.Vector3(lead.head.x, 0, lead.head.z), goal: lead.target.clone(),
+    dir: lead.heading.clone(), t0: now,
+    until: now + (len ?? lead.rng.range(TWINE_LEN[0], TWINE_LEN[1])),
+  };
+  for (let i = 0; i < members.length; i++) { members[i].twine = g; members[i].twinePhase = (i / members.length) * Math.PI * 2; }
+  return g;
 }
 
 /* Vi's next victim: on screen, reachable, and weighted so her favorite target comes up most. */
@@ -724,7 +738,7 @@ export function steer(sys, e, dt) {
   const looping = e.gait === 'loop' && now < e.gaitUntil && !e.tunnel && !e.food;
   const snug = e.snuggle.with && now < e.snuggle.until && e.snuggle.with.gait === 'hold' && !e.snuggle.with.slurpedBy ? e.snuggle.with : null;
   if (!snug) e.snuggle.with = null;
-  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e);
+  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e) || !!sys.bond?.active(e);
   // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
   // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
   const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
@@ -838,6 +852,9 @@ export function steer(sys, e, dt) {
   // The crush gag (eel-crush.js) parks its lane point here: social tier, a target write and nothing
   // else, so the turn-rate clamp is what makes the follower miss Jaz's corners.
   if (!busy) { const m = sys.crush?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
+  // The life bond (eel-bond.js) parks the seek, the hello, the stroll lane, and the vigil here, the
+  // same way and in the same tier. The rest phase writes nothing: the snuggle block above owns it.
+  if (!busy) { const m = sys.bond?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
 
   tmpB.subVectors(e.target, head); tmpB.y = 0;
   // A hold that has reached its spot stops pulling and (below) stops creeping: at creep speed the turn
@@ -931,25 +948,22 @@ export function steer(sys, e, dt) {
     const dx = e.partner.head.x - head.x, dz = e.partner.head.z - head.z;
     const d = Math.hypot(dx, dz);
     if (d > e.length * 1.2 && d < 8) {
-      const w = e.quirks.followWeight ?? 0.3;
+      const w = (e.quirks.followWeight ?? 0.3) * (sys.bond?.pullMul(e) ?? 1);
       force.x += (dx / d) * w; force.z += (dz / d) * w;
     }
   }
 
   // Twining. The leader starts it: fond eels swimming alongside get pulled into a braid for a while.
-  if (!e.twine && twineFree(sys, e, now) && rng.chance(TWINE_CHANCE * dt)) {
+  if (!e.twine && twineFree(sys, e, now) && rng.chance(TWINE_CHANCE * dt * (sys.bond?.twineMul(e) ?? 1))) {
     let members = null;
     for (const o of e.flock) {
-      if (o === e || !twineFree(sys, o, now) || affection(e, o, now) < 0.6) continue;
+      if (o === e || !twineFree(sys, o, now) || (affection(e, o, now) < 0.6 && !sys.bond?.bonded(e, o))) continue;
       const d = Math.hypot(o.head.x - head.x, o.head.z - head.z);
       if (d > TWINE_REACH * e.length || o.heading.dot(e.heading) < 0.3) continue;
       (members ??= [e]).push(o);
       if (members.length === 3) break;
     }
-    if (members) {
-      const g = { members, guide: new THREE.Vector3(head.x, 0, head.z), goal: e.target.clone(), dir: e.heading.clone(), t0: now, until: now + rng.range(TWINE_LEN[0], TWINE_LEN[1]) };
-      for (let i = 0; i < members.length; i++) { members[i].twine = g; members[i].twinePhase = (i / members.length) * Math.PI * 2; }
-    }
+    if (members) startTwine(sys, members, now);
   }
   if (e.twine) {
     const g = e.twine, lead = g.members[0];
@@ -1168,7 +1182,7 @@ export function steer(sys, e, dt) {
   let crowd = 0;
   if (!e.tunnel) {
     const sep = (o) => {
-      if (o === e || o === e.partner || o.slurpedBy) return;
+      if (o === e || o === e.partner || o.slurpedBy || sys.bond?.bonded(e, o)) return;
       const dx = head.x - o.head.x, dz = head.z - o.head.z;
       const d = Math.hypot(dx, dz);
       let want = (e.length + o.length) * 0.25;
@@ -1218,9 +1232,9 @@ export function steer(sys, e, dt) {
 
   // A crush member is committed to moving: the cadence roll waits until the bout lets go, or a
   // random hold would sit them down mid-chase and read as giving up for no reason.
-  if (!sys.crush?.active(e)) updateGait(sys, e, now, (1 + 0.35 * rainEnv) * (sys.air?.travelMul(e) ?? 1));
+  if (!sys.crush?.active(e) && !sys.bond?.follower(e)) updateGait(sys, e, now, (1 + 0.35 * rainEnv) * (sys.air?.travelMul(e) ?? 1));
   // A long hold bout is where the coil and the sickle start, one per bout.
-  if (e.gait === 'hold' && e.gaitUntil - e.gaitFrom > 5 && e.poseBout !== e.gaitFrom) {
+  if (e.gait === 'hold' && e.gaitUntil - e.gaitFrom > 5 && e.poseBout !== e.gaitFrom && !sys.bond?.inBout(e)) {
     e.poseBout = e.gaitFrom;
     if (e.quirks.spiralSleep) startPose(e, 'coil', now);
     else if (e.quirks.sickleRest) startPose(e, 'sickle', now);
@@ -1261,6 +1275,8 @@ export function steer(sys, e, dt) {
   if (e.restPose.kind) gaitBL = Math.max(gaitBL, e.prowlBL);   // the shape only draws if she keeps moving
   if (crowd > 0.3 && gait === 'hold') gaitBL = Math.max(gaitBL, e.prowlBL * 0.6);   // shuffle out of a pile
   if (crowd > 0.6 && e.gait === 'hold' && !snug) { e.gaitUntil = Math.min(e.gaitUntil, now); }   // a real shove wakes a napper
+  // Strolling at the couple's pace, not their own: the quicker partner throttles so neither swims alone.
+  if (gait !== 'hold') gaitBL *= sys.bond?.paceMul(e) ?? 1;
   const stim = Math.max(0, e.speedMul - 1);
   // Q-D on the voluntary rate only, before the clamp: a food-drunk eel is slower, never a slower eel.
   const drunk = foodDrunk(e);

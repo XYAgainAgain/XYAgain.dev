@@ -68,8 +68,8 @@ export const IDENTITIES = [
     quirks: { follows: 'Bee', followWeight: 0.4, snake: true, spiralSleep: true, gourmet: true, graze: true },
   },
   {
-    name: 'Jim',   // wears Dad's beloved tablecloth, all 26 stripes, a different tonic every roll;
-                   // slow, checks on the others; low hunger, yields meals; bonded with Shelley
+    name: 'Jim',   // wears Dad's beloved tablecloth, all 26 stripes, a different tonic every roll; slow,
+                   // checks on the others; low hunger, yields meals; life-bonded to Shelley, strolling level with her
     pronouns: 'he/him',
     nicks: [['Jim', 70], ['Dad', 20], ['My Literal Actual Father', 10]],
     build: { length: [2.3, 2.7], radius: [0.085, 0.1] },
@@ -78,17 +78,18 @@ export const IDENTITIES = [
     ramp: { stops: JIM_TABLECLOTH, rotate: true, jitter: 0.15, sat: 1.4, gain: 1.15, skin: 1 },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], band: [1, 1, 1], flank: [0, 0, 0], wavy: [0, 1] },   // every stripe edge lights, no flank
     traits: { cruise: [0.68, 0.82], prowl: [0.24, 0.34], hunger: 0.5, yield: 1, curious: 1.25, braincellUsage: 0.7, nose: 0.8, stim: 0.2, leap: 0.1, home: 'pad', fears: { eleanor: 0.7 }, spinOdds: 0.2 },
-    quirks: { follows: 'Shelley', followWeight: 0.7 },
+    quirks: { follows: 'Shelley', followWeight: 0.7, lifeBond: 'Shelley', lifeBondSeek: 0.5, lifeBondLead: 0.4, lifeBondAhead: 0 },
   },
   {
-    name: 'Shelley',   // silvery, fast, often ahead of Jim; random rest stops, tiny attention span
+    name: 'Shelley',   // silvery, fast, often ahead of Jim; random rest stops, tiny attention span;
+                       // life-bonded to Jim, leads most strolls, and rides half a body ahead of him
     pronouns: 'she/her',
     nicks: [['Shelley', 60], ['Mom', 20], ['Shel', 10], ['My Literal Actual Mother', 10]],
     build: { length: [2.2, 2.6], radius: [0.08, 0.095] },
     colorsA: [SILVER], colorsB: [SILVER, MAGENTA],
     pattern: { stripe: [0.4, 0.2, 0.5], spot: [0.4, 0.2, 0.5], flank: [0.9, 0.5, 0.9], wavy: [0, 1.2] },
     traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 } },
-    quirks: { follows: 'Jim', followWeight: 0.45 },
+    quirks: { follows: 'Jim', followWeight: 0.45, lifeBond: 'Jim', lifeBondSeek: 0.5, lifeBondLead: 0.6, lifeBondAhead: 0.5 },
   },
   {
     name: 'Josh',   // longest, always some orange; bold, fast, sharp turns; crush on Eleanor

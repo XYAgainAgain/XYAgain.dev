@@ -267,6 +267,7 @@ export class AirStates {
     // A refuge contest owns both parties' ticks; starting an air state under one would run two
     // controllers on the same eel and pause the contest with its locks still held.
     if (sys.fear?.contesting?.(e)) return null;
+    if (sys.bond?.inBout?.(e)) return null;   // a couple mid-bout keeps to the water; the bout would end on any of these
     if (sys.time < st.coolUntil) return null;
     if (needStamina && st.airFor > AIR_CAP * 0.5) return null;
     if (this.scared(sys, e)) return null;
@@ -625,6 +626,7 @@ export class AirStates {
     // One dig per hold bout, the way the coil and the sickle work: the asleep hold asks every tick,
     // and without this the eel climbs out and immediately digs back in for the whole bout.
     if (!force && st.burrowBout === e.gaitFrom) return false;
+    if (!force && sys.bond?.inBout?.(e)) return false;   // the asleep hold asks from steer, past ready()
     // Force skips the contest, never the placement test: a dig under a pad or a log is a body in scenery.
     if (!force && sys.fear?.contesting?.(e)) return false;
     if (!this.canBurrow(e)) return false;

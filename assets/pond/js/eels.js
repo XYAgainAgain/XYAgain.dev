@@ -115,7 +115,7 @@ export class Eel {
 const EVENT_TYPES = [
   'startle', 'eat', 'slurp', 'nibble', 'swap', 'sing', 'headbutt', 'rescue', 'graze', 'tea', 'drop',
   'peek', 'splash', 'dig', 'bonk', 'gape', 'lunge', 'spin', 'scatter', 'moonbite', 'overit',
-  'toss', 'void', 'huff',
+  'toss', 'void', 'huff', 'boop',
 ];
 // Held-feed cadence: 250 BPM on the simulation clock, so the crumb stream is the same at 60 and 240 Hz.
 const CRUMB_S = 60 / 250;
@@ -181,6 +181,14 @@ export class EelSystem {
         odds: 1, joinRadius: 5, joinBoost: 1.6, gap: 1.0, laneTol: 0.6, flusterPer: 0.34,
         boutMax: 25, huff: 3, snub: 8, cool: 120, exitStagger: [0.3, 0.8], bonk: 1,
       },
+      // The life bond (eel-bond.js): the pining meter's clocks in seconds, the two coins (null hands the
+      // choice back to the identities), the stroll and rest spans, and the vigil kept on a guest.
+      bond: {
+        apart: [60, 120], farDist: 5, nearFill: 0.7, seekMax: 40, seekOdds: null, hello: 1.5, helloTwine: 0.75,
+        stroll: [30, 90], strollHold: 0.6, strollRest: 0.05, leadOdds: null, twineBoost: 4, rest: [20, 60],
+        restTogether: 2, loneRest: 0.5, cool: 45, apartPull: 0.5, keep: 0.5, guestNear: 6, panicCut: 0.35,
+        vigilGap: 2.5, vigilMax: 30, brave: 0.15, reunionHellos: 3, forceWait: 90,
+      },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
     // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt) and initEel(sys, e).
@@ -211,6 +219,7 @@ export class EelSystem {
     this.stim = null;              // eel-quirks.js; stimming, bonks, spin feeding, the one roll owner
     this.treats = null;            // treats.js; the airborne crumb, its shadow, and the landing
     this.crush = null;             // eel-crush.js; the followers' failed attempts at Jaz's grid
+    this.bond = null;              // eel-bond.js; the bonded couples finding each other and settling down
     this.headingAdapter = null;    // Chunk 1's context steering: (sys, e, force, dt) → desired heading angle
     // Everything smellable, keyed by kind. Crumbs register themselves in feed(); a fish school or a
     // dipping firefly registers the same shape with its own plume growth and plop radius.

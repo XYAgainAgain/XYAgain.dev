@@ -168,6 +168,8 @@ class FearSystem {
       let t = o.threat ?? 0.3;
       // A hunter published its quarry: everyone else is a bystander to the same chase.
       if (o.threatOn) t *= o.threatOn === observer ? 1.5 : 0.6;
+      // An eel keeping watch on the guest who swallowed their partner is not afraid of her right now.
+      t *= this.sys.bond?.brave(observer, o) ?? 1;
       return clamp01(t);
     }
     const now = this.sys.time;
@@ -579,6 +581,7 @@ class FearSystem {
         if (v === e || v.slurpedBy || sys.air?.owns(v)) continue;
         const vs = this.stateFor(v);
         if (vs.contest || vs.scatter) continue;
+        if (sys.bond?.inBout?.(e) || sys.bond?.inBout?.(v)) continue;   // a couple mid-bout picks no fights
         if (Math.hypot(v.head.x - refuge.x, v.head.z - refuge.z) > reach) continue;
         if (affection(e, v, now) > 0 || affection(v, e, now) > 0) continue;
         const pk = this.pairKey(e, v);

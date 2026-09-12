@@ -332,6 +332,13 @@ export class PondAudio {
     this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan, delay: 0.12 });
   }
 
+  /* A snoot-boop: two tiny bubs a hair further apart than the rescue's, and never throttled, since a
+     reunion fires three of these in a row and swallowing any one of them ruins the joke. */
+  boop({ pan = null } = {}) {
+    this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan });
+    this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan, delay: 0.18 });
+  }
+
   /* Nibble/surface bubbles; lightly throttled so a dinner circle stays bubbly, not fizzy. */
   tinyBub({ pan = null } = {}) {
     const now = Tone.now();
