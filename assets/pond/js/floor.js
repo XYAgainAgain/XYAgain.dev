@@ -459,7 +459,7 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const loader = new THREE.TextureLoader();
   const manifest = await loadManifest();
   // Every manifest set loads here, once; the flora takes leaf and duckweed from the returned library.
-  const names = ['sand', 'stone', 'algae', 'wood', 'leaf', 'duckweed'];
+  const names = ['sand', 'stone', 'algae', 'wood', 'leaf', 'duckweed', 'detritus'];
   const sets = await Promise.all(names.map((n) => loadSet(loader, manifest, n, textureSize)));
   const textures = Object.fromEntries(names.map((n, i) => [n, sets[i]]));
   const { sand, stone, algae, wood } = textures;

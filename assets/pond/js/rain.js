@@ -63,6 +63,7 @@ export class RainScheduler {
     this.surface = surface;
     this.audio = audio;
     this.habitat = null;       // set by main once the flora exists; feature drops dodge the pads
+    this.onFeatureDrop = null;  // the CPU ripple sink, connected once the detritus system exists
 
     this.envelope = 0;         // what the pond sees: intensity, capped under reduced motion
     this.intensity = 0;        // what the shower actually is; the audio bed rides this
@@ -210,8 +211,15 @@ export class RainScheduler {
             d.v = 0.5 + (Math.random() - 0.5) * bv;
             open = !this.habitat?.padAt((d.u - 0.5) * this.sim.extent, (d.v - 0.5) * this.sim.extent, 0);
           }
-          if (open) { d.s = roll(BIG_STRENGTH); d.r = roll(BIG_RADIUS); }
-          else { d.s = roll(STRENGTH); d.r = MICRO_RADIUS; }
+          if (open) {
+            d.s = roll(BIG_STRENGTH); d.r = roll(BIG_RADIUS);
+            this.onFeatureDrop?.(
+              (d.u - 0.5) * this.sim.extent,
+              (d.v - 0.5) * this.sim.extent,
+              d.s,
+              d.r * this.sim.extent / SIM_RES
+            );
+          } else { d.s = roll(STRENGTH); d.r = MICRO_RADIUS; }
         } else {
           d.u = Math.random();
           d.v = Math.random();

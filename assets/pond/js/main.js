@@ -5,7 +5,7 @@ import { seedFromUrl, deriveSeed, createRng } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
-import { buildFloor, setTextureSize, setRelief } from './floor.js';
+import { buildFloor, floorHeightAt, setTextureSize, setRelief } from './floor.js';
 import { WakeBuffer } from './wake.js';
 import { ReliefField } from './relief.js';
 import { Habitat } from './cover.js';
@@ -31,6 +31,8 @@ import { FloaterSystem } from './floaters.js';
 import { PuffCloud } from './puff-cloud.js';
 import { AlgaeTufts } from './algae.js';
 import { Rushes } from './reeds.js';
+import { createDetritus } from './detritus.js';
+import { createDetritusMeshes } from './detritus-render.js';
 import { PondInput, detectLoop } from './input.js';
 import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle, bindJunk } from './ui.js';
@@ -334,6 +336,24 @@ async function boot() {
   const rushes = new Rushes({ underScene, overScene, U, shading, wake, seed, shoals, colliders, habitat, motion, view: { w: viewW, h: viewH } });
   // After the pads, which the landing has to query, and before hand.feed, which is now a throw.
   const treats = attachTreats(eels, { overScene, pads, view, motion, U });
+  // Floating litter: the drift and contact are the floaters' own collider tables and curl, so the litter
+  // banks on the same rocks the specks do, and the dials land on pond.eels.knobs.detritus.
+  const detritus = createDetritus({
+    U, seed, view: { w: viewW, h: viewH }, wind: rain.wind, knobs: eels.knobs,
+    current: (x, z, at, out) => floaters.currentAt(x, z, at, out),
+    contact: (x, z, r, out) => floaters.obstacleContact(x, z, r, out),
+    matField: (x, z) => floaters.memAt(x, z),
+    floorAt: floorHeightAt,
+  });
+  rain.onFeatureDrop = (x, z, strength, radius) => detritus.ring(x, z, strength, radius);
+  // The atlas arrives as the manifest's own set, whose albedo carries the cutout in its alpha; passing it
+  // as `atlas` would look for an albedoOpacity key and silently fall back to the plain leaf map.
+  const detritusMeshes = createDetritusMeshes({ U, sim, textures, buffers: detritus.buffers, pads, shading });
+  overScene.add(detritusMeshes.sticks, detritusMeshes.cards, detritusMeshes.chunky);
+  underScene.add(detritusMeshes.sinkTray);
+  detritusMeshes.setCounts(detritus.draw);
+  const litterShadow = 0.65;
+  detritusMeshes.setShadow(litterShadow);
   eels.graze = new Grazing({ floaters, algae, pads, habitat });
   eels.tea = new TeaTime({ pads });
   eels.knobs.tea = eels.tea.knobs;   // pond.eels.knobs.tea.<dial>, tuned live
@@ -374,11 +394,20 @@ async function boot() {
         U.coverWobble.value = 0;
         setFloaters({ detile: false, pollen: false });
         treats.setQuality({ shadow: false });
+        // Cards and chunky go, decorative twigs halve, the six shelter sticks stay: cover is ecology.
+        detritus.setQuality({ cardFraction: 0, twigFraction: 0.5, chunkFraction: 0 });
+        detritusMeshes.setCounts(detritus.draw);
+        detritusMeshes.sinkTray.visible = false;
+        detritusMeshes.setShadow(0);
       },
       off: () => {
         algae.setQuality({ tuftFraction: 1 });
         pads.setQuality({ lilyFraction: 1, puffScale: 1 });
         treats.setQuality({ shadow: true });
+        detritus.setQuality({});
+        detritusMeshes.setCounts(detritus.draw);
+        detritusMeshes.sinkTray.visible = true;
+        detritusMeshes.setShadow(litterShadow);
         U.algaeDetail.value = uRestore.algaeDetail;
         U.coverWobble.value = uRestore.coverWobble;
         setFloaters({ detile: true, pollen: true });
@@ -427,12 +456,14 @@ async function boot() {
   let swishUntil = 0;
   let lastCrackle = 0;
   // A finger through the water leaves a wake too; the frame loop hands the drag segment to the wake buffer.
-  const finger = { x: 0, z: 0, px: 0, pz: 0, at: -1, path: null, idx: 0 };
+  const finger = { x: 0, z: 0, px: 0, pz: 0, vx: 0, vz: 0, at: -1, moveAt: 0, path: null, idx: 0 };
   // One handler set: PondInput drives it live and eels.playInput drives the same functions, so a
   // recorded gesture makes the same water, sounds, and spooks a hand does.
   const hand = {
     poke: (x, z) => {
-      sim.addDrop(x, z, 0.5, motion.reduced ? 0.08 : 0.2);
+      const strength = motion.reduced ? 0.08 : 0.2;
+      sim.addDrop(x, z, 0.5, strength);
+      detritus.ring(x, z, strength, 0.5);
       floaters.tap(x, z);
       eels.spook(x, z, 1);
       audio.plip(1, toPan(x));
@@ -458,11 +489,15 @@ async function boot() {
         let vx = (b.x - a.x) / dtp, vz = (b.z - a.z) / dtp;
         const sp = Math.hypot(vx, vz);
         if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
-        for (let k = Math.max(finger.idx, n - 1 - 16); k < n - 1; k++) floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+        for (let k = Math.max(finger.idx, n - 1 - 16); k < n - 1; k++) {
+          floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+          detritus.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+        }
         wake.poke(a.x, a.z, b.x, b.z, vx, vz, 0.35, 16);
         rushes.poke(a.x, a.z, b.x, b.z, vx, vz);
       }
       finger.at = -1;
+      finger.vx = 0; finger.vz = 0; finger.moveAt = 0;
       for (const p of path.slice(-6)) eels.lure(p.x, p.z);
     },
     // The crumb is born a pond depth up and the splash comes with it; the ring and the plop moved to
@@ -568,6 +603,27 @@ async function boot() {
     sim.addDrop(x, z, 0.8 + Math.random() * 0.8, 0.08 + Math.random() * 0.1);
   }
 
+  /* The litter's own splashes, batched into the injector the pads and the rain already share. An impact
+     also shoves what it ran into, since a branch outweighs a pad rim, a rush, and every twig it meets. */
+  const wakePool = Array.from({ length: detritus.wakes.length }, () => ({ u: 0, v: 0, s: 0, r: 0 }));
+  const wakeDrops = [];
+  const spendWakes = () => {
+    const n = detritus.wakeN;
+    if (!n || !impulse.available) return;
+    wakeDrops.length = 0;
+    for (let i = 0; i < n; i++) {
+      const w = detritus.wakes[i], d = wakePool[i];
+      // sim.toUV inline: it returns a fresh pair, and this runs up to 16 times a frame.
+      d.u = w.x / sim.extent + 0.5; d.v = w.z / sim.extent + 0.5;
+      d.s = w.s; d.r = w.r * SIM_RES / sim.extent;
+      wakeDrops.push(d);
+      if (!w.hit) continue;
+      pads.disturb(w.x, w.z, w.r);
+      rushes.poke(w.x, w.z, w.x, w.z, 0, 0);
+    }
+    impulse.inject(wakeDrops);
+  };
+
   // ?impulse=test: 40 micro-drops a frame over the middle of the pool, so the injector is visible
   // under both backends without waiting on a live shower. One reused array, no per-frame allocation.
   const testDrops = params.get('impulse') === 'test' ? Array.from({ length: 40 }, () => ({ u: 0, v: 0, s: 0.006, r: 2.5 })) : null;
@@ -657,6 +713,11 @@ async function boot() {
     // Right after the eels wrote this frame's influence slots: drips, plops, and stalk swings read the live pose.
     pads.update(dt, t, rain, impulse);
     floaters.update(dt, t);
+    // Litter steps on the frame clock with the specks' own dt ceiling inside, so a slept tab cannot
+    // teleport it; it reads the influence slots eels.update just wrote and the pokes of the last frame.
+    detritus.tick(dt);
+    detritusMeshes.sync();
+    spendWakes();
     algae.update(dt, t);
     rushes.update(dt, t);
     if (t > coverBakeAt) { coverBakeAt = t + 2; habitat.composeCover(sim); }
@@ -677,10 +738,20 @@ async function boot() {
       if (gov.rung < 7 || (causticFrame & 1) === 0 || t < 0.5) caustics.render();
     }
     // The drag segment since the last frame becomes a pointer capsule; a flick is capped so it shoves, not teleports.
-    if (finger.at >= 0 && performance.now() - finger.at < 120) {
+    const nowMs = performance.now();
+    if (finger.at >= 0 && nowMs - finger.at < 120) {
       let vx = (finger.x - finger.px) / Math.max(dt, 1e-3), vz = (finger.z - finger.pz) / Math.max(dt, 1e-3);
       const sp = Math.hypot(vx, vz);
       if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
+      // The pointer handler is throttled well below the frame rate, so most frames of a real drag see no
+      // movement at all. A hand mid-swish is still moving through the water: carry the last speed over.
+      if (sp > 1e-4) { finger.vx = vx; finger.vz = vz; finger.moveAt = nowMs; }
+      else {
+        // Held at full for one throttle interval, then faded: a finger that has stopped must not keep
+        // shoving litter, the rushes, and the wake field for the rest of the stale window.
+        const f = 1 - Math.max(0, Math.min(1, (nowMs - finger.moveAt - 45) / 75));
+        vx = finger.vx * f; vz = finger.vz * f;
+      }
       // A finger crosses a texel in one frame where a body lingers for many, so it pushes 16× as hard.
       wake.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz, 0.35, 16);
       rushes.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
@@ -688,11 +759,21 @@ async function boot() {
       // The wake field gains nothing from sub-frame precision; the CPU speck sim and the noise carve do,
       // so they get every coalesced sample since the last frame, newest 16 at most.
       const path = finger.path;
-      if (path && path.length > 1) {
+      const walked = !!(path && path.length > 1);
+      let fed = 0;
+      if (walked) {
         let k = Math.max(finger.idx, path.length - 1 - 16);
-        for (; k < path.length - 1; k++) floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+        for (; k < path.length - 1; k++) {
+          floaters.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+          detritus.poke(path[k].x, path[k].z, path[k + 1].x, path[k + 1].z, vx, vz);
+          fed++;
+        }
         finger.idx = path.length - 1;
-      } else floaters.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
+      }
+      if (!walked) floaters.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
+      // The litter collides with the hand rather than sampling a field, so it needs one on every frame of
+      // a drag, not only the frames a new pointer sample landed on.
+      if (!fed) detritus.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
       finger.px = finger.x; finger.pz = finger.z;
     }
     // After eels.update wrote this frame's influence slots, before anything samples the field.
@@ -700,6 +781,7 @@ async function boot() {
     // Costs nothing on a frame with no dig and no sand still settling back.
     relief.update(dt);
 
+    if (U.litterShadow.value > 0) detritusMeshes.renderShadow(renderer);
     renderer.setRenderTarget(underRT);
     renderer.setClearColor(0x000000, 1);
     renderer.clear();
@@ -770,7 +852,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, puffs, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, textures, audio,
+      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, puffs, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, detritus, detritusMeshes, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

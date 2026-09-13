@@ -415,6 +415,71 @@ export class FloaterSystem {
     return false;
   }
 
+  pushContact(out, nx, nz, depth) {
+    const cap = out.hits.length / 3;
+    if (out.n < cap) {
+      const o = out.n * 3;
+      out.hits[o] = nx; out.hits[o + 1] = nz; out.hits[o + 2] = depth;
+    }
+    out.n++;
+    if (depth > out.depth) { out.nx = nx; out.nz = nz; out.depth = depth; }
+  }
+
+  /* The collider data behind insideObstacle, shared instead of its one bit: how deep a disc of radius r
+     at (x, z) sits in the waterline, and which way is out. Nothing here duplicates the bark profile. */
+  obstacleContact(x, z, r, out) {
+    if (!out.hits) out.hits = new Float32Array(12);
+    out.n = 0; out.depth = 0; out.nx = 1; out.nz = 0;
+    const ob = this.obsBox;
+    if (!ob || x < ob.x0 - r || x > ob.x1 + r || z < ob.z0 - r || z > ob.z1 + r) return 0;
+    const d = this.obsDisc;
+    for (let i = 0, k = 0; i < d.length; i += 3, k++) {
+      const dx = x - d[i], dz = z - d[i + 1], rm = this.rimMax[k] + r;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= rm * rm) continue;
+      const dist = Math.sqrt(d2);
+      const depth = this.rimR(k, Math.atan2(dz, dx)) + r - dist;
+      if (depth <= 0) continue;
+      // Radial from the real rim, so the normal follows a lumpy stone rather than its mean chord.
+      this.pushContact(out, dist > 1e-5 ? dx / dist : 1, dist > 1e-5 ? dz / dist : 0, depth);
+    }
+    const c = this.obsCap;
+    for (let i = 0, k = 0; i < c.length; i += 5, k++) {
+      const pr = this.obsProfile[k];
+      if (!pr) {
+        const ax = c[i], az = c[i + 1], bx = c[i + 2] - ax, bz = c[i + 3] - az;
+        const t = Math.max(0, Math.min(1, ((x - ax) * bx + (z - az) * bz) / (bx * bx + bz * bz || 1e-9)));
+        const dx = x - (ax + bx * t), dz = z - (az + bz * t), dist = Math.sqrt(dx * dx + dz * dz);
+        const depth = c[i + 4] + r - dist;
+        if (depth <= 0) continue;
+        this.pushContact(out, dist > 1e-5 ? dx / dist : 1, dist > 1e-5 ? dz / dist : 0, depth);
+        continue;
+      }
+      const rx = x - pr.ax, rz = z - pr.az;
+      const s = rx * pr.ux + rz * pr.uz;
+      if (s < 0 || s > pr.len) continue;   // both mouths are open annuli, so nothing juts past an end
+      const perp = rx * -pr.uz + rz * pr.ux;
+      const ap = perp < 0 ? -perp : perp;
+      const rw = this.logHalfWidth(pr, s / pr.len, perp >= 0 ? 0 : 1);
+      if (!(rw > 0)) continue;             // the bark is drowned here: this station is water, not wall
+      const g = perp >= 0 ? 1 : -1;
+      const sx = -pr.uz * g, sz = pr.ux * g;
+      if (ap >= rw) {
+        const depth = rw + r - ap;
+        if (depth > 0) this.pushContact(out, sx, sz, depth);
+        continue;
+      }
+      // Inside the bark, out through whichever face is nearer: the choice the specks already make, so a
+      // piece that drifted in past a mouth leaves by the mouth and not the whole width of the trunk.
+      const near0 = s * 2 <= pr.len, endGap = near0 ? s : pr.len - s;
+      if (endGap < rw - ap) {
+        const e = near0 ? -1 : 1;
+        this.pushContact(out, pr.ux * e, pr.uz * e, endGap + r);
+      } else this.pushContact(out, sx, sz, rw - ap + r);
+    }
+    return out.n;
+  }
+
   /* A stone's waterline radius at a world angle, from its table; the plain chord when it has none. */
   rimR(k, theta) {
     const t = this.rimTable[k];
@@ -1206,6 +1271,7 @@ export class FloaterSystem {
       dpdx += g * c.x; dpdz += g * c.y;
     }
     out.x = dpdz; out.z = -dpdx;
+    return out;
   }
 
   /* Right after pads.update, on this frame's pose. Growth and drift are two clocks walking one float per

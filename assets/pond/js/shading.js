@@ -160,6 +160,10 @@ export function createSceneUniforms(waveSet, currentSet) {
     motionScale: uniform(1),                              // 1, or 0.1 under reduced motion: scales plant-owned idle motion
     // Surface cover (mask G) and the live sim, swapped in by main.js before any material builds.
     coverTex: texture(placeholder),
+    // The floating litter's own silhouette, drawn by detritus-render and read at the same entry point
+    // as the cover mask. Strength 0 until main turns it on, so an unwired build looks unchanged.
+    litterTex: texture(placeholder),
+    litterShadow: uniform(0),
     simTex: texture(placeholder),
     maskExtent: uniform(1),
     coverStrength: uniform(0),                            // 0 until something floats: the floor's shadow fetches are gated on it
@@ -280,6 +284,18 @@ export function makeUnderwaterShading(U) {
   // Shadow wobble stencil: two sim texels either side of the entry point, in mask uv; sim heights are
   // a few hundredths of a unit, so the gain turns them into a visible fraction-of-a-unit crawl.
   const kWobbleGain = uniform(40);
+  // Mask uv of the point where this fragment's moon ray crossed the surface, up-moon of it. Both
+  // shadow reads below call it, so the pads' shadow and the litter's can never land in different places.
+  const shadowEntryUV = Fn(([L, p]) => {
+    const entry = p.xz.add(L.xz.mul(p.y.negate().div(L.y.max(1e-3)))).toVar();
+    const azim = L.xz.div(length(L.xz).max(1e-4));
+    const c = entry.div(U.maskExtent).add(0.5);
+    // U.simTexel is sim.uTexel (assigned in main beside simTex), so the stencil follows rung 6.
+    const step2 = azim.mul(U.simTexel.mul(2));
+    const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
+    entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
+    return entry.div(U.maskExtent).add(0.5);
+  });
   const shade = Fn(([albedo, n, p, roughnessIn]) => {
     const roughness = float(roughnessIn).toVar();
     const L = lightDir();
@@ -312,25 +328,24 @@ export function makeUnderwaterShading(U) {
     // taps along the azimuth make the shadow crawl with the ripples. Nothing floating can shade a
     // point above the water, and the eel glow below is never attenuated: the eels are under the pad.
     const cover = float(0).toVar();
-    // Branch on the uniform alone: sampling inside per-fragment control flow is a WGSL uniformity error.
-    If(U.coverStrength.greaterThan(0), () => {
-      const entry = p.xz.add(L.xz.mul(p.y.negate().div(L.y.max(1e-3)))).toVar();
-      const azim = L.xz.div(length(L.xz).max(1e-4));
-      const c = entry.div(U.maskExtent).add(0.5);
-      // U.simTexel is sim.uTexel (assigned in main beside simTex), so the stencil follows rung 6.
-      const step2 = azim.mul(U.simTexel.mul(2));
-      const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
-      entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
-      const g = U.coverTex.sample(entry.div(U.maskExtent).add(0.5)).g;
-      cover.assign(g.mul(U.coverStrength).mul(smoothstep(0.02, -0.02, p.y)));
+    const litter = float(0).toVar();
+    // One stencil solve and branch for both masks: the two sim taps are the expensive part, so no shadow
+    // is what a tight rung gets instead. Uniforms-only branch, since a per-fragment one is a WGSL uniformity error.
+    If(U.coverStrength.add(U.litterShadow).greaterThan(0), () => {
+      // toVar, or both fetches below inline the whole stencil and pay for its sim taps twice.
+      const entryUV = shadowEntryUV(L, p).toVar();
+      const under = smoothstep(0.02, -0.02, p.y).toVar();
+      cover.assign(U.coverTex.sample(entryUV).g.mul(U.coverStrength).mul(under));
+      litter.assign(U.litterTex.sample(entryUV).r.mul(U.litterShadow).mul(under));
     });
-    direct.mulAssign(cover.oneMinus());
+    const shadow = cover.oneMinus().mul(litter.oneMinus());
+    direct.mulAssign(shadow);
     direct.mulAssign(U.moonStrength);
     const ambient = kAmbient;
     const V = vec3(0, 1, 0);
     const H = normalize(L.add(V));
     const specPow = mix(kSpecHi, kSpecLo, roughness);
-    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25).mul(cover.oneMinus()).mul(wet.mul(2).add(1));
+    const spec = dot(n, H).max(0).pow(specPow).mul(roughness.oneMinus()).mul(caustic.mul(0.5).add(0.3)).mul(0.25).mul(shadow).mul(wet.mul(2).add(1));
     // Wrapped Lambert over the normal map so gravel facets face or shade the glow; the roughness-
     // driven highlight puts a neon glint on wet stones.
     const glow = vec3(0).toVar();
@@ -354,6 +369,7 @@ export function makeUnderwaterShading(U) {
     if (dbg === 'caustic') return vec3(caustic.mul(0.5));
     if (dbg === 'albedo') return albedo;
     if (dbg === 'cover') return vec3(cover);
+    if (dbg === 'litter') return vec3(litter);
     return alb.mul(U.moonColor.mul(direct.add(ambient)))
       .add(U.moonColor.mul(spec))
       .add(alb.mul(glow).mul(0.9))
