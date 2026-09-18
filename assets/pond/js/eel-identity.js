@@ -1,14 +1,14 @@
 import * as THREE from 'three/webgpu';
-import { JIM_TABLECLOTH, PRIDE_FLAGS, twoToneStops } from './eel-palette.js';
+import { JIM_TABLECLOTH, PRIDE_FLAGS, twoToneStops, JAM, COBALT, SHELLEY_SWIRL, STAR_SILVER, STAR_GOLD } from './eel-palette.js';
 import { EEL_COUNT } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
+import { STAR_METAL_ODDS, SWIRL_FREQ, FACET_TILT } from './eel-stars-core.js';
 
 /* The cast. An identity constrains build, glow palette, and behavior knobs; each visit samples fresh
    values inside those constraints, so Matthew is always Matthew without ever being an exact rerun. */
 
 const TEAL = [0.10, 1.00, 0.85], MAGENTA = [1.00, 0.25, 0.70], BLUE = [0.35, 0.55, 1.00], YELLOW = [0.95, 0.95, 0.20];
 const ORANGE = [1.00, 0.45, 0.10], PURPLE = [0.60, 0.20, 1.00], GREEN = [0.20, 1.00, 0.30], RED = [1.00, 0.15, 0.25];
-const SILVER = [0.78, 0.82, 0.90];
 // The census colors. Pushed saturated on purpose: these are emission on a near-black body, so a
 // tasteful millennial pink or goldenrod would read as mud rather than as a lit sign.
 const PINK = [1.00, 0.40, 0.68], NEON_GREEN = [0.45, 1.00, 0.10], TURQUOISE = [0.15, 0.90, 0.82];
@@ -72,7 +72,7 @@ export const IDENTITIES = [
                    // checks on the others; low hunger, yields meals; life-bonded to Shelley, strolling level with her
     pronouns: 'he/him',
     nicks: [['Jim', 70], ['Dad', 20], ['My Literal Actual Father', 10]],
-    build: { length: [2.3, 2.7], radius: [0.085, 0.1] },
+    build: { length: [2.8, 3.2], radius: [0.1, 0.115] },   // the parents run big: older, and they have eaten more
     colorsA: [CLOTH_NAVY], colorsB: [CLOTH_EMBER],
     // gain lives in the bake and clamps per channel, so anything past ~1.2 bleaches the pale bands white.
     ramp: { stops: JIM_TABLECLOTH, rotate: true, jitter: 0.15, sat: 1.4, gain: 1.15, skin: 1 },
@@ -81,13 +81,16 @@ export const IDENTITIES = [
     quirks: { follows: 'Shelley', followWeight: 0.7, lifeBond: 'Shelley', lifeBondSeek: 0.5, lifeBondLead: 0.4, lifeBondAhead: 0 },
   },
   {
-    name: 'Shelley',   // silvery, fast, often ahead of Jim; random rest stops, tiny attention span;
-                       // life-bonded to Jim, leads most strolls, and rides half a body ahead of him
+    name: 'Shelley',   // jam marbled with cobalt, glittering with stars: Mom's own color chart. Fast,
+                       // often ahead of Jim; random rest stops, tiny attention span; life-bonded to him
     pronouns: 'she/her',
     nicks: [['Shelley', 60], ['Mom', 20], ['Shel', 10], ['My Literal Actual Mother', 10]],
-    build: { length: [2.2, 2.6], radius: [0.08, 0.095] },
-    colorsA: [SILVER], colorsB: [SILVER, MAGENTA],
-    pattern: { stripe: [0.4, 0.2, 0.5], spot: [0.4, 0.2, 0.5], flank: [0.9, 0.5, 0.9], wavy: [0, 1.2] },
+    build: { length: [2.7, 3.1], radius: [0.095, 0.11] },   // big like Jim, a touch slimmer: she is the fast one
+    // The ramp is her truth; colA/colB only feed the fallback layer and the guest capsules.
+    colorsA: [COBALT], colorsB: [JAM],
+    // gain sits low on purpose: the whole body is lit, and jam past ~0.6 tone-maps to hot pink on screen.
+    ramp: { stops: SHELLEY_SWIRL, jitter: 0.15, soften: 110, sat: 1, gain: 0.6, skin: 1 },
+    pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1], swirl: [1, 1, 1], stars: [1, 1, 1], glitter: [1, 1, 1] },
     traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 } },
     quirks: { follows: 'Jim', followWeight: 0.45, lifeBond: 'Jim', lifeBondSeek: 0.5, lifeBondLead: 0.6, lifeBondAhead: 0.5 },
   },
@@ -370,7 +373,21 @@ export function rollIdentityPattern(e, id, rng) {
   // Same rule as band: no draw unless the identity asks, so the old residents keep their rng streams.
   const rep = id.ramp?.repeats ?? p.repeats;
   e.repeats = rep ? rng.range(rep[0], rep[1]) : 1;
+  // Shelley's three families, appended here so every earlier identity's rng stream is byte-identical;
+  // same no-draw-unless-declared guard as band and race.
+  e.wStars = p.stars ? roll(p.stars) : 0;
+  e.starClass = p.stars ? rng.int(0, 2) : 1;
+  e.starMetal = p.stars ? (rng.chance(STAR_METAL_ODDS) ? 1 : 0) : 0;
+  e.starSeed = p.stars ? rng.range(0, 100) : 0;
+  e.wSwirl = p.swirl ? roll(p.swirl) : 0;
+  e.swirlFreq = p.swirl ? rng.range(SWIRL_FREQ[0], SWIRL_FREQ[1]) : 2.5;
+  e.swirlSeed = p.swirl ? rng.range(0, 100) : 0;
+  e.wGlitter = p.glitter ? roll(p.glitter) : 0;
+  e.glitterSeed = p.glitter ? rng.range(0, 100) : 0;
+  e.facetTilt = p.glitter ? rng.range(FACET_TILT[0], FACET_TILT[1]) : 30;
+  // The pattern roll runs after the color roll, so this is where the tag can take the metal of the night.
+  if (p.stars) e.nameStyle = new THREE.Color(...(e.starMetal ? STAR_GOLD : STAR_SILVER)).getStyle();
   e.glowMode = new THREE.Vector4(...(id.glow ?? STEADY_PULSE));
-  if (e.flagBands) { e.wStripe = e.wSpot = e.wRace = e.wPlaid = e.wRidge = e.wFlank = 0; e.wBand = 1; e.repeats = 1; }
-  if (e.wStripe + e.wSpot + e.wBand + e.wRace + e.wPlaid + e.wRidge + e.wFlank === 0) e.wFlank = 1;
+  if (e.flagBands) { e.wStripe = e.wSpot = e.wRace = e.wPlaid = e.wRidge = e.wFlank = e.wSwirl = e.wStars = e.wGlitter = 0; e.wBand = 1; e.repeats = 1; }
+  if (e.wStripe + e.wSpot + e.wBand + e.wRace + e.wPlaid + e.wRidge + e.wFlank + e.wSwirl + e.wStars + e.wGlitter === 0) e.wFlank = 1;
 }

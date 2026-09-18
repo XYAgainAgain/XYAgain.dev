@@ -62,6 +62,23 @@ export const PRIDE_FLAGS = {
   omnisexual: hexStops(['#FE9ACE', '#FF53BF', '#200044', '#6760FE', '#8EA6FF']),
 };
 
+// Shelley's own hex codes, off the color chart she sent. LIT_COBALT is cobalt pushed toward white so
+// a star's outline reads as a ring on the jam and on the cobalt alike.
+export const JAM = hexStops(['#66052c'])[0].color;
+export const COBALT = hexStops(['#1339be'])[0].color;
+export const LIT_COBALT = [0.35, 0.50, 1.00];
+export const STAR_SILVER = [0.92, 0.94, 1.00];
+export const STAR_GOLD = [1.00, 0.84, 0.25];
+
+// Monotonic jam→cobalt: noise clustered around 0.5 lands in the jam two-thirds and only the field's
+// high tail reaches cobalt, as pools with one soft edge. Cobalt at both ends drew contour rings instead.
+// Two jam stops rather than one wide one so the name tag's bright-stop pick sees a three-stop ramp.
+export const SHELLEY_SWIRL = [
+  { color: JAM, width: 1 },
+  { color: JAM, width: 1 },
+  { color: COBALT, width: 1 },
+];
+
 export function twoToneStops(colA, colB) {
   return [{ color: colA, width: 1 }, { color: colB, width: 1 }];
 }

@@ -5,6 +5,7 @@ import { bakeRampData } from './eel-palette-core.js';
    lives in eel-palette-core.js so node --test can reach it without a bare 'three/webgpu' specifier. */
 
 export { JIM_TABLECLOTH, PRIDE_FLAGS, hexStops, twoToneStops, bakeRampData } from './eel-palette-core.js';
+export { JAM, COBALT, LIT_COBALT, STAR_SILVER, STAR_GOLD, SHELLEY_SWIRL } from './eel-palette-core.js';
 
 // NoColorSpace: the bytes are already the linear values the shader wants, so nothing decodes them.
 export function makeRampTexture() {

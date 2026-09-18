@@ -5,6 +5,7 @@ import { TICK, TRAIL_LEN, segDist, pushTrail, followBody, collide, constrain, re
 import { expire, pickTarget, steer } from './eel-behavior.js';
 import { EelRenderer } from './eel-render.js';
 import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPattern, rollNickname } from './eel-identity.js';
+import { GLITTER_SCROLL_WRAP } from './eel-stars-core.js';
 import { pushFingerSample, seedFingerHistory, tumbleFor } from './treats-core.js';
 
 // How long a spook stays in sys.spooks. eel-fear.js ages its per-eel "already counted" ids on the same
@@ -83,6 +84,7 @@ export class Eel {
     this.nopeZig = 0;
     this.attnReset = false;
     this.roll = 0;             // unwrapped roll phase about the long axis; commitPose wraps the uniform
+    this.glitterScroll = 0;    // accumulated fleck-field offset; the tick integrates it off speedBL
     // Per-eel clamp bounds. eel-air.js owns every change to them; collide() falls back to these same
     // numbers when no air module is attached, so a pond without it clamps exactly as it always did.
     this.floorY = -DEPTH + this.radius + 0.08;
@@ -239,6 +241,9 @@ export class EelSystem {
     this.shimFn = null;
     this.renderer = new EelRenderer(scene, U, shading, this.knobs);
     this.knobs.jelly = this.renderer.jellyU;   // pond.eels.knobs.jelly.<dial>.value, tuned live
+    // Same shape for Shelley's three families. forceClass (-1, or 0-2) and forceMetal (-1, 0 silver,
+    // 1 gold) move a CPU grid, so they take applyKnobs(); every uniform dial is instant.
+    this.knobs.families = this.renderer.familyU;
     this.group = this.renderer.group;
     // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.
     this.debug = !!opts.debug;
@@ -484,6 +489,9 @@ export class EelSystem {
   }
   recolor() {
     for (const e of this.eels) {
+      // Inside Eleanor the fear tick is paused, so a comfort-stop snapshot taken now would be restored
+      // over whatever the eel wears after the spit; it keeps its look until it is back in the water.
+      if (e.slurpedBy) continue;
       // F6's comfort stop: a spammed eel keeps what it is wearing, and skipping it before the rolls
       // is what stops the veto from shifting everybody else's appearance too.
       if (this.fear && !this.fear.noteRecolor(this, e)) continue;
@@ -707,6 +715,21 @@ export class EelSystem {
     const { skin, glow } = this.knobs;
     for (const e of this.eels) e.uLayers.value.set(skin * e.skinMul, glow);
     for (const g of this.guests) g.uLayers.value.set(skin * g.skinMul, glow);
+    for (const e of this.allOfCast()) if (e.uStars) this.renderer.pushFamilies(e);
+  }
+
+  /* The glitter lags the body the way the liquid lags a water wiggler's tube: an accumulated scroll,
+     not a rate, so changing speed slides the fleck field instead of teleporting it. */
+  driftGlitter(all, dt) {
+    const g = this.knobs.families?.glitter;
+    if (!g) return;
+    const base = g.base.value, lag = g.lagGain.value;
+    for (const e of all) {
+      if (!e.uGlitter) continue;
+      // The wrap is a whole number of hash periods for both fleck grids, so nothing pops when it lands.
+      e.glitterScroll = (e.glitterScroll + (base + e.speedBL * lag) * dt) % GLITTER_SCROLL_WRAP;
+      e.uGlitter.value.w = e.glitterScroll;
+    }
   }
 
   /* Fixed-rate solve: the chain and its collision memory behave the same at 60 and 240 Hz. */
@@ -774,6 +797,7 @@ export class EelSystem {
     for (const e of all) if (!e.slurpedBy) constrain(e);
     for (const e of all) if (!e.slurpedBy) rememberPushes(e);
     this.surfaceContact(all, dt);
+    this.driftGlitter(all, dt);
     if (this.debug) this.sweepNaN(all);
     for (let i = this.foods.length - 1; i >= 0; i--) {
       const f = this.foods[i];

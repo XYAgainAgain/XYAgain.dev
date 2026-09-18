@@ -38,6 +38,20 @@ export class PondInput {
       this.endMode();
     });
     c.addEventListener('dragstart', (e) => e.preventDefault());
+    // The reroll rides mousedown, not pointerdown: a second button pressed while another is held
+    // gets no pointerdown at all, which read as "the middle click stopped working."
+    c.addEventListener('mousedown', (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      this.h.activity?.();
+      this.h.recolor?.();
+    });
+    c.addEventListener('auxclick', (e) => e.preventDefault());
+    // A touch interrupted by the OS can leave its id in the map forever, and three fingers then count
+    // as four; losing focus is the one moment every gesture is certainly over.
+    const reset = () => { this.pointers.clear(); clearTimeout(this.touchTimer); this.touchStart = null; this.cancelMode(); };
+    window.addEventListener('blur', reset);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) reset(); });
   }
 
   onDown(e) {
@@ -68,7 +82,6 @@ export class PondInput {
     }
     if (e.button === 0) this.begin('left', e.clientX, e.clientY);
     else if (e.button === 2) this.begin('right', e.clientX, e.clientY);
-    else if (e.button === 1) { e.preventDefault(); this.h.recolor?.(); }
   }
 
   begin(mode, cx, cy) {

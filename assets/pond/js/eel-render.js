@@ -1,11 +1,27 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld, screenUV, screenSize, viewportSharedTexture, cameraViewMatrix, exp } from 'three/tsl';
+import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld, screenUV, screenSize, viewportSharedTexture, cameraViewMatrix, exp, sign, mod, fwidth, length, If } from 'three/tsl';
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
-import { valueNoise2 } from './shading.js';
-import { makeRampTexture, bakeRamp } from './eel-palette.js';
+import { valueNoise2, fbm2Y, hash2 } from './shading.js';
+import { makeRampTexture, bakeRamp, LIT_COBALT, STAR_SILVER, STAR_GOLD } from './eel-palette.js';
+import { GLITTER, GLITTER_HASH_PERIOD, GLITTER_DEEP_DRIFT, starLayout, glitterLayout, swirlAround } from './eel-stars-core.js';
 import { crumbScale } from './treats-core.js';
 
 const RINGS = 48, SIDES = 12;
+const DEG = Math.PI / 180;
+
+/* Inigo Quilez's five-point star, signed distance from the outline. `rf` is the inner/outer radius
+   ratio and arrives as a uniform: a bare literal feeding runtime math types abstract, and Naga rejects it. */
+const sdStar5 = Fn(([pIn, r, rf]) => {
+  const k1 = vec2(0.809016994375, -0.587785252292);
+  const k2 = vec2(-0.809016994375, -0.587785252292);
+  const p = vec2(abs(pIn.x), pIn.y).toVar();
+  p.assign(p.sub(k1.mul(dot(k1, p).max(0).mul(2))));
+  p.assign(p.sub(k2.mul(dot(k2, p).max(0).mul(2))));
+  p.assign(vec2(abs(p.x), p.y.sub(r)));
+  const ba = vec2(0.587785252292, 0.809016994375).mul(rf).sub(vec2(0, 1)).toVar();
+  const h = dot(p, ba).div(dot(ba, ba)).max(0).min(r);
+  return length(p.sub(ba.mul(h))).mul(sign(p.y.mul(ba.x).sub(p.x.mul(ba.y))));
+});
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 const tmpPink = new THREE.Color(), tmpFlash = new THREE.Color();
@@ -52,6 +68,21 @@ export class EelRenderer {
       rim: uniform(1.1), wash: uniform(0.4), ghost: uniform(0.2),
       lamp: { value: 0.3 }, halo: { value: 0.2 },
     };
+    // Shelley's three families, live via pond.eels.knobs.families.<group>.<dial>.value. The plain
+    // {value} entries move a CPU-side grid, so they land on the next applyKnobs() rather than instantly.
+    this.familyU = {
+      stars: {
+        twinkle: uniform(0.25), fillGain: uniform(1.0), rimGain: uniform(1.8), rimFade: uniform(0.6),
+        rf: uniform(0.4), scatter: uniform(1.0), forceClass: { value: -1 }, forceMetal: { value: -1 },
+      },
+      swirl: { drift: uniform(0.02), contrast: uniform(1.3), floor: uniform(0.5) },
+      glitter: {
+        density: uniform(GLITTER.density), gain: uniform(1.0), sharp: uniform(48),
+        hueWobble: uniform(0.08), deepGain: uniform(0.5), tint: uniform(0.3),
+        base: { value: 0.01 }, lagGain: { value: 0.04 },
+        deepScale: { value: GLITTER.deepScale }, cell: { value: GLITTER.cell },
+      },
+    };
     this.group = new THREE.Group();
     scene.add(this.group);
     this.geometry = makeTubeGeometry();
@@ -93,6 +124,17 @@ export class EelRenderer {
     e.uRace = uniform(new THREE.Vector2(e.wRace, e.raceOff));
     e.uPlaid = uniform(new THREE.Vector3(e.wPlaid, e.plaidFreq, e.wRidge));
     e.uGlowMode = uniform(e.glowMode.clone());
+    // Shelley's set. uGlitter.w is an accumulated scroll position, not a rate: rewriting a rate under a
+    // time multiply would jump the whole fleck field every time she changed speed.
+    e.uStars = uniform(new THREE.Vector4(0, 1, 1, 0.3));      // wStars, cellsAlong, cellsAround, radius
+    e.uStarsB = uniform(new THREE.Vector4(0.5, 0, 0.1, 1));   // density, starSeed, rim, twinkleRateMul
+    e.uStarCol = uniform(new THREE.Color(...STAR_SILVER));
+    e.uStarRim = uniform(new THREE.Color(...LIT_COBALT));
+    e.uSwirl = uniform(new THREE.Vector4(0, 2.5, 2, 0));      // wSwirl, freq, cells around, seed
+    e.uGlitter = uniform(new THREE.Vector4(0, 0, 30, 0));     // wGlitter, seed, facetTilt (deg), scroll
+    e.uGlitterB = uniform(new THREE.Vector4(1, 1, 1, 1));     // the two fleck grids, surface then deep
+    e.uGlitterCol = uniform(new THREE.Color(...STAR_SILVER));
+    this.pushFamilies(e);
     const rampNode = texture(e.rampTex);
     const U = this.U;
 
@@ -127,7 +169,9 @@ export class EelRenderer {
 
     // Eleanor's glow is its own animal: dim wavy ridge lines running the length of the body plus a
     // pink tail photophore with a rare red flash (the pelican eel's real trick), not the pattern mix.
-    const emission = e.identity?.dorsalGlow ? Fn(() => {
+    // Two graphs from one builder: the halo shell skips the glitter, since a 2–3 px fleck magnified
+    // 2.4× is bloom noise, not bloom.
+    const emissionFor = (detail) => e.identity?.dorsalGlow ? Fn(() => {
       const t = vUV.x, ang = vUV.y;
       const time = U.time;
       const wander = sin(t.mul(7).sub(time.mul(0.2)).add(e.uSeed)).mul(0.5);
@@ -185,24 +229,132 @@ export class EelRenderer {
       const bandA = smoothstep(0.35, 0.65, sin(ang.mul(e.uPlaid.y)).mul(0.5).add(0.5));
       const plaid = bandT.add(bandA).mul(0.35).add(bandT.mul(bandA).mul(0.5));
 
+      // The marbled swirl. fbm2Y is bell-shaped around 0.5, and 0.5 sits in the ramp's jam, so jam wins
+      // by more than the stop widths say and cobalt only surfaces as veins and pools where the field peaks.
+      const F = this.familyU;
+      // Each family sits behind a uniform branch: a whole draw takes it or skips it, so the eleven
+      // eels without it pay nothing, and fwidth stays in uniform control flow.
+      const wSwirl = e.uSwirl.x;
+      const fieldSwirl = float(0.5).toVar(), maskSwirl = float(0).toVar();
+      If(wSwirl.greaterThan(0), () => {
+        // Periodic around the girth (uSwirl.z is an integer cell count) so a roll never shows a seam.
+        const swirlN = fbm2Y(vec2(t.mul(e.uSwirl.y).add(time.mul(U.motionScale).mul(F.swirl.drift)).add(e.uSwirl.w), ang.div(TWO_PI).mul(e.uSwirl.z)), e.uSwirl.z);
+        fieldSwirl.assign(swirlN.sub(0.5).mul(F.swirl.contrast).add(0.5).clamp(0, 1));
+        // Floored so jam still glows and the cobalt pools read a notch brighter: lit cobalt, on the body too.
+        maskSwirl.assign(wSwirl.mul(F.swirl.floor.add(F.swirl.floor.oneMinus().mul(fieldSwirl))));
+      });
+
       // The field indexes the ramp: crests and flank read the main half, spots and between-stripe skin the
       // accent half, bands walk the whole ramp; a flank-only eel borrows the spot field so it is not split at mid-body.
       const wRace = e.uRace.x, wPlaid = e.uPlaid.x, wRidge = e.uPlaid.z;
-      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge)).oneMinus();
+      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl)).oneMinus();
       const wSpotF = e.uWeights.y.add(bare);
-      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).max(1e-3);
+      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl).max(1e-3);
       const field = wave.oneMinus().mul(e.uWeights.x.div(wSum))
         .add(spots.mul(wSpotF.div(wSum)))
         .add(t.mul(e.uBand.y).mul(e.uBand.x.div(wSum)))
         .add(race.oneMinus().mul(wRace.div(wSum)))
         .add(bandT.add(bandA).mul(0.5).mul(wPlaid.div(wSum)))
-        .add(ridge.clamp(0, 1).oneMinus().mul(wRidge.div(wSum)));
+        .add(ridge.clamp(0, 1).oneMinus().mul(wRidge.div(wSum)))
+        .add(fieldSwirl.mul(wSwirl.div(wSum)));
 
       // The bake puts a band-edge mask in alpha, so each stripe boundary lights up from the one sample.
       const samp = rampNode.sample(vec2(field, 0.5));
       const ramp = samp.rgb;
       const mask = stripes.mul(e.uWeights.x).add(spots.mul(e.uWeights.y)).add(flank.mul(e.uWeights.z)).add(samp.a.mul(e.uBand.x))
-        .add(race.mul(wRace)).add(plaid.mul(wPlaid)).add(ridge.mul(wRidge));
+        .add(race.mul(wRace)).add(plaid.mul(wPlaid)).add(ridge.mul(wRidge)).add(maskSwirl);
+
+      // The stars. Each fragment tests the four nearest cells, so a star may sit anywhere in its own cell
+      // (a full half-cell of jitter each way) without being cut at the edge: that is what breaks the rows.
+      // Stars do crop at the nose and tail, like a pattern painted onto a body that ends.
+      const stars = vec3(0).toVar();
+      If(e.uStars.x.greaterThan(0), () => {
+        const cellsA = e.uStars.y, cellsR = e.uStars.z;
+        const sp = vec2(t.mul(cellsA), ang.div(TWO_PI).mul(cellsR));
+        const base = floor(sp.sub(0.5));
+        // On the darkest jam a lit-cobalt ring reads as a blue dot with a pale center, so there the rim
+        // fades toward the star's own metal; the ramp runs jam → cobalt, so dark jam is the low field.
+        const jamness = smoothstep(0.55, 0.75, fieldSwirl).oneMinus();
+        const rimCol = mix(e.uStarRim, e.uStarCol.mul(0.8), jamness.mul(F.stars.rimFade));
+        const starAcc = vec3(0).toVar();
+        for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+          const cell = base.add(vec2(ox, oy));
+          // The girth wraps: the hash reads the wrapped row so the seam's neighbors are the same stars.
+          const wrapR = cell.y.sub(floor(cell.y.div(cellsR)).mul(cellsR));
+          const cid = vec2(cell.x, wrapR).add(e.uStarsB.y);
+          const sh = (hx, hy) => hash2(cid.add(vec2(hx, hy)));
+          const present = step(e.uStarsB.x.oneMinus(), sh(0.137, 0.911));
+          const rStar = e.uStars.w.mul(sh(0.531, 0.229).mul(0.7).add(0.65));
+          const center = cell.add(0.5).add(vec2(sh(0.813, 0.457), sh(0.271, 0.083)).sub(0.5).mul(F.stars.scatter));
+          const q = sp.sub(center);
+          const spin = sh(0.647, 0.359).mul(TWO_PI), cs = cos(spin), sn = sin(spin);
+          const sd = sdStar5(vec2(q.x.mul(cs).sub(q.y.mul(sn)), q.x.mul(sn).add(q.y.mul(cs))), rStar, F.stars.rf);
+          // Half a derivative footprint keeps a five-pixel star's points sharp; the rim is the difference
+          // of two coverages so it stays a band with two real edges instead of a fading aura.
+          const soft = fwidth(sd).mul(0.5).max(1e-5);
+          const fill = smoothstep(soft.negate(), soft, sd).oneMinus();
+          const rimOuter = smoothstep(e.uStarsB.z.sub(soft), e.uStarsB.z.add(soft), sd).oneMinus();
+          const rimBand = rimOuter.sub(fill).max(0);
+          const twH = sh(0.929, 0.041);
+          // The square skews amplitudes low, so a handful barely move and the dimmest still holds 0.2.
+          const twAmp = twH.mul(twH).mul(0.5).add(0.3).mul(U.motionScale);
+          // twinkle is in Hz; the spin doubles as the phase, since nobody can read that correlation.
+          const twRate = F.stars.twinkle.mul(e.uStarsB.w).mul(twH.mul(0.6).add(0.7)).mul(TWO_PI);
+          const tw = float(1).sub(twAmp.mul(sin(time.mul(twRate).add(spin)).mul(0.5).add(0.5)));
+          const one = fill.mul(e.uStarCol).mul(F.stars.fillGain).add(rimBand.mul(rimCol).mul(F.stars.rimGain)).mul(present).mul(tw);
+          // max, not add: two stars that drift into each other overlap like paper, they do not double up.
+          starAcc.assign(starAcc.max(one));
+        }
+        stars.assign(starAcc.mul(e.uStars.x).mul(e.uLayers.y));
+      });
+
+      // The glitter: flat foil flecks on hashed facets, flashing as her motion swings them through the
+      // moon's half-vector. FrontSide hands this camera the tube's far wall, so a visible fragment's
+      // normal points away from it; flip it back before building facets, or every fleck faces the floor.
+      const glitter = vec3(0).toVar();
+      if (detail) If(e.uGlitter.x.greaterThan(0), () => {
+        const nRaw = normalize(vNormal);
+        const nrm = nRaw.mul(step(float(0), nRaw.y).mul(2).sub(1));
+        const halfV = normalize(this.shading.lightDir().add(vec3(0, 1, 0)));
+        const tanA = normalize(cross(nrm, vec3(0, 0, 1)).add(vec3(1e-5, 0, 0)));
+        const tanB = cross(nrm, tanA);
+        // A napping eel tilts nothing, so a slow wobble of the facet angle keeps her from going flat.
+        const wob = sin(time.mul(0.05).mul(TWO_PI).mul(U.motionScale).add(e.uGlitter.y)).mul(0.25).add(1);
+        const tiltMax = e.uGlitter.z.mul(DEG).mul(wob);
+        const fleck = (along, around, driftMul) => {
+          const gT = t.sub(e.uGlitter.w.mul(driftMul)).mul(along), gA = ang.div(TWO_PI).mul(around);
+          // The scroll drives the along id negative without bound, and TSL's hash saturates negative seeds
+          // to one value; wrapping it to a 1024-cell period keeps every fleck its own fleck for a whole night.
+          const P = float(GLITTER_HASH_PERIOD);
+          const idT = floor(gT).toVar();
+          idT.assign(idT.sub(floor(idT.div(P)).mul(P)));
+          const gid = vec2(idT, mod(floor(gA), around)).add(e.uGlitter.y).add(1000.5);
+          const gh = (ox, oy) => hash2(gid.add(vec2(ox, oy)));
+          const hAz = gh(0.733, 0.319), hTilt = gh(0.457, 0.601);
+          const az = hAz.mul(TWO_PI);
+          const tilt = tiltMax.mul(hTilt.mul(0.6).add(0.4));
+          const facet = normalize(nrm.mul(cos(tilt)).add(tanA.mul(cos(az)).add(tanB.mul(sin(az))).mul(sin(tilt))));
+          // A soft sliver inside the cell, nudged off center by hashes the facet already paid for: a whole
+          // lit cell is a square, and squares are not foil.
+          const jit = vec2(fract(hAz.mul(17.17)), fract(hTilt.mul(23.31))).sub(0.5).mul(0.12);
+          const local = vec2(fract(gT), fract(gA)).sub(0.5).sub(jit);
+          const shape = smoothstep(0.42, 0.16, abs(local.x).add(abs(local.y).mul(1.4)));
+          // First-order hue rotation about the grey axis: the holographic wobble real craft glitter has,
+          // for a handful of ALU instead of an RGB to HSV round trip.
+          const w = gh(0.089, 0.523).sub(0.5).mul(2).mul(F.glitter.hueWobble);
+          const c = e.uGlitterCol;
+          return {
+            lit: dot(facet, halfV).max(0).pow(F.glitter.sharp).mul(step(F.glitter.density.oneMinus(), gh(0.211, 0.877))).mul(shape),
+            col: c.add(vec3(c.z.sub(c.y), c.x.sub(c.z), c.y.sub(c.x)).mul(w)),
+          };
+        };
+        const surf = fleck(e.uGlitterB.x, e.uGlitterB.y, 1);
+        const deep = fleck(e.uGlitterB.z, e.uGlitterB.w, GLITTER_DEEP_DRIFT);
+        // The deeper layer is tinted toward the body's own ramp, as if seen through the jam.
+        glitter.assign(surf.col.mul(surf.lit)
+          .add(mix(deep.col, ramp, F.glitter.tint).mul(deep.lit).mul(F.glitter.deepGain))
+          .mul(e.uGlitter.x).mul(F.glitter.gain).mul(e.uLayers.y));
+      });
 
       const breathe = sin(time.mul(TWO_PI).mul(0.25).add(e.uSeed)).mul(0.25).add(0.75);
       const pulse = sin(time.mul(e.uPattern.w).sub(t.mul(7)).add(e.uSeed)).mul(0.25).add(0.85);
@@ -214,8 +366,11 @@ export class EelRenderer {
       const skin = ramp.mul(e.uLayers.x).mul(e.uSkinTint);
       const glow = ramp.mul(mask).mul(e.uLayers.y).mul(e.uGlowTint).mul(envelope);
       const eyeT = smoothstep(0.0, 0.05, t).oneMinus();
-      return skin.add(glow).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.3));
+      // Stars and glitter never index the ramp and skip the glow envelope, so the swirl's colors do not
+      // tint them and the traveling pulse does not sweep across them. Excite still lifts everything.
+      return skin.add(glow).add(stars).add(glitter).mul(e.uExcite.mul(0.8).add(1)).add(eyeT.mul(0.3));
     });
+    const emission = emissionFor(true), emissionCoarse = emissionFor(false);
 
     const bodyMat = new THREE.NodeMaterial();
     bodyMat.positionNode = buildPosition(1);
@@ -238,7 +393,7 @@ export class EelRenderer {
     haloMat.fragmentNode = Fn(() => {
       const n = normalize(vNormal);
       const edge = dot(n, vec3(0, 1, 0)).max(0);
-      const glow = emission().mul(0.16).mul(edge.pow(1.5)).mul(e.uHaloMul);
+      const glow = emissionCoarse().mul(0.16).mul(edge.pow(1.5)).mul(e.uHaloMul);
       return vec4(glow, 0);
     })();
     haloMat.transparent = true;
@@ -352,6 +507,24 @@ export class EelRenderer {
 
   /* A reroll rebakes the ramp texture and moves uniforms; the node graph and the materials are the
      ones built at boot, which is what keeps a middle click free of a pipeline compile. */
+  /* The CPU side of Shelley's families: the star and glitter cell grids, the class table, and the metal.
+     Cheap enough to re-run from applyKnobs, which is what makes forceClass and forceMetal usable. */
+  pushFamilies(e) {
+    const K = this.familyU;
+    const L = starLayout(e.length, e.radius, K.stars.forceClass.value >= 0 ? K.stars.forceClass.value : e.starClass ?? 1);
+    e.uStars.value.set(e.wStars ?? 0, L.cellsAlong, L.cellsAround, L.radius);
+    e.uStarsB.value.set(L.density, e.starSeed ?? 0, L.rim, 1);
+    const metal = K.stars.forceMetal.value >= 0 ? K.stars.forceMetal.value : e.starMetal ?? 0;
+    e.uStarCol.value.setRGB(...(metal ? STAR_GOLD : STAR_SILVER));
+    e.uGlitterCol.value.copy(e.uStarCol.value);
+    e.uStarRim.value.setRGB(...LIT_COBALT);
+    const freq = e.swirlFreq ?? 2.5;
+    e.uSwirl.value.set(e.wSwirl ?? 0, freq, swirlAround(e.length, e.radius, freq), e.swirlSeed ?? 0);
+    const G = glitterLayout(e.length, e.radius, K.glitter.cell.value, K.glitter.deepScale.value);
+    e.uGlitter.value.set(e.wGlitter ?? 0, e.glitterSeed ?? 0, e.facetTilt ?? 30, e.glitterScroll ?? 0);
+    e.uGlitterB.value.set(G.surface.along, G.surface.around, G.deep.along, G.deep.around);
+  }
+
   applyAppearance(e) {
     const baked = bakeRamp(e.rampTex, e.rampStops, e.rampOpts, e.rng);
     e.rampHead = baked.head; e.rampTail = baked.tail;
@@ -363,6 +536,7 @@ export class EelRenderer {
     e.uPlaid.value.set(e.wPlaid, e.plaidFreq, e.wRidge);
     e.uGlowMode.value.copy(e.glowMode);
     e.uLayers.value.set(this.knobs.skin * e.skinMul, this.knobs.glow);
+    this.pushFamilies(e);
     this.syncBodyMaterial(e);
   }
 

@@ -22,6 +22,35 @@ export const valueNoise2 = Fn(([p]) => {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 });
 
+// Periodic in y with an integer period: the lattice row wraps before the hash, so a tube's girth closes.
+export const valueNoise2Y = Fn(([p, py]) => {
+  const i = floor(p);
+  const f = fract(p);
+  const u = f.mul(f).mul(f.mul(-2).add(3));
+  const y0 = i.y.sub(floor(i.y.div(py)).mul(py));
+  const y1 = i.y.add(1).sub(floor(i.y.add(1).div(py)).mul(py));
+  const a = hash2(vec2(i.x, y0));
+  const b = hash2(vec2(i.x.add(1), y0));
+  const c = hash2(vec2(i.x, y1));
+  const d = hash2(vec2(i.x.add(1), y1));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+});
+
+// Octaves scale by exactly 2 (fbm2 uses 2.03) so the y period doubles cleanly and stays an integer.
+export const fbm2Y = Fn(([p, py]) => {
+  const v = float(0).toVar();
+  const amp = float(0.5).toVar();
+  const q = p.toVar();
+  const per = py.toVar();
+  Loop(4, () => {
+    v.addAssign(valueNoise2Y(q, per).mul(amp));
+    q.mulAssign(2);
+    per.mulAssign(2);
+    amp.mulAssign(0.5);
+  });
+  return v;
+});
+
 export const fbm2 = Fn(([p]) => {
   const v = float(0).toVar();
   const amp = float(0.5).toVar();
