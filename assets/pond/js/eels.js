@@ -154,7 +154,14 @@ export class EelSystem {
       // buriedEvict multiplies the spook line a buried eel is dug out by; buriedGrace is the seconds of
       // lesser pressure it sits through first. 1 and 0 restore the old evict-on-any-scare behavior.
       // relief scales the dig's dent in the sand, lean and shade together; 1 is the default depth, 0 is flat.
-      air: { peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1, puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60, leapExcite: 0.2 },
+      // The nose-first dig: punch angle (degrees), how deep counts as in (radii), its give-up, the contact
+      // spray; then run depth (radii), the collar in spine points, and the deadline that closes it anyway.
+      air: {
+        peek: 1, flop: 1, leap: 1, stamina: 1, moonbite: 1, puff: 1, puffSize: 1, grainSize: 1,
+        puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60, leapExcite: 0.2,
+        punchSlope: 55, punchIn: 0.6, punchMax: 5, snoutPuff: 1,
+        digDepth: 1.6, digSoft: 2, digMax: 12, digCatchup: 1.5, buriedMin: 2,
+      },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },
       contestCap: { perOccupant: 30, perMinute: 3 },
@@ -241,8 +248,8 @@ export class EelSystem {
     this.shimFn = null;
     this.renderer = new EelRenderer(scene, U, shading, this.knobs);
     this.knobs.jelly = this.renderer.jellyU;   // pond.eels.knobs.jelly.<dial>.value, tuned live
-    // Same shape for Shelley's three families. forceClass (-1, or 0-2) and forceMetal (-1, 0 silver,
-    // 1 gold) move a CPU grid, so they take applyKnobs(); every uniform dial is instant.
+    // Same shape for the pattern families. Every force dial (stars.forceClass, tiger.forceBreak,
+    // splotch.forceW, and the rest) moves a CPU value, so it takes applyKnobs(); uniform dials are instant.
     this.knobs.families = this.renderer.familyU;
     this.group = this.renderer.group;
     // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.

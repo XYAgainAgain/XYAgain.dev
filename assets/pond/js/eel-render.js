@@ -1,10 +1,11 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld, screenUV, screenSize, viewportSharedTexture, cameraViewMatrix, exp, sign, mod, fwidth, length, If } from 'three/tsl';
+import { Fn, uniform, uniformArray, attribute, vec2, vec3, vec4, float, int, floor, mix, normalize, cross, sin, cos, abs, fract, step, smoothstep, varying, dot, texture, TWO_PI, positionWorld, screenUV, screenSize, viewportSharedTexture, cameraViewMatrix, exp, sign, mod, fwidth, length, hue, If, Discard } from 'three/tsl';
 import { EEL_COUNT, EEL_POINTS, INF_SLOTS, DEPTH } from './config.js';
 import { valueNoise2, fbm2Y, hash2 } from './shading.js';
 import { makeRampTexture, bakeRamp, LIT_COBALT, STAR_SILVER, STAR_GOLD } from './eel-palette.js';
 import { GLITTER, GLITTER_HASH_PERIOD, GLITTER_DEEP_DRIFT, starLayout, glitterLayout, swirlAround } from './eel-stars-core.js';
 import { crumbScale } from './treats-core.js';
+import { floorHeightAt } from './floor.js';
 
 const RINGS = 48, SIDES = 12;
 const DEG = Math.PI / 180;
@@ -27,6 +28,12 @@ const UP = new THREE.Vector3(0, 1, 0);
 const tmpPink = new THREE.Color(), tmpFlash = new THREE.Color();
 // Generic smoothstep; handles reversed edges the way GLSL's does not, which blink() relies on.
 const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+/* TSL's hue() on the CPU: the same rotation about the grey axis, so the sand light turns with the body. */
+function rotateHue(col, ang, w) {
+  const cs = Math.cos(ang), sn = Math.sin(ang) * 0.57735, m = (col.r + col.g + col.b) / 3 * (1 - cs);
+  const r = col.r * cs + (col.b - col.g) * sn + m, g = col.g * cs + (col.r - col.b) * sn + m, b = col.b * cs + (col.g - col.r) * sn + m;
+  col.setRGB(col.r + (Math.max(0, r) - col.r) * w, col.g + (Math.max(0, g) - col.g) * w, col.b + (Math.max(0, b) - col.b) * w);
+}
 
 /* Tube geometry parameterized by (t along, angle around); the spine comes in as a uniform array. */
 function makeTubeGeometry() {
@@ -76,6 +83,28 @@ export class EelRenderer {
         rf: uniform(0.4), scatter: uniform(1.0), forceClass: { value: -1 }, forceMetal: { value: -1 },
       },
       swirl: { drift: uniform(0.02), contrast: uniform(1.3), floor: uniform(0.5) },
+      // Tiger is a look, not a formula: every constant in the tear is a live dial. forceBreak (null, or
+      // 0–1) overrides the rolled break on every tiger-declaring eel and lands on the next applyKnobs().
+      tiger: {
+        gain: uniform(1), freqT: uniform(9), freqA: uniform(2.2), spacing: uniform(0.8),
+        taper: uniform(0.6), fork: uniform(1.7), phase: uniform(3.6),
+        edgeLo: uniform(0.32), edgeHi: uniform(0.68), forceBreak: { value: null },
+      },
+      // levelsForce under 2.5 means "use the eel's own roll"; rung 3 writes 3 here and 0 into oct2.
+      splotch: {
+        freqMul: uniform(1), around: uniform(0.9), edgeW: uniform(0.06),
+        levelsForce: uniform(0), oct2: uniform(1), forceW: { value: null }, forceLit: { value: null },
+      },
+      sheen: {
+        span: uniform(0.6), width: uniform(0.35), center: uniform(0.32),
+        rimLo: uniform(0.15), rimHi: uniform(0.85), forceW: { value: null },
+      },
+      // pingPong 1 walks the ramp up and back down; 0 is the sawtooth, which snaps at the wrap.
+      tailOwn: { rate: uniform(0.08), from: uniform(0.82), to: uniform(0.95), pingPong: uniform(1), force: { value: null } },
+      rgb: { rate: uniform(0.78), force: { value: null } },
+      // The wet look: a moonlit specular streak down every resident's back. gain 0 is the old matte body.
+      // tint pulls the streak toward the eel's own chroma (0 is bare moonlight); refR is the girth sharp is tuned at.
+      wet: { gain: uniform(0.3), sharp: uniform(40), tint: uniform(0.7), refR: { value: 0.1 } },
       glitter: {
         density: uniform(GLITTER.density), gain: uniform(1.0), sharp: uniform(48),
         hueWobble: uniform(0.08), deepGain: uniform(0.5), tint: uniform(0.3),
@@ -134,6 +163,14 @@ export class EelRenderer {
     e.uGlitter = uniform(new THREE.Vector4(0, 0, 30, 0));     // wGlitter, seed, facetTilt (deg), scroll
     e.uGlitterB = uniform(new THREE.Vector4(1, 1, 1, 1));     // the two fleck grids, surface then deep
     e.uGlitterCol = uniform(new THREE.Color(...STAR_SILVER));
+    // Splotch, sheen, and tiger share this pack: three uniforms rather than nine. Paisley's three
+    // components stay zero until its own slice lands, costing a uniform write instead of a fourth per-eel one.
+    e.uFam = uniform(new THREE.Vector4(0, 0, 0, 0));        // wSplotch, wSheen, wPaisley, tigerBreak
+    e.uFamB = uniform(new THREE.Vector4(0, 0, 0, 0));       // splotchFreq, splotchLevels, sheenDrift, paisleyScale
+    e.uGlowModeB = uniform(new THREE.Vector4(0, 0, 0, 0));  // tailOwn, rgb, splotchLit, paisleyTiles
+    e.uWet = uniform(new THREE.Vector4(1, 1, 1, 1));        // the streak's chroma, and its per-eel gain
+    e.uWetSharp = uniform(1);
+    e.uBury = uniform(new THREE.Vector3(-1e3, -1e3, 0));    // closed-over index, collar's far index, cut height
     this.pushFamilies(e);
     const rampNode = texture(e.rampTex);
     const U = this.U;
@@ -141,6 +178,13 @@ export class EelRenderer {
     const vNormal = varying(vec3(0), 'vEelN');
     const vWorld = varying(vec3(0), 'vEelP');
     const vUV = varying(vec2(0), 'vEelUV');
+
+    // The sand the solver reads is analytic and the floor drawn is a mesh, so a buried tube grazing it
+    // pokes through in flickering slivers. Closed-over rings are not drawn; the collar is cut at the sand.
+    const cutBuried = () => {
+      const segF = vUV.x.mul(EEL_POINTS - 1);
+      If(segF.lessThan(e.uBury.x).or(segF.lessThan(e.uBury.y).and(vWorld.y.lessThan(e.uBury.z))), () => { Discard(); });
+    };
 
     const buildPosition = (radiusScale) => Fn(() => {
       const t = attribute('aT', 'float');
@@ -196,8 +240,26 @@ export class EelRenderer {
       const rolled = vUV.y.add(e.uRoll).div(TWO_PI).fract().mul(TWO_PI);
       const t = vUV.x, ang = mix(vUV.y, rolled, step(1e-6, e.uRoll));
       const time = U.time;
-      const wave = sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5);
-      const stripes = smoothstep(0.35, 0.65, wave);
+      const T = this.familyU.tiger;
+      const wave = sin(t.mul(e.uPattern.x).mul(TWO_PI).add(sin(ang.add(t.mul(6))).mul(e.uPattern.z)).sub(time.mul(0.6))).mul(0.5).add(0.5).toVar();
+      const stripes = smoothstep(0.35, 0.65, wave).toVar();
+      // Tiger: one noise fetch spent three ways, so the edges fork, the pitch stops being a metronome,
+      // and the bands narrow toward the ends. The halo skips the fetch: at 2.4×, a tear is bloom noise.
+      if (detail) If(e.uFam.w.mul(e.uWeights.x).greaterThan(0), () => {
+        const brk = e.uFam.w.mul(T.gain);
+        const tearN = valueNoise2(vec2(t.mul(T.freqT), ang.mul(T.freqA).add(e.uSeed)));
+        const tear = tearN.sub(0.5).mul(brk);
+        const spacing = tearN.sub(0.5).mul(T.spacing).mul(brk).add(1);
+        const taper = abs(t.sub(0.5)).mul(T.taper).mul(brk).oneMinus();
+        const torn = sin(t.mul(e.uPattern.x).mul(spacing).mul(TWO_PI)
+          .add(sin(ang.add(t.mul(6)).add(tearN.mul(T.fork))).mul(e.uPattern.z))
+          .add(tear.mul(T.phase)).sub(time.mul(0.6))).mul(0.5).add(0.5);
+        // Clamped because a cranked break could otherwise push the low edge past the high one, and a
+        // smoothstep with reversed edges is undefined; the rolled range never reaches 0.17 anyway.
+        const wob = tear.mul(0.5).mul(taper).clamp(-0.17, 0.17);
+        wave.assign(torn);
+        stripes.assign(smoothstep(T.edgeLo.sub(wob), T.edgeHi.add(wob), torn));
+      });
       const spotsN = valueNoise2(vec2(t.mul(e.uPattern.y), ang.mul(1.2).add(e.uSeed)));
       const spots = smoothstep(0.62, 0.8, spotsN);
       const flank = smoothstep(0.05, 0.35, abs(cos(ang))).oneMinus();
@@ -244,25 +306,77 @@ export class EelRenderer {
         maskSwirl.assign(wSwirl.mul(F.swirl.floor.add(F.swirl.floor.oneMinus().mul(fieldSwirl))));
       });
 
+      // Splotch: two octaves quantized to flat plateaus, each plateau landing on its own ramp region.
+      // Hand-rolled rather than shading.js's fbm2, whose four octaves are more detail than a plateau needs.
+      const SP = F.splotch, wSplotch = e.uFam.x;
+      const fieldSplotch = float(0).toVar(), maskSplotch = float(0).toVar();
+      If(wSplotch.greaterThan(0), () => {
+        const freq = e.uFamB.x.mul(SP.freqMul);
+        const n = valueNoise2(vec2(t.mul(freq), ang.mul(SP.around).add(e.uSeed))).toVar();
+        // The halo never builds the second octave and rung 3 branches past it; a multiply by zero still
+        // pays for the fetch. Normalized by the amplitude sum, so dropping it costs detail, not brightness.
+        if (detail) If(SP.oct2.greaterThan(0), () => {
+          const octB = valueNoise2(vec2(t.mul(freq).mul(2.03), ang.mul(SP.around).mul(2.03).add(e.uSeed)));
+          n.assign(n.mul(0.5).add(octB.mul(0.25).mul(SP.oct2)).div(SP.oct2.mul(0.25).add(0.5)));
+        });
+        // levels is a uniform: a bare literal feeding runtime math types abstract in WGSL.
+        const levels = mix(e.uFamB.y, SP.levelsForce, step(2.5, SP.levelsForce));
+        const scaled = n.mul(levels);
+        fieldSplotch.assign(floor(scaled).div(levels.sub(1).max(1)).clamp(0, 1));
+        const edge = smoothstep(SP.edgeW, 0.0, abs(fract(scaled).sub(0.5).abs().sub(0.5)));
+        // Picks between dim plateaus with neon outlines and lit plateau interiors, per splotchLit.
+        maskSplotch.assign(mix(edge, fieldSplotch, e.uGlowModeB.z).mul(wSplotch));
+      });
+
+      // Sheen: a near-solid body whose color wanders across a narrow slice of the ramp, drawn at the rim.
+      const SH = F.sheen, wSheen = e.uFam.y;
+      const fieldSheen = float(0).toVar(), maskSheen = float(0).toVar();
+      If(wSheen.greaterThan(0), () => {
+        const drift = valueNoise2(vec2(t.mul(SH.span), time.mul(U.motionScale).mul(e.uFamB.z).add(e.uSeed)));
+        fieldSheen.assign(drift.mul(SH.width).add(SH.center));
+        // The camera is fixed straight down, so a real Fresnel collapses to 1 - dot(n, up). FrontSide
+        // hands it the tube's far wall, so take |n.y|: unflipped, dot(n, up) clamps to 0 and the rim is flat.
+        maskSheen.assign(smoothstep(SH.rimLo, SH.rimHi, normalize(vNormal).y.abs().oneMinus()).mul(wSheen));
+      });
+
       // The field indexes the ramp: crests and flank read the main half, spots and between-stripe skin the
       // accent half, bands walk the whole ramp; a flank-only eel borrows the spot field so it is not split at mid-body.
       const wRace = e.uRace.x, wPlaid = e.uPlaid.x, wRidge = e.uPlaid.z;
-      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl)).oneMinus();
+      const bare = smoothstep(0.0, 1e-3, e.uWeights.x.add(e.uWeights.y).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl).add(wSplotch).add(wSheen)).oneMinus();
       const wSpotF = e.uWeights.y.add(bare);
-      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl).max(1e-3);
+      const wSum = e.uWeights.x.add(wSpotF).add(e.uBand.x).add(wRace).add(wPlaid).add(wRidge).add(wSwirl).add(wSplotch).add(wSheen).max(1e-3);
       const field = wave.oneMinus().mul(e.uWeights.x.div(wSum))
         .add(spots.mul(wSpotF.div(wSum)))
         .add(t.mul(e.uBand.y).mul(e.uBand.x.div(wSum)))
         .add(race.oneMinus().mul(wRace.div(wSum)))
         .add(bandT.add(bandA).mul(0.5).mul(wPlaid.div(wSum)))
         .add(ridge.clamp(0, 1).oneMinus().mul(wRidge.div(wSum)))
-        .add(fieldSwirl.mul(wSwirl.div(wSum)));
+        .add(fieldSwirl.mul(wSwirl.div(wSum)))
+        .add(fieldSplotch.mul(wSplotch.div(wSum)))
+        .add(fieldSheen.mul(wSheen.div(wSum)))
+        .toVar();
+
+      // The tail-own envelope: the tip walks the ramp on its own slow clock instead of the body's field.
+      // A field move, not a brightness term, which is why it lands here and not in the glow envelope.
+      const TO = F.tailOwn;
+      If(e.uGlowModeB.x.greaterThan(0), () => {
+        const tailT = smoothstep(TO.from, TO.to, t).mul(e.uGlowModeB.x);
+        const walk = fract(time.mul(U.motionScale).mul(TO.rate).add(e.uSeed.mul(0.1)));
+        const ownF = mix(walk, walk.sub(0.5).abs().mul(2), TO.pingPong);
+        field.assign(mix(field, ownF, tailT));
+      });
 
       // The bake puts a band-edge mask in alpha, so each stripe boundary lights up from the one sample.
       const samp = rampNode.sample(vec2(field, 0.5));
-      const ramp = samp.rgb;
+      const ramp = vec3(0).toVar();
+      ramp.assign(samp.rgb);
+      // The gamer glow: a real hue rotation, a full wheel every eight seconds. Skin, glow, and the sand
+      // light (writeSlot runs the same angle) all turn together, or the body and its light drift apart.
+      If(e.uGlowModeB.y.greaterThan(0), () => {
+        ramp.assign(mix(ramp, hue(ramp, time.mul(U.motionScale).mul(F.rgb.rate)), e.uGlowModeB.y));
+      });
       const mask = stripes.mul(e.uWeights.x).add(spots.mul(e.uWeights.y)).add(flank.mul(e.uWeights.z)).add(samp.a.mul(e.uBand.x))
-        .add(race.mul(wRace)).add(plaid.mul(wPlaid)).add(ridge.mul(wRidge)).add(maskSwirl);
+        .add(race.mul(wRace)).add(plaid.mul(wPlaid)).add(ridge.mul(wRidge)).add(maskSwirl).add(maskSplotch).add(maskSheen);
 
       // The stars. Each fragment tests the four nearest cells, so a star may sit anywhere in its own cell
       // (a full half-cell of jitter each way) without being cut at the edge: that is what breaks the rows.
@@ -381,8 +495,16 @@ export class EelRenderer {
       const body = vec3(0.03, 0.035, 0.05).mul(U.moonColor).mul(lambert);
       const glow = emission();
       const rim = dot(n, vec3(0, 1, 0)).max(0).oneMinus().pow(2).mul(0.4);
+      // FrontSide hands this camera the far wall, so only y is mirrored: that is the back's real normal
+      // at this xz, and a full negate would put the streak on the side away from the moon.
+      const W = this.familyU.wet;
+      const back = vec3(n.x, n.y.abs(), n.z);
+      const wet = dot(back, normalize(L.add(vec3(0, 1, 0)))).max(0).pow(W.sharp.mul(e.uWetSharp))
+        .mul(W.gain).mul(e.uWet.w).mul(mix(vec3(1), e.uWet.xyz, W.tint)).mul(U.moonColor);
       const depthFrac = vWorld.y.negate().div(DEPTH).clamp(0, 1);
-      return vec4(body.add(glow).add(glow.mul(rim)), depthFrac);
+      const out = vec4(body.add(glow).add(glow.mul(rim)).add(wet), depthFrac).toVar();
+      cutBuried();
+      return out;
     })();
     bodyMat.side = THREE.FrontSide;
 
@@ -393,7 +515,8 @@ export class EelRenderer {
     haloMat.fragmentNode = Fn(() => {
       const n = normalize(vNormal);
       const edge = dot(n, vec3(0, 1, 0)).max(0);
-      const glow = emissionCoarse().mul(0.16).mul(edge.pow(1.5)).mul(e.uHaloMul);
+      const glow = emissionCoarse().mul(0.16).mul(edge.pow(1.5)).mul(e.uHaloMul).toVar();
+      cutBuried();
       return vec4(glow, 0);
     })();
     haloMat.transparent = true;
@@ -443,7 +566,9 @@ export class EelRenderer {
         const transmission = exp(vec3(1).sub(pale).mul(density).negate());
         const refracted = background.mul(transmission).mul(J.gain.clamp(0, 1));
         const opacity = J.wash.mul(thick.mul(0.6).add(0.4)).add(rim.mul(J.rim).mul(breathe)).clamp(0, 0.8);
-        return vec4(refracted.add(emission().mul(J.ghost)), opacity);
+        const out = vec4(refracted.add(emission().mul(J.ghost)), opacity).toVar();
+        cutBuried();
+        return out;
       })();
       // Alpha blending: the see-through part is the exact scene beneath, self-overlaps accumulate
       // instead of punching floor-colored holes, and dst alpha survives for the depth pass below.
@@ -459,7 +584,7 @@ export class EelRenderer {
       // Depth companion: RGB untouched, alpha becomes eel depth so the refraction pass keeps its contract.
       const d = new THREE.NodeMaterial();
       d.positionNode = buildPosition(1);
-      d.fragmentNode = Fn(() => vec4(vec3(0), vWorld.y.negate().div(DEPTH).clamp(0, 1)))();
+      d.fragmentNode = Fn(() => { cutBuried(); return vec4(vec3(0), vWorld.y.negate().div(DEPTH).clamp(0, 1)); })();
       d.transparent = true;
       d.blending = THREE.CustomBlending;
       d.blendEquation = THREE.AddEquation;
@@ -507,10 +632,29 @@ export class EelRenderer {
 
   /* A reroll rebakes the ramp texture and moves uniforms; the node graph and the materials are the
      ones built at boot, which is what keeps a middle click free of a pipeline compile. */
-  /* The CPU side of Shelley's families: the star and glitter cell grids, the class table, and the metal.
-     Cheap enough to re-run from applyKnobs, which is what makes forceClass and forceMetal usable. */
+  /* The CPU side of the families: the star and glitter cell grids, the class table, the metal, and the
+     splotch/sheen/tiger pack. Cheap enough to re-run from applyKnobs, which is what makes the force dials usable. */
   pushFamilies(e) {
     const K = this.familyU;
+    // The streak's width on screen goes as girth over root-sharp, so sharp scales with girth squared:
+    // a thick back keeps a thin wet line instead of wearing a broad pale stripe.
+    const c = tmpPink.copy(e.colA).lerp(e.colB, 0.35), m = Math.max(c.r, c.g, c.b, 1e-3);
+    e.uWet.value.set(c.r / m, c.g / m, c.b / m, e.identity?.wet ?? 1);
+    e.uWetSharp.value = Math.min(12, Math.max(0.5, (e.radius / K.wet.refR.value) ** 2));
+    // A force dial on a body family only reaches the eels that declare it, since their shape parameters
+    // are rolled alongside the weight; the two envelopes need none, so those force onto anybody.
+    const pick = (forced, declared, own) => (forced != null && declared ? forced : own ?? 0);
+    e.uFam.value.set(
+      pick(K.splotch.forceW.value, e.splotchDeclared, e.wSplotch),
+      pick(K.sheen.forceW.value, e.sheenDeclared, e.wSheen),
+      e.wPaisley ?? 0,
+      pick(K.tiger.forceBreak.value, e.tigerDeclared, e.tigerBreak));
+    e.uFamB.value.set(e.splotchFreq ?? 0, e.splotchLevels ?? 0, e.sheenDrift ?? 0, e.paisleyScale ?? 0);
+    e.uGlowModeB.value.set(
+      K.tailOwn.force.value ?? e.wTailOwn ?? 0,
+      K.rgb.force.value ?? e.wRgb ?? 0,
+      K.splotch.forceLit.value ?? e.splotchLit ?? 0,
+      e.paisleyTiles ?? 0);
     const L = starLayout(e.length, e.radius, K.stars.forceClass.value >= 0 ? K.stars.forceClass.value : e.starClass ?? 1);
     e.uStars.value.set(e.wStars ?? 0, L.cellsAlong, L.cellsAround, L.radius);
     e.uStarsB.value.set(L.density, e.starSeed ?? 0, L.rim, 1);
@@ -562,6 +706,12 @@ export class EelRenderer {
     // span as before: a full head→tail lerp passes through grey on complementary palettes.
     U.eelCol.array[i].copy(e.rampHead).lerp(e.rampTail, 0.25).multiplyScalar(k);
     U.eelColB.array[i].copy(e.rampHead).lerp(e.rampTail, 0.55).multiplyScalar(k);
+    const wRgb = e.uGlowModeB.value.y;
+    if (wRgb > 0) {
+      const ang = U.time.value * U.motionScale.value * this.familyU.rgb.rate.value;
+      rotateHue(U.eelCol.array[i], ang, wRgb);
+      rotateHue(U.eelColB.array[i], ang, wRgb);
+    }
   }
 
   clearSlot(i) {
@@ -604,6 +754,7 @@ export class EelRenderer {
   sync(eels, foods, alpha) {
     for (const e of eels) {
       for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
+      this.syncBury(e);
       // Eye placement from the head frame.
       const h = e.show[0], n1 = e.show[1];
       tmpA.subVectors(h, n1).normalize();
@@ -621,6 +772,15 @@ export class EelRenderer {
       f.mesh.position.set(f.mx ?? f.x, f.y, f.mz ?? f.z);
       f.mesh.scale.setScalar(crumbScale(f.amount));
     }
+  }
+
+  /* The cut rides the closure front: rings the sand has fully closed on vanish, and inside the collar
+     anything under the sand at the hole (plus a sliver of margin for the mesh) does too. */
+  syncBury(e) {
+    const front = e.burrowFront ?? -1;
+    if (!(front >= 0)) { e.uBury.value.set(-1e3, -1e3, 0); return; }
+    const c = e.show[Math.min(EEL_POINTS - 1, Math.round(front))];
+    e.uBury.value.set(front - (e.burrowSoft ?? 0), front + 1, floorHeightAt(c.x, c.z) + 0.02 + e.radius * 0.1);
   }
 
   /* The guest owns slots EEL_COUNT and EEL_COUNT + 1. She is parked offstage and hidden between

@@ -4,7 +4,10 @@ import { createRng, deriveSeed } from './rng.js';
 import { paceWave, commitPose, claimTick, releaseTick } from './eel-behavior.js';
 import { floorHeightAt, floorSurfaceAt, sandColorAt, sandAlbedoAt } from './floor.js';
 import { RELIEF_HEAL_TAU } from './relief-core.js';
-import { moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01 } from './eel-air-core.js';
+import {
+  moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01,
+  burrowFront, buryDepth, digStamps, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
+} from './eel-air-core.js';
 
 /* Verticality: every state that leaves the water column's comfort band. Peek, log flop, ballistic
    leap, burrow with dig puffs, and the moon bite, plus the per-eel moon mood the rest of the pond
@@ -41,8 +44,7 @@ const SPIN_LEAP = 60;          // knobs.air.spinLeap default: the zoomies multip
 const ZOOMIE_MUL = 1.3;       // speedMul at or above this is a burst, not ordinary swimming
 const BELLY_AMP = 1.3;
 const BELLY_RING = 1.6;
-const DIG_ONE = 1.5, DIG_TWO = 1;
-const DIG_ONE_MAX = 6;        // dig1 is a goal now, so this is only the give-up deadline
+const DIG_TWO = 1;
 const DIG_HALO = 0.15;        // the additive shell blooms through the sand as a bright ball
 const DIG_TRICKLE = 0.8;      // seconds between the buried hold's idle billows
 const SILT_TINT = [0.85, 1.0, 1.35];   // silt catching moonlight, not the sand it came from
@@ -50,6 +52,15 @@ const DIG_SLOPE = 20 * Math.PI / 180;
 const DIG_YAW1 = 25 * Math.PI / 180, DIG_HZ1 = 4;
 const DIG_YAW2 = 15 * Math.PI / 180, DIG_HZ2 = 2;
 const DIG_BUDGET = { one: [20, 24], two: [6, 4], wake: [6, 16] };
+// The punch: the snout drives at the sand steeper and harder than the run that follows, and nothing
+// is drawn until it is through. PUNCH_IN is radii of head past the surface that counts as in.
+const PUNCH_SLOPE = 55, PUNCH_IN = 0.6, PUNCH_MAX = 5, PUNCH_RETRY = 8;
+const PUNCH_YAW = 18 * Math.PI / 180, PUNCH_HZ = 5;
+const SNOUT_GRAINS = 4;       // the contact spray, the one thing allowed before the head is in
+// The feed: the body runs this many radii under the local sand, the sand closes over it at the head's
+// own pace, and DIG_MAX is the deadline past which DIG_CATCHUP seconds close it the rest of the way.
+const DIG_DEPTH = BURY_DEPTH, DIG_MAX = 12, DIG_CATCHUP = 1.5;
+const BURIED_MIN = 2;         // seconds under the sand a finished dig is owed whatever the bout says
 // The sand relief. RELIEF_R is one spine stamp's Gaussian radius in world units, RELIEF_RIDGE the
 // mound's height in body radii, RELIEF_TROUGH what the exit leaves as a fraction of that mound.
 const RELIEF_R = 0.45, RELIEF_RIDGE = 0.5, RELIEF_TROUGH = 0.6;
@@ -90,6 +101,9 @@ export class AirStates {
     this.anchor = { x: 0, z: 0, ok: false };
     this.troughs = [];      // { trail, t0, puffAt } per exit, so the silt can follow the sand closing
     this.recoveries = [];   // { name, took, hitDeadline }, kept only under ?debug=1
+    // The relief stamp's scratch, reused across eels and ticks so a dig allocates nothing per frame.
+    this.stampBuf = [];
+    this.stampOpts = { step: 3, soft: BURY_SOFT, ridge: 0, sandAt: floorHeightAt };
   }
 
   // Live knobs, read every call so the console can tune mid-night.
@@ -115,6 +129,8 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
     e.burrowing = 0;
+    e.burrowFront = -1;
+    e.burrowSoft = BURY_SOFT;
     e.sandBound = false;
     const rng = createRng(deriveSeed(this.seed, AIR_SALT + (e.index ?? 0)));
     this.map.set(e, {
@@ -595,6 +611,7 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.floorY = this.defaultFloor(e);
     e.sandBound = false;
+    e.burrowFront = -1;
     st.state = null; st.phase = ''; st.exempt = false; st.leap = null;
     // Left armed, a cancelled belly leap fires its flop splash on the next film crossing, whatever caused it.
     st.ringUp = 0.4; st.ringDown = 0.4; st.belly = false;
@@ -634,51 +651,63 @@ export class AirStates {
     if (!force && sys.fear?.contesting?.(e)) return false;
     if (!this.canBurrow(e)) return false;
     st.burrowBout = e.gaitFrom;
-    st.state = 'burrow'; st.phase = 'dig1'; st.t0 = sys.time;
-    st.dig = { ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0, scareFor: 0 };
+    st.state = 'burrow'; st.phase = 'punch'; st.t0 = sys.time;
+    st.dig = {
+      ang: Math.atan2(e.heading.z, e.heading.x), grains: 0, silt: 0, puffAt: 0, scareFor: 0,
+      adv: 0, lx: e.head.x, ly: e.head.y, lz: e.head.z, struck: false,
+    };
+    e.burrowing = 0;
+    e.burrowFront = -1;
+    e.burrowSoft = this.digSoft();
     st.exempt = true;
     sys.emit('dig', e, { size: e.length, detail: { phase: 'in' } });
     return true;
   }
 
+  digSoft() { return knob(this.sys.knobs?.air?.digSoft, BURY_SOFT); }
+
+  /* A punch that never broke the sand: nothing was drawn, so there is nothing to collapse either.
+     The cooldown is what stops the asleep hold asking again on the very next tick. */
+  abortDig(sys, e, st) {
+    this.release(e, st);
+    st.abortedBy = 'punch';
+    st.coolUntil = Math.max(st.coolUntil, sys.time + PUNCH_RETRY);
+    sys.emit('dig', e, { size: e.length, detail: { phase: 'out' } });
+  }
+
   digTick(sys, e, st, dt) {
     const now = sys.time, d = st.dig, head = e.head;
     const sand = floorHeightAt(head.x, head.z);
-    e.floorY = sand - 1.2 * e.radius;
+    e.floorY = sand - BURY_FLOOR * e.radius;
     e.sandBound = true;   // collide() must not lift this bound by the shoal a second time
     const el = now - st.t0;
-    // The press ramps in over dig1 so the body slides under instead of snapping there, holds through
-    // the buried hold, and lets go at wake; the halo follows it down and back up.
-    const press = st.phase === 'dig1' ? Math.min(1, el / DIG_ONE) : st.phase === 'wake' ? 0 : 1;
-    e.burrowing = press;
-    this.dimHalo(e, st, press, dt);
-    this.stampRelief(e, st, dt, press);
-    if (st.phase === 'dig1') {
-      const sink = e.prowlBL * e.length * Math.sin(DIG_SLOPE);
-      this.puffBudget(e, st, el / DIG_ONE, DIG_BUDGET.one);
-      this.drive(sys, e, dt, {
-        heading: d.ang + DIG_YAW1 * Math.sin(el * DIG_HZ1 * Math.PI * 2),
-        speedBL: e.prowlBL * Math.cos(DIG_SLOPE),
-        ySet: head.y - sink * dt, ampMul: 1.2,
-      });
-      // The mirror of finishRecover's test: dig1 ends on a buried chain, not on a stopwatch, so a
-      // long slow eel simply takes longer to get all of itself down there.
-      const under = maxY(e) <= sand - e.radius;
-      if (el >= DIG_ONE && (under || el >= DIG_ONE_MAX)) { st.phase = 'dig2'; st.t0 = now; d.grains = 0; d.silt = 0; }
-      return;
-    }
+    e.burrowSoft = this.digSoft();
+    if (st.phase === 'punch') { this.punchTick(sys, e, st, dt, sand, el); return; }
+    if (st.phase === 'feed') { this.feedTick(sys, e, st, dt, sand, el); return; }
+    // Past the feed the sand is closed over the whole chain, and lets go again at wake.
+    const buried = st.phase !== 'wake';
+    e.burrowFront = buried ? e.pts.length + e.burrowSoft : -1;
+    e.burrowing = buried ? 1 : 0;
+    this.dimHalo(e, st, buried ? 1 : 0, dt);
+    if (buried) this.stampRelief(e, st, dt);
     if (st.phase === 'dig2') {
       this.puffBudget(e, st, el / DIG_TWO, DIG_BUDGET.two);
       this.drive(sys, e, dt, {
         heading: d.ang + DIG_YAW2 * Math.sin(el * DIG_HZ2 * Math.PI * 2),
         speedBL: 0, ySet: head.y, ampMul: 0.15, resting: true,
       });
-      if (el >= DIG_TWO) { st.phase = 'buried'; st.t0 = now; e.buried = true; d.grains = 0; d.silt = 0; }
+      if (el >= DIG_TWO) {
+        st.phase = 'buried'; st.t0 = now; e.buried = true; d.grains = 0; d.silt = 0;
+        // Feeding a whole body in takes seconds now, so a bout that ran out during the dig would
+        // surface the eel the tick it arrived. A scare still evicts it at once; a clock does not.
+        d.holdUntil = now + knob(this.sys.knobs?.air?.buriedMin, BURIED_MIN);
+      }
       return;
     }
     if (st.phase === 'buried') {
       // The hold owns the clock: the bout ending, a scare, or a quorum wake all lift the head out.
-      if (now >= e.gaitUntil || this.buriedScared(sys, e, st, dt)) { this.startWake(sys, e, st); return; }
+      const held = now < (d.holdUntil ?? 0);
+      if ((!held && now >= e.gaitUntil) || this.buriedScared(sys, e, st, dt)) { this.startWake(sys, e, st); return; }
       if (now >= (d.puffAt ?? 0)) {
         this.trickle(e);
         d.puffAt = now + this.puffRng.range(0.75, 1.25) * knob(this.sys.knobs?.air?.puffTrickle, DIG_TRICKLE);
@@ -695,11 +724,76 @@ export class AirStates {
     if (head.y >= want - 0.01) this.startRecover(sys, e, st, 'burrow');
   }
 
+  /* The hole. The snout drives at the sand steeper than the run that follows and nothing is drawn
+     until it is through, so the dig reads as work rather than as a body sinking through the floor. */
+  punchTick(sys, e, st, dt, sand, el) {
+    const now = sys.time, d = st.dig, head = e.head;
+    const rad = knob(this.sys.knobs?.air?.punchSlope, PUNCH_SLOPE) * Math.PI / 180;
+    const sink = e.prowlBL * e.length * Math.sin(rad);
+    if (!d.struck && head.y - e.radius <= sand) { d.struck = true; this.snoutPuff(e); }
+    this.drive(sys, e, dt, {
+      heading: d.ang + PUNCH_YAW * Math.sin(el * PUNCH_HZ * Math.PI * 2),
+      speedBL: e.prowlBL * Math.cos(rad),
+      ySet: head.y - sink * dt, ampMul: 1.1,
+    });
+    if (head.y <= sand - e.radius * knob(this.sys.knobs?.air?.punchIn, PUNCH_IN)) {
+      st.phase = 'feed'; st.t0 = now;
+      d.adv = 0; d.lx = head.x; d.ly = head.y; d.lz = head.z; d.grains = 0; d.silt = 0;
+      return;
+    }
+    if (el >= knob(this.sys.knobs?.air?.punchMax, PUNCH_MAX)) this.abortDig(sys, e, st);
+  }
+
+  /* The body feeding down the hole the snout made. The head runs level under the sand at its dig
+     depth, and the sand closes behind it at the head's own pace, which is what the mound and the cap both read. */
+  feedTick(sys, e, st, dt, sand, el) {
+    const now = sys.time, d = st.dig, head = e.head, n = e.pts.length;
+    const moved = Math.hypot(head.x - d.lx, head.y - d.ly, head.z - d.lz);
+    if (Number.isFinite(moved)) d.adv += moved;
+    // The run covers a body length now, which is enough to carry a dig off the frame, so the snout
+    // turns for the middle once it passes the same inset a leap has to land inside.
+    const limX = sys.view.w * LEAP_INSET, limZ = sys.view.h * LEAP_INSET;
+    if (Math.abs(head.x) > limX || Math.abs(head.z) > limZ) {
+      d.ang += wrapPi(Math.atan2(-head.z, -head.x) - d.ang) * Math.min(1, dt * 2);
+    }
+    // The deadline is a give-up, not a schedule: a body that cannot make headway still gets covered.
+    if (el > knob(this.sys.knobs?.air?.digMax, DIG_MAX)) {
+      d.adv += (e.spacing * (n - 1) * dt) / Math.max(0.1, knob(this.sys.knobs?.air?.digCatchup, DIG_CATCHUP));
+    }
+    const soft = e.burrowSoft;
+    const front = burrowFront(d.adv, e.spacing);
+    e.burrowFront = front;
+    const frac = clamp01(front / Math.max(1, n - 1));
+    e.burrowing = frac;
+    this.dimHalo(e, st, frac, dt);
+    this.stampRelief(e, st, dt);
+    this.puffBudget(e, st, frac, DIG_BUDGET.one);
+    const wantY = sand - e.radius * buryDepth(knob(this.sys.knobs?.air?.digDepth, DIG_DEPTH));
+    const step = e.prowlBL * e.length * Math.sin(DIG_SLOPE) * dt;
+    this.drive(sys, e, dt, {
+      heading: d.ang + DIG_YAW1 * Math.sin(el * DIG_HZ1 * Math.PI * 2),
+      speedBL: e.prowlBL * Math.cos(DIG_SLOPE),
+      ySet: head.y + Math.max(-step, Math.min(step, wantY - head.y)),
+      ampMul: 1.2,
+    });
+    // A bad head must not become the origin, or every later step measures from nowhere.
+    if (Number.isFinite(head.x + head.y + head.z)) { d.lx = head.x; d.ly = head.y; d.lz = head.z; }
+    // The collar is the last thing to close, so the tail is only truly under a soft past the last point.
+    if (front >= n - 1 + soft) { st.phase = 'dig2'; st.t0 = now; d.grains = 0; d.silt = 0; }
+  }
+
+  /* The spray off the snout at first contact, and the only thing this dig draws before the head is in. */
+  snoutPuff(e) {
+    const n = Math.round(SNOUT_GRAINS * knob(this.sys.knobs?.air?.snoutPuff, 1));
+    if (n > 0) this.puff(e.head.x, e.head.z, 'grain', n, e.heading);
+  }
+
   startWake(sys, e, st) {
     this.collapseRelief(e, st);
     st.phase = 'wake'; st.t0 = sys.time;
     e.buried = false;
     e.burrowing = 0;
+    e.burrowFront = -1;
     st.dig.grains = 0; st.dig.silt = 0;
     sys.emit('dig', e, { size: e.length, detail: { phase: 'out' } });
   }
@@ -708,28 +802,30 @@ export class AirStates {
      buried eel starts its physical dig-out; anyone else has nothing to do. */
   wake(e) {
     const st = this.map.get(e);
-    if (!st || st.state !== 'burrow' || (st.phase !== 'buried' && st.phase !== 'dig1' && st.phase !== 'dig2')) return false;
+    if (!st || st.state !== 'burrow') return false;
+    if (st.phase !== 'buried' && st.phase !== 'punch' && st.phase !== 'feed' && st.phase !== 'dig2') return false;
     this.startWake(this.sys, e, st);
     return true;
   }
 
   // The sand relief
 
-  /* The dig's mark: sand heaved up along the buried part of the body. Stamped toward a height, not
-     added, on a coarse clock, so a long hold keeps its mound against the heal for free. */
-  stampRelief(e, st, dt, press) {
+  /* The dig's mark: sand heaved over only the part of the body it has closed on, so the mound runs
+     tailward. Stamped toward a height on a coarse clock, so a long hold outlasts the heal for free. */
+  stampRelief(e, st, dt) {
     const field = this.sys.relief;
     const d = st.dig;
-    if (!field || !d) return;
+    if (!field || !d || !(e.burrowFront >= 0)) return;
     d.reliefAt = (d.reliefAt ?? 0) - dt;
     if (d.reliefAt > 0) return;
     d.reliefAt = RELIEF_TICK;
-    const h = RELIEF_RIDGE * e.radius * Math.max(0, Math.min(1, press));
-    if (!(h > 0)) return;
-    for (let i = 0; i < e.pts.length; i += 3) {
-      const p = e.pts[i];
-      if (p.y > floorHeightAt(p.x, p.z)) continue;
-      field.stamp(p.x, p.z, RELIEF_R, h);
+    const opts = this.stampOpts;
+    opts.soft = e.burrowSoft;
+    opts.ridge = RELIEF_RIDGE * e.radius;
+    const n = digStamps(e.pts, e.burrowFront, opts, this.stampBuf);
+    for (let i = 0; i < n; i++) {
+      const s = this.stampBuf[i];
+      field.stamp(s.x, s.z, RELIEF_R, s.h);
     }
   }
 
@@ -737,7 +833,8 @@ export class AirStates {
      trough while it fills, which is what hides the healing. */
   collapseRelief(e, st) {
     const field = this.sys.relief;
-    if (!field || st.phase === 'wake') return;
+    // A punch that never got in stamped nothing, so there is no ridge to fall in on itself.
+    if (!field || st.phase === 'wake' || !(e.burrowFront >= 0)) return;
     const h = -RELIEF_TROUGH * RELIEF_RIDGE * e.radius;
     const trail = [];
     for (let i = 0; i < e.pts.length; i += 3) {
@@ -958,6 +1055,7 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
     e.burrowing = 0;
+    e.burrowFront = -1;
     e.sandBound = false;
     st.dim = 0;
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
@@ -1071,6 +1169,7 @@ export class AirStates {
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
     e.burrowing = 0;
+    e.burrowFront = -1;
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
     // Parity with release(): a deferred nope left armed here fires at the end of an unrelated later state.
     if (st) {
@@ -1171,6 +1270,7 @@ export class AirStates {
       moonBright: +this.moonBright(e).toFixed(4), moonOff: +st.moonOff.toFixed(4),
       floorY: +e.floorY.toFixed(4), ceilingY: +e.ceilingY.toFixed(4),
       buried: !!e.buried, burrowing: +(e.burrowing ?? 0).toFixed(3),
+      burrowFront: +(e.burrowFront ?? -1).toFixed(2), digAdv: +(st.dig?.adv ?? 0).toFixed(3),
       exempt: st.exempt, abortedBy: st.abortedBy ?? '',
     };
   }

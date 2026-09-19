@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { EEL_POINTS, DEPTH } from './config.js';
 import { floorHeightAt, shoalHeightAt } from './floor.js';
+import { BURY_FLOOR, BURY_CAP } from './eel-air-core.js';
 
 export const TICK = 1 / 90;
 export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
@@ -152,9 +153,10 @@ export function collide(eels, colliders) {
     // Guests run slip below 1. A body eight units long snags on scenery its brain steered past three
     // seconds ago, and the strongest eel in the pond should shrug that off, not park on it.
     const slip = ea.slip ?? 1;
-    // A burrow needs a ceiling as well as a floor, and a per-point one: the dune over the tail is not
-    // the dune over the snout, so eel-air ramps this fraction in over dig1 and drops it at wake.
-    const bury = Math.min(1, ea.burrowing ?? 0);
+    // A burrow needs a ceiling as well as a floor, and a per-point one: the sand closes over the body
+    // from the snout back, so eel-air hands over how many points behind the head are under it yet.
+    const front = ea.burrowFront ?? -1;
+    const collar = ea.burrowSoft ?? 1;
     // Decide the pair cull once per eel, outside the 24×24 point loop it gates. Scenery gets the same
     // treatment: a collider that the body's whole bounding sphere clears cannot push any of its 24 points.
     const pad = ea.boundR + 0.6;   // margin: pair pushes earlier in this pass can move a point up to a radius or so
@@ -185,7 +187,7 @@ export function collide(eels, colliders) {
       if (ea.sandBound) {
         // A dig's bound is the sand under each point, not under the head: on a mound the tail lies
         // lower than the head, and a head-based bound snaps it up the slope the moment the press lets go.
-        const fp = floorHeightAt(p.x, p.z) - r * 1.2;
+        const fp = floorHeightAt(p.x, p.z) - r * BURY_FLOOR;
         if (p.y < fp) p.y = fp;
       } else {
         if (p.y < bFloor) p.y = bFloor;
@@ -195,9 +197,10 @@ export function collide(eels, colliders) {
         if (mound > 0 && p.y < bFloor + mound) p.y = Math.min(bFloor + mound, bCeil - r * 0.5);
       }
       if (p.y > bCeil) p.y = bCeil;
-      if (bury > 0) {
-        const cap = floorHeightAt(p.x, p.z) - r * 0.9;
-        if (p.y > cap) p.y += (cap - p.y) * bury;
+      if (front >= i) {
+        const w = collar > 0 ? Math.min(1, (front - i) / collar) : 1;
+        const cap = floorHeightAt(p.x, p.z) - r * BURY_CAP;
+        if (w > 0 && p.y > cap) p.y += (cap - p.y) * w;
       }
       for (let si = 0; si < nS; si++) {
         const s = hitS[si];

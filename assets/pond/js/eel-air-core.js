@@ -1,5 +1,5 @@
-/* The air states' pure math: the moon mood curve, the leap's ballistics, and the landing clearance
-   test. No THREE, no pond, so the unit tests can sweep it in Node. */
+/* The air states' pure math: the moon mood curve, the leap's ballistics, the landing clearance test,
+   and the nose-first burrow's closure front. No THREE, no pond, so the unit tests can sweep it in Node. */
 
 /* NaN clamps to 0 rather than through: this gate sits upstream of sqrt, of the moon curve's power,
    and of every trigger rate, and a NaN there poisons an eel's whole night. */
@@ -75,4 +75,57 @@ export function crestHeight(s, rOuter, crestY, r) {
   const R = rOuter + r;
   const a = Math.min(Math.abs(s), R);
   return crestY - rOuter + Math.sqrt(Math.max(0, R * R - a * a));
+}
+
+// The nose-first burrow
+
+export const BURY_SOFT = 2;    // spine points the sand takes to close: the collar around the hole
+export const BURY_FLOOR = 1.9; // the solver's own sand floor, in radii; a run below it reads as a stall
+// The cap keeps the tube's top 0.4 radii under the analytic sand: the floor mesh is triangulated, and a
+// body grazing it pokes its ring joints through in flickering slivers as it wiggles.
+export const BURY_CAP = 1.4, BURY_DEPTH = 1.6;
+
+/* Point i of the chain trails the snout by i × spacing, so the arc the head has covered since the
+   snout went under is, measured in point indices, exactly how far back the sand has closed. */
+export function burrowFront(adv, spacing) {
+  if (!Number.isFinite(adv) || adv < 0) return 0;
+  if (!Number.isFinite(spacing) || !(spacing > 1e-6)) return 0;
+  return adv / spacing;
+}
+
+/* How buried point i is: 1 well behind the front, 0 ahead of it, a ramp across the collar. A soft of
+   0 is a hard line, which is what a caller asking for no collar means. */
+export function buryWeight(i, front, soft = BURY_SOFT) {
+  if (!Number.isFinite(i) || !Number.isFinite(front) || front < 0) return 0;
+  const s = Number.isFinite(soft) ? soft : BURY_SOFT;
+  if (!(s > 0)) return i <= front ? 1 : 0;
+  return clamp01((front - i) / s);
+}
+
+/* A burrowed body runs this far under the local sand, in radii, capped clear of the solver's floor. */
+export function buryDepth(v) {
+  const d = Number.isFinite(v) && v > 0 ? v : BURY_DEPTH;
+  return Math.min(d, BURY_FLOOR - 0.05);
+}
+
+/* Which spine points heave the sand and by how much. A point still in the water stamps nothing, so
+   the mound only ever grows tailward behind the snout. `out` is reused; the return is its length. */
+export function digStamps(pts, front, o, out = []) {
+  const ridge = o?.ridge, sandAt = o?.sandAt;
+  if (!Array.isArray(pts) && !pts?.length) return 0;
+  if (!Number.isFinite(front) || front < 0) return 0;
+  if (!Number.isFinite(ridge) || !(ridge > 0) || typeof sandAt !== 'function') return 0;
+  const step = Math.max(1, Math.floor(o?.step ?? 1) || 1);
+  let n = 0;
+  for (let i = 0; i < pts.length; i += step) {
+    const p = pts[i];
+    const w = buryWeight(i, front, o?.soft);
+    if (!(w > 0) || !Number.isFinite(p.x) || !Number.isFinite(p.z)) continue;
+    const sand = sandAt(p.x, p.z);
+    if (!Number.isFinite(sand) || !Number.isFinite(p.y) || p.y > sand) continue;
+    const s = (out[n] ??= { x: 0, z: 0, h: 0 });
+    s.x = p.x; s.z = p.z; s.h = ridge * w;
+    n++;
+  }
+  return n;
 }

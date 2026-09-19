@@ -372,6 +372,10 @@ async function boot() {
   // setQuality resets any field it is not given, so the whole desired state goes over on every call.
   const floaterQ = { speckFraction: 1, detile: true, pollenFraction: 1, pollen: true };
   const setFloaters = (patch) => { Object.assign(floaterQ, patch); floaters.setQuality({ ...floaterQ }); };
+  const setSplotch = (levels, oct2) => {
+    const s = eels.knobs.families?.splotch;
+    if (s) { s.levelsForce.value = levels; s.oct2.value = oct2; }
+  };
   let texChain = Promise.resolve();
   const setTex = (size) => {
     if (size === texSizeNow) return;
@@ -385,7 +389,11 @@ async function boot() {
   const RUNGS = {
     1: { on: () => setFloaters({ pollenFraction: 0.5 }), off: () => setFloaters({ pollenFraction: 1 }) },
     2: { on: () => rain.setCap(0.5), off: () => rain.setCap(1) },
-    3: { on: () => setFloaters({ speckFraction: 0.4 }), off: () => setFloaters({ speckFraction: 1 }) },
+    // Splotch loses its second octave and every eel drops to 3 plateaus: two uniform writes, no recompile.
+    3: {
+      on: () => { setFloaters({ speckFraction: 0.4 }); setSplotch(3, 0); },
+      off: () => { setFloaters({ speckFraction: 1 }); setSplotch(0, 1); },
+    },
     4: {
       on: () => {
         algae.setQuality({ tuftFraction: 0.5 });

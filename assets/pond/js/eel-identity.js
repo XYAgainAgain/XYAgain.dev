@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { JIM_TABLECLOTH, PRIDE_FLAGS, twoToneStops, JAM, COBALT, SHELLEY_SWIRL, STAR_SILVER, STAR_GOLD } from './eel-palette.js';
+import { JIM_TABLECLOTH, PRIDE_FLAGS, THEMES, weightedPickName, twoToneStops, JAM, COBALT, SHELLEY_SWIRL, STAR_SILVER, STAR_GOLD } from './eel-palette.js';
 import { EEL_COUNT } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { STAR_METAL_ODDS, SWIRL_FREQ, FACET_TILT } from './eel-stars-core.js';
@@ -61,7 +61,7 @@ export const IDENTITIES = [
     build: { length: [2.0, 2.6], radius: [0.105, 0.125] },
     colorsA: [TURQUOISE], colorsB: [PURPLE],
     jelly: 0.33,
-    pattern: { stripe: [0.2, 0.2, 0.5], spot: [0.95, 0.4, 1], flank: [0.9, 0.4, 1], wavy: [0, 1.6] },
+    pattern: { stripe: [0.2, 0.2, 0.5], spot: [0.95, 0.4, 1], flank: [0.9, 0.4, 1], wavy: [0, 1.6], splotch: [0.8, 0.3, 0.7] },
     glow: [0, 1, 0, 0],
     traits: { holdChance: 0.7, holdTime: [3, 9], persistence: 2.5, cover: 1.7, cruise: [0.72, 0.88], turn: [4.2, 5.6], attention: [8, 16], braincellUsage: 1.0, nose: 1.0, stim: 0.3, leap: 0, home: 'log', fears: { eleanor: 0.2 } },
     census: { startle: 'freeze', hunt: 'stalk', party: 'corner', twoAM: 'cozy' },
@@ -120,7 +120,7 @@ export const IDENTITIES = [
     nicks: [['Chan', 60], ['Chandler', 20], ['Changirl', 10], ['Chananigans', 7], ['shit goth. zing.', 3]],
     build: { length: [2.3, 2.7], radius: [0.085, 0.1] },
     colorsA: [PINK], colorsB: [NEON_GREEN],
-    pattern: { stripe: [0.9, 0.5, 1], spot: [0.9, 0.5, 1], flank: [0.3, 0.2, 0.4], wavy: [1.8, 3] },
+    pattern: { stripe: [0.9, 0.5, 1], spot: [0.9, 0.5, 1], flank: [0.3, 0.2, 0.4], wavy: [1.8, 3], tiger: [0.8, 0.3, 0.6], splotch: [0.9, 0.4, 0.8] },
     glow: STEADY_PULSE,
     traits: { curious: 1.6, spookMul: 0.8, cover: 0.85, persistence: 2.2, hunger: 1.2, braincellUsage: 0.5, nose: 1.1, stim: 0.9, leap: 0.6, home: 'rock', fears: { eleanor: 0.3 } },
     census: { startle: 'flip', hunt: 'stalk', party: 'corner', twoAM: 'cozy' },
@@ -135,7 +135,7 @@ export const IDENTITIES = [
     build: { length: [2.0, 2.4], radius: [0.095, 0.11] },
     colorsA: [GREEN], colorsB: [LIME_YELLOW],
     jelly: 0.33,
-    pattern: { stripe: [0.15, 0.2, 0.4], spot: [0.9, 0.5, 1], flank: [0.8, 0.4, 0.9], wavy: [0, 1.4] },
+    pattern: { stripe: [0.15, 0.2, 0.4], spot: [0.9, 0.5, 1], flank: [0.8, 0.4, 0.9], wavy: [0, 1.4], splotch: [0.6, 0.25, 0.5], sheen: [0.8, 0.4, 0.8] },
     glow: [0, 1, 1, 0],   // breathe and pulse together; the envelope normalizes by the weight sum
     traits: { curious: 0.85, cover: 1.1, hunger: 0.5, braincellUsage: 0.85, nose: 0.9, stim: 0.3, leap: 0.3, home: 'pad', fears: { eleanor: 0.75, vi: 0.2 }, spinOdds: 0, eats: { crumb: 0 } },
     census: { startle: 'later', hunt: 'bonk', party: 'exits', twoAM: 'cozy' },
@@ -149,7 +149,7 @@ export const IDENTITIES = [
     nicks: [['Vi', 60], ['Violet', 20], ['Violence', 15], ['Pro Rage Baiter', 5]],
     build: { length: [3.0, 3.4], radius: [0.115, 0.13] },   // tall and bulky, and then some
     colorsA: [PURPLE], colorsB: [BLACK],   // black stops are unlit in both layers, so the gaps come free
-    pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.7, 1], flank: [0.35, 0.2, 0.5], wavy: [0, 1.2] },
+    pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.7, 1], flank: [0.35, 0.2, 0.5], wavy: [0, 1.2], splotch: [0.5, 0.2, 0.4] },
     glow: [0, 0, 0, 1],
     traits: { curious: 1.35, spookMul: 1.4, cover: 1.6, braincellUsage: 0.4, nose: 0.7, stim: 0.7, leap: 0.5, home: 'rock', fears: { eleanor: 0.1 }, spinOdds: 0.6 },
     census: { startle: 'flip', hunt: 'doordash', party: 'exits', twoAM: 'cozy' },
@@ -163,7 +163,7 @@ export const IDENTITIES = [
     build: { length: [2.0, 2.4], radius: [0.135, 0.155] },   // thicc as hell: the roundest resident
     colorsA: [MILLENNIAL_PINK], colorsB: [GOLDENROD],
     jelly: 0.45,   // fewer shipped varietals than the other two glass rollers, so Bee jellies more
-    pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.6, 1], flank: [0.6, 0.3, 0.7], wavy: [0, 1.2] },
+    pattern: { stripe: [0.1, 0.2, 0.4], spot: [1, 0.6, 1], flank: [0.6, 0.3, 0.7], wavy: [0, 1.2], splotch: [0.9, 0.4, 0.8] },
     glow: [1, 1, 0, 0],
     traits: { holdChance: 0.8, holdTime: [8, 25], curious: 1.1, spookMul: 1.2, cover: 1.35, braincellUsage: 0.5, nose: 1.0, stim: 0.4, leap: 0, home: 'pad', fears: { eleanor: 0.4, vi: 0.5 } },
     census: { startle: 'investigate', hunt: 'doordash', party: 'snacks', twoAM: 'asleep' },
@@ -176,8 +176,9 @@ export const IDENTITIES = [
     build: { length: [2.6, 3.0], radius: [0.1, 0.12] },
     colorsA: [GREEN], colorsB: [TEAL],
     ramp: { prideFlag: 0.5 },
-    pattern: { stripe: [0.9, 0.5, 1], spot: [0.85, 0.4, 0.9], flank: [0.3, 0.2, 0.5], wavy: [1.8, 3] },
+    pattern: { stripe: [0.9, 0.5, 1], spot: [0.85, 0.4, 0.9], flank: [0.3, 0.2, 0.5], wavy: [1.8, 3], tiger: [0.7, 0.25, 0.5], splotch: [0.85, 0.4, 0.8] },
     glow: [0, 1, 0, 0],
+    glowB: [1, 0],   // the tail tip runs its own clock through the ramp: green to teal, or a flag's stripes in order
     // turn is up so the long way round for a right-hand turn is a loop, not a glacial arc.
     traits: { holdChance: 0.8, holdTime: [8, 25], curious: 0.85, cover: 1.1, turn: [7.0, 8.5], braincellUsage: 0.3, nose: 1.0, stim: 0.1, leap: 0.2, home: 'rock', fears: { eleanor: 0.7, vi: 0 } },
     census: { startle: 'investigate', hunt: 'bonk', party: 'corner', twoAM: 'asleep' },
@@ -204,6 +205,7 @@ export const IDENTITIES = [
     pronouns: 'she/her',
     active: false,
     dorsalGlow: true,   // dim wavy ridge lights + tail photophore instead of the standard pattern glow
+    wet: 0.45,   // the back's moonlit streak, dimmed: at full gain it reads as a third ridge light between her two
     build: { length: [7.5, 8.5], radius: [0.24, 0.28] },   // barely fits under the surface; drifting up breaches
     colorsA: [PURPLE], colorsB: [TEAL],
     pattern: { stripe: [0.4, 0.3, 0.6], spot: [0.9, 0.6, 1], flank: [0.9, 0.6, 1], wavy: [1, 2.5] },
@@ -312,6 +314,10 @@ export function rollIdentityColors(e, id, rng) {
     // Three flags in four fly Jim-style: whole cloth showing, every stripe edge lit; the rest ride the families.
     e.flagBands = rng.chance(0.75);
     if (e.flagBands) e.skinMul = 1;
+    // Themed palettes, guarded like every other opt-in: THEMES is empty, so nobody declares this yet.
+  } else if (ramp?.themes && rng.chance(ramp.themeChance ?? 1)) {
+    e.rampStops = THEMES[weightedPickName(rng, ramp.themes)];
+    e.rampOpts = { soften: 6, ...ramp };
   } else {
     e.rampStops = twoToneStops(e.colA.toArray(), e.colB.toArray());
     e.rampOpts = { ...ramp, soften: 1 };
@@ -341,16 +347,23 @@ export function rollNickname(e, id, rng) {
 }
 
 // Matthew's answers, split 33:33:34 stated:stated:any. The closet is every shipped family at equal odds.
-const CLOSET = ['stripe', 'spot', 'band', 'race', 'plaid', 'ridge', 'flank'];
+const CLOSET = ['stripe', 'spot', 'band', 'race', 'plaid', 'ridge', 'flank', 'splotch', 'sheen', 'tiger'];
+const RGB_CHANCE = 0.35;   // the gamer glow's odds per chaos identity, on top of the wardrobe pick
 function chaosKit(rng) {
   const u = rng.next();
-  if (u < 0.33) return { stripe: [0, 0, 0], spot: [1, 0.5, 0.9], flank: [0.8, 0.3, 0.7], wavy: [0, 1.4] };   // splotches
-  if (u < 0.66) return { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [1, 0.1, 0.25], wavy: [0, 1] };   // near-solid, subtle sheen
+  if (u < 0.33) return { stripe: [0, 0, 0], spot: [1, 0.5, 0.9], flank: [0.8, 0.3, 0.7], wavy: [0, 1.4], splotch: [1, 0.5, 0.9] };
+  if (u < 0.66) return { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1], sheen: [1, 0.5, 0.9] };   // near-solid, wet-leaf sheen
   const kit = { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 3] };
   kit[rng.pick(CLOSET)] = [1, 0.6, 1];
   if (kit.band) kit.repeats = [2.5, 5];   // banded at repeats 1 on a two-stop ramp splits the body in half
+  if (kit.tiger) kit.stripe = [1, 0.6, 1];   // tiger tears the stripe field, so a closet tiger needs stripes to tear
   return kit;
 }
+
+/* A side stream for a family that must cost zero draws off the shared rng: one recolor pass rolls every
+   eel from one generator, so an appended draw would move the nickname after it and everyone downstream. */
+const bits = (v) => Math.round(v * 1e6) | 0;
+const subStream = (e, salt) => createRng(deriveSeed(bits(e.wavy) ^ bits(e.pulseRate) ^ bits(e.spotFreq), salt));
 
 /* Pattern spec per family is [chance, lo, hi]: the chance gates the family, lo–hi bounds its weight. */
 export function rollIdentityPattern(e, id, rng) {
@@ -385,9 +398,37 @@ export function rollIdentityPattern(e, id, rng) {
   e.wGlitter = p.glitter ? roll(p.glitter) : 0;
   e.glitterSeed = p.glitter ? rng.range(0, 100) : 0;
   e.facetTilt = p.glitter ? rng.range(FACET_TILT[0], FACET_TILT[1]) : 30;
+  // Tiger tears the stripe edges; it modifies the stripe field rather than joining the weights, so it
+  // never reaches wSum. Its stream hangs off this roll's own values (see subStream) instead of `rng`.
+  e.tigerDeclared = !!p.tiger;
+  e.tigerBreak = 0;
+  if (p.tiger) {
+    const sub = subStream(e, 0x716);
+    e.tigerBreak = sub.chance(p.tiger[0]) ? sub.range(p.tiger[1], p.tiger[2]) : 0;
+  }
+  e.splotchDeclared = !!p.splotch;
+  e.wSplotch = 0; e.splotchFreq = 0; e.splotchLevels = 0; e.splotchLit = 0;
+  if (p.splotch) {
+    const sub = subStream(e, 0x5b1);
+    e.wSplotch = sub.chance(p.splotch[0]) ? sub.range(p.splotch[1], p.splotch[2]) : 0;
+    e.splotchFreq = sub.range(2.5, 5);
+    e.splotchLevels = sub.int(3, 4);
+    e.splotchLit = sub.chance(0.5) ? 1 : 0;   // lit interiors or lit outlines, a fresh toss per roll
+  }
+  e.sheenDeclared = !!p.sheen;
+  e.wSheen = 0; e.sheenDrift = 0;
+  if (p.sheen) {
+    const sub = subStream(e, 0x5ee);
+    e.wSheen = sub.chance(p.sheen[0]) ? sub.range(p.sheen[1], p.sheen[2]) : 0;
+    e.sheenDrift = sub.range(0.05, 0.12);
+  }
+  // The two envelopes: tail-own is a flat declaration, and the gamer glow is an independent roll for
+  // whoever answered chaos, which is why it keys off id.chaos rather than off a name.
+  e.wTailOwn = id.glowB?.[0] ?? 0;
+  e.wRgb = id.chaos ? (subStream(e, 0x76b).chance(RGB_CHANCE) ? 1 : 0) : id.glowB?.[1] ?? 0;
   // The pattern roll runs after the color roll, so this is where the tag can take the metal of the night.
   if (p.stars) e.nameStyle = new THREE.Color(...(e.starMetal ? STAR_GOLD : STAR_SILVER)).getStyle();
   e.glowMode = new THREE.Vector4(...(id.glow ?? STEADY_PULSE));
-  if (e.flagBands) { e.wStripe = e.wSpot = e.wRace = e.wPlaid = e.wRidge = e.wFlank = e.wSwirl = e.wStars = e.wGlitter = 0; e.wBand = 1; e.repeats = 1; }
-  if (e.wStripe + e.wSpot + e.wBand + e.wRace + e.wPlaid + e.wRidge + e.wFlank + e.wSwirl + e.wStars + e.wGlitter === 0) e.wFlank = 1;
+  if (e.flagBands) { e.wStripe = e.wSpot = e.wRace = e.wPlaid = e.wRidge = e.wFlank = e.wSwirl = e.wStars = e.wGlitter = e.wSplotch = e.wSheen = e.tigerBreak = 0; e.wBand = 1; e.repeats = 1; }
+  if (e.wStripe + e.wSpot + e.wBand + e.wRace + e.wPlaid + e.wRidge + e.wFlank + e.wSwirl + e.wStars + e.wGlitter + e.wSplotch + e.wSheen === 0) e.wFlank = 1;
 }

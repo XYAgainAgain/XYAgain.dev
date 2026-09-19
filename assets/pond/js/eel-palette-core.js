@@ -79,6 +79,22 @@ export const SHELLEY_SWIRL = [
   { color: COBALT, width: 1 },
 ];
 
+/* Named stop lists an identity can opt into, the generalization of the flag table. Deliberately empty:
+   every ramp in this pond means something to somebody, so themes get named on purpose, never guessed. */
+export const THEMES = {};
+
+/* Picks a theme name from { name: weight } or a plain list of names. One draw either way, so a future
+   themed identity's rng stream does not depend on which shape it declared. */
+export function weightedPickName(rng, spec) {
+  const names = Array.isArray(spec) ? spec : Object.keys(spec);
+  const weight = (n) => (Array.isArray(spec) ? 1 : spec[n] ?? 1);
+  let total = 0;
+  for (const n of names) total += weight(n);
+  let r = rng.next() * total;
+  for (const n of names) { r -= weight(n); if (r < 0) return n; }
+  return names[names.length - 1];
+}
+
 export function twoToneStops(colA, colB) {
   return [{ color: colA, width: 1 }, { color: colB, width: 1 }];
 }
