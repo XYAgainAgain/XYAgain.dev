@@ -18,27 +18,39 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 /* WebKit plays VP9 WebM but drops its alpha channel, and no media query or canPlayType reports that;
    the vendor string is the one stable signal, so those engines get the animated WebP instead. */
+let shownAt = 0;
+let settled = false;
+let dismissed = false;
+let clipSwapped = false;
+
+function showAnimation() {
+  if (clipSwapped || dismissed || !clip?.isConnected || !anim?.isConnected) return;
+  clipSwapped = true;
+  clip.remove();
+  anim.src = anim.dataset.src;
+  anim.classList.remove('loader-alt');
+}
+
 function pickClip() {
   if (!clip) return;
   if (reduced) {
-    // The clip has no src until this decides otherwise, so the poster frame is the whole reduced-motion state.
     clip.autoplay = false;
     clip.preload = 'none';
     clip.pause();
+    clip.removeAttribute('src');
+    clip.load();
     return;
   }
   const webmAlpha = !!clip.canPlayType?.('video/webm; codecs="vp9"') && navigator.vendor !== 'Apple Computer, Inc.';
   if (!webmAlpha && anim) {
-    clip.remove();
-    anim.src = anim.dataset.src;
-    anim.classList.remove('loader-alt');
+    showAnimation();
     return;
   }
-  clip.src = clip.dataset.src;
+  clip.addEventListener('error', showAnimation, { once: true });
+  if (clip.error) { showAnimation(); return; }
+  clip.play().catch(showAnimation);
 }
 
-let shownAt = 0;
-let settled = false;
 const resolvers = {};
 const ready = new Promise((res) => { resolvers.ready = res; });
 const failed = new Promise((res) => { resolvers.failed = res; });
@@ -50,6 +62,7 @@ if (screen) {
 
 function dismiss(then) {
   if (!screen) { then?.(); return; }
+  dismissed = true;
   screen.classList.add('is-gone');
   setTimeout(() => {
     screen.hidden = true;
