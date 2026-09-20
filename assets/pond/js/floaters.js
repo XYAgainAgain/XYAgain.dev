@@ -1101,7 +1101,7 @@ export class FloaterSystem {
       const r = length(q);
       // A soft broad core for a mote, a hard-edged disc for a pinprick, mixed by class.
       const soft = pow(r.oneMinus().max(0), uPollenMotePow).mul(uPollenMoteA);
-      const hard = smoothstep(1.0, 0.55, r).mul(uPollenPinA);
+      const hard = smoothstep(0.55, 1.0, r).oneMinus().mul(uPollenPinA);
       const shape = mix(hard, soft, vPolClass);
       // The mat's own two-texel slope, reused: a passing wave brightens a ribbon of pollen, never a flash.
       const c = vPolPos.div(this.uWeedExtent).add(0.5);

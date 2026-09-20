@@ -330,7 +330,7 @@ export class PadSystem {
       const th = A.w.add(thRel);
       // Notch as a V collapsed from the rim toward the center; old pads tear the cut ragged.
       const tear = sin(thRel.mul(37).add(B.w)).mul(0.06).mul(smoothstep(0.8, 1.0, C.x));
-      const wedge = smoothstep(B.x, B.x.mul(0.35), abs(thRel).add(tear));
+      const wedge = smoothstep(B.x.mul(0.35), B.x, abs(thRel).add(tear)).oneMinus();
       const undulate = sin(thRel.mul(9).add(B.w)).mul(0.012).add(sin(thRel.mul(23).add(B.w.mul(3))).mul(0.006)).add(1);
       const rEff = rr.mul(undulate).mul(wedge.mul(B.y).oneMinus()).mul(radius);
       const radial = vec2(cos(th), sin(th));
@@ -398,7 +398,7 @@ export class PadSystem {
       const seed = vPadInfo.x, age = vPadInfo.y, bite = vPadInfo.z, wet = vPadInfo.w;
       const n0 = normalize(vPadN);
       const ew = fwidth(rr).mul(1.2);
-      const rimA = smoothstep(float(1).add(ew), float(1).sub(ew), rr);
+      const rimA = smoothstep(float(1).sub(ew), float(1).add(ew), rr).oneMinus();
       // One planar map in pad space: the leaf tile is isotropic, so a polar stretch bought nothing but a pinch.
       const padUV = local.mul(uPadTileC).add(seed.mul(0.37));
       const alb0 = tex.albedo ? tex.albedo.sample(padUV).rgb : vec3(0.18, 0.42, 0.16);
@@ -406,11 +406,11 @@ export class PadSystem {
       // Integer harmonics keep the ±π seam of atan invisible; the fwidth fade stops veins sparkling
       // where they pack under a pixel at the hub.
       const fan = thRel.mul(uPadVeins).add(sin(thRel.mul(4).add(seed)).mul(0.5)).add(rr.mul(sin(thRel.mul(7).add(seed.mul(2)))).mul(0.6));
-      const veinAA = smoothstep(1.6, 0.5, fwidth(fan));
+      const veinAA = smoothstep(0.5, 1.6, fwidth(fan)).oneMinus();
       const vein = smoothstep(0.86, 1.0, abs(sin(fan))).mul(smoothstep(0.06, 0.35, rr)).mul(veinAA);
       const albedo = alb0.mul(vein.mul(0.25).oneMinus()).mul(arm.r.mul(0.5).add(0.5)).toVar();
       // Age: bronze new pads, straw-edged old ones.
-      albedo.assign(mix(albedo, albedo.mul(uPadBronze), smoothstep(0.2, 0.0, age)));
+      albedo.assign(mix(albedo, albedo.mul(uPadBronze), smoothstep(0.0, 0.2, age).oneMinus()));
       albedo.assign(mix(albedo, uPadStraw.mul(albedo.g.add(0.3)), smoothstep(0.7, 1.0, rr).mul(smoothstep(0.8, 1.0, age)).mul(0.7)));
       albedo.mulAssign(mix(1.0, 0.75, wet));
       const rough = arm.g.sub(vein.mul(0.2)).sub(wet.mul(0.35)).clamp(0.05, 1).toVar();
@@ -434,7 +434,7 @@ export class PadSystem {
         const hs = hash(bite.add(k.mul(5.1))).mul(0.09).add(0.03).div(radius);
         const hc = vec2(hr.mul(cos(ha)), hr.mul(sin(ha)));
         const dh = length(local.sub(hc)).div(hs);
-        hole.addAssign(smoothstep(1.0, 0.75, dh).mul(on));
+        hole.addAssign(smoothstep(0.75, 1.0, dh).oneMinus().mul(on));
         const dk = length(local.sub(hc)).add(on.oneMinus().mul(10));
         sink.assign(select(dk.lessThan(sinkD), hc, sink));
         sinkD.assign(dk.min(sinkD));
@@ -458,7 +458,7 @@ export class PadSystem {
         const bd = length(f.sub(jit)).div(hash(dot(cid, vec2(5.3, 91.1))).mul(0.30).add(0.14));
         const cap = bd.mul(bd).oneMinus().max(0).sqrt();
         const life = ph.mul(2).sub(1).abs().oneMinus();   // triangle: 0 at the wrap, 1 mid-run
-        const m = smoothstep(1.0, 0.82, bd).mul(wet).mul(smoothstep(0.35, 0.10, tilt)).mul(smoothstep(0.0, 0.35, life));
+        const m = smoothstep(0.82, 1.0, bd).oneMinus().mul(wet).mul(smoothstep(0.10, 0.35, tilt).oneMinus()).mul(smoothstep(0.0, 0.35, life));
         const bn = normalize(vec3(f.sub(jit).x, cap.mul(0.6), f.sub(jit).y));
         n.assign(normalize(mix(n, vPadTan.mul(bn.x).add(n0.mul(bn.y)).add(vPadRad.mul(bn.z)), m)));
         beadMask.assign(beadMask.max(m));
@@ -466,7 +466,7 @@ export class PadSystem {
       beadLayer(float(0), vec2(0, 0));
       beadLayer(float(0.5), vec2(3.7, 1.9));
       // Red-purple underside where the curl turns the rim away from the moon.
-      const under = smoothstep(0.86, 1.0, rr).mul(smoothstep(0.93, 0.6, n0.y));
+      const under = smoothstep(0.86, 1.0, rr).mul(smoothstep(0.6, 0.93, n0.y).oneMinus());
       albedo.assign(mix(albedo, uPadUnder, under));
       // Direct moon, above the water: the same air-side lobe shade() gives rock tops.
       const ndl = dot(n, U.moonDir).max(0);
@@ -490,7 +490,7 @@ export class PadSystem {
       const shV = local.sub(shC);
       // Stretched along the light so it reads as cast, with a penumbra that widens away from the flower.
       const shD = length(vec2(dot(shV, ml).mul(0.8), dot(shV, vec2(ml.y.negate(), ml.x)))).div(shR);
-      const lilyShade = smoothstep(1.15, 0.45, shD).mul(0.55).mul(smoothstep(0.0, 0.02, vPadLily));
+      const lilyShade = smoothstep(0.45, 1.15, shD).oneMinus().mul(0.55).mul(smoothstep(0.0, 0.02, vPadLily));
       col.mulAssign(lilyShade.oneMinus());
       col.addAssign(albedo.mul(vPadTrans).mul(uPadTransGain));
       return vec4(col, rimA.mul(hole.min(1).oneMinus()));
@@ -655,10 +655,10 @@ export class PadSystem {
         const y = latN.div(widthShape);
         const field = length(vec2(x, y)).sub(1);
         const aa = fwidth(field).mul(0.7).add(uLilyEps);
-        const cov = smoothstep(aa, aa.negate(), field);
+        const cov = smoothstep(aa.negate(), aa, field).oneMinus();
         // A thin darker rim and a crease down the middle keep each petal legible against its neighbors.
         const rim = smoothstep(-0.22, 0.0, field).mul(0.22).oneMinus();
-        const crease = smoothstep(0.08, 0.0, abs(latN)).mul(0.10).oneMinus();
+        const crease = smoothstep(0.0, 0.08, abs(latN)).oneMinus().mul(0.10).oneMinus();
         // A fake cupped normal: a dome while closed, shallow petals with a center ridge once open.
         const radialSlope = mix(uLilyNormal.x, uLilyNormal.y, open);
         const nx = axis.x.mul(radialSlope).mul(petalT).add(tang.x.mul(uLilyNormal.z).mul(latN));
@@ -676,7 +676,7 @@ export class PadSystem {
       const sr = uLilyShape.z.mul(mix(0.65, 1.0, b)).mul(sin(theta.mul(18).add(seed)).mul(uLilyShape.w).add(1));
       const sField = length(p).sub(sr);
       const sAA = fwidth(sField).mul(0.7).add(uLilyEps);
-      const sCov = smoothstep(sAA, sAA.negate(), sField).mul(smoothstep(0.55, 0.82, b));
+      const sCov = smoothstep(sAA.negate(), sAA, sField).oneMinus().mul(smoothstep(0.55, 0.82, b));
       const sN = normalize(vec3(p.x.mul(0.34).sub(slope.x), 1, p.y.mul(0.34).sub(slope.y)));
       const sIrr = uLilyLight.x.add(U.moonStrength.mul(uLilyLight.y).mul(dot(sN, U.moonDir).max(0)));
       const sCol = uLilyGold.mul(sIrr).mul(1.12).min(uLilyLight.w);

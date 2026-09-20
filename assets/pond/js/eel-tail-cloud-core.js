@@ -275,14 +275,12 @@ export function normalizePlumeColor(r, g, b, cfg = {}, out = [0, 0, 0]) {
   return out;
 }
 
-/* A push takes the slot furthest down the plume, so the newest color always displaces the oldest and the
-   six never collide. A slot nobody can see takes the color at once; a live one has to retire first. */
+/* A push takes the furthest non-retiring slot, so two colors arriving together never overwrite one another.
+   A slot nobody can see takes the color at once; a live one has to retire first. */
 export function queuePush(q, r, g, b, cfg) {
-  let pick = q.slots[0];
-  for (const s of q.slots) if (s.pos > pick.pos) pick = s;
-  if (pick.w > 0 || pick.pending) {
-    for (const s of q.slots) if (!(s.w > 0) && !s.pending) { pick = s; break; }
-  }
+  let pick = null;
+  for (const s of q.slots) if (!s.pending && (!pick || s.pos > pick.pos)) pick = s;
+  if (!pick) return null;
   normalizePlumeColor(r, g, b, cfg, COLOR_SCRATCH);
   pick.pr = COLOR_SCRATCH[0]; pick.pg = COLOR_SCRATCH[1]; pick.pb = COLOR_SCRATCH[2];
   if (pick.w > 0) { pick.pending = true; return pick; }

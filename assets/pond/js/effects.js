@@ -123,7 +123,7 @@ export class UnderwaterEffectsPool {
       }
       // Rings vanish all at once, like real bubbles; only blobs get the slow fade.
       const softEnv = smoothstep(0.0, 0.15, f).mul(f.oneMinus());
-      const holdEnv = smoothstep(0.0, 0.1, f).mul(smoothstep(1.0, 0.82, f));
+      const holdEnv = smoothstep(0.0, 0.1, f).mul(smoothstep(0.82, 1.0, f).oneMinus());
       vFade.assign(mix(softEnv, holdEnv, hold));
       const tp = t.max(0);
       const grav = gr.x;
@@ -145,7 +145,7 @@ export class UnderwaterEffectsPool {
       const q = uv().sub(0.5).mul(2);
       const r = length(q);
       // Two angular waves with per-instance phase, so no two bubbles shimmy alike.
-      const th = atan(q.y, q.x);
+      const th = atan(q.y, q.x.add(step(r, float(1e-5)).mul(1e-3)));
       const wob = sin(th.mul(3).add(this.uTime.mul(6)).add(vSeed)).mul(0.035)
         .add(sin(th.mul(5).sub(this.uTime.mul(8.3)).add(vSeed.mul(1.7))).mul(0.02));
       // Rings ripple, pebbles go lumpy, and silt keeps its perfect circle; no instance is ever two of those.
@@ -153,8 +153,8 @@ export class UnderwaterEffectsPool {
         ? r.mul(wob.mul(vRing.add(vGrain.mul(uGrainWob))).add(1))
         : r.mul(wob.mul(vRing).add(1));
       const blob = max(0, rw.oneMinus()).pow(1.5);
-      const ring = smoothstep(0.68, 0.82, rw).mul(smoothstep(0.96, 0.88, rw)).mul(0.85)
-        .add(smoothstep(0.18, 0.0, rw).mul(0.18));
+      const ring = smoothstep(0.68, 0.82, rw).mul(smoothstep(0.88, 0.96, rw).oneMinus()).mul(0.85)
+        .add(smoothstep(0.0, 0.18, rw).oneMinus().mul(0.18));
       const shape = mix(blob, ring, vRing).mul(vFade);
       if (!this.premultiplied) return vec4(vTint.mul(shape), 0);
       // Premultiplied: sediment has to occlude, and copying the additive vec4(rgb, 0) would make it
@@ -168,7 +168,7 @@ export class UnderwaterEffectsPool {
       const dome = normalize(vec3(q.x.mul(uGrainDome.x), uGrainDome.y, q.y.mul(uGrainDome.x)));
       const chip = this.subTex.sample(vSub.xy.add(q.mul(vSub.z))).rgb.mul(this.uSubGain);
       const pebble = this.shading.shade(mix(vTint, chip, this.uSubOn), dome, positionWorld, float(0.85));
-      const a = mix(shape, smoothstep(uGrainEdge.x, uGrainEdge.y, rw).mul(vFade), vGrain).mul(vAlpha).clamp(0, 1);
+      const a = mix(shape, smoothstep(uGrainEdge.y, uGrainEdge.x, rw).oneMinus().mul(vFade), vGrain).mul(vAlpha).clamp(0, 1);
       return vec4(mix(vTint, pebble, vGrain).mul(a), a);
     })();
     mat.transparent = true;

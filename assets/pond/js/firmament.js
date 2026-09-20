@@ -116,7 +116,7 @@ export class Firmament {
           // keeps a scattering skirt going for tens of pixels.
           const halo = moffat(d, float(BRIGHT.alphaHi).mul(4.7)).mul(0.13);
           const q = vec2(d.x.mul(ca).sub(d.y.mul(sa)), d.x.mul(sa).add(d.y.mul(ca))).toVar();
-          const len = V.spikeLen.mul(mix(float(0.7), float(1.3), h2.y)).toVar();
+          const len = V.spikeLen.max(1e-3).mul(mix(float(0.7), float(1.3), h2.y)).toVar();
           const w2 = float(2.6);
           const bar = exp(q.x.abs().negate().div(len)).mul(exp(q.y.mul(q.y).negate().div(w2)))
             .add(exp(q.y.abs().negate().div(len.mul(0.82))).mul(exp(q.x.mul(q.x).negate().div(w2))));
@@ -140,7 +140,7 @@ export class Firmament {
     // Reduced motion keeps the twinkle at half amplitude: a frozen sky reads as a broken one.
     const amt = V.twinkle.mul(mix(float(0.5), float(1), motion)).clamp(0, 1);
     const tw = time.mul(V.twinkleRate).mul(0.16);
-    const s = V.starScale, dn = V.starDensity;
+    const s = V.starScale.max(1e-3), dn = V.starDensity;
     const dust = this.tier(p, px, this.off[0], DUST.mag, float(DUST.cells).mul(s),
       dn.mul(DUST.density), V.dustGain, () => float(DUST.alpha), false, V, tw, amt);
     const mid = this.tier(p, px, this.off[1], MID.mag, float(MID.cells).mul(s),
@@ -157,13 +157,15 @@ export class Firmament {
      is the whole reason the old four-arm pinwheel had to go. */
   galaxies(p, V, time) {
     const acc = vec3(0).toVar();
-    const cells = V.galCells;
+    const cells = V.galCells.max(1e-3);
+    const scale = V.galScale.max(1e-4);
     const g = p.mul(cells).toVar();
     const base = floor(g.sub(0.5)).toVar();
-    const reach = V.galScale.mul(1.35).toVar();
+    const reach = scale.mul(1.35).toVar();
     const dens = V.galDensity.mul(V.galaxies.mul(1 / 6)).toVar();
-    for (let dx = 0; dx < 2; dx++) {
-      for (let dy = 0; dy < 2; dy++) {
+    If(V.galaxies.greaterThan(0), () => {
+      for (let dx = 0; dx < 2; dx++) {
+        for (let dy = 0; dy < 2; dy++) {
         const c = base.add(vec2(dx, dy)).toVar();
         const h1 = hash3(vec3(c.add(CELL_BIAS), this.off[3])).toVar();
         const at = c.add(h1.xy.mul(0.5).add(0.25));
@@ -173,7 +175,7 @@ export class Firmament {
         If(step(h1.z, dens).mul(near).greaterThan(0.5), () => {
           const h2 = hash3(vec3(c.add(CELL_BIAS), this.off[3] + 2)).toVar();
           const h3 = hash3(vec3(c.add(CELL_BIAS), this.off[3] + 4)).toVar();
-          const ra = V.galScale.mul(mix(float(0.45), float(1.35), h2.x)).toVar();
+          const ra = scale.mul(mix(float(0.45), float(1.35), h2.x)).toVar();
           // The axis ratio is the inclination: 1 is face-on, 0.2 an edge-on sliver.
           const rb = ra.mul(mix(float(0.20), float(1.00), h2.y)).toVar();
           // A full turn in 8 to 20 minutes, either way round: visible if you watch, restful if you don't.
@@ -189,15 +191,15 @@ export class Firmament {
           const A = log(u).mul(mix(float(4.5), float(11.0), h3.y)).toVar();
           const armCos = dir.x.mul(dir.x).mul(2).sub(1).mul(cos(A))
             .add(dir.x.mul(dir.y).mul(2).mul(sin(A)));
-          const arm = armCos.mul(0.5).add(0.5).max(1e-4).pow(V.galArmSharp).toVar();
+          const arm = armCos.mul(0.5).add(0.5).max(1e-4).pow(V.galArmSharp.max(0)).toVar();
           // The break noise raises the floor an arm has to clear, chewing it into flocculent fragments
           // instead of leaving a crisp pinwheel.
           const lo = valueNoise2(q.div(ra).mul(4.0).add(h3.x.mul(40))).mul(V.galArmBreak).toVar();
           const armK = arm.sub(lo).div(float(1).sub(lo).max(0.12)).clamp(0, 1);
           const spiral = step(0.42, h3.x).mul(V.galArm);
-          const disk = exp(u.mul(V.galDiskFall).negate())
+          const disk = exp(u.mul(V.galDiskFall.max(0)).negate())
             .mul(float(1).sub(spiral.mul(armK.oneMinus()))).toVar();
-          const core = exp(u.mul(V.galCoreFall).negate()).mul(V.galCore);
+          const core = exp(u.mul(V.galCoreFall.max(0)).negate()).mul(V.galCore);
           // Exponential wings never reach zero; without the cut every galaxy leaves a faint box.
           const env = float(1).sub(smoothstep(0.72, 1.00, u));
           const tint = mix(vec3(1.00, 0.86, 0.64), vec3(0.66, 0.78, 1.00), smoothstep(0.10, 0.80, u));
@@ -210,8 +212,9 @@ export class Firmament {
           const L = mix(float(0.28), float(1.00), rel.mul(rel)).mul(V.galGain);
           acc.addAssign(tint.mul(fam).mul(core.add(disk)).mul(env).mul(L));
         });
+        }
       }
-    }
+    });
     return acc;
   }
 

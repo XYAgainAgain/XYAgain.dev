@@ -167,7 +167,7 @@ export class WaterSim {
           const o = uDiscs.element(i);
           const d = p.sub(o.xy);
           const dist = length(d);
-          solid.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), dist));
+          solid.addAssign(smoothstep(o.z.sub(uEdge), o.z.add(uEdge), dist).oneMinus());
           // The tight channels take the stone's real rim at this angle when it has one, else the chord.
           const f = fract(atan(d.y, d.x).div(PI.mul(2))).mul(RIM_N);
           const i0 = f.floor();
@@ -175,7 +175,7 @@ export class WaterSim {
           const k0 = base.add(int(i0)), k1 = base.add(int(i0.add(1).min(float(RIM_N))));
           const rim = mix(uRimW.element(k0), uRimW.element(k1), f.sub(i0));
           const rr = mix(o.z, rim, o.w);
-          const tightDisc = smoothstep(rr.add(uEdge), rr.sub(uEdge), dist);
+          const tightDisc = smoothstep(rr.sub(uEdge), rr.add(uEdge), dist).oneMinus();
           tight.addAssign(tightDisc);
           open.addAssign(tightDisc);
         });
@@ -185,7 +185,7 @@ export class WaterSim {
           const a = ab.xy, b = ab.zw;
           const ba = b.sub(a);
           const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
-          const plain = smoothstep(r.add(uEdge), r.sub(uEdge), length(p.sub(a.add(ba.mul(t)))));
+          const plain = smoothstep(r.sub(uEdge), r.add(uEdge), length(p.sub(a.add(ba.mul(t))))).oneMinus();
           solid.addAssign(plain);
           // The profiled trunk: the station's half-width on the fragment's side of the axis, interpolated.
           const A = uProfA.element(i), B = uProfB.element(i);
@@ -201,13 +201,13 @@ export class WaterSim {
           const k1 = base.add(int(i0.add(1).min(float(PROF_N))).mul(2)).add(side);
           const w0 = uProfW.element(k0), w1 = uProfW.element(k1);
           const wid = mix(w0, w1, f.sub(i0));
-          const shaped = smoothstep(wid.add(uEdge), wid.sub(uEdge), perp.abs()).mul(inSpan);
+          const shaped = smoothstep(wid.sub(uEdge), wid.add(uEdge), perp.abs()).oneMinus().mul(inSpan);
           tight.addAssign(mix(plain, shaped, B.y));
           open.addAssign(mix(plain, shaped.mul(smoothstep(B.z.sub(uEdge), B.z.add(uEdge), perp.abs())), B.y));
         });
         Loop(COVER_DISCS, ({ i }) => {
           const o = uCovD.element(i);
-          cover.addAssign(smoothstep(o.z.add(uEdge), o.z.sub(uEdge), length(p.sub(o.xy))).mul(o.w));
+          cover.addAssign(smoothstep(o.z.sub(uEdge), o.z.add(uEdge), length(p.sub(o.xy))).oneMinus().mul(o.w));
         });
         Loop(COVER_CAPS, ({ i }) => {
           const ab = uCovC.element(i.mul(2));
@@ -215,7 +215,7 @@ export class WaterSim {
           const a = ab.xy, b = ab.zw;
           const ba = b.sub(a);
           const t = p.sub(a).dot(ba).div(ba.dot(ba).max(1e-6)).clamp(0, 1);
-          cover.addAssign(smoothstep(rs.x.add(uEdge), rs.x.sub(uEdge), length(p.sub(a.add(ba.mul(t))))).mul(rs.y));
+          cover.addAssign(smoothstep(rs.x.sub(uEdge), rs.x.add(uEdge), length(p.sub(a.add(ba.mul(t))))).oneMinus().mul(rs.y));
         });
         return vec4(solid.min(1), cover.min(1), tight.min(1), open.min(1));
       })();

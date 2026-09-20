@@ -118,7 +118,7 @@ class TreatSystem {
       const q = uv().sub(0.5).mul(2);
       if (isShadow) {
         const d = length(q);
-        const dark = smoothstep(1.0, 0.15, d).mul(this.uShadow).mul(mix(float(1), float(SHADOW_FADE), vHigh));
+        const dark = smoothstep(0.15, 1.0, d).oneMinus().mul(this.uShadow).mul(mix(float(1), float(SHADOW_FADE), vHigh));
         // Multiply blending: rgb 1 outside the disc is a no-op, so only the disc darkens the water.
         const keep = dark.oneMinus().toVar();
         return vec4(keep, keep, keep, 1);
@@ -132,7 +132,7 @@ class TreatSystem {
       // across, and a held crumb is half that again, so a fixed band reads as blur at one size or
       // aliasing at the other. Uniform control flow here, so no uniformFlow() guard is needed.
       const band = fwidth(d).mul(1.2).clamp(0.02, 0.4);
-      const alpha = smoothstep(1.0, float(1).sub(band), d).toVar();
+      const alpha = smoothstep(float(1).sub(band), 1.0, d).oneMinus().toVar();
       // Premultiplied, so the lozenge's transparent rim contributes nothing instead of a pale fringe.
       return vec4(vec3(0.95, 0.85, 0.6).mul(alpha), alpha);
     })();

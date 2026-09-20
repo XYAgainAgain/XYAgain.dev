@@ -44,6 +44,7 @@ export function makeTailCloud(e, U, V, ctx) {
   const uPhase = uniform(0);                      // the gas's own crawl outward, accumulated and wrapped
   const uEvolve = uniform(0);                     // the warp field's drift, same
   const uFlash = uniform(new THREE.Vector2());    // the two glitter layers' flash phases, the second lagged
+  const uFlashLarge = uniform(0);                 // accumulated separately so two component wraps cannot flip it
   // Where in the pond the plume's base is, in gas cells: the gas hangs in the water and he drags through it.
   const uWorld = uniform(new THREE.Vector2());
   // The queue: rgb plus its place along the plume, then its band half width, weight, and breakup phase.
@@ -77,6 +78,9 @@ export function makeTailCloud(e, U, V, ctx) {
     // A polyline's nearest-point frame kinks at every joint, and the gas drawn in it creases there. Each
     // segment's frame is blended by how close it is instead, which is smooth across the joint; only the
     // nearest segment carries any weight more than a blend width away from one.
+    const maxW = uWidth.x.max(uWidth.y).max(uWidth.z);
+    const out = vec3(0).toVar();
+    If(bestD2.lessThan(maxW.mul(maxW)), () => {
     const kk = V.tailJointBlend.clamp(0.02, 2).toVar();
     const bestS = float(0).toVar(), side = float(0).toVar(), wSum = float(0).toVar();
     for (let k = 0; k < ROPE_POINTS - 1; k++) {
@@ -103,7 +107,6 @@ export function makeTailCloud(e, U, V, ctx) {
     const env = smoothstep(0, V.tailRise.clamp(0.02, 0.6), t)
       .mul(smoothstep(V.tailFall.clamp(0.3, 0.9), 1.0, t).oneMinus().pow(V.tailEndPow.max(0.1)))
       .mul(across).toVar();
-    const out = vec3(0).toVar();
     If(env.greaterThan(0.004), () => {
       // Pond units on both axes, in the rope's own frame, shifted by where in the water he is. That shift
       // is what drags him through gas that hangs in the pond; blending the two frames per fragment instead
@@ -214,7 +217,7 @@ export function makeTailCloud(e, U, V, ctx) {
         const glit = mix(col, vec3(1), a.flash.mul(V.tailGlitWhite.clamp(0, 1))).mul(a.lit).toVar();
         If(V.tailSheets.greaterThan(2.5), () => {
           const b = fleck(cell.mul(V.tailGlitDeepScale.max(1.05)), uFlash.y);
-          const c = fleck(cell.mul(V.tailGlitLargeScale.max(2)), uFlash.x.add(uFlash.y).mul(0.5), true);
+          const c = fleck(cell.mul(V.tailGlitLargeScale.max(2)), uFlashLarge, true);
           glit.addAssign(mix(col, vec3(1), b.flash.mul(V.tailGlitWhite.clamp(0, 1)))
             .mul(b.lit).mul(V.tailGlitDeep.max(0)));
           glit.addAssign(mix(col, vec3(1), c.flash.mul(V.tailGlitWhite.clamp(0, 1)))
@@ -228,6 +231,7 @@ export function makeTailCloud(e, U, V, ctx) {
       const lum = lit.r.max(lit.g).max(lit.b).max(1e-5).toVar();
       const k = V.tailStretchK.max(0.1);
       out.assign(lit.mul(asinh(lum.mul(k)).div(asinh(k)).div(lum).min(1)));
+    });
     });
     return vec4(out, 0);
   })();
@@ -258,7 +262,7 @@ export function makeTailCloud(e, U, V, ctx) {
   const cfg = { bend: 0.7, kink: 0.55, smooth: 0.45, lag: 0.35, grade: 0.8, endScale: 1.65 };
   const colorCfg = { sat: 0.72, lum: 0.78, grey: 0.18 };
   const anchor = new THREE.Vector3();
-  let primed = false, clock = 0, breathT = 0, lagSpeed = 0;
+  let primed = false, breathT = 0, lagSpeed = 0;
 
   /* One pickup pass over the cast, on the frame clock: anybody who brings a head within tailNear body
      widths of his leaves two stops of their own ramp in the queue, then goes on cooldown. */
@@ -314,7 +318,7 @@ export function makeTailCloud(e, U, V, ctx) {
       // the plume and its queue; only the pickup cooldowns keep wall-clock time.
       const h = Math.min(1 / 30, Math.max(0, dt));
       const hm = h * U.motionScale.value;
-      clock += h; breathT += hm;
+      breathT += hm;
       // Every taste dial normalized once, here: a junk value snaps back instead of reaching a uniform.
       const back = dialNum(V.tailBack, 0.02, 0.5, 0.08);
       const past = dialNum(V.tailPast, 0.02, 0.9, 0.14);
@@ -374,14 +378,16 @@ export function makeTailCloud(e, U, V, ctx) {
       const rate = dialNum(V.tailGlitRate, 0, 20, 0.35);
       const motion = dialNum(V.tailGlitMotion, 0, 20, 1.3);
       lagSpeed += (wag - lagSpeed) * (1 - Math.exp(-hm / 0.35));
-      uFlash.value.set((uFlash.value.x + (rate + wag * motion) * hm * TWO_PI_JS) % TWO_PI_JS,
-        (uFlash.value.y + (rate + lagSpeed * motion) * 0.6 * hm * TWO_PI_JS) % TWO_PI_JS);
+      const flashA = (rate + wag * motion) * hm * TWO_PI_JS;
+      const flashB = (rate + lagSpeed * motion) * 0.6 * hm * TWO_PI_JS;
+      uFlash.value.set((uFlash.value.x + flashA) % TWO_PI_JS, (uFlash.value.y + flashB) % TWO_PI_JS);
+      uFlashLarge.value = (uFlashLarge.value + (flashA + flashB) * 0.5) % TWO_PI_JS;
       uBreath.value = 1 + V.tailBreath.value
         * Math.sin(breathT * Math.PI * 2 / Math.max(1, V.tailBreathPeriod.value));
 
       queueStep(queue, hm, dialNum(V.tailLife, 1, 900, 150), dialNum(V.tailRetire, 0.05, 8, 1.5));
       if (hm > 0 && !jumped) {
-        pickups(cast, clock, dialNum(V.tailNear, 0.1, 8, 1), dialNum(V.tailCool, 0, 600, 90));
+        pickups(cast, performance.now() * 0.001, dialNum(V.tailNear, 0.1, 8, 1), dialNum(V.tailCool, 0, 600, 90));
         feeders(hm, heat, wag > 0.04 || (e.speedBL ?? 0) > 0.05, dialNum(V.tailIdle, 0.5, 600, 45),
           dialNum(V.tailDripMin, 1, 600, 90), dialNum(V.tailDripMax, 1, 900, 180));
       }

@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
 import { texture, Fn, vec4, uv, uniform } from 'three/tsl';
-import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS, SIM_RES, CAUSTIC_RES, SEDIMENT_POOL, finite01 } from './config.js';
+import { VIEW_H, DEPTH, POOL_SCALE, MOON_ELEVATION, MOON_ORBIT_SECONDS, MAX_PIXELS, SIM_RES, CAUSTIC_RES, SEDIMENT_POOL, finite01, chooseTextureTier } from './config.js';
 import { seedFromUrl, deriveSeed, createRng } from './rng.js';
 import { WaterSim } from './sim.js';
 import { CausticsPass } from './caustics.js';
 import { createSceneUniforms, makeUnderwaterShading, createWaveSet, createCurrentSet } from './shading.js';
-import { buildFloor, floorHeightAt, setTextureSize, setRelief } from './floor.js';
+import { buildFloor, prepareTextures, floorHeightAt, setRelief } from './floor.js';
 import { WakeBuffer } from './wake.js';
 import { ReliefField } from './relief.js';
 import { Habitat } from './cover.js';
@@ -34,10 +34,10 @@ import { Rushes } from './reeds.js';
 import { createDetritus } from './detritus.js';
 import { createDetritusMeshes } from './detritus-render.js';
 import { PondInput, detectLoop } from './input.js';
-import { PondAudio } from './audio.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle, bindJunk } from './ui.js';
 import { NameLabels } from './names.js';
 import { QualityGovernor } from './quality.js';
+import { pondLoad } from './loader.js';
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -64,6 +64,20 @@ async function createRenderer(forceWebGL) {
 
 async function boot() {
   const seed = seedFromUrl();
+
+  // ?tier=0–8 pins a rung for testing; otherwise the ladder resumes where the last session settled.
+  const tierParam = params.get('tier');
+  const pinnedTier = tierParam !== null && /^[0-8]$/.test(tierParam.trim()) ? +tierParam : null;
+  const initialRung = pinnedTier ?? QualityGovernor.load();
+  const mobile = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  const texSizeNow = chooseTextureTier({ rung: initialRung, mobile });
+  /* Fetch and decode only: buildFloor's own seeded stream still makes every draw in today's order,
+     it just no longer waits for the renderer to finish negotiating before the bytes are on the wire. */
+  const texturesP = prepareTextures({ textureSize: texSizeNow });
+  texturesP.catch(() => {});
+  // Tone leaves the static graph here; the fetch overlaps renderer negotiation and floor construction.
+  const audioP = import('./audio.js').catch((err) => { console.warn('Pond: audio module failed to load', err); return null; });
+
   let renderer;
   try {
     // Firefox's WebGPU runs this scene at roughly half its WebGL2 rate with no visible difference, so it
@@ -73,8 +87,9 @@ async function boot() {
   } catch (err) {
     console.warn('Pond: WebGPU init failed, retrying on WebGL2.', err);
     try { renderer = await createRenderer(true); }
-    catch (err2) { console.error('Pond: no renderer available.', err2); root.classList.add('no-renderer'); return; }
+    catch (err2) { console.error('Pond: no renderer available.', err2); root.classList.add('no-renderer'); pondLoad.fail('no-renderer', err2); return; }
   }
+  pondLoad.stage('renderer-ready');
   const liveCanvas = renderer.domElement;
   root.dataset.backend = renderer.backend?.isWebGPUBackend ? 'webgpu' : 'webgl2';
   renderer.onDeviceLost = (info) => { console.error('Pond: device lost', info); renderer.setAnimationLoop(null); root.classList.add('no-renderer'); };
@@ -103,6 +118,7 @@ async function boot() {
   // Nothing may ride the injector until this passes; rain and strider legs are its first customers.
   const impulse = new ImpulseInjector(renderer, sim);
   await impulse.probe();
+  pondLoad.stage('impulse-probed');
   // Wake memory for the flora layers; runs from boot so the field is warm before anything reads it.
   const wake = new WakeBuffer(renderer, U, extent, seed);
   // Published before buildFloor so the floor, rocks, and bark can read the algae cover out of channel B.
@@ -119,19 +135,11 @@ async function boot() {
   setRelief(relief);
   const habitat = new Habitat();
 
-  // ?tier=0–8 pins a rung for testing; otherwise the ladder resumes where the last session settled.
-  const tierParam = params.get('tier');
-  const pinnedTier = tierParam !== null && /^[0-8]$/.test(tierParam.trim()) ? +tierParam : null;
-  const initialRung = pinnedTier ?? QualityGovernor.load();
-  const mobile = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
-  const texBase = mobile ? 1024 : 2048;
-  // Known from the first frame, so a remembered rung 6 boots straight into small maps instead of re-decoding 2K.
-  let texSizeNow = initialRung >= 6 ? texBase / 2 : texBase;
-
   const underScene = new THREE.Scene();
   // Anything floating *on* the water: the surface pass would refract it through the very surface it sits on.
   const overScene = new THREE.Scene();
-  const { colliders, textures, shoals } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat, { textureSize: texSizeNow });
+  const { colliders, textures, shoals } = await buildFloor(underScene, shading, extent, seed, { w: viewW, h: viewH }, habitat, { textureSize: texSizeNow, textures: texturesP });
+  pondLoad.stage('assets-ready');
   sim.setObstacles(colliders.waterline.discs, colliders.waterline.capsules);
   // ?cast=jim,shelley pins those residents in first and freezes the off-screen rotation for testing;
   // a bare ?cast= freezes the seeded draw as-is.
@@ -235,8 +243,16 @@ async function boot() {
     requestAnimationFrame(() => { resizeQueued = false; resize(); });
   });
 
-  // Audio + UI
-  const audio = new PondAudio();
+  // Audio + UI. A failed module load leaves a silent stub, so every call site below is a no-op.
+  const audioMod = await audioP;
+  const silentAudio = {
+    unlocked: false, muted: true, volume: 0, players: {}, userBuses: { ambience: 1, eel: 1, env: 1 }, onState: null,
+    mix: { buses: { ambience: 0, eel: 0, env: 0 }, levels: {} },
+    busVolume(name) { return this.userBuses[name] ?? 1; },
+  };
+  const audio = audioMod ? new audioMod.PondAudio() : new Proxy(silentAudio, { get: (o, k) => (k in o ? o[k] : () => {}), set: (o, k, v) => (o[k] = v, true) });
+  // Buffers fetch and decode behind the loader; Tone.start() still waits for the gate or a pointer.
+  audio.preload?.();
   const soundBtn = document.getElementById('sound');
   bindSoundButton(soundBtn, document.getElementById('volume-panel'), audio, document.getElementById('mute'));
   // Dev-only mix console; the module never loads without the flag.
@@ -384,16 +400,6 @@ async function boot() {
     const s = eels.knobs.families?.splotch;
     if (s) { s.levelsForce.value = levels; s.oct2.value = oct2; }
   };
-  let texChain = Promise.resolve();
-  const setTex = (size) => {
-    if (size === texSizeNow) return;
-    texSizeNow = size;
-    // Serialized: two decodes in flight would leave whichever finished last applied, not whichever was asked last.
-    texChain = texChain
-      .then(() => (texSizeNow === size ? setTextureSize(textures, size) : null))
-      .catch((err) => console.warn('Pond: texture resize failed', err));
-  };
-
   const RUNGS = {
     1: { on: () => setFloaters({ pollenFraction: 0.5 }), off: () => setFloaters({ pollenFraction: 1 }) },
     2: { on: () => rain.setCap(0.5), off: () => rain.setCap(1) },
@@ -435,10 +441,11 @@ async function boot() {
     },
     6: {
       on: () => {
-        sim.setResolution(384); caustics.setResolution(512); setTex(texBase / 2);
+        // Textures are pinned for the visit now; a settled rung 6 picks the smaller tier on the next boot.
+        sim.setResolution(384); caustics.setResolution(512);
         eels.renderer.setVoidQuality({ nebOct: 2, galaxies: 4, twinkleMin: 0.65, corona: 0, sheets: 2, tailOct: 2 });
       },
-      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); setTex(texBase); eels.renderer.setVoidQuality({}); },
+      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); eels.renderer.setVoidQuality({}); },
     },
     // 7 halves the caustic update rate in the frame loop; 8 only derives eels.perfHot, which both guests already read.
   };
@@ -571,7 +578,7 @@ async function boot() {
     liveCanvas.addEventListener('pointerdown', () => audio.unlock(), { once: true });
   } else {
     eels.setEnabled(false);
-    askAboutEels(dialog).then(async (v) => {
+    pondLoad.ready.then(() => askAboutEels(dialog)).then(async (v) => {
       writeEelChoice(v);
       applyChoice(v);
       revealTarget = 1;
@@ -653,6 +660,7 @@ async function boot() {
   timer.connect(document);
   let t = 0;
   let running = false;
+  let composed = false;
   const moonDir = new THREE.Vector3();
   const epoch = (Date.now() / 1000) % MOON_ORBIT_SECONDS;
   // The pond's night clock: one orbit is one night. Lilies, mat growth, and later larvae read it.
@@ -818,6 +826,13 @@ async function boot() {
       }
     }
 
+    if (!composed) {
+      composed = true;
+      pondLoad.stage('first-composed-frame');
+      pondLoad.done({ backend: root.dataset.backend, tier: gov.rung });
+      if (debug) pondLoad.report();
+    }
+
     // Long sounds ride each creature's own panner, so they sweep the stereo field as it swims.
     if (audio.unlocked && eels.enabled) {
       for (const e of eels.eels) audio.setTrackPan(e.index, toPan(e.head.x));
@@ -859,6 +874,54 @@ async function boot() {
   };
   reduceMotion.addEventListener('change', applyMotion);
   applyMotion();
+  /* One hidden pass through the real draw order behind the loader, so the first visible frame compiles
+     nothing. Nothing here steps the water, the wake, or the relief: those carry state the eels read. */
+  function warmPasses() {
+    caustics.render();
+    if (U.litterShadow.value > 0) detritusMeshes.renderShadow(renderer);
+    renderer.setRenderTarget(underRT);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear();
+    renderer.render(underScene, camera);
+    surface.render();
+    if (overScene.children.length) {
+      const prevAutoClear = renderer.autoClear;
+      renderer.autoClear = false;
+      try { renderer.render(overScene, camera); }
+      finally { renderer.autoClear = prevAutoClear; }
+    }
+  }
+
+  // ?warm=0 boots without it, which is how the first visible frame is compared with and without.
+  async function warmUp() {
+    if (params.get('warm') === '0') return;
+    const undo = [];
+    // compileAsync skips an invisible object graph outright, so a first-time or eels-declined visitor
+    // (the group starts hidden) would otherwise warm nothing at all; force it open for this pass only.
+    const groupWasVisible = eels.renderer.group.visible;
+    eels.renderer.group.visible = true;
+    undo.push(() => { eels.renderer.group.visible = groupWasVisible; });
+    try {
+      // The two pipelines that only appear minutes in: a jelly roll and the other guest's identity.
+      const cast = eels.eels;
+      if (cast[0]) undo.push(eels.renderer.prewarmLate(cast[0], 'jelly'));
+      undo.push(eels.renderer.prewarmLate(cast[1] ?? guest, 'void'));
+      await renderer.compileAsync(underScene, camera);
+      await renderer.compileAsync(overScene, camera);
+      warmPasses();
+    } catch (err) {
+      console.warn('Pond: warm-up incomplete', err);
+    } finally {
+      for (const fn of undo) { try { fn(); } catch {} }
+    }
+  }
+
+  pondLoad.stage('scene-built');
+  await warmUp();
+  pondLoad.stage('pipelines-warmed');
+  // Warm-up sits between the Timer's construction and its first update, and that whole gap would
+  // otherwise arrive as frame one's delta and drag the quality ladder up before a frame was drawn.
+  timer.reset();
   start();
 
   if (params.get('debug') === '1') {
@@ -906,4 +969,5 @@ async function boot() {
 boot().catch((err) => {
   console.error('Pond failed to start', err);
   root.classList.add('no-renderer');
+  pondLoad.fail('boot', err);
 });

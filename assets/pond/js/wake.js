@@ -76,13 +76,13 @@ export class WakeBuffer {
       const aff = float(0).toVar();
       Loop(SUB_DISCS, ({ i }) => {
         const o = this.uSubDisc.element(i);
-        aff.addAssign(smoothstep(o.z.add(this.uAlgaeClingReach), o.z.sub(0.1), length(p.sub(o.xy))));
+        aff.addAssign(smoothstep(o.z.sub(0.1), o.z.add(this.uAlgaeClingReach), length(p.sub(o.xy))).oneMinus());
       });
       Loop(SUB_CAPS, ({ i }) => {
         const ab = this.uSubCapA.element(i);
         const r = this.uSubCapB.element(i).x;
         const d = length(p3.sub(closestOnSegment(p3, vec3(ab.x, 0, ab.y), vec3(ab.z, 0, ab.w))));
-        aff.addAssign(smoothstep(r.add(this.uAlgaeClingReach), r.sub(0.1), d));
+        aff.addAssign(smoothstep(r.sub(0.1), r.add(this.uAlgaeClingReach), d).oneMinus());
       });
       return aff.min(1);
     });
@@ -127,7 +127,7 @@ export class WakeBuffer {
       const fd = length(p3.sub(closestOnSegment(p3, a.xyz, b.xyz)));
       // Latched, not accumulated: a finger crosses a texel in a single frame, so a rate-based gain
       // would never reach the tear threshold at any sane drag speed.
-      const fw = smoothstep(this.uFingerR.y, this.uFingerR.x, fd).mul(pv.w.min(1));
+      const fw = smoothstep(this.uFingerR.x, this.uFingerR.y, fd).oneMinus().mul(pv.w.min(1));
       const finger = prev.w.mul(this.uFingerDecay).max(fw);
       // Algae cover: the seeded FBM thickened against the substrate and stirred by the wake, thinned by
       // what floats overhead, by traffic, and by rain, then eased so 30 and 240 fps converge alike.

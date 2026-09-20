@@ -70,7 +70,8 @@ async function loadTex(loader, url, srgb, size) {
 /* Loads one material's maps from the manifest; any missing map comes back null. */
 async function loadSet(loader, manifest, name, size) {
   const entry = manifest?.[name] || {};
-  const base = 'assets/pond/textures/';
+  // One tier per visit: the manifest's prefix picks the whole generation, so a set never mixes sizes.
+  const base = 'assets/pond/textures/' + (manifest?.tiers?.[size] ?? '');
   const [albedo, normal, roughness, arm, height, opacity] = await Promise.all([
     loadTex(loader, entry.albedo && base + entry.albedo, true, size),
     loadTex(loader, entry.normal && base + entry.normal, false, size),
@@ -250,7 +251,7 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       const rq = vec2(p.x.mul(uAlgaeRot.x).sub(p.z.mul(uAlgaeRot.y)), p.x.mul(uAlgaeRot.y).add(p.z.mul(uAlgaeRot.x)));
       const detail = valueNoise2(rq.mul(uAlgaeDetailScale)).sub(0.5).mul(U.algaeDetail);
       algae = smoothstep(0.12, 0.78, b.add(detail.mul(0.22)))
-        .mul(smoothstep(0.02, -0.06, p.y))                      // submerged only; nothing above the waterline furs up
+        .mul(smoothstep(-0.06, 0.02, p.y).oneMinus())           // submerged only; nothing above the waterline furs up
         .mul(mix(0.45, 1.0, geomN.y.clamp(0, 1)))               // settles on tops more than undersides
         .mul(uAlgaeMat).mul(U.algaeGain).clamp(0, 1);
       const streak = valueNoise2(rq.mul(uAlgaeGrainScale)).sub(0.5).mul(U.algaeDetail);
@@ -454,14 +455,21 @@ const placeholders = {
   },
 };
 
-export async function buildFloor(scene, shading, extent, seed, view, habitat = null, { textureSize = DEFAULT_TEX_SIZE } = {}) {
-  const rng = createRng(deriveSeed(seed, 77));
+/* Every manifest set, fetched and decoded; the flora takes leaf and duckweed from the returned library.
+   Split out of buildFloor so boot can start the bytes moving while the renderer negotiates. */
+export async function prepareTextures({ textureSize = DEFAULT_TEX_SIZE } = {}) {
   const loader = new THREE.TextureLoader();
   const manifest = await loadManifest();
-  // Every manifest set loads here, once; the flora takes leaf and duckweed from the returned library.
   const names = ['sand', 'stone', 'algae', 'wood', 'leaf', 'duckweed', 'detritus'];
   const sets = await Promise.all(names.map((n) => loadSet(loader, manifest, n, textureSize)));
-  const textures = Object.fromEntries(names.map((n, i) => [n, sets[i]]));
+  return Object.fromEntries(names.map((n, i) => [n, sets[i]]));
+}
+
+export async function buildFloor(scene, shading, extent, seed, view, habitat = null, { textureSize = DEFAULT_TEX_SIZE, textures: pending = null } = {}) {
+  // Created before the await so the stream's first draw is still the dune shaping, whatever the
+  // textures did; nothing else reads this seed, so overlapping the fetch cannot reorder it.
+  const rng = createRng(deriveSeed(seed, 77));
+  const textures = await (pending ?? prepareTextures({ textureSize }));
   const { sand, stone, algae, wood } = textures;
 
   const group = new THREE.Group();

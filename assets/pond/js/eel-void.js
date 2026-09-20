@@ -141,7 +141,9 @@ function nebula(p, V, time, live) {
     f.assign(a.mul(0.5).add(b.mul(0.33)).add(c.mul(0.17)));
   });
   // Coverage still carves real black sky; the fetched octave differences only choose which gas is visible.
-  const cov = smoothstep(V.nebLo, V.nebHi, f).pow(1.6);
+  const nebLo = V.nebLo.min(V.nebHi.sub(1e-3));
+  const nebHi = V.nebHi.max(V.nebLo.add(1e-3));
+  const cov = smoothstep(nebLo, nebHi, f).pow(1.6);
   const hotLo = V.nebHotLo.clamp(0, 0.95);
   // The ionization blend rides the finest octave in hand as well as the coarse one, so hue turns several
   // times along his length; a narrow window over one octave alone paints whole stretches a single flat hue.
@@ -185,7 +187,7 @@ export function makeVoidMaterial(e, U, ctx) {
     // bend inward at the silhouette. lens is in pixels, so it divides by the screen's short side.
     const nView = cameraViewMatrix.mul(vec4(n, 0)).xyz;
     // Only the silhouette bends: across the rest of the girth he is a flat window, so a coil crossing a coil shows one sky.
-    const edge = smoothstep(V.lensBand, 1.0, dot(n, vec3(0, 1, 0)).abs().oneMinus());
+    const edge = smoothstep(V.lensBand.min(0.999), 1.0, dot(n, vec3(0, 1, 0)).abs().oneMinus());
     sp.assign(sp.sub(nView.xy.mul(V.lens).mul(edge).div(screenSize.y)));
     const p = firmament.uv(sp, V, time, live).toVar();
     // Stars are sized in pixels, so the field keeps its look at any viewport or device ratio.
@@ -222,8 +224,11 @@ export function makeSunMaterial(e, U, V, seed) {
     const hot = mix(vec3(...SUN_LIMB), vec3(...SUN_CORE), mu);
     // The blobby hot/cool face of the reference star: one slow low-frequency octave, hard-shouldered so
     // the patches have edges instead of reading as another wash.
-    const patch = smoothstep(0.40, 0.60, valueNoise2(vec2(nL.x.mul(2).add(e.uSunT.mul(0.07)).add(sd.mul(3.7)), nL.z.mul(2))));
-    const surf = mix(hot, mix(hot.mul(0.72), mix(hot, vec3(...SUN_HOT), 0.4), patch), V.blob);
+    const surf = hot.toVar();
+    If(V.blob.greaterThan(0), () => {
+      const patch = smoothstep(0.40, 0.60, valueNoise2(vec2(nL.x.mul(2).add(e.uSunT.mul(0.07)).add(sd.mul(3.7)), nL.z.mul(2))));
+      surf.assign(mix(hot, mix(hot.mul(0.72), mix(hot, vec3(...SUN_HOT), 0.4), patch), V.blob));
+    });
     const col = mix(vec3(...SUN_EMBER).mul(0.34), surf, heat).mul(grain.add(sizzle).add(1)).mul(V.sunGain);
     return vec4(col, positionWorld.y.negate().div(DEPTH).clamp(0, 1));
   })();
@@ -291,7 +296,8 @@ export function makeSingularity(e, U, V) {
     const ang = atan(p.y, p.x.add(step(d, float(1e-5)).mul(1e-3))).add(uRingAng).div(TWO_PI).mul(period);
     const n = fbm2Y(vec2(d.mul(3.0), ang), period);
     // The horizon's own edge in this quad's normalized radius; the ring is brightest right against it.
-    const inner = float(1).div(V.ringScale);
+    const ringScale = V.ringScale.max(1.001);
+    const inner = float(1).div(ringScale);
     // Falling edges are written as one-minus: a smoothstep with its edges reversed is undefined in WGSL and GLSL.
     const band = smoothstep(inner.sub(0.08), inner, d).mul(smoothstep(inner, 1.0, d).oneMinus());
     const col = mix(vec3(...FLARE_HOT), vec3(...RING_OUT), smoothstep(inner, 1.0, d));
@@ -348,11 +354,17 @@ export function makeVoidSet(e, U, ctx) {
   const cloud = makeTailCloud(e, U, V, ctx);
   const hole = makeSingularity(e, U, V);
   ctx.group.add(coronas[0], coronas[1], hole.horizon, hole.ring);
+  let coronaVisible = false;
+  const setCoronaVisible = (v) => {
+    if (coronaVisible === v) return;
+    coronaVisible = v;
+    for (const c of coronas) c.visible = v;
+  };
   return {
-    body, suns, coronaMats, coronas, cloud, hole,
+    body, suns, coronaMats, coronas, cloud, hole, setCoronaVisible,
     show(v) {
       cloud.show(v);
-      for (const c of coronas) c.visible = v;
+      setCoronaVisible(v && V.corona.value > 0);
       if (!v) hole.horizon.visible = hole.ring.visible = false;
     },
     dispose() {

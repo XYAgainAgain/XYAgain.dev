@@ -47,3 +47,10 @@ export const JUNK_KEY = 'xy.junk';
 export function finite01(v, fallback = 0) {
   return typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback;
 }
+
+/* Chosen once before any request: swapping tiers mid-session means re-decoding maps already resident,
+   so a settled low rung only takes effect on the next visit, via the persisted rung. */
+export function chooseTextureTier({ rung = 0, mobile = false } = {}) {
+  const base = mobile ? 1024 : 2048;
+  return rung >= 6 ? base / 2 : base;
+}

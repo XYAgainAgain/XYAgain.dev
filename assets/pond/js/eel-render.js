@@ -8,7 +8,7 @@ import { crumbScale } from './treats-core.js';
 import { floorHeightAt } from './floor.js';
 import { Firmament } from './firmament.js';
 import { makeVoidDials, makeVoidSet, FLARE_WRAP, SUN_WRAP } from './eel-void.js';
-import { CLOUD_LIGHT } from './eel-tail-cloud-core.js';
+import { CLOUD_LIGHT, dialNum } from './eel-tail-cloud-core.js';
 
 const RINGS = 48, SIDES = 12;
 const DEG = Math.PI / 180;
@@ -33,6 +33,13 @@ const UP = new THREE.Vector3(0, 1, 0);
 const tmpPink = new THREE.Color(), tmpFlash = new THREE.Color();
 // Generic smoothstep; handles reversed edges the way GLSL's does not, which blink() relies on.
 const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+const VOID_BOUNDS = [
+  ['nebLo', 0, 0.999, 0.5], ['nebHi', 0.001, 1, 0.86], ['lensBand', 0, 0.999, 0.42],
+  ['starScale', 1e-3, 64, 1], ['spikeLen', 1e-3, 128, 11], ['galCells', 1e-3, 64, 5],
+  ['galScale', 1e-4, 4, 0.045], ['galArmSharp', 0, 64, 1.7], ['galDiskFall', 0, 128, 2.6],
+  ['galCoreFall', 0, 128, 6.5], ['ringScale', 1.001, 16, 2.5], ['holeOpen', 1e-3, 60, 0.4],
+  ['holeClose', 1e-3, 60, 0.6],
+];
 /* TSL's hue() on the CPU: the same rotation about the grey axis, so the sand light turns with the body. */
 function rotateHue(col, ang, w) {
   const cs = Math.cos(ang), sn = Math.sin(ang) * 0.57735, m = (col.r + col.g + col.b) / 3 * (1 - cs);
@@ -136,6 +143,38 @@ export class EelRenderer {
   }
 
   endPrewarm() { if (this.warmFood) { this.group.remove(this.warmFood); this.warmFood = null; } }
+
+  /* Builds a lazy pipeline on one eel and shows it for the loader's warm-up render, then puts the
+     bundle back. Render state only: no seeded roll, no pose, no clock. `what` is 'jelly' or 'void'. */
+  prewarmLate(e, what) {
+    if (!e?.body) return () => {};
+    const was = { visible: e.body.visible, material: e.body.material };
+    if (what === 'jelly') {
+      e.matJelly ??= e._mkJelly();
+      e.body.material = e.matJelly;
+      if (e.jellyDepth) e.jellyDepth.visible = true;
+    } else {
+      e.voidSet ??= e._mkVoid();
+      e.body.material = e.voidSet.body;
+      e.voidSet.show(true);
+      // show(true) never opens the singularity or swaps the eyes to suns; both are otherwise never
+      // attached to a visible mesh, so compileAsync would skip their pipelines entirely.
+      was.eyeMats = e.eyes.map((m) => m.material);
+      e.eyes.forEach((m, i) => { m.material = e.voidSet.suns[i]; });
+      const hole = e.voidSet.hole;
+      was.hole = { horizon: hole.horizon.visible, ring: hole.ring.visible };
+      hole.horizon.visible = hole.ring.visible = true;
+    }
+    e.body.visible = true;
+    return () => {
+      e.body.visible = was.visible;
+      e.body.material = was.material;
+      e.voidSet?.show(false);
+      if (was.eyeMats) e.eyes.forEach((m, i) => { m.material = was.eyeMats[i]; });
+      if (was.hole) { e.voidSet.hole.horizon.visible = was.hole.horizon; e.voidSet.hole.ring.visible = was.hole.ring; }
+      this.syncBundleVisibility(e);
+    };
+  }
 
   buildMesh(e) {
     const spine = [];
@@ -655,7 +694,12 @@ export class EelRenderer {
       this.syncBundleVisibility(e);
       return;
     }
-    if (e.voidSet) e.voidSet.show(false);
+    if (e.voidSet) {
+      e.voidSet.show(false);
+      e._voidAt = undefined;
+      e._tailPrev = null;
+      e.tailSpeed = 0;
+    }
     if (e.matEye) for (const m of e.eyes) m.material = e.matEye;
     // His suns turn with his head; an ordinary eye is a flat dot, so the pose has to come back with it.
     if (e.eyes) for (const m of e.eyes) { m.scale.setScalar(e.radius * 0.2); m.quaternion.identity(); }
@@ -838,17 +882,18 @@ export class EelRenderer {
     const U = this.U, time = U.time.value, ms = U.motionScale.value;
     const v = e.speedBL * e.length;
     const heat = Math.min(1, Math.max(0, e.sunHeat ?? 1));
-    const seg = (slot, a, b, r) => {
-      U.infA.array[slot].set(a.x, a.y, a.z, r);
-      U.infB.array[slot].set(b.x, b.y, b.z, 1);
-      U.infC.array[slot].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
-    };
+    const infC = U.infC.array;
     // A point capsule at the eyes' reach, so the sand under his face is lit and his body is not.
     tmpC.copy(e.show[0]).addScaledVector(e.heading, 0.05);
-    seg(EEL_COUNT, tmpC, tmpC, e.radius * 1.4);
+    U.infA.array[EEL_COUNT].set(tmpC.x, tmpC.y, tmpC.z, e.radius * 1.4);
+    U.infB.array[EEL_COUNT].set(tmpC.x, tmpC.y, tmpC.z, 1);
+    infC[EEL_COUNT].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
     // The tail capsule belongs under the cloud, which starts late and reaches past his tip.
-    if (e.voidSet) { e.voidSet.cloud.capsule(tmpCap); seg(EEL_COUNT + 1, tmpCap.a, tmpCap.b, e.radius * 2.2); }
-    else seg(EEL_COUNT + 1, e.show[19], e.show[23], e.radius * 2.2);
+    if (e.voidSet) e.voidSet.cloud.capsule(tmpCap);
+    else { tmpCap.a.copy(e.show[19]); tmpCap.b.copy(e.show[23]); }
+    U.infA.array[EEL_COUNT + 1].set(tmpCap.a.x, tmpCap.a.y, tmpCap.a.z, e.radius * 2.2);
+    U.infB.array[EEL_COUNT + 1].set(tmpCap.b.x, tmpCap.b.y, tmpCap.b.z, 1);
+    infC[EEL_COUNT + 1].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
     // The shader's sizzle on the CPU, so the sand flickers in the same cycle the suns do.
     const tw = (time * ms) % (Math.PI * 2);
     const sizzle = 1 + (Math.sin(tw * 37 + e.uSeed.value) * 0.04 + Math.sin(tw * 91) * 0.02) * heat;
@@ -921,6 +966,8 @@ export class EelRenderer {
      open, all decoration only since behavior reads none of it. `fwd` is the caller's normalized forward vector. */
   syncVoid(e, fwd) {
     const S = e.voidSet, U = this.U, V = this.voidU;
+    for (const [dial, lo, hi, fallback] of VOID_BOUNDS) dialNum(V[dial], lo, hi, fallback);
+    S.setCoronaVisible(e.body.visible && V.corona.value > 0);
     const now = U.time.value, ms = U.motionScale.value;
     const dt = Math.min(0.1, Math.max(0, now - (e._voidAt ?? now)));
     e._voidAt = now;
@@ -951,17 +998,19 @@ export class EelRenderer {
     const yaw = Math.atan2(fwd.z, fwd.x);
     // The coronas ride above the body so the tube's own depth cannot swallow them; straight down, only
     // their xz placement reads anyway.
-    const lift = (p) => { p.y = e.show[0].y + e.radius * 1.5; };
+    const liftY = e.show[0].y + e.radius * 1.5;
     for (let i = 0; i < 2; i++) {
       e.eyes[i].quaternion.setFromRotationMatrix(tmpM);
       S.coronaMats[i].uAng.value = yaw;
       S.coronas[i].position.copy(e.eyes[i].position);
-      lift(S.coronas[i].position);
+      S.coronas[i].position.y = liftY;
       S.coronas[i].scale.setScalar(e.radius * 0.2 * V.eyeScale.value * Math.max(1e-3, V.coronaSize.value || 0));
     }
     // The meal scale eases open in 0.4 s and shut in 0.6 s; the controller only ever sets the target.
-    const want = Math.max(0, e.horizon ?? 0), cur = e._hole ?? 0;
-    const rate = want > cur ? Math.max(want, 1e-3) / V.holeOpen.value : Math.max(cur, 1e-3) / V.holeClose.value;
+    const want = Number.isFinite(e.horizon) ? Math.max(0, e.horizon) : 0;
+    const cur = Number.isFinite(e._hole) ? Math.max(0, e._hole) : 0;
+    const tau = want > cur ? V.holeOpen.value : V.holeClose.value;
+    const rate = Math.max(want, cur, 1e-3) / tau;
     e._hole = cur + Math.sign(want - cur) * Math.min(Math.abs(want - cur), rate * dt);
     const open = e._hole > 1e-3 && e.body.visible;
     S.hole.horizon.visible = S.hole.ring.visible = open;
@@ -970,7 +1019,7 @@ export class EelRenderer {
     S.hole.horizon.position.copy(e.show[0]).addScaledVector(fwd, e.radius * 0.5);
     S.hole.horizon.scale.setScalar(rad);
     S.hole.ring.position.copy(S.hole.horizon.position);
-    lift(S.hole.ring.position);
+    S.hole.ring.position.y = liftY;
     S.hole.ring.scale.setScalar(rad * V.ringScale.value * 2);
     S.hole.spin(dt, ms > 0.5);
   }

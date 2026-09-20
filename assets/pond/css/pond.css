@@ -1,10 +1,56 @@
+:root {
+  /* One source of truth for the flat fill: the page's first paint and the loading screen are the
+     same color, so the loader arrives without a flash. Matches the theme-color meta. */
+  --pond-bg: #05070c;
+  --loader-fade: 700ms;
+}
+
 html, body {
   margin: 0;
   block-size: 100%;
-  background: #05070c;
+  background: var(--pond-bg);
   color: var(--ink);
   overflow: hidden;
   overscroll-behavior: none;
+}
+
+/* Loading screen: it owns the viewport until the first composed pond frame, then cross-fades out. */
+.loader {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 1.5rem;
+  padding-inline: 16px;
+  background: var(--pond-bg);
+  transition: opacity var(--loader-fade) ease;
+}
+.loader[hidden] { display: none; }
+.loader.is-gone {
+  opacity: 0;
+  pointer-events: none;
+}
+.loader-eel {
+  inline-size: min(70vw, 480px);
+  block-size: auto;
+  opacity: 0;
+  transition: opacity 320ms ease;
+}
+.loader.eel-in .loader-eel { opacity: 1; }
+.loader-alt { display: none; }
+.loader-text {
+  margin: 0;
+  min-block-size: 1lh;
+  color: var(--ink);
+  font-size: 0.95rem;
+  text-align: center;
+  text-wrap: balance;
+  max-inline-size: 40ch;
+}
+@media (prefers-reduced-motion: reduce) {
+  .loader, .loader-eel { transition-duration: 1ms; }
 }
 
 #stage {
@@ -40,7 +86,8 @@ html, body {
   object-fit: cover;
   display: block;
 }
-html[data-backend] .fallback {
+/* The loader covers boot now, so the fallback layer only exists for the no-renderer state. */
+.fallback {
   opacity: 0;
   pointer-events: none;
 }

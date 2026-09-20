@@ -92,7 +92,7 @@ export class PuffCloud {
       const q = uv().sub(0.5).mul(2);
       const r = length(q);
       // The film's pinprick, with no slope taps: these grains are in the air, not on the water.
-      const shape = smoothstep(1.0, 0.55, r).mul(uPuffPinA);
+      const shape = smoothstep(0.55, 1.0, r).oneMinus().mul(uPuffPinA);
       const col = uPuffColor.mul(U.moonColor).mul(U.moonStrength).mul(uPuffGain).mul(shape).mul(vPuffAlpha);
       return vec4(col, 0);
     })();

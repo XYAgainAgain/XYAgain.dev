@@ -165,11 +165,40 @@ export class PondAudio {
     });
   }
 
+  /* Buffers fetch and decode behind the loading screen, in audible-now order. decodeAudioData does
+     not need a running context, only playback does, so Tone.start() still waits for the gesture. */
+  preload() {
+    if (this.preloadP) return this.preloadP;
+    this.buffers = {};
+    const warn = (name) => (err) => console.warn(`Pond audio: ${name} failed to preload`, err);
+    const one = (key, file) => {
+      const b = new Tone.ToneAudioBuffer();
+      return b.load(BASE + file).then(() => { this.buffers[key] = b; }, warn(key));
+    };
+    let chain = one('ambient', 'ambient-pond.ogg')
+      .then(() => one('rain', 'drippy-pond-rain.ogg'))
+      .then(() => one('drone', 'sam-drone.ogg'));
+    // One-shots last and one category at a time: the beds are what a visitor hears first.
+    for (const [name, files] of Object.entries(SETS)) {
+      chain = chain.then(() => Promise.all(files.map((f, i) => {
+        const b = new Tone.ToneAudioBuffer();
+        return b.load(BASE + f).then(() => { (this.buffers[name] ??= {})[i] = b; }, warn(name));
+      })));
+    }
+    this.preloadP = chain;
+    return chain;
+  }
+
+  // A preloaded buffer, or the URL so an unfinished preload still resolves the normal way.
+  src(key, file) { return this.buffers?.[key] ?? `${BASE}${file}`; }
+
   loadAll() {
     const warn = (name) => (err) => console.warn(`Pond audio: ${name} failed to load`, err);
     this.players.ambient = new Tone.Player({
-      url: `${BASE}ambient-pond.ogg`, loop: true, fadeIn: 2, fadeOut: 1, volume: this.mix.levels.ambient,
-      onload: () => { if (this.unlocked) this.players.ambient.start(); },
+      url: this.src('ambient', 'ambient-pond.ogg'), loop: true, fadeIn: 2, fadeOut: 1, volume: this.mix.levels.ambient,
+      // A preloaded buffer fires this during construction, before the assignment lands; the explicit
+      // check at the end of loadAll covers that case, so exactly one of the two ever starts the bed.
+      onload: () => { if (this.unlocked) this.players.ambient?.start(); },
       onerror: warn('ambient'),
     }).connect(this.buses.ambience);
     // Rain gets its own gain and filter so the envelope can swell and open up without touching the
@@ -177,21 +206,24 @@ export class PondAudio {
     this.rainGain = new Tone.Gain(0).connect(this.buses.env);
     this.rainFilter = new Tone.Filter({ type: 'lowpass', frequency: RAIN_LP[0], Q: 0.4 }).connect(this.rainGain);
     this.players.rain = new Tone.Player({
-      url: `${BASE}drippy-pond-rain.ogg`, loop: true, fadeIn: 1.5, fadeOut: 2, volume: this.mix.levels.rain,
-      onload: () => { if (this.rainEnv > 0) this.setRain(this.rainEnv); },
+      url: this.src('rain', 'drippy-pond-rain.ogg'), loop: true, fadeIn: 1.5, fadeOut: 2, volume: this.mix.levels.rain,
+      onload: () => { if (this.rainEnv > 0) this.players.rain && this.setRain(this.rainEnv); },
       onerror: warn('rain'),
     }).connect(this.rainFilter);
     // The space eel's bed: a seamless loop, so the player's own fades only ever touch its start and stop.
     this.players.drone = new Tone.Player({
-      url: `${BASE}sam-drone.ogg`, loop: true, fadeIn: 0.05, fadeOut: 0.05, volume: 0,
+      url: this.src('drone', 'sam-drone.ogg'), loop: true, fadeIn: 0.05, fadeOut: 0.05, volume: 0,
       onerror: warn('drone'),
     }).connect(this.droneSwell);
     // The sets stay unconnected: they only hold decoded buffers for shot() to spawn from.
     for (const [name, files] of Object.entries(SETS)) {
       const urls = {};
-      files.forEach((f, i) => { urls[i] = f; });
+      files.forEach((f, i) => { urls[i] = this.buffers?.[name]?.[i] ?? f; });
       this.players[name] = new Tone.Players({ urls, baseUrl: BASE, onerror: warn(name) });
     }
+    // A buffer that was already decoded gives Player nothing to wait on, so onload may never fire.
+    if (this.players.ambient.loaded && this.unlocked) this.players.ambient.start();
+    if (this.players.rain.loaded && this.rainEnv > 0) this.setRain(this.rainEnv);
   }
 
   setVolume(v) {

@@ -228,7 +228,7 @@ export const closestOnSegment = Fn(([p, a, b]) => {
    and the CPU twin below all read this one curve so they can never drift apart. */
 export const capsuleWeight = Fn(([p, a, b]) => {
   const d = length(p.sub(closestOnSegment(p, a.xyz, b.xyz)));
-  return smoothstep(a.w.add(0.9), a.w.add(0.05), d);
+  return smoothstep(a.w.add(0.05), a.w.add(0.9), d).oneMinus();
 });
 
 /* Wake push at p from one influence slot, for anything creatures shove around (lily pads first).
@@ -363,7 +363,7 @@ export function makeUnderwaterShading(U) {
     If(U.coverStrength.add(U.litterShadow).greaterThan(0), () => {
       // toVar, or both fetches below inline the whole stencil and pay for its sim taps twice.
       const entryUV = shadowEntryUV(L, p).toVar();
-      const under = smoothstep(0.02, -0.02, p.y).toVar();
+      const under = smoothstep(-0.02, 0.02, p.y).oneMinus().toVar();
       cover.assign(U.coverTex.sample(entryUV).g.mul(U.coverStrength).mul(under));
       litter.assign(U.litterTex.sample(entryUV).r.mul(U.litterShadow).mul(under));
     });
@@ -388,7 +388,8 @@ export function makeUnderwaterShading(U) {
       const cNow = eelSlotGlow(p, i);
       // The wrap keeps crevices dim rather than black under a soft nearby glow.
       glow.addAssign(cNow.mul(dot(n, Le).add(0.35).div(1.35).clamp(0, 1)));
-      const He = normalize(Le.add(V));
+      const heV = Le.add(V);
+      const He = heV.div(length(heV).max(1e-4));
       glowSpec.addAssign(cNow.mul(dot(n, He).max(0).pow(specPow)).mul(roughness.oneMinus()).mul(1.2));
     });
     const dbg = new URLSearchParams(location.search).get('shade');
