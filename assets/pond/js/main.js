@@ -17,7 +17,7 @@ import { attachQuirks } from './eel-quirks.js';
 import { attachCrush } from './eel-crush.js';
 import { attachBond } from './eel-bond.js';
 import { attachTreats } from './treats.js';
-import { attachEleanor } from './eleanor.js';
+import { attachGuest } from './eleanor.js';
 import { Grazing } from './eel-graze.js';
 import { TeaTime } from './eel-tea.js';
 import { IDENTITIES } from './eel-identity.js';
@@ -141,9 +141,11 @@ async function boot() {
   const pin = (name) => { const raw = params.get(name); return raw === null || raw.trim() === '' ? null : finite01(Number(raw), null); };
   eels.pins = { brain: pin('brain'), moon: pin('moon') };
   eels.relief = relief;
-  const eleanor = attachEleanor(eels, seed);
-  // After Eleanor, so addModule's init hook reaches the guest too: she gets wits and module state at
-  // attach time even though her controller never runs steer. Fear registers first, because the
+  // ?guest=eleanor|sam pins which of the two takes the slot, the way ?cast= pins the residents;
+  // otherwise the roll happens here and again at every park.
+  const guest = attachGuest(eels, seed, { guest: params.get('guest') });
+  // After the guest, so addModule's init hook reaches it too: it gets wits and module state at attach
+  // time even though neither guest controller runs steer. Fear registers first, because the
   // braincell's focus reads this tick's panic out of it in the same prepass.
   const fear = attachFear(eels, seed);
   const braincell = attachBraincell(eels, seed);
@@ -264,7 +266,7 @@ async function boot() {
   const toPan = (x) => Math.max(-1, Math.min(1, x / (view.w / 2))) * 0.8;
   // Audio is one subscriber among several to come; pan arrives precomputed on the payload.
   eels.on('startle', (ev) => { ev.kind === 'eleanor' ? audio.eleanorStartle({ pan: ev.pan }) : audio.startle({ pan: ev.pan, length: ev.length }); });
-  eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.kind === 'eleanor' ? 0.5 : 1 }));
+  eels.on('eat', (ev) => audio.eat(ev.size ?? 1, { pan: ev.pan, rate: ev.kind === 'eleanor' ? 0.5 : 1, ev }));
   // Every crumb announces itself at the splash, click and held stream alike: the dimple and the plop
   // are subscribers, so the ring and the sound arrive with the crumb instead of with the button.
   eels.on('drop', (ev) => {
@@ -278,8 +280,8 @@ async function boot() {
   eels.on('void', (ev) => audio.plip(0.35, toPan(ev.x)));
   // The toss itself stays quiet: a whoosh on every held crumb at 250 BPM would be unbearable, and an
   // empty listener would still cost a payload per throw, so there is deliberately no subscriber.
-  eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan }));
-  eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan }));
+  eels.on('slurp', (ev) => audio.slurp({ pan: ev.pan, ev }));
+  eels.on('nibble', (ev) => audio.tinyBub({ pan: ev.pan, ev }));
   eels.on('sing', (ev) => audio.sing({ pan: ev.pan, notes: ev.food?.notes ?? 3 }));
   eels.on('headbutt', (ev) => audio.headbutt({ pan: ev.pan, length: ev.length }));
   eels.on('rescue', (ev) => audio.rescue({ pan: ev.pan }));
@@ -334,6 +336,12 @@ async function boot() {
   const algae = new AlgaeTufts({ underScene, U, shading, wake, seed, colliders, motion, view: { w: viewW, h: viewH } });
   // Rushes root in the shoals buildFloor just raised, and register their shadow proxies before the first bake.
   const rushes = new Rushes({ underScene, overScene, U, shading, wake, seed, shoals, colliders, habitat, motion, view: { w: viewW, h: viewH } });
+  // The swallow is simulation, not decoration: it rides the fixed tick, last of all, so the overlap is
+  // read off the pose the collision solve just committed rather than off whichever frame looks next.
+  eels.addModule({
+    postpass: (sys, dt) => rushes.tickSwallow(dt, sys.guests),
+    onEnabled: (sys, on) => { if (!on) rushes.releaseSwallow(); },
+  });
   // After the pads, which the landing has to query, and before hand.feed, which is now a throw.
   const treats = attachTreats(eels, { overScene, pads, view, motion, U });
   // Floating litter: the drift and contact are the floaters' own collider tables and curl, so the litter
@@ -426,10 +434,13 @@ async function boot() {
       off: () => { qualityScale = 1; resize(); rushes.setQuality({ pxFloor: 0 }); },
     },
     6: {
-      on: () => { sim.setResolution(384); caustics.setResolution(512); setTex(texBase / 2); },
-      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); setTex(texBase); },
+      on: () => {
+        sim.setResolution(384); caustics.setResolution(512); setTex(texBase / 2);
+        eels.renderer.setVoidQuality({ nebOct: 2, galaxies: 4, twinkleMin: 0.65, corona: 0, sheets: 2, tailOct: 2 });
+      },
+      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); setTex(texBase); eels.renderer.setVoidQuality({}); },
     },
-    // 7 halves the caustic update rate in the frame loop; 8 only derives eels.perfHot, which Eleanor already reads.
+    // 7 halves the caustic update rate in the frame loop; 8 only derives eels.perfHot, which both guests already read.
   };
 
   function applyRung(rung, prev) {
@@ -437,6 +448,7 @@ async function boot() {
     else for (let r = prev; r > rung; r--) RUNGS[r]?.off();
     eels.perfHot = rung >= 8;
   }
+  let droneOn = false, droneResting = false;
   const gov = new QualityGovernor({ initialRung, pinned: pinnedTier !== null, onChange: applyRung });
 
   // Audio already speaks for a nibble; this is the second subscriber, and it only makes bubbles.
@@ -809,7 +821,14 @@ async function boot() {
     // Long sounds ride each creature's own panner, so they sweep the stereo field as it swims.
     if (audio.unlocked && eels.enabled) {
       for (const e of eels.eels) audio.setTrackPan(e.index, toPan(e.head.x));
-      if (eleanor.body?.visible) audio.setTrackPan(eleanor.index, toPan(eleanor.head.x));
+      if (guest.body?.visible) audio.setTrackPan(guest.index, toPan(guest.head.x));
+      // Latched only once the bed has loaded: guestDrone is a no-op before that, and the file may never exist.
+      const wantDrone = !!(guest.body?.visible && guest.identity?.void);
+      const droneRest = wantDrone && guest.state === 'lair' && guest.returnLeg >= 2;
+      if ((wantDrone !== droneOn || droneRest !== droneResting) && audio.players.drone?.loaded) {
+        droneOn = wantDrone; droneResting = droneRest;
+        audio.guestDrone(wantDrone, { track: guest.index, rest: droneRest });
+      }
     }
     if (eels.enabled && t - lastCrackle > 4 && Math.random() < dt * 0.08) {
       lastCrackle = t;
@@ -860,7 +879,7 @@ async function boot() {
       console.log(label, rt.width + 'x' + rt.height, 'mean', sum.map((v) => (v / n).toFixed(4)).join(' '), 'max', max.map((v) => v.toFixed(3)).join(' '), 'nan', nan);
     };
     window.pond = {
-      renderer, sim, caustics, eels, eleanor, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, puffs, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, detritus, detritusMeshes, textures, audio,
+      renderer, sim, caustics, eels, guest, braincell, fear, air, quirks, crush, bond, treats, U, surface, seed, overScene, impulse, effects, sediment, puffs, rain, wake, relief, habitat, moon, pads, floaters, algae, rushes, detritus, detritusMeshes, textures, audio,
       grow: (i, d = 1) => growEel(eels.eels[i], d),
       swap: (i, name) => eels.swapIdentity(eels.eels[i], name ? IDENTITIES.find((id) => id.name.toLowerCase() === name.toLowerCase()) : null),
       stats: fpsStats,

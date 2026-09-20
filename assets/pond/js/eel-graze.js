@@ -1,8 +1,8 @@
 import { DEPTH, MOON_ORBIT_SECONDS } from './config.js';
 import { CARVE_TICK, FINGER_CARVE_R, FINGER_CARVE } from './floaters.js';
 
-/* Morgan's menu. An herbivore in a pond of carnivores: crumbs are somebody else's dinner, so her
-   wander targets become duckweed furrows, algae tufts, and lily pads. Two hooks, called from steer. */
+/* The grazer's menu: duckweed furrows, algae tufts, and lily pads become the wander targets. An
+   herbivore skips crumbs outright; an omnivore grazer only lands here once nothing is smelled. */
 
 // ~half the time at Morgan's hunger 0.5, so she still wanders and rests like everyone else.
 const PICK_BASE = 0.35, PICK_HUNGER = 0.3;

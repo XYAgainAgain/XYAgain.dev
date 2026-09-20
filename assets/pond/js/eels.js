@@ -198,9 +198,17 @@ export class EelSystem {
         restTogether: 2, loneRest: 0.5, cool: 45, apartPull: 0.5, keep: 0.5, guestNear: 6, panicCut: 0.35,
         vigilGap: 2.5, vigilMax: 30, brave: 0.15, reunionHellos: 3, forceWait: 90,
       },
+      // The guest slot's dials, split across guest-stage.js, eleanor.js, and sam-eel.js: sam* scale his
+      // clocks and odds, presence/calm/bow/bowReach are the ambient cues he leaves behind as he passes.
+      guest: {
+        samOdds: 0.8, samStay: 1, samCap: 1, samGrows: 0, samWait: 45, samCruise: 0.8,
+        samRounds: [90, 150], samNap: [120, 240],
+        presence: 0.35, calm: 4, bow: 0.08, bowReach: 0.5,
+      },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
-    // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt) and initEel(sys, e).
+    // Registered behavior modules (eel-brain, eel-fear, eel-air): prepass(sys, dt), postpass(sys, dt)
+    // once the poses are committed, and initEel(sys, e).
     this.modules = [];
     // One pond-wide input snapshot, written by main from the pointer events and advanced on the
     // simulation clock in the prepass, so nothing about it follows the frame rate.
@@ -251,6 +259,7 @@ export class EelSystem {
     // Same shape for the pattern families. Every force dial (stars.forceClass, tiger.forceBreak,
     // splotch.forceW, and the rest) moves a CPU value, so it takes applyKnobs(); uniform dials are instant.
     this.knobs.families = this.renderer.familyU;
+    this.knobs.void = this.renderer.voidU;     // Sam's universe, suns, tail cloud, and singularity
     this.group = this.renderer.group;
     // A pinned ?cast= is a test rig, so it also freezes the rotation; a seeded draw keeps swapping.
     this.debug = !!opts.debug;
@@ -819,6 +828,9 @@ export class EelSystem {
     expire(this.spooks, this.time, SPOOK_LIFE);
     expire(this.lures, this.time, 9);
     expire(this.vortices, this.time, 7);
+    // Tick Contract step 6: whatever the world owes the poses this tick just committed, in registration
+    // order like the prepass. Nothing here may move a body; the chain is final by now.
+    for (const m of this.modules) m.postpass?.(this, dt);
   }
 
   /* A whole treat has enough surface tension under it to ride the film for a while; a speck goes

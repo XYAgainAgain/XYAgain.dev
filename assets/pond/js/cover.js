@@ -83,6 +83,7 @@ export class Habitat {
   nearestPerch(x, z, type = null, freeOnly = false) {
     let best = null, bestD = Infinity;
     for (const p of this.perches) {
+      if (p.gone) continue;   // its stem is swallowed; nothing may perch where there is no stem
       if (type && p.type !== type) continue;
       if (freeOnly && this.claims.has(p.id)) continue;
       const dx = x - p.x, dz = z - p.z, d = dx * dx + dz * dz;   // squaring preserves order, so the winner is the same

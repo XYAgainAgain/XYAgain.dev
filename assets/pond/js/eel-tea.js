@@ -98,7 +98,7 @@ export class TeaTime {
     const env = sys.rain?.envelope ?? 0;
     if (!st.want && env > k.rainOn && now >= st.breakUntil) st.want = 'rain';
     // A due cup with no trip yet expedites the next retarget. The crumb guard mirrors hook one's;
-    // the graze guard lets a tea-drinking grazer (Morgan) finish her salad before the kettle calls.
+    // the graze guard lets a tea-drinking grazer finish her salad before the kettle calls.
     const liveCrumb = sys.braincell?.hasSensedFood(e) ?? sys.foods.some((f) => f.amount > 0);
     if (st.want && st.padIdx < 0 && now >= st.breakUntil && !e.food && !e.tunnel && e.coverSpot?.type !== 'graze' && !liveCrumb) {
       e.retargetAt = Math.min(e.retargetAt, now);

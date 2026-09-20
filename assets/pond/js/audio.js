@@ -23,6 +23,15 @@ const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', '
 // Rain's lowpass sweep: a shut-in patter at the first drops, wide open in a downpour.
 const RAIN_LP = [700, 7000];
 
+/* The space eel's voice is Eleanor's, reversed and half an octave down, through the space reverb.
+   The envelope carries kind 'sam'; his identity is also the only void one, so either proves him. */
+const SPACE_RATE = 0.707;
+const isSam = (ev) => ev?.kind === 'sam' || ev?.eel?.identity?.void === true;
+// His bed loop: 4 s in on arrival, 4 s out on departure, and 6 dB down under his own one-shots.
+const DRONE_FADE = 4;
+const DRONE_SWELL = 120;   // seconds for one full swell of the bed, low to high and back
+const DRONE_DUCK = -6;
+
 /* Mixed by ear via ?mixer=1; the panel still overrides these per-browser via localStorage. */
 const DEFAULT_MIX = {
   buses: { ambience: 0, eel: 0, env: 0 },
@@ -32,9 +41,19 @@ const DEFAULT_MIX = {
     startle: -10, eleanorStartle: -8,
     crackleLil: -2.5, crackleMed: -2.5, crackleBig: -2.5,
     eat: -3, slurp: -3, tinyBub: -18, shortBub: -15, sip: 4,
-    drip: -17, padSettle: -8,
+    drip: -17, padSettle: -8, drone: -5, droneLow: -10, droneRest: -3,
   },
 };
+
+/* The audible length of a one-shot is not buffer.duration / rate: the rate is jittered and trim picks
+   a random start and a 70–100% length after that. Pure, so a caller can line a visual up with it. */
+export function shotVariant(bufDur, { jitter = 0.15, rate = 1, trim = false } = {}, rand = Math.random) {
+  const r = rate * (1 - jitter / 2 + rand() * jitter);
+  const offset = trim ? rand() * 0.1 * bufDur : 0;
+  // Untrimmed plays the whole buffer, which Tone wants as an absent duration, not a number.
+  const dur = trim ? (0.7 + rand() * 0.3) * (bufDur - offset) : undefined;
+  return { rate: r, offset, dur, duration: (dur ?? bufDur) / r };
+}
 
 /* All of Korobeiniki (public-domain folk tune) in semitones from A, A section then B; crumb
    drops walk it, a 2 s gap resets to the top, and big plops roll a 2-octave major pentatonic. */
@@ -57,8 +76,12 @@ export class PondAudio {
     this.master = null;
     this.buses = null;
     this.players = {};
-    this.tracks = new Map();       // creature id -> persistent Panner on the eel bus
+    this.tracks = new Map();       // (creature id, bus) → persistent Panner; the eel bus keys on the id alone
+    this.trackPan = new Map();     // last pan per creature, so a second route for it opens already aimed
+    this.reversed = new Map();     // set|key → a reversed copy of that buffer
     this.live = new Set();         // in-flight throwaway players, for stopAll()
+    this.droneOn = false;
+    this.duckUntil = 0;
     this.swishPl = null;
     this.swishPanner = null;
     this.lastPlip = 0;
@@ -112,7 +135,18 @@ export class PondAudio {
       eel: new Tone.Gain(this.busGain('eel')).connect(this.master),
       env: new Tone.Gain(this.busGain('env')).connect(this.master),
     };
+    /* The space reverb feeds the eel bus, so the mixer's eel row still governs him and gains no row.
+       Tone generates the impulse off-thread; until it lands the dry half still passes, so nothing waits. */
+    this.space = new Tone.Reverb({ decay: 5, preDelay: 0.02, wet: 0.55 }).connect(this.buses.eel);
+    this.space.ready.catch((err) => console.warn('Pond audio: space reverb failed', err));
     this.swishPanner = new Tone.Panner(0).connect(this.buses.env);
+    this.droneGain = new Tone.Gain(0);                            // arrival/departure envelope
+    // The bed breathes between its two mixer levels on a slow swell; a gain, since an LFO into a dB param is nonsense.
+    this.droneSwell = new Tone.Gain(1).connect(this.droneGain);
+    this.droneLfo = new Tone.LFO({ frequency: 1 / DRONE_SWELL, min: Tone.dbToGain(this.mix.levels.droneLow), max: Tone.dbToGain(this.mix.levels.drone) });
+    this.droneLfo.connect(this.droneSwell.gain);
+    this.droneOut = new Tone.Gain(1).connect(this.buses.eel);     // the duck under his one-shots
+    this.droneGain.connect(this.droneOut);
     this.loadAll();
     this.watchVisibility();
     this.onState?.();
@@ -147,6 +181,11 @@ export class PondAudio {
       onload: () => { if (this.rainEnv > 0) this.setRain(this.rainEnv); },
       onerror: warn('rain'),
     }).connect(this.rainFilter);
+    // The space eel's bed: a seamless loop, so the player's own fades only ever touch its start and stop.
+    this.players.drone = new Tone.Player({
+      url: `${BASE}sam-drone.ogg`, loop: true, fadeIn: 0.05, fadeOut: 0.05, volume: 0,
+      onerror: warn('drone'),
+    }).connect(this.droneSwell);
     // The sets stay unconnected: they only hold decoded buffers for shot() to spawn from.
     for (const [name, files] of Object.entries(SETS)) {
       const urls = {};
@@ -179,51 +218,100 @@ export class PondAudio {
     this.onState?.();
   }
 
-  /* Lazy per-creature Panner so a long sound keeps tracking its owner across the screen. */
-  trackPanner(id) {
-    let tr = this.tracks.get(id);
-    if (!tr) { tr = new Tone.Panner(0).connect(this.buses.eel); this.tracks.set(id, tr); }
+  /* Where a routing override lands. The space reverb is deliberately not a member of this.buses: it
+     has no gain and no mixer row, and every bus loop in here would trip over it. */
+  busNode(name) { return name === 'space' ? this.space : this.buses[name]; }
+
+  /* Lazy per-creature Panner so a long sound keeps tracking its owner across the screen. Keyed by
+     creature and bus, since one panner wired to the eel bus would swallow a space route silently. */
+  trackPanner(id, bus = 'eel') {
+    const key = bus === 'eel' ? id : `${id}|${bus}`;
+    let tr = this.tracks.get(key);
+    if (!tr) {
+      tr = new Tone.Panner(this.trackPan.get(id) ?? 0).connect(this.busNode(bus) ?? this.buses.eel);
+      this.tracks.set(key, tr);
+    }
     return tr;
   }
 
   setTrackPan(id, pan) {
     if (!this.unlocked) return;
-    this.trackPanner(id).pan.value = Math.max(-1, Math.min(1, pan));
+    const p = Math.max(-1, Math.min(1, pan));
+    this.trackPan.set(id, p);
+    this.trackPanner(id).pan.value = p;
+    const space = this.tracks.get(`${id}|space`);
+    if (space) space.pan.value = p;
+  }
+
+  /* Reversing a Tone.Player flips the channel data of the buffer in place, and that data is shared
+     with the set's own Players, so a reversed copy is cut once per variant and played forward. */
+  reversedBuffer(set, key, buf) {
+    const id = `${set}|${key}`;
+    let rev = this.reversed.get(id);
+    if (!rev) {
+      if (!(buf.duration > 0)) return null;
+      rev = buf.slice(0);
+      rev.reverse = true;
+      this.reversed.set(id, rev);
+    }
+    return rev;
   }
 
   swishPan(pan) { if (this.swishPanner) this.swishPanner.pan.value = Math.max(-1, Math.min(1, pan)); }
 
-  /* Spawn one throwaway Player over the set's shared buffer. opts: db (level offset), jitter (pitch
-     spread), rate (pitch multiplier), pan (static), track (creature panner id), trim (random start
-     and length, for small pools like Eleanor's), delay (seconds ahead, for phrases), bus (routing override). */
-  shot(set, key, levelKey, { db = 0, jitter = 0.15, rate = 1, pan = null, track = null, trim = false, delay = 0, bus = null, lp = 0 } = {}) {
+  /* Resolves the variant, trim, and jittered rate up front, returning { play, duration } so a caller can
+     align a visual with the sound before it plays. opts match shot()'s; levelKey may carry opts.level. */
+  prepare(set, key, levelKey, opts = {}) {
+    if (levelKey && typeof levelKey === 'object') { opts = levelKey; levelKey = opts.level; }
+    const { db = 0, jitter = 0.15, rate = 1, pan = null, track = null, trim = false,
+      delay = 0, bus = null, lp = 0, reverse = false } = opts;
     if (!this.unlocked) return null;
     const src = this.players[set]?.player(String(key));
     if (!src?.loaded) return null;
-    const buf = src.buffer;
-    const p = new Tone.Player(buf);
-    p.playbackRate = rate * (1 - jitter / 2 + Math.random() * jitter);
-    p.volume.value = this.mix.levels[levelKey] + db;
-    p.fadeIn = trim ? 0.03 : 0;
-    p.fadeOut = trim ? 0.15 : 0.05;
-    let panner = null, filt = null;
-    let out = this.buses[bus] ?? (EEL_SETS.has(set) ? this.buses.eel : this.buses.env);
-    // lp is a lowpass in Hz for sounds made under water; the filter sits last so the panner is unchanged.
-    if (lp > 0) { filt = new Tone.Filter({ type: 'lowpass', frequency: lp, Q: 0.5 }).connect(out); out = filt; }
-    if (track != null) p.connect(this.trackPanner(track));
-    else if (pan != null) { panner = new Tone.Panner(Math.max(-1, Math.min(1, pan))).connect(out); p.connect(panner); }
-    else p.connect(out);
-    this.live.add(p);
-    p.onstop = () => { this.live.delete(p); setTimeout(() => { panner?.dispose(); filt?.dispose(); p.dispose(); }, 250); };
-    let offset = 0, dur;
-    if (trim) { offset = Math.random() * 0.1 * buf.duration; dur = (0.7 + Math.random() * 0.3) * (buf.duration - offset); }
-    p.start(Tone.now() + Math.max(0, delay), offset, dur);
-    return p;
+    const buf = reverse ? this.reversedBuffer(set, key, src.buffer) : src.buffer;
+    if (!buf) return null;
+    const v = shotVariant(buf.duration, { jitter, rate, trim }, Math.random);
+    const play = () => {
+      const p = new Tone.Player(buf);
+      p.playbackRate = v.rate;
+      p.volume.value = (this.mix.levels[levelKey] ?? 0) + db;
+      p.fadeIn = trim ? 0.03 : 0;
+      p.fadeOut = trim ? 0.15 : 0.05;
+      let panner = null, filt = null;
+      let out = this.busNode(bus) ?? (EEL_SETS.has(set) ? this.buses.eel : this.buses.env);
+      // lp is a lowpass in Hz for sounds made under water; the filter sits last so the panner is unchanged.
+      if (lp > 0) { filt = new Tone.Filter({ type: 'lowpass', frequency: lp, Q: 0.5 }).connect(out); out = filt; }
+      if (track != null) p.connect(this.trackPanner(track, bus ?? 'eel'));
+      else if (pan != null) { panner = new Tone.Panner(Math.max(-1, Math.min(1, pan))).connect(out); p.connect(panner); }
+      else p.connect(out);
+      this.live.add(p);
+      p.onstop = () => { this.live.delete(p); setTimeout(() => { panner?.dispose(); filt?.dispose(); p.dispose(); }, 250); };
+      p.start(Tone.now() + Math.max(0, delay), v.offset, v.dur);
+      return p;
+    };
+    return { play, duration: v.duration, rate: v.rate };
+  }
+
+  /* Spawn one throwaway Player over the set's shared buffer. trim randomizes the start and length, bus
+     overrides routing ('space' included), reverse plays a backward copy; the rest are self-explanatory. */
+  shot(set, key, levelKey, opts) {
+    return this.prepare(set, key, levelKey, opts)?.play() ?? null;
   }
 
   pick(set, levelKey, opts) {
     return this.shot(set, Math.floor(Math.random() * SETS[set].length), levelKey, opts);
   }
+
+  /* One of his: prepared first so the drone can duck for exactly as long as the sound lasts. */
+  guestShot(set, key, levelKey, opts) {
+    const s = this.prepare(set, key, levelKey, opts);
+    if (!s) return null;
+    this.duckDrone(s.duration);
+    return s.play();
+  }
+
+  /* The space voice on top of whatever the resident sound already asked for. */
+  spaceOpts(rate = 1) { return { reverse: true, bus: 'space', rate: rate * SPACE_RATE }; }
 
   plip(strength = 1, pan = null) {
     const now = Tone.now();
@@ -269,8 +357,10 @@ export class PondAudio {
     this.pick('startles', 'startle', { db, jitter: 0.2, rate: this.rateForLength(length), pan });
   }
 
-  /* The big girl's chunky startle: throttled, and trimmed/jittered since there's only one file. */
-  eleanorStartle({ pan = null } = {}) {
+  /* The big girl's chunky startle: throttled, and trimmed/jittered since there's only one file.
+     Hers alone; the space eel never startles anyone, so his envelope is refused outright. */
+  eleanorStartle({ pan = null, ev = null } = {}) {
+    if (isSam(ev)) return;
     const now = Tone.now();
     if (now < this.eleanorAt) return;
     if (this.shot('eleanor', 0, 'eleanorStartle', { jitter: 0.2, trim: true, pan })) this.eleanorAt = now + 2.5;
@@ -286,9 +376,12 @@ export class PondAudio {
     if (pl) this.crackleAt = now + (pl.buffer.duration / pl.playbackRate) * 0.8;
   }
 
-  /* size 1 = big treat, 2 = crumb, 3 = tiny; rate 0.5 drops Eleanor's an octave. */
-  eat(size = 2, { pan = null, rate = 1, db = 0 } = {}) {
-    this.shot('eats', Math.min(3, Math.max(1, size)) - 1, 'eat', { jitter: 0.3, rate, pan, db });
+  /* size 1 = big treat, 2 = crumb, 3 = tiny; rate 0.5 drops Eleanor's an octave. His voice is hers,
+     so a Sam meal starts from her rate whatever the caller passed, then the space voice slows it again. */
+  eat(size = 2, { pan = null, rate = 1, db = 0, ev = null } = {}) {
+    const key = Math.min(3, Math.max(1, size)) - 1;
+    if (isSam(ev)) return this.guestShot('eats', key, 'eat', { jitter: 0.3, pan, db, ...this.spaceOpts(0.5) });
+    return this.shot('eats', key, 'eat', { jitter: 0.3, rate, pan, db });
   }
 
   /* Morgan's mouthfuls: the crumb eat, pitched up and pulled back, since she takes many small bites.
@@ -297,7 +390,11 @@ export class PondAudio {
     this.shot('eats', 1, 'eat', { jitter: 0.3, rate: 1.35, db: -3, pan, lp: muffled ? 900 : 0 });
   }
 
-  slurp({ pan = null } = {}) { this.pick('slurps', 'slurp', { jitter: 0.2, trim: true, pan }); }
+  slurp({ pan = null, ev = null } = {}) {
+    const key = Math.floor(Math.random() * SETS.slurps.length);
+    if (isSam(ev)) return this.guestShot('slurps', key, 'slurp', { jitter: 0.2, trim: true, pan, ...this.spaceOpts() });
+    return this.shot('slurps', key, 'slurp', { jitter: 0.2, trim: true, pan });
+  }
 
   /* Matthew at the notch. One "sshpp" per sip, pitch-and-time squished by playbackRate: a wide random
      spread plus a climb through the cup (`step` counts sips since the cup began), so no two land alike. */
@@ -340,11 +437,13 @@ export class PondAudio {
   }
 
   /* Nibble/surface bubbles; lightly throttled so a dinner circle stays bubbly, not fizzy. */
-  tinyBub({ pan = null } = {}) {
+  tinyBub({ pan = null, ev = null } = {}) {
     const now = Tone.now();
     if (now - this.bubAt < 0.15) return;
     this.bubAt = now;
-    this.pick('tinyBubs', 'tinyBub', { jitter: 0.3, pan });
+    const key = Math.floor(Math.random() * SETS.tinyBubs.length);
+    if (isSam(ev)) return this.guestShot('tinyBubs', key, 'tinyBub', { jitter: 0.3, pan, ...this.spaceOpts() });
+    return this.shot('tinyBubs', key, 'tinyBub', { jitter: 0.3, pan });
   }
 
   shortBub({ pan = null } = {}) { this.pick('shortBubs', 'shortBub', { jitter: 0.25, pan }); }
@@ -417,6 +516,45 @@ export class PondAudio {
     this.rainFilter.frequency.rampTo(RAIN_LP[0] + (RAIN_LP[1] - RAIN_LP[0]) * e ** 0.7, 0.6);
   }
 
+  /* The space eel's bed. Silent and inert until the drone file exists; `instant` cuts the fade to nearly
+     nothing, reserved for a future move too abrupt to fade through. No caller passes it yet. `track` is
+     his creature id, so the bed pans with his head. */
+  guestDrone(on, { instant = false, track = null, rest = false } = {}) {
+    if (!this.unlocked || !this.players.drone?.loaded) return;
+    const p = this.players.drone;
+    const fade = instant ? 0.05 : DRONE_FADE;
+    if (track != null && this.droneTrack !== track) {
+      this.droneTrack = track;
+      this.droneOut.disconnect();
+      this.droneOut.connect(this.trackPanner(track));
+    }
+    clearTimeout(this.droneStopAt);
+    if (on) {
+      this.droneOn = true;
+      if (p.state !== 'started') p.start();
+      if (this.droneLfo.state !== 'started') this.droneLfo.start();
+      // Asleep in the log the bed drops by the droneRest level: a dial relative to drone, set by ear.
+      this.droneRest = rest;
+      this.droneGain.gain.rampTo(rest ? Tone.dbToGain(this.mix.levels.droneRest) : 1, fade);
+      return;
+    }
+    this.droneOn = false;
+    this.droneGain.gain.rampTo(0, fade);
+    // A loop left running keeps the graph awake for nothing; a return before the timer cancels it.
+    this.droneStopAt = setTimeout(() => { if (!this.droneOn && p.state === 'started') p.stop(); }, fade * 1000 + 400);
+  }
+
+  /* His one-shots duck the bed under them for exactly as long as they sound. */
+  duckDrone(seconds) {
+    if (!this.droneOn || !this.droneOut) return;
+    const until = Tone.now() + Math.max(0.2, seconds) + 0.35;
+    if (until <= this.duckUntil) return;   // a longer duck already covers this one
+    this.duckUntil = until;
+    this.droneOut.gain.rampTo(Tone.dbToGain(DRONE_DUCK), 0.08);
+    clearTimeout(this.duckTimer);
+    this.duckTimer = setTimeout(() => { this.duckUntil = 0; this.droneOut?.gain.rampTo(1, 0.5); }, (until - Tone.now()) * 1000);
+  }
+
   /* Dry means stopped, not silent: a loop left running keeps the graph awake for nothing. The timer
      outlasts the gain ramp, and a shower that returns first cancels it by flipping rainOn back. */
   stopRain() {
@@ -438,6 +576,9 @@ export class PondAudio {
     // The two looping slots track their slider live; one-shots pick the new level up on next play.
     if (key === 'ambient' && this.players.ambient) this.players.ambient.volume.value = db;
     if (key === 'rain' && this.players.rain) this.players.rain.volume.value = db;
+    if (key === 'drone' && this.droneLfo) this.droneLfo.max = Tone.dbToGain(db);
+    if (key === 'droneLow' && this.droneLfo) this.droneLfo.min = Tone.dbToGain(db);
+    if (key === 'droneRest' && this.droneOn && this.droneRest) this.droneGain.gain.rampTo(Tone.dbToGain(db), 0.1);
     // swishPl stays non-null through its fade tail (onstop clears it), so this also catches fades.
     if (key === 'swish' && this.swishPl) this.swishPl.volume.value = db;
     this.saveMix();
@@ -470,6 +611,7 @@ export class PondAudio {
     this.mix = structuredClone(DEFAULT_MIX);
     if (this.players.ambient) this.players.ambient.volume.value = this.mix.levels.ambient;
     if (this.players.rain) this.players.rain.volume.value = this.mix.levels.rain;
+    if (this.droneLfo) { this.droneLfo.max = Tone.dbToGain(this.mix.levels.drone); this.droneLfo.min = Tone.dbToGain(this.mix.levels.droneLow); }
     if (this.swishPl) this.swishPl.volume.value = this.mix.levels.swish;
     for (const n of Object.keys(this.buses ?? {})) this.applyBus(n);
   }

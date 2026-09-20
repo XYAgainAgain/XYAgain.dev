@@ -7,7 +7,12 @@ import { DEPTH, VIEW_H, INF_SLOTS, RUSH_POOL } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { capsuleInfluenceCPU } from './shading.js';
 import { floorHeightAt } from './floor.js';
-import { layoutTussocks, shadowCapsules, shoalHeight, SHADOW_CAPS, SHADOW_LEAN } from './reeds-core.js';
+import {
+  layoutTussocks, shadowCapsules, shoalHeight, SHADOW_CAPS, SHADOW_LEAN,
+  growScale, nearSpineXZ, swallowEase, stemUsable,
+  SWALLOW_FALL, SWALLOW_GROW, SWALLOW_MARGIN, SWALLOW_PUSH, SWALLOW_PUSH_R, SWALLOW_STRIDE,
+  SWALLOW_SNAP, SWALLOW_USABLE,
+} from './reeds-core.js';
 
 /* Soft rush on the sand shoals: one instanced ribbon drawn twice, opaque in underScene (alpha is the depth
    fraction) and emergent-only in overScene, bent by a damped CPU spring per stem, never by a raw wake read. */
@@ -61,6 +66,8 @@ export class Rushes {
     this.capsCount = 0;
     this.pokes = [];
     this.pushTmp = { x: 0, z: 0 };
+    this.nearTmp = { d: 0, dx: 0, dz: 0 };
+    this.stemPerches = null;
     this.layout(seed, shoals ?? [], colliders, view, habitat);
     this.build(U, shading, wake);
     underScene.add(this.mesh);
@@ -114,11 +121,21 @@ export class Rushes {
     geo.setAttribute('aRushC', new THREE.InstancedBufferAttribute(C, 4));
     // The spring's bend per stem, in radians on xz, rewritten each frame; the fourth instanced buffer.
     this.bendArr = new Float32Array(n * 4);
+    // z is the height scale both draws read; a stem is full height until something swallows it.
+    for (let i = 0; i < n; i++) this.bendArr[i * 4 + 2] = 1;
     this.aBend = new THREE.InstancedBufferAttribute(this.bendArr, 4);
     this.aBend.setUsage(THREE.DynamicDrawUsage);
     geo.setAttribute('aRushD', this.aBend);
     this.springX = new Float32Array(n); this.springZ = new Float32Array(n);
     this.velX = new Float32Array(n); this.velZ = new Float32Array(n);
+    // Swallow state: the committed lifecycle amount, the drawn copy chasing it, this tick's asserted
+    // target, the unavailable flag the cover bake and the perches read, and the extra shove a void hull
+    // lays on the stems it does not swallow. Everything but swallowVis is tick-side.
+    this.swallow = new Float32Array(n);
+    this.swallowVis = new Float32Array(n);
+    this.swallowT = new Float32Array(n);
+    this.gone = new Uint8Array(n);
+    this.pushX = new Float32Array(n); this.pushZ = new Float32Array(n);
     geo.instanceCount = this.stems.length;
 
     // Uniforms, never bare literals: an all-literal WGSL expression is abstract and Naga rejects the
@@ -149,6 +166,13 @@ export class Rushes {
       omega: 3.6, zeta: 0.12, contact: 1.4, massSoft: 0.6, finger: 1.2, fingerR: 0.55,
       gain: this.motion?.reduced ? 0.5 : 1,
     };
+    // The swallow, all CPU: how far past a hull a root still counts as under it, the fold and the
+    // regrowth clocks, and the wider shove the stems just outside that hull get instead.
+    this.swallowK = {
+      margin: SWALLOW_MARGIN, fall: SWALLOW_FALL, grow: SWALLOW_GROW,
+      push: SWALLOW_PUSH, pushR: SWALLOW_PUSH_R, stride: SWALLOW_STRIDE,
+      usable: SWALLOW_USABLE, snap: SWALLOW_SNAP,
+    };
     // Rung 5 drops the internal DPR, and below about two pixels a ribbon crawls whatever MSAA does.
     const uRushPxFloor = uniform(0), uRushPxFrom = uniform(0.6), uRushViewH = uniform(VIEW_H);
     const uRushShadow = uniform(0.3);
@@ -170,7 +194,11 @@ export class Rushes {
       const rib = attribute('aRib', 'vec4');
       const v = rib.x, side = rib.y;
       const base = vec3(A4.x, C4.x, A4.y), baseXZ = vec2(A4.x, A4.y);
-      const len = A4.z, lean = B4.y;
+      // Swallowed stems scale to nothing about their own root, so a stem never floats or fades: it sinks
+      // into the sand and grows back out of it, in this draw and the emergent copy alike.
+      const grow = D4.z;
+      const len = A4.z.mul(grow), lean = B4.y;
+      const headU = B4.z.mul(grow);
       const azDir = vec2(cos(A4.w), sin(A4.w));
       const bend = azDir.mul(lean).toVar();
 
@@ -198,12 +226,14 @@ export class Rushes {
       const tangent = vec3(0, 1, 0).mul(cos(th)).add(dir.mul(sin(th)));
 
       const sideV = vec3(dir2.y.negate(), 0, dir2.x);
+      // The pixel floor widens a thin ribbon, so the height scale has to reach past it or a swallowed
+      // stem leaves a two-pixel dot sitting on the sand.
       const wide = mix(uRushWBase, uRushWTip, v).mul(C4.w).mul(mix(float(1), uRushDeadW, C4.y))
-        .max(step(uRushPxFrom, v).mul(uRushPxFloor).mul(uRushViewH).div(screenSize.y).mul(0.5));
+        .max(step(uRushPxFrom, v).mul(uRushPxFloor).mul(uRushViewH).div(screenSize.y).mul(0.5)).mul(grow);
       p.addAssign(sideV.mul(side).mul(wide));
       // The seed head, a diamond that collapses to a point when this stem carries none.
-      p.addAssign(sideV.mul(rib.z).mul(B4.z).mul(uRushHeadW));
-      p.addAssign(tangent.mul(rib.w).mul(B4.z).mul(uRushHeadL));
+      p.addAssign(sideV.mul(rib.z).mul(headU).mul(uRushHeadW));
+      p.addAssign(tangent.mul(rib.w).mul(headU).mul(uRushHeadL));
 
       vRushP.assign(p);
       vRushT.assign(tangent);
@@ -265,7 +295,7 @@ export class Rushes {
       wBase: uRushWBase, wTip: uRushWTip, headW: uRushHeadW, headL: uRushHeadL,
       sway: uRushSway, omega: uRushOmega,
       wakeK: uRushWakeK, wakeGain: uRushWakeGain, bendMax: uRushBendMax,
-      spring: this.spring,
+      spring: this.spring, swallow: this.swallowK,
       pxFloor: uRushPxFloor, pxFrom: uRushPxFrom, shadow: uRushShadow,
       wetTint: uRushWetTint, wetBand: uRushWetBand, meniscus: uRushMeniscus, meniscusW: uRushMeniscusW,
       // Not a uniform: the cover bake is CPU work, and this picks which shape it pushes.
@@ -276,10 +306,11 @@ export class Rushes {
   /* Two shapes, one knob. Per stem (the default) a displaced shadow is the strongest standing-up cue a
      straight-down camera has; the two rest-pose proxies per tussock never disagree with a parting stem. */
   publishShadows(habitat) {
-    this.shadowStems = this.stems.filter((s) => !s.dead).map((s) => {
+    this.shadowStems = this.stems.map((s, i) => {
+      if (s.dead) return null;
       const tip = restPoint(s, 1);
-      return { x: s.x, z: s.z, tipX: tip.x, tipZ: tip.z, tipY: Math.max(0, tip.y) };
-    });
+      return { i, x: s.x, z: s.z, tipX: tip.x, tipZ: tip.z, tipY: Math.max(0, tip.y) };
+    }).filter(Boolean);
     habitat.addCoverSource((discs, caps) => {
       const m = this.U.moonDir.value;
       const h = Math.hypot(m.x, m.z) || 1;
@@ -288,6 +319,7 @@ export class Rushes {
       if (this.knobs.shadowPerStem) {
         for (const s of this.shadowStems) {
           if (caps.length - before >= PER_STEM_CAPS) break;
+          if (this.gone[s.i]) continue;   // a swallowed stem casts nothing, whenever the bake next runs
           const lift = SHADOW_LEAN * s.tipY;
           caps.push({ ax: s.x, az: s.z, bx: s.tipX + mx * lift, bz: s.tipZ + mz * lift, r: STEM_CAP_R, strength: STEM_CAP_S });
         }
@@ -304,13 +336,98 @@ export class Rushes {
   /* Rushes shed seeds and their tips are the only thing standing in open water; the fireflies and the
      dragonflies are the consumers, and neither exists yet. */
   publishPerches(habitat) {
-    for (const s of this.stems) {
-      if (s.dead) continue;
+    this.habitat = habitat;
+    this.stemPerches = new Map();
+    this.stems.forEach((s, i) => {
+      if (s.dead) return;
+      const mine = [];
       const tip = restPoint(s, 1);
-      habitat.addPerch({ x: tip.x, y: tip.y, z: tip.z, type: 'stem', radius: 0.04 });
-      if (!s.head) continue;
-      const head = restPoint(s, HEAD_V);
-      habitat.addPerch({ x: head.x, y: head.y, z: head.z, type: 'stem', radius: 0.05 });
+      mine.push(habitat.addPerch({ x: tip.x, y: tip.y, z: tip.z, type: 'stem', radius: 0.04 }));
+      if (s.head) {
+        const head = restPoint(s, HEAD_V);
+        mine.push(habitat.addPerch({ x: head.x, y: head.y, z: head.z, type: 'stem', radius: 0.05 }));
+      }
+      this.stemPerches.set(i, mine);
+    });
+  }
+
+  /* Per-stem swallow, 0 (standing) to 1 (folded away). Tick-side: assert it from the fixed tick, and
+     tickSwallow() spends it at the end of that same tick, highest assertion this tick wins. Meant for a
+     mouth that lingers on a stem across many ticks, letting go to start the regrowth; feedVoid asserts
+     its own hull overlap straight into swallowT instead, with no caller of this one yet. */
+  swallowStem(i, amount) {
+    if (!(i >= 0) || i >= this.swallowT.length) return;
+    const a = amount > 1 ? 1 : amount > 0 ? amount : 0;
+    if (a > this.swallowT[i]) this.swallowT[i] = a;
+  }
+
+  /* A stem is gone the moment something asserts a swallow on it, and stays gone until the lifecycle has
+     stood it back up past the usable height, so nothing can claim a stalk the render still shows as sand. */
+  setGone(i, on) {
+    if (this.gone[i] === (on ? 1 : 0)) return;
+    this.gone[i] = on ? 1 : 0;
+    const mine = this.stemPerches?.get(i);
+    if (!mine) return;
+    for (const p of mine) {
+      p.gone = on;
+      if (on) this.habitat?.release(p.id);
+    }
+  }
+
+  /* Stems rooted inside a void hull are swallowed; the ring just outside it gets a wider, harder shove
+     than a body of that girth would otherwise give, so nothing ends up lying across the back. */
+  feedVoid(bodies) {
+    if (!bodies) return;
+    const K = this.swallowK, out = this.nearTmp, stride = Math.max(1, K.stride | 0);
+    for (const e of bodies) {
+      if (!e?.identity?.void || !e.body?.visible || !e.pts?.length) continue;
+      const hull = e.radius + K.margin, reach = hull + Math.max(0, K.pushR);
+      let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+      for (const p of e.pts) {
+        if (p.x < x0) x0 = p.x;
+        if (p.x > x1) x1 = p.x;
+        if (p.z < z0) z0 = p.z;
+        if (p.z > z1) z1 = p.z;
+      }
+      x0 -= reach; x1 += reach; z0 -= reach; z1 += reach;
+      for (let i = 0; i < this.stems.length; i++) {
+        const s = this.stems[i];
+        if (s.x < x0 || s.x > x1 || s.z < z0 || s.z > z1) continue;
+        const d = nearSpineXZ(e.pts, s.x, s.z, stride, out);
+        if (d < hull) { this.swallowT[i] = 1; continue; }
+        if (d >= reach || K.push <= 0) continue;
+        const w = (1 - (d - hull) / K.pushR) * K.push, k = w / Math.max(d, 1e-4);
+        this.pushX[i] += out.dx * k; this.pushZ[i] += out.dz * k;
+      }
+    }
+  }
+
+  /* The simulation half of the swallow, run from the fixed tick once the bodies have their final pose:
+     the overlap test, the lifecycle step, and the availability the cover bake and the perches read. The
+     hull shove is latched here too, so the spring feels one body scan's worth however the frames fall. */
+  tickSwallow(dt, bodies) {
+    const n = this.stems.length;
+    if (!n) return;
+    const step = dt > 0 ? Math.min(dt, DT_MAX) : 0;
+    this.pushX.fill(0); this.pushZ.fill(0);
+    this.feedVoid(bodies);
+    const K = this.swallowK;
+    for (let i = 0; i < n; i++) {
+      const sw = swallowEase(this.swallow[i], this.swallowT[i], step, K.fall, K.grow);
+      this.swallow[i] = sw;
+      this.setGone(i, this.swallowT[i] > 0 || !stemUsable(sw, K.usable));
+      this.swallowT[i] = 0;
+    }
+  }
+
+  /* Nothing is lying on the rushes once the cast is switched off, and no tick will run to grow them
+     back, so the tussocks stand up with the eels rather than freezing mid-fold. */
+  releaseSwallow() {
+    for (let i = 0; i < this.stems.length; i++) {
+      this.swallow[i] = 0;
+      this.swallowT[i] = 0;
+      this.pushX[i] = 0; this.pushZ[i] = 0;
+      this.setGone(i, false);
     }
   }
 
@@ -322,16 +439,19 @@ export class Rushes {
 
   /* One damped spring per stem: bodies and the finger push, the stem swings back through 2–3 overshoots,
      and nothing reads a per-frame field, so a swish cannot make a clump jitter. */
-  update(dt) {
+  update(dt, t) {
     const n = this.stems.length;
     if (!n) { this.pokes.length = 0; return; }
     const step = dt > 0 ? Math.min(dt, DT_MAX) : 0;
+    const K = this.swallowK;
     const S = this.spring, U = this.U, out = this.pushTmp;
     const w2 = S.omega * S.omega, damp = 2 * S.zeta * S.omega;
     const maxBend = this.knobs.bendMax.value;
     for (let i = 0; i < n; i++) {
       const s = this.stems[i];
-      let fx = 0, fz = 0;
+      // The hull shove is a force the last tick latched from the pose, not an accumulator: a frame that
+      // fell between two ticks must feel the same lean as one that straddled three.
+      let fx = this.pushX[i], fz = this.pushZ[i];
       for (let k = 0; k < INF_SLOTS; k++) {
         if (!capsuleInfluenceCPU(U, s.x, s.y, s.z, k, out)) continue;
         const a = U.infA.array[k], b = U.infB.array[k];
@@ -360,6 +480,10 @@ export class Rushes {
       this.springX[i] = bx; this.springZ[i] = bz;
       const o = i * 4;
       this.bendArr[o] = bx; this.bendArr[o + 1] = bz;
+      // The drawn height chases the committed lifecycle rather than keeping its own clock, so the stem
+      // on screen and the stem the perches publish can never tell two different stories.
+      const vis = swallowEase(this.swallowVis[i], this.swallow[i], step, K.snap, K.snap);
+      if (vis !== this.swallowVis[i]) { this.swallowVis[i] = vis; this.bendArr[o + 2] = growScale(vis); }
     }
     this.pokes.length = 0;
     this.aBend.needsUpdate = true;
@@ -375,6 +499,8 @@ export class Rushes {
       stems: this.stems.length,
       alive,
       heads: this.stems.filter((s) => s.head > 0).length,
+      swallowed: this.gone.reduce((a, b) => a + b, 0),
+      folding: this.swallow.reduce((a, v) => a + (v > 0 ? 1 : 0), 0),
       capsules: this.capsCount,
       perTussock: this.tussocks.map((t) => ({
         x: +t.x.toFixed(2), z: +t.z.toFixed(2), stems: t.count,

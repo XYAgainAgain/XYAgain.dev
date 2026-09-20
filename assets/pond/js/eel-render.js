@@ -6,6 +6,9 @@ import { makeRampTexture, bakeRamp, LIT_COBALT, STAR_SILVER, STAR_GOLD } from '.
 import { GLITTER, GLITTER_HASH_PERIOD, GLITTER_DEEP_DRIFT, starLayout, glitterLayout, swirlAround } from './eel-stars-core.js';
 import { crumbScale } from './treats-core.js';
 import { floorHeightAt } from './floor.js';
+import { Firmament } from './firmament.js';
+import { makeVoidDials, makeVoidSet, FLARE_WRAP, SUN_WRAP } from './eel-void.js';
+import { CLOUD_LIGHT } from './eel-tail-cloud-core.js';
 
 const RINGS = 48, SIDES = 12;
 const DEG = Math.PI / 180;
@@ -23,7 +26,9 @@ const sdStar5 = Fn(([pIn, r, rf]) => {
   const h = dot(p, ba).div(dot(ba, ba)).max(0).min(r);
   return length(p.sub(ba.mul(h))).mul(sign(p.y.mul(ba.x).sub(p.x.mul(ba.y))));
 });
-const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
+const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3(), tmpY = new THREE.Vector3();
+const tmpM = new THREE.Matrix4();
+const tmpCap = { a: new THREE.Vector3(), b: new THREE.Vector3() };
 const UP = new THREE.Vector3(0, 1, 0);
 const tmpPink = new THREE.Color(), tmpFlash = new THREE.Color();
 // Generic smoothstep; handles reversed edges the way GLSL's does not, which blink() relies on.
@@ -112,6 +117,10 @@ export class EelRenderer {
         deepScale: { value: GLITTER.deepScale }, cell: { value: GLITTER.cell },
       },
     };
+    // Sam's dials, live via pond.eels.knobs.void.<dial>.value. The firmament and every void material
+    // are built on his first visit, so a pond that only ever sees Eleanor pays nothing for him.
+    this.voidU = makeVoidDials();
+    this.firmament = null;
     this.group = new THREE.Group();
     scene.add(this.group);
     this.geometry = makeTubeGeometry();
@@ -602,6 +611,18 @@ export class EelRenderer {
       return m;
     };
 
+    // Sam's set, lazy for the same reason the jelly is: the firmament and five pipelines only exist
+    // once an identity declares the void.
+    e.voidSet = null;
+    e._mkVoid = () => {
+      this.firmament ??= new Firmament();
+      return makeVoidSet(e, U, {
+        position: buildPosition(1),
+        vNormal, vWorld, vUV, geometry: this.geometry, group: this.group,
+        firmament: this.firmament, V: this.voidU,
+      });
+    };
+
     e.body = new THREE.Mesh(this.geometry, bodyMat);
     e.halo = new THREE.Mesh(this.geometry, haloMat);
     e.body.frustumCulled = e.halo.frustumCulled = false;
@@ -610,6 +631,7 @@ export class EelRenderer {
     const eyeGeo = new THREE.SphereGeometry(1, 8, 6);
     const eyeMat = new THREE.NodeMaterial();
     eyeMat.fragmentNode = Fn(() => vec4(vec3(1.0, 0.98, 0.9), positionWorld.y.negate().div(DEPTH).clamp(0, 1)))();
+    e.matEye = eyeMat;
     e.eyes = [new THREE.Mesh(eyeGeo, eyeMat), new THREE.Mesh(eyeGeo, eyeMat)];
     e.eyes.forEach((m) => { m.scale.setScalar(e.radius * 0.2); this.group.add(m); });
     this.group.add(e.body, e.halo);
@@ -617,17 +639,59 @@ export class EelRenderer {
     this.syncBodyMaterial(e);
   }
 
-  /* Jelly is the one roll that swaps the material. renderOrder 2 sits after the opaques (so the
-     copy holds the whole floor) but under algae, halos, and every surface layer. */
+  /* Jelly swaps the material; the void swaps the whole set. renderOrder 2 sits after the opaques (so the
+     copy holds the floor) but under algae, halos, and every surface layer; the void is an ordinary opaque at 0. */
   syncBodyMaterial(e) {
+    if (e.identity?.void) {
+      const set = (e.voidSet ??= e._mkVoid());
+      if (e.body.material !== set.body) { e.body.material = set.body; e.body.renderOrder = 0; }
+      // A sun needs the pixels to show a surface, so his eyes run larger than an eel's: eyeScale is a void dial.
+      for (let i = 0; i < e.eyes.length; i++) {
+        e.eyes[i].material = set.suns[i];
+        e.eyes[i].scale.setScalar(e.radius * 0.2 * this.voidU.eyeScale.value);
+      }
+      // The ordinary lit halo is not his silhouette: the rim lens is, and the sheets are his tail.
+      if (e.uHaloMul) e.uHaloMul.value = 0;
+      this.syncBundleVisibility(e);
+      return;
+    }
+    if (e.voidSet) e.voidSet.show(false);
+    if (e.matEye) for (const m of e.eyes) m.material = e.matEye;
+    // His suns turn with his head; an ordinary eye is a flat dot, so the pose has to come back with it.
+    if (e.eyes) for (const m of e.eyes) { m.scale.setScalar(e.radius * 0.2); m.quaternion.identity(); }
     const want = e.jelly ? (e.matJelly ??= e._mkJelly()) : e.matBody;
     if (e.body.material !== want) {
       e.body.material = want;
       e.body.renderOrder = e.jelly ? 2 : 0;
     }
-    if (e.jellyDepth) e.jellyDepth.visible = !!e.jelly && e.body.visible;
     // The 2.4× additive shell screams "lamp"; a jelly keeps only a whisper of it.
     if (e.uHaloMul) e.uHaloMul.value = e.jelly ? this.jellyU.halo.value : 1;
+    this.syncBundleVisibility(e);
+  }
+
+  /* Show or hide a whole animal. The stage calls this for every park and every arrival, so it owns the
+     halo, the jelly depth companion, and every piece of the void bundle, not just the body and eyes. */
+  setVisible(e, v) {
+    if (!e.body) return;
+    e.body.visible = v;
+    for (const m of e.eyes) m.visible = v;
+    this.syncBundleVisibility(e);
+  }
+
+  /* The per-identity bundle behind setVisible: the void hides the halo outright, and the jelly depth
+     companion only ever shows for a jelly that is actually on screen. */
+  syncBundleVisibility(e) {
+    const v = !!e.body?.visible, isVoid = !!e.identity?.void;
+    if (e.halo) e.halo.visible = v && !isVoid;
+    // The jelly companion writes depth into the channel the refraction pass reads, so a swallowed jelly
+    // eel would keep occluding from inside whichever guest's mouth ate it.
+    if (e.jellyDepth) e.jellyDepth.visible = v && !!e.jelly && !isVoid;
+    if (!e.voidSet) return;
+    const on = v && isVoid;
+    e.voidSet.show(on);
+    // A guest who leaves mid-meal would otherwise ease his mouth shut in front of everyone on the way
+    // back in; the open is stage state, not something the swap should carry.
+    if (!on) e._hole = 0;
   }
 
   /* A reroll rebakes the ramp texture and moves uniforms; the node graph and the materials are the
@@ -680,8 +744,24 @@ export class EelRenderer {
     e.uPlaid.value.set(e.wPlaid, e.plaidFreq, e.wRidge);
     e.uGlowMode.value.copy(e.glowMode);
     e.uLayers.value.set(this.knobs.skin * e.skinMul, this.knobs.glow);
+    // A guest identity swap re-samples the build, so everything derived from the radius is refreshed
+    // here too: the resident hot-swap does it by hand, and nothing else would for the guest.
+    e.uRadius.value = e.radius;
     this.pushFamilies(e);
     this.syncBodyMaterial(e);
+  }
+
+  /* The ladder's void column. Like every other setQuality here it resets what it is not given, so the
+     whole desired state goes over on each call. */
+  setVoidQuality({ nebOct = 3, galaxies = 6, twinkleMin = 0, corona = 1, sheets = 3, tailOct = 3 } = {}) {
+    const V = this.voidU;
+    V.nebOct.value = nebOct;
+    V.galaxies.value = galaxies;
+    V.twinkleMin.value = twinkleMin;
+    V.corona.value = corona;
+    // The cloud's two costs are overdraw and octaves, so the ladder sheds a sheet and a fetch together.
+    V.tailSheets.value = sheets;
+    V.tailOct.value = tailOct;
   }
 
   createFoodMesh() { return new THREE.Mesh(this.foodGeo, this.foodMat); }
@@ -726,6 +806,7 @@ export class EelRenderer {
   /* Her body is long enough that one chord reads as a static bar, so she gets two chained capsules,
      the last two INF_SLOTS past the six residents, that actually follow her S-curve. */
   writeGuestSlots(e) {
+    if (e.identity?.void) { this.writeVoidSlots(e); return; }
     const U = this.U;
     const v = e.speedBL * e.length;
     const k = 0.7 + e.uExcite.value * 0.6;
@@ -751,7 +832,39 @@ export class EelRenderer {
     U.eelColB.array[EEL_COUNT + 1].copy(e.colB).lerp(tmpPink, 0.75).add(tmpFlash).multiplyScalar(k);
   }
 
+  /* Sam lights the sand with two things and nothing between: his face and his tail cloud. The head is a
+     point capsule flickering on the suns' own sizzle; the tail third brightens as it churns. */
+  writeVoidSlots(e) {
+    const U = this.U, time = U.time.value, ms = U.motionScale.value;
+    const v = e.speedBL * e.length;
+    const heat = Math.min(1, Math.max(0, e.sunHeat ?? 1));
+    const seg = (slot, a, b, r) => {
+      U.infA.array[slot].set(a.x, a.y, a.z, r);
+      U.infB.array[slot].set(b.x, b.y, b.z, 1);
+      U.infC.array[slot].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
+    };
+    // A point capsule at the eyes' reach, so the sand under his face is lit and his body is not.
+    tmpC.copy(e.show[0]).addScaledVector(e.heading, 0.05);
+    seg(EEL_COUNT, tmpC, tmpC, e.radius * 1.4);
+    // The tail capsule belongs under the cloud, which starts late and reaches past his tip.
+    if (e.voidSet) { e.voidSet.cloud.capsule(tmpCap); seg(EEL_COUNT + 1, tmpCap.a, tmpCap.b, e.radius * 2.2); }
+    else seg(EEL_COUNT + 1, e.show[19], e.show[23], e.radius * 2.2);
+    // The shader's sizzle on the CPU, so the sand flickers in the same cycle the suns do.
+    const tw = (time * ms) % (Math.PI * 2);
+    const sizzle = 1 + (Math.sin(tw * 37 + e.uSeed.value) * 0.04 + Math.sin(tw * 91) * 0.02) * heat;
+    const face = (0.35 + heat * 0.55) * sizzle;
+    U.eelCol.array[EEL_COUNT].setRGB(1.0, 0.50, 0.18).multiplyScalar(face);
+    U.eelColB.array[EEL_COUNT].copy(U.eelCol.array[EEL_COUNT]);
+    const churn = (0.35 + Math.min(1, e.tailSpeed ?? 0) * 0.6) * (0.35 + heat * 0.65);
+    // The sand under the plume takes the color queue's own weighted mean, so a pickup lights the floor too.
+    const glow = e.voidSet?.cloud.light ?? CLOUD_LIGHT;
+    U.eelCol.array[EEL_COUNT + 1].setRGB(glow[0], glow[1], glow[2]).multiplyScalar(churn);
+    U.eelColB.array[EEL_COUNT + 1].copy(U.eelCol.array[EEL_COUNT + 1]).multiplyScalar(0.7);
+  }
+
   sync(eels, foods, alpha) {
+    // Held for the guest pass below it: the plume reads these eels' ramps when one swims up to his face.
+    this.plumeCast = eels;
     for (const e of eels) {
       for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
       this.syncBury(e);
@@ -787,8 +900,6 @@ export class EelRenderer {
      visits, so a dark body must never leave a lit capsule sitting in the pond. */
   syncGuest(e, alpha) {
     for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
-    if (e.body.visible) this.writeGuestSlots(e);
-    else { this.clearSlot(EEL_COUNT); this.clearSlot(EEL_COUNT + 1); }
     const h = e.show[0], n1 = e.show[1];
     tmpA.subVectors(h, n1).normalize();
     tmpB.crossVectors(tmpA, UP).normalize();
@@ -796,15 +907,84 @@ export class EelRenderer {
     e.eyes[0].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, r * 0.62);
     e.eyes[1].position.copy(h).addScaledVector(tmpA, -e.radius * 1.5).addScaledVector(tmpB, -r * 0.62);
     e.eyes[0].position.y += r * 0.22; e.eyes[1].position.y += r * 0.22;
+    // A parked or swallowed guest pays nothing for the void: the plume's whole update, its uniform writes,
+    // and its sweep over the cast would all run for something nobody can see.
+    if (e.identity?.void && e.voidSet) {
+      if (e.body.visible) this.syncVoid(e, tmpA);
+      else { e._voidAt = undefined; e._tailPrev = null; e.tailSpeed = 0; }
+    }
+    if (e.body.visible) this.writeGuestSlots(e);
+    else { this.clearSlot(EEL_COUNT); this.clearSlot(EEL_COUNT + 1); }
+  }
+
+  /* Everything about Sam that lives on the frame clock: tail speed, the sun clocks, and the singularity's
+     open, all decoration only since behavior reads none of it. `fwd` is the caller's normalized forward vector. */
+  syncVoid(e, fwd) {
+    const S = e.voidSet, U = this.U, V = this.voidU;
+    const now = U.time.value, ms = U.motionScale.value;
+    const dt = Math.min(0.1, Math.max(0, now - (e._voidAt ?? now)));
+    e._voidAt = now;
+    // Lateral travel of the tail against the body it hangs off, smoothed over 0.3 s so one frame of
+    // solver jitter cannot flash the whole cloud.
+    tmpC.subVectors(e.show[22], e.show[18]);
+    const prev = (e._tailPrev ??= tmpC.clone());
+    // Capped because a park teleports the whole chain, and an uncapped frame of that would flare the
+    // cloud for a second after he comes back.
+    const raw = dt > 1e-4 ? Math.min(6, tmpC.distanceTo(prev) / dt) : (e.tailSpeed ?? 0);
+    prev.copy(tmpC);
+    const smoothed = e.tailSpeed ?? 0;
+    e.tailSpeed = smoothed + (raw - smoothed) * (dt > 0 ? 1 - Math.exp(-dt / 0.3) : 0);
+    const heat = Math.min(1, Math.max(0, e.sunHeat ?? 1));
+    e.uSunHeat.value = heat;
+    e.uSizzleT.value = (this.U.time.value * this.U.motionScale.value) % (Math.PI * 2);
+    e.uFlareT.value = (this.U.time.value * this.U.motionScale.value * V.flareSpeed.value) % FLARE_WRAP;
+    // Accumulated and ping-ponged rather than wrapped: the sun face reads non-periodic noise, so a modulo
+    // of its clock would jump the whole granulation.
+    e._sunT = (e._sunT ?? 0) + dt * ms;
+    e.uSunT.value = SUN_WRAP - Math.abs((e._sunT % (SUN_WRAP * 2)) - SUN_WRAP);
+    // The cast is what his plume picks colors up from; sync() runs over it just before this one.
+    S.cloud.sync(dt, heat, this.plumeCast);
+    // His suns are eyeballs: the surface graph reads the local normal, so the mesh itself has to carry
+    // the head's frame, and the flares take the same turn as an angular offset.
+    tmpB.crossVectors(fwd, UP).normalize();
+    tmpM.makeBasis(tmpB, tmpY.crossVectors(fwd, tmpB), fwd);
+    const yaw = Math.atan2(fwd.z, fwd.x);
+    // The coronas ride above the body so the tube's own depth cannot swallow them; straight down, only
+    // their xz placement reads anyway.
+    const lift = (p) => { p.y = e.show[0].y + e.radius * 1.5; };
+    for (let i = 0; i < 2; i++) {
+      e.eyes[i].quaternion.setFromRotationMatrix(tmpM);
+      S.coronaMats[i].uAng.value = yaw;
+      S.coronas[i].position.copy(e.eyes[i].position);
+      lift(S.coronas[i].position);
+      S.coronas[i].scale.setScalar(e.radius * 0.2 * V.eyeScale.value * Math.max(1e-3, V.coronaSize.value || 0));
+    }
+    // The meal scale eases open in 0.4 s and shut in 0.6 s; the controller only ever sets the target.
+    const want = Math.max(0, e.horizon ?? 0), cur = e._hole ?? 0;
+    const rate = want > cur ? Math.max(want, 1e-3) / V.holeOpen.value : Math.max(cur, 1e-3) / V.holeClose.value;
+    e._hole = cur + Math.sign(want - cur) * Math.min(Math.abs(want - cur), rate * dt);
+    const open = e._hole > 1e-3 && e.body.visible;
+    S.hole.horizon.visible = S.hole.ring.visible = open;
+    if (!open) return;
+    const rad = e._hole * e.radius;
+    S.hole.horizon.position.copy(e.show[0]).addScaledVector(fwd, e.radius * 0.5);
+    S.hole.horizon.scale.setScalar(rad);
+    S.hole.ring.position.copy(S.hole.horizon.position);
+    lift(S.hole.ring.position);
+    S.hole.ring.scale.setScalar(rad * V.ringScale.value * 2);
+    S.hole.spin(dt, ms > 0.5);
   }
 
   dispose(eels) {
     this.geometry.dispose();
     for (const e of eels) {
       e.matBody.dispose(); e.matJelly?.dispose(); e.matJellyDepth?.dispose(); e.halo.material.dispose(); e.rampTex.dispose();
-      // Both eyes share one geometry and one material, so dispose through the first eye only.
-      e.eyes?.[0]?.geometry.dispose(); e.eyes?.[0]?.material.dispose();
+      e.voidSet?.dispose();
+      // Both eyes share one geometry, and the eye material is held on the eel rather than read off the
+      // mesh, which may be wearing Sam's suns instead.
+      e.eyes?.[0]?.geometry.dispose(); e.matEye?.dispose();
     }
+    this.firmament?.dispose();
     this.foodGeo.dispose(); this.foodMat.dispose();
   }
 }

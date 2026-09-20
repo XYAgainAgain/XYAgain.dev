@@ -1,149 +1,157 @@
 import { DEPTH } from './config.js';
 import { Eel } from './eels.js';
-import { IDENTITIES } from './eel-identity.js';
+import { IDENTITIES, applyIdentity } from './eel-identity.js';
 import { paceWave } from './eel-behavior.js';
-import { pushTrail, retreatAlongTrail, growEel } from './eel-physics.js';
+import { growEel } from './eel-physics.js';
+import {
+  SLURP_AT, begin, capture, deriveLair, exitTarget, moveGuest, nopeTick, onStage, park, parkOffstage,
+  pickExit, progressStrike, rescueLadder, resetGuest, resetProgress, setExit, setVisible,
+  spit, startle, teleport,
+} from './guest-stage.js';
+import { brain as samBrain, enterSam, initSam } from './sam-eel.js';
 
-/* Eleanor, the mega-eel guest. Home is a log lair when the pond rolls a bore she fits (grand logs,
-   mostly), otherwise offstage. She answers feed sprees, takes the odd swim-by so a watch session
-   always glimpses her, hunts anyone who dares approach her size, and stands down when the pond
-   runs hot: she is the pond's biggest cost and she knows it. */
+/* The guest slot: one shared body, one of two identities rolled at each park. Eleanor is the original:
+   log lair, feed-spree visits, hunts anyone near her size, and a stand-down when the pond runs hot,
+   because she is the pond's biggest cost and knows it. Sam the Space Eel shares her slot, none of her
+   menace; guest-stage.js runs the shared stage, sam-eel.js his half. */
 
 const FEED_WORTH = 4;   // recent feed-spree total that makes the trip worthwhile
 const VISIT_CAP = 30;   // seconds before she loses interest in an outing
-const SLURP_AT = 7;     // residents longer than this get repossessed segment by segment
 const ZOOM_EVERY = 0.7; // seconds between evasive re-aims for a zoomies prey
 const ZOOM_JITTER = 40 * Math.PI / 180;
-const SLIP = 0.5;         // rock and log pushes on her snout, halved: she is far too strong to be held by bark
-const REV_JAM = 1;        // seconds of motionless head before a backing-out fold gets help
-const REV_TRAIL = 6;      // retreatAlongTrail starves at 4; below this the path can no longer feed a reverse
-const PROG_WINDOW = 0.5;  // stuck is judged over this window, never tick to tick
+const SLIP = 0.5;         // rock and log pushes on a guest snout, halved: far too strong to be held by bark
 const COMMOTION_NEAR = 4; // she picks out individual crumbs only once she is this close to the table
 // F2's published threat, by state. Anything that frightens residents publishes one of these.
 const THREAT = { lair: 0.15, depart: 0.3, return: 0.3, hunt: 1, slurp: 1, graze: 0.7, swimby: 0.5, wriggle: 0, offstage: 0 };
 
-export function attachEleanor(sys, seed) {
-  const id = IDENTITIES.find((i) => i.name === 'Eleanor');
-  const e = new Eel(6, seed, sys.extent, sys.colliders, sys.view, id);
-  e.brain = brain;
-  // Q-D is a resident's crumb-spam wobble; a guest is born past the line and is not drunk, just big.
-  e.drunkAt = Infinity;
-  e.checkAt = 0;
-  e.stateAt = 0;
-  e.coolAt = 0;
-  e.forceParkAt = null;
-  e.revPush = 0;
-  e.nopePulse = 0;
-  e.rescued = false;
-  e.stuckStrikes = 0;
-  e.prey = null;
-  e.zoomAt = 0;
-  e.slip = SLIP;
-  e.threat = 0;      // F2: how scary she is being right now; her own brain() keeps it current
-  e.threatOn = null; // whoever she is actually hunting, so bystanders read a lighter threat
-  e.table = null;    // the commotion she is investigating this visit
-  // park() re-rolls this per park, but a first depart-from-lair reads it first: undefined here fed
-  // cos/sin a NaN that poisoned her whole chain until the stuck rescue finally parked her.
-  e.parkAng = e.rng.range(0, Math.PI * 2);
-  setExit(e, null);
-  resetProgress(e);
-  const log = sys.colliders.logs[0];
-  // Lair test is stricter than the passage fit: she wants a den, not a squeeze.
-  e.lair = log && log.rInner >= e.radius * 1.6 ? log : null;
-  if (e.lair) {
-    const ax = e.lair.b.x - e.lair.a.x, az = e.lair.b.z - e.lair.a.z;
-    const len = Math.hypot(ax, az);
-    e.lairDir = { x: ax / len, z: az / len };
-    e.lairPoint = { x: e.lair.b.x - e.lairDir.x * 0.6, y: e.lair.b.y, z: e.lair.b.z - e.lairDir.z * 0.6 };
-    e.lairApproach = { x: e.lair.a.x - e.lairDir.x * 2.0, y: e.lair.a.y, z: e.lair.a.z - e.lairDir.z * 2.0 };
-    e.lairExit = { x: e.lair.b.x + e.lairDir.x * 2.0, y: e.lair.b.y, z: e.lair.b.z + e.lairDir.z * 2.0 };
-    teleport(e, e.lairPoint.x, e.lairPoint.z, Math.atan2(e.lairDir.z, e.lairDir.x), e.lairPoint.y);
-    e.state = 'lair';
-  } else {
-    park(sys, e);
-    e.state = 'offstage';
-  }
-  e.nextSwimBy = e.rng.range(30, 60);
+/* The guest table: which controller drives the body, how it takes a lair at boot, and what it needs
+   initialized on top of the shared reset. Everything identity-specific about the swap is a row here. */
+const GUESTS = {
+  Eleanor: { brain, init: initEleanor, enter: enterEleanor },
+  Sam: { brain: samBrain, init: initSam, enter: enterSam },
+};
+
+const guestId = (name) => IDENTITIES.find((i) => i.name === name);
+
+function samOdds(sys) {
+  const v = sys.knobs.guest?.samOdds;
+  return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.8;
+}
+
+/* The roll: one draw from the guest's own rng, so ?seed pins who visits when. ?guest= freezes it the
+   way ?cast= freezes the resident rotation. */
+function rollGuest(sys, e) {
+  const pin = String(sys.guestPin ?? '').trim().toLowerCase();
+  if (pin === 'sam') return guestId('Sam');
+  if (pin === 'eleanor') return guestId('Eleanor');
+  return e.rng.chance(samOdds(sys)) ? guestId('Sam') : guestId('Eleanor');
+}
+
+export function attachGuest(sys, seed, opts = null) {
+  sys.guestPin = opts?.guest ?? null;
+  // Born Eleanor whatever the roll says: the swap below is the only path that dresses the body, so
+  // there is exactly one place that can get it wrong.
+  const e = new Eel(6, seed, sys.extent, sys.colliders, sys.view, guestId('Eleanor'));
+  // A refused swap would leave the body with no controller at all, and eels.js falls back to steer(),
+  // which no guest survives; Eleanor is the floor.
+  if (!applyGuestIdentity(sys, e, rollGuest(sys, e))) applyGuestIdentity(sys, e, guestId('Eleanor'));
   sys.renderer.buildMesh(e);
-  setVisible(e, e.state === 'lair');
+  sys.renderer.applyAppearance(e);
+  if (!GUESTS[e.name].enter(sys, e, sys.time)) { park(sys, e); e.state = 'offstage'; }
+  setVisible(sys, e, e.state === 'lair');
   sys.guests.push(e);
-  // Late bond resolution: residents whose crush names her (Josh) acquire her as a partner now.
-  for (const r of sys.eels) if (!r.partner && r.quirks.follows === e.name) r.partner = e;
+  // Every later park rolls the next visit's identity, from inside the park itself.
+  e.onPark = (s, g) => applyGuestIdentity(s, g, rollGuest(s, g));
+  bindFollowers(sys, e);
   return e;
 }
 
-function setVisible(e, v) {
-  if (!e.body) return;
-  e.body.visible = e.halo.visible = v;
-  // The jelly companion writes depth into the channel the refraction pass reads, so a swallowed jelly eel
-  // would keep occluding from inside her mouth. The e.jelly gate matches the rule in syncBodyMaterial.
-  if (e.jellyDepth) e.jellyDepth.visible = v && !!e.jelly;
-  e.eyes.forEach((m) => { m.visible = v; });
-}
-
-/* Every exit change clears the reverse-jam watch with it, so a fresh fold never inherits the last one's strikes. */
-function setExit(e, mode) {
-  e.exiting = mode;
-  e.exitFor = 0;
-  e.revJam = 0;
-  e.revNudged = false;
-  e.revPush = 0;
-  e.revX = e.head.x; e.revZ = e.head.z;
-}
-
-/* Any spine point inside the view plus the hot-swap margin: the test for whether a chain move would be seen. */
-function onStage(sys, e) {
-  const hw = sys.view.w * 0.5 + e.radius * 2.5, hh = sys.view.h * 0.5 + e.radius * 2.5;
-  for (const p of e.pts) if (Math.abs(p.x) <= hw && Math.abs(p.z) <= hh) return true;
-  return false;
-}
-
-function resetProgress(e) {
-  e.stuckFor = 0;
-  e.progT = 0;
-  e.progX = e.head.x; e.progZ = e.head.z;
-}
-
-function park(sys, e) {
-  if (sys.debug && e.body?.visible && onStage(sys, e)) console.warn(`[eleanor] parked from on stage in ${e.state} (t=${sys.time.toFixed(2)})`);
-  e.parkAng = e.rng.range(0, Math.PI * 2);
-  setExit(e, null);
-  e.nopePulse = 0;
-  const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
-  teleport(e, Math.cos(e.parkAng) * d, Math.sin(e.parkAng) * d, e.parkAng + Math.PI);
-}
-
-/* Full-chain move: pose, history, and collision memory all reset so the body arrives already laid out. */
-function teleport(e, x, z, ang, y = -DEPTH + e.radius + 0.1) {
-  const cx = Math.cos(ang), cz = Math.sin(ang);
-  for (let i = 0; i < e.pts.length; i++) {
-    e.pts[i].set(x - cx * i * e.spacing, y, z - cz * i * e.spacing);
-    e.prev[i].copy(e.pts[i]);
-    e.pose0[i].copy(e.pts[i]);
-    e.show[i].copy(e.pts[i]);
-    e.offsets[i].set(0, 0, 0);
+/* The whole swap, in the order the shared body needs it: unbind, reset, rebuild, re-init, redress.
+   It runs only while fully offstage, which is exactly where park() calls it from. */
+export function applyGuestIdentity(sys, e, id) {
+  if (!id || !GUESTS[id.name]) return false;
+  if (e.body && onStage(sys, e)) {
+    if (sys.debug) console.warn(`[guest] refused an identity swap on stage in ${e.state}`);
+    return false;
   }
-  e.trailHead = 0;
-  e.trailCount = 0;
-  for (let i = e.pts.length - 1; i >= 0; i--) pushTrail(e, e.pts[i]);
-  e.heading.set(cx, 0, cz);
-  e.targetY = y;
+  const from = e.name;
+  unbindGuest(sys, e);
+  e.gen = (e.gen ?? 0) + 1;
+  // applyIdentity rolls the new length straight onto the eel; growEel is the only path that carries
+  // spacing, ampTail, and the trail buffer with it, so hand the delta back through it.
+  const oldLen = e.length;
+  e.identity = id;
+  applyIdentity(e, id, e.rng);
+  const want = e.length;
+  e.length = oldLen;
+  growEel(e, want - oldLen);
+  e.baseLength = e.length;
+  e.rollColors(e.rng);
+  e.rollPattern(e.rng);
+  e.rollNick(e.rng);
+  resetGuest(e);
+  e.brain = GUESTS[id.name].brain;
+  e.slip = SLIP;
+  // The crumb-spam wobble is a resident's thing; a guest is born past the line and is not drunk, just big.
+  e.drunkAt = Infinity;
+  // The clamp band and the eye scale are functions of the radius that just changed; eel-air.js rewrites
+  // the band with the same numbers in the init loop below, but a pond without it would keep the old one.
+  e.floorY = -DEPTH + e.radius + 0.08;
+  e.ceilingY = -e.radius * 0.5;
+  if (e.uRadius) e.uRadius.value = e.radius;
+  if (e.eyes) for (const m of e.eyes) m.scale.setScalar(e.radius * 0.2);
+  GUESTS[id.name].init(sys, e);
+  // Same hooks a hot-swap fires, in registration order: wits, fear state, air bounds, quirk state.
+  for (const m of sys.modules) m.initEel?.(sys, e);
+  if (e.body) sys.renderer.applyAppearance(e);
+  bindFollowers(sys, e);
+  if (from !== e.name) sys.emit('swap', e, { from, to: e.name });
+  return true;
 }
 
-/* Only ever called when she leaves the log, so the gravelly startle rides along here. */
-function pickExit(sys, e) {
-  sys.emit('startle', e);
-  return e.rng.chance(0.4) ? 'turn' : e.rng.chance(0.58) ? 'reverse' : 'ahead';
+/* Everything in the pond that was pointing at the body while somebody else wore it. A crush is rebound
+   by name afterwards, which is what restores Eleanor's follower the moment she takes the body back. */
+function unbindGuest(sys, e) {
+  // Every live path spits before it parks, so a body still in the jaws here means an invariant broke;
+  // let it go rather than hand the next identity a hidden, collapsed resident.
+  if (e.prey?.slurpedBy === e) {
+    if (sys.debug) console.warn(`[guest] swapped with ${e.prey.name} still swallowed`);
+    e.prey.slurpedBy = null;
+    e.prey.length = e.prey.baseLength;
+    growEel(e.prey, 0);
+    sys.air?.restore(e.prey);
+    setVisible(sys, e.prey, true);
+  }
+  e.prey = null;
+  sys.lairGuest = null;
+  for (const r of sys.eels) {
+    if (r.partner === e) r.partner = null;
+    if (r.slurpedBy === e) { r.slurpedBy = null; setVisible(sys, r, true); }
+    if (r.buttTo === e) r.buttTo = null;
+    if (r.rescueTo === e) r.rescueTo = null;
+    if (r.cuddle?.with === e) r.cuddle.until = 0;
+    if (r.snuggle?.with === e) r.snuggle.with = null;
+    if (r.coverSpot?.owner === e) r.coverSpot = null;
+  }
 }
 
-function begin(e, state, now) {
-  e.state = state;
-  e.stateAt = now;
-  e.forceParkAt = null;
-  e.rescued = false;
-  e.stuckStrikes = 0;
-  resetProgress(e);
-  setVisible(e, true);
+/* Late bond resolution: residents whose crush names the guest (Josh names Eleanor) acquire the body. */
+function bindFollowers(sys, e) {
+  for (const r of sys.eels) if (!r.partner && r.quirks.follows === e.name) r.partner = e;
+}
+
+function initEleanor(sys, e) {
+  // Lair test is stricter than the passage fit: she wants a den, not a squeeze.
+  const log = sys.colliders.logs[0];
+  deriveLair(e, log && log.rInner >= e.radius * 1.6 ? log : null);
+}
+
+function enterEleanor(sys, e) {
+  e.nextSwimBy = e.rng.range(30, 60);
+  if (!e.lair) return false;
+  teleport(e, e.lairPoint.x, e.lairPoint.z, Math.atan2(e.lairDir.z, e.lairDir.x), e.lairPoint.y);
+  e.state = 'lair';
+  return true;
 }
 
 function goHome(sys, e, now) {
@@ -153,45 +161,6 @@ function goHome(sys, e, now) {
   resetProgress(e);
   if (e.lair && !sys.perfHot) { e.state = 'return'; e.returnLeg = 0; }
   else e.state = 'depart';
-}
-
-/* The surrender: spit anything held (never park with someone in her jaws), swim off, rest a while.
-   Both the visit-cap ladder and the give-up below end here. A hard park is the teleport a viewer sees,
-   so on stage it becomes a depart; the park itself waits until she is off frame or overdue. */
-function parkOffstage(sys, e, now) {
-  if (e.prey && e.prey.slurpedBy === e) spit(sys, e, now);
-  e.prey = null;
-  e.rescued = false;
-  e.homeFails = 0;
-  e.nextSwimBy = now + e.rng.range(40, 80);
-  // Without this the next tick picked a fresh visit: hunt and graze read nothing but coolAt.
-  e.coolAt = Math.max(e.coolAt, now + e.rng.range(40, 80));
-  if (onStage(sys, e) && now < (e.forceParkAt ?? Infinity)) {
-    if (e.forceParkAt === null) e.forceParkAt = now + 15;
-    e.parkAng = Math.atan2(e.head.z, e.head.x);   // straight out the nearest rim, not across the pond
-    e.state = 'depart'; e.stateAt = now;
-    e.stuckStrikes = 0;
-    resetProgress(e);
-    setExit(e, null);
-    return;
-  }
-  e.forceParkAt = null;
-  e.state = 'offstage';
-  park(sys, e);
-  setVisible(e, false);
-}
-
-/* Obstacle push, written into the module scratch so the steering loops allocate nothing. Squared
-   falloff keeps the far field a hint; the tangent is what saves a head-on, where radial alone cancels. */
-let avoidX = 0, avoidZ = 0;
-function avoid(e, dx, dz, d, reach) {
-  const f = 1 - d / reach, k = f * f * 2.2;
-  avoidX = (dx / d) * k; avoidZ = (dz / d) * k;
-  const ahead = (-dx * e.heading.x - dz * e.heading.z) / d;
-  if (ahead <= 0) return;
-  const sx = -e.heading.z, sz = e.heading.x;
-  const kt = k * ahead * 1.4 * (dx * sx + dz * sz >= 0 ? 1 : -1);   // slide toward the flank it is not on
-  avoidX += sx * kt; avoidZ += sz * kt;
 }
 
 function brain(sys, e, dt) {
@@ -218,27 +187,27 @@ function brain(sys, e, dt) {
       e.checkAt = now + 1;
       const fromLair = e.state === 'lair';
       // A hot pond empties even the lair; otherwise: repossessions first, then dinner, then a lap.
-      if (fromLair && sys.perfHot) { begin(e, 'depart', now); setExit(e, pickExit(sys, e)); return; }
+      if (fromLair && sys.perfHot) { begin(sys, e, 'depart', now); setExit(e, pickExit(sys, e)); return; }
       if (!sys.perfHot && now > e.coolAt) {
         const gnarly = sys.eels.filter((r) => r.length > SLURP_AT && !r.slurpedBy);
         if (gnarly.length) {
           gnarly.sort((a, b) => b.length - a.length);
           e.prey = gnarly[0];
-          begin(e, 'hunt', now);
+          begin(sys, e, 'hunt', now);
           setExit(e, fromLair ? pickExit(sys, e) : null);
         } else if (sys.feedRecent >= FEED_WORTH) {
           sys.feedRecent = 0;
-          begin(e, 'graze', now);
+          begin(sys, e, 'graze', now);
           e.table = sys.commotion;
           setExit(e, fromLair ? pickExit(sys, e) : null);
         } else if (now > e.nextSwimBy) {
-          begin(e, 'swimby', now);
+          begin(sys, e, 'swimby', now);
           setExit(e, fromLair ? pickExit(sys, e) : null);
           e.swimbyX = e.rng.range(-sys.view.w * 0.35, sys.view.w * 0.35);
           e.swimbyZ = e.rng.range(-sys.view.h * 0.35, sys.view.h * 0.35);
           e.swimbyBest = Infinity; e.swimbyBestAt = now;
         } else if (e.state === 'offstage' && e.lair) {
-          begin(e, 'return', now);
+          begin(sys, e, 'return', now);
           e.returnLeg = 0;
         }
       }
@@ -247,20 +216,8 @@ function brain(sys, e, dt) {
   }
 
   // Stuck rescue ladder: nope backward down her own path first; the hard park is the last resort.
-  if (now - e.stateAt > VISIT_CAP + 20) {
-    if (!e.rescued) { e.rescued = true; e.stateAt = now - VISIT_CAP - 10; e.nopePulse = now + 1.4; sys.emit('startle', e); }
-    else {
-      parkOffstage(sys, e, now);
-      return;
-    }
-  }
-  if (now < e.nopePulse) {
-    e.reverse = true;
-    e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
-    paceWave(e, dt, false);
-    retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
-    return;
-  }
+  if (rescueLadder(sys, e, now, VISIT_CAP)) return;
+  if (nopeTick(sys, e, dt, now)) return;
   // A meal in progress finishes before any performance retreat; slurp plus wriggle caps under 4 s.
   if (sys.perfHot && e.state !== 'depart' && e.state !== 'slurp' && e.state !== 'wriggle') { e.state = 'depart'; e.stateAt = now; }
 
@@ -271,43 +228,16 @@ function brain(sys, e, dt) {
     paceWave(e, dt, false);
     e.wavePhase += Math.PI * 2 * 2.5 * dt;   // the victory shimmy runs hotter than her actual beat
     e.uExcite.value += (1 - e.uExcite.value) * Math.min(1, dt * 4);
-    if (now - e.stateAt > 1.2) { spit(sys, e, now); goHome(sys, e, now); }
+    if (now - e.stateAt > 1.2) { spit(sys, e, now, { growPredator: true }); goHome(sys, e, now); }
     return;
   }
 
   e.reverse = false;
   let tx = 0, tz = 0, ty = -DEPTH + e.radius + 0.1, wantBL = e.cruiseBL;
-  // Three ways out of the lair: fold around inside like proper water pasta and leave the way she
-  // came, back out tail-first down her own entry path, or just carry on out the far mouth.
-  if (e.exiting === 'reverse') {
-    e.reverse = true;
-    e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
-    paceWave(e, dt, false);
-    // The jam shove is spent over 0.2 s at the retreat's own pace; as one pop it moved her snout 0.1 L in a tick.
-    if (now < e.revPush) e.head.addScaledVector(e.heading, e.length * 0.5 * dt);
-    else retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
-    const behind = (e.head.x - e.lair.a.x) * e.lairDir.x + (e.head.z - e.lair.a.z) * e.lairDir.z;
-    if (behind < -0.8) { setExit(e, null); return; }
-    // A reverse eats the path it walks, so it can jam on the bore or simply run out of history. One
-    // shove deeper buys fresh trail to back down; after that the fold is the only way out.
-    if (e.trailCount <= REV_TRAIL) { setExit(e, 'turn'); return; }
-    if (Math.hypot(e.head.x - e.revX, e.head.z - e.revZ) > e.radius * 0.5) {
-      e.revJam = 0; e.revX = e.head.x; e.revZ = e.head.z;
-    } else if ((e.revJam += dt) > REV_JAM) {
-      if (e.revNudged) { setExit(e, 'turn'); return; }
-      e.revPush = now + 0.2;
-      e.revJam = 0; e.revNudged = true;
-    }
-    return;
-  }
-  if (e.exiting) {
-    const p = e.exiting === 'turn' ? e.lairApproach : e.lairExit;
-    tx = p.x; tz = p.z; ty = e.lairPoint.y; wantBL = e.prowlBL;
-    // The fold runs with avoidance and the stuck watch both off, so a jam is steered only by collision;
-    // 2 s without arriving demotes it to the far-mouth exit (never reverse: a spent trail flips that back to turn).
-    e.exitFor += dt;
-    if (e.exiting === 'turn' && e.exitFor > 2) setExit(e, 'ahead');
-    if (Math.hypot(tx - e.head.x, tz - e.head.z) < 0.8) setExit(e, null);
+  const fold = exitTarget(sys, e, dt, now);
+  if (fold === 'done') return;
+  if (fold) {
+    tx = fold.x; tz = fold.z; ty = fold.y; wantBL = e.prowlBL;
   } else if (e.state === 'depart') {
     const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
     tx = Math.cos(e.parkAng) * d; tz = Math.sin(e.parkAng) * d;
@@ -316,7 +246,7 @@ function brain(sys, e, dt) {
     if (Math.hypot(tx - e.head.x, tz - e.head.z) < 1.5) {
       e.state = 'offstage';
       park(sys, e);
-      setVisible(e, false);
+      setVisible(sys, e, false);
       e.nextSwimBy = now + e.rng.range(40, 80);
       // The offstage check reads coolAt, not nextSwimBy: without this a feeding spree pulls her straight back.
       e.coolAt = Math.max(e.coolAt, e.nextSwimBy);
@@ -354,15 +284,9 @@ function brain(sys, e, dt) {
     // A zoomies prey is never actually caught: the run itself burns her back under SLURP_AT.
     if (p.quirks?.zoomies) zoomTick(sys, e, p, dt, now);
     else if (Math.min(Math.hypot(e.head.x - tail.x, e.head.z - tail.z), Math.hypot(e.head.x - p.head.x, e.head.z - p.head.z)) < 0.9) {
-      p.slurpedBy = e;
-      // The slurp owns the pose from here: no air exemption may outlive the jaws closing on it.
-      sys.air?.cancel(p);
-      e.slurpT = 0;
-      begin(e, 'slurp', now);
       // F1: everybody close enough to watch loses every second of trust she had earned, and carries
       // two minutes of extra fear on top of it.
-      sys.fear?.witnessSlurp(sys, e, p);
-      sys.emit('slurp', e);
+      capture(sys, e, p, now, { state: 'slurp', witness: true });
       return;
     }
   } else {
@@ -403,89 +327,20 @@ function brain(sys, e, dt) {
     }
   }
 
-  const head = e.head;
-  // She has the residents' sense of obstacles, scaled to her bulk; grinding on scenery is beneath
-  // her, except mid-bore where the lair run needs the walls to do the steering.
-  let ax = tx - head.x, az = tz - head.z;
-  const al = Math.hypot(ax, az) || 1e-4;
-  ax /= al; az /= al;
-  const inBore = !!e.exiting || (e.state === 'return' && e.returnLeg === 1);
   // Homing aims at a point two units off her own log's mouth, so that log must stop shoving her away
   // from it or she orbits her own front door until the visit times out.
-  const homing = e.state === 'return';
-  if (!inBore) {
-    // Reach is her turning radius at this speed, not a fixed collar: eight units of eel has to start
-    // the sweep long before the snout arrives, or the turn finishes somewhere inside the rock.
-    const look = 0.9 + e.radius * 2 + Math.min(2.4, e.speedBL * e.length / Math.max(0.8, e.turnRate));
-    for (const o of sys.colliders.spheres) {
-      const dx = head.x - o.x, dz = head.z - o.z;
-      const d = Math.hypot(dx, dz), reach = (o.rHit ?? o.r) + look;
-      if (d < reach && d > 1e-4) { avoid(e, dx, dz, d, reach); ax += avoidX; az += avoidZ; }
-    }
-    for (const l of sys.colliders.logs) {
-      if (homing && l === e.lair) continue;
-      const abx = l.b.x - l.a.x, abz = l.b.z - l.a.z;
-      const tp = Math.max(0, Math.min(1, ((head.x - l.a.x) * abx + (head.z - l.a.z) * abz) / (abx * abx + abz * abz)));
-      const nx = l.a.x + abx * tp, nz = l.a.z + abz * tp;
-      const dx = head.x - nx, dz = head.z - nz;
-      const d = Math.hypot(dx, dz), reach = l.rOuter + look;
-      if (d < reach && d > 1e-4) { avoid(e, dx, dz, d, reach); ax += avoidX; az += avoidZ; }
-    }
-  }
+  const inBore = !!e.exiting || (e.state === 'return' && e.returnLeg === 1);
+  moveGuest(sys, e, dt, now, tx, tz, ty, wantBL, { inBore, homing: e.state === 'return' ? e.lair : null });
 
-  let diff = Math.atan2(az, ax) - Math.atan2(e.heading.z, e.heading.x);
-  diff = Math.atan2(Math.sin(diff), Math.cos(diff));
-  // Slow = supple: near-stationary she can hairpin inside her own bore; the exit fold leans on this.
-  const supple = (1.6 - 0.6 * Math.min(1, e.speedBL / e.cruiseBL)) * (e.exiting === 'turn' ? 4 : 1);
-  const maxTurn = e.turnRate * supple * dt;
-  const yaw = Math.max(-maxTurn, Math.min(maxTurn, diff * Math.min(1, dt * 5)));
-  const c = Math.cos(yaw), sn = Math.sin(yaw);
-  e.heading.set(e.heading.x * c - e.heading.z * sn, 0, e.heading.x * sn + e.heading.z * c).normalize();
-
-  wantBL *= sys.motion.reduced ? 0.35 : 1;
-  e.speedBL += Math.max(-0.5 * dt, Math.min(0.5 * dt, wantBL - e.speedBL));
-  const speed = e.speedBL * e.length;
-  const f = paceWave(e, dt, false);
-  const wob = Math.cos(e.wavePhase) * e.ampTail * 0.2 * e.anterior * Math.PI * 2 * f * dt;
-  head.addScaledVector(e.heading, speed * dt);
-  head.x += -e.heading.z * wob;
-  head.z += e.heading.x * wob;
-  e.targetY = ty;
-  head.y += (e.targetY - head.y) * Math.min(1, dt * 0.6);
-
-  // Her back barely fits under the surface; riding high plows a wake through the sim for free.
-  if (head.y > -e.radius * 1.2 && now > e.rippleAt && !sys.motion.reduced) {
-    e.rippleAt = now + 0.22;
-    sys.sim.addDrop(head.x, head.z, 0.7 + e.radius, 0.014 * speed);
-    if (now > (e.bubSoundAt ?? 0)) { e.bubSoundAt = now + e.rng.range(1.2, 2.4); sys.emit('nibble', e); }
-  }
-
-  // Stuck: commanded speed and no ground covered over a window. Per tick, a body her size reads every
-  // scrape along a log as a jam; three bad windows is a real one, and 1.5 s is still early enough.
-  const cmd = e.speedBL * e.length;
-  if (cmd > 0.5 && !e.exiting) {
-    e.progT += dt;
-    if (e.progT >= PROG_WINDOW) {
-      const moved = Math.hypot(head.x - e.progX, head.z - e.progZ);
-      if (moved < cmd * e.progT * 0.3) e.stuckFor += e.progT; else e.stuckFor = 0;
-      e.progT = 0; e.progX = head.x; e.progZ = head.z;
-      if (e.stuckFor > PROG_WINDOW * 2) {
-        e.stuckFor = 0;
-        e.stuckStrikes++;
-        if (e.stuckStrikes >= 2) {
-          e.stuckStrikes = 0;
-          // The old rescue for a jammed return was another return, and goHome resets the visit clock,
-          // so the hard park never fired. A second failed trip home now surrenders the visit instead.
-          if (e.forceParkAt !== null || (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2)) parkOffstage(sys, e, now);
-          else goHome(sys, e, now);
-        }
-        else { e.nopePulse = now + 1.3; sys.emit('startle', e); }
-      }
-    }
-  } else {
-    e.progT = 0; e.progX = head.x; e.progZ = head.z;
-    e.stuckFor = Math.max(0, e.stuckFor - dt * 2);
-  }
+  // Per tick, a body her size reads every scrape along a log as a jam; three bad windows is a real
+  // one, and 1.5 s is still early enough.
+  if (!progressStrike(e, dt)) return;
+  if (e.stuckStrikes < 2) { e.nopePulse = now + 1.3; startle(sys, e); return; }
+  e.stuckStrikes = 0;
+  // The old rescue for a jammed return was another return, and goHome resets the visit clock,
+  // so the hard park never fired. A second failed trip home now surrenders the visit instead.
+  if (e.forceParkAt !== null || (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2)) parkOffstage(sys, e, now);
+  else goHome(sys, e, now);
 }
 
 /* Chandler outruns the queen. Speed comes from the residents' own steer: a speedMul spike set after
@@ -527,25 +382,9 @@ function slurpTick(sys, e, dt, now) {
     if (depth > 0) p.pts[i].lerp(mouth, Math.min(1, depth * (dt * 14 + 0.15)));
   }
   if (e.slurpT >= 1) {
-    setVisible(p, false);
+    setVisible(sys, p, false);
     p.length = p.baseLength;
     growEel(p, 0);   // recomputes spacing and damped tail amplitude at the reset length
-    begin(e, 'wriggle', now);
+    begin(sys, e, 'wriggle', now);
   }
-}
-
-function spit(sys, e, now) {
-  const p = e.prey;
-  e.prey = null;
-  if (!p) return;
-  teleport(p, e.head.x + e.heading.x * 0.5, e.head.z + e.heading.z * 0.5, Math.atan2(e.heading.z, e.heading.x), Math.max(-DEPTH + p.radius + 0.1, e.head.y));
-  p.slurpedBy = null;
-  // Bounds back from the current radius, after the chain reset above.
-  sys.air?.restore(p);
-  p.speedMul = 2.2;
-  p.speedBL = p.cruiseBL;
-  p.fleeUntil = now + 1;
-  setVisible(p, true);
-  // The queen stays winning. (No eat sound here: the slurp already covered the meal.)
-  growEel(e, 0.5);
 }

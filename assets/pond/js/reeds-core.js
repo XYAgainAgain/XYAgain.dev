@@ -56,6 +56,83 @@ export const TIP_CEIL = 1.0;                 // world y a tip may reach; past it
 export const LEAN = [0.60, 1.10];
 export const LEAN_DEAD = [0.90, 1.30];
 
+/* Swallowed stems: a stem whose root lies under a body that must read as a hole in the world folds away
+   rather than draw across it, and grows back from the base at a rush's own pace. */
+export const SWALLOW_MARGIN = 0.12;          // past the hull radius: this close, a stem would still graze it
+export const SWALLOW_FALL = 0.22;            // seconds from full height to nothing
+// The duckweed's furrow closes on an 85 s time constant, so ~95% of it is back in 255 s. A rush is a
+// slower plant than a floating weed, so a swallowed stem takes twice that to stand again.
+export const SWALLOW_GROW = 510;
+// The spring settles at force × contact, so this lands the nearest ring just under the bend ceiling
+// and lets the rest of the falloff read as a lean rather than pinning every stem flat.
+export const SWALLOW_PUSH = 0.6;
+export const SWALLOW_PUSH_R = 0.55;          // how far past the hull that shove still reaches
+export const SWALLOW_STRIDE = 2;             // spine points per segment tested; the body is a smooth curve
+// Drawn height a stem has to reach before it is a perch and a shadow again: a shoot is not a stalk, and
+// anything that claims one has to find it standing there.
+export const SWALLOW_USABLE = 0.8;
+export const SWALLOW_SNAP = 0.03;            // seconds the drawn height takes to catch the committed one
+
+/* One step of the swallow amount toward its target: down fast, back up slowly. */
+export function swallowEase(cur, target, dt, fall = SWALLOW_FALL, grow = SWALLOW_GROW) {
+  const t = target > 1 ? 1 : target > 0 ? target : 0;
+  cur = cur > 1 ? 1 : cur > 0 ? cur : 0;
+  const el = dt > 0 ? dt : 0;
+  if (t > cur) return Math.min(t, cur + el / Math.max(fall, 1e-3));
+  if (t < cur) return Math.max(t, cur - el / Math.max(grow, 1e-3));
+  return cur;
+}
+
+/* Swallow amount to the height scale the two draws use. Smoothstepped, so regrowth starts as a shoot
+   pushing out of the sand instead of a stem fading in at full length. */
+export function growScale(swallow) {
+  const g = swallow > 1 ? 0 : swallow > 0 ? 1 - swallow : 1;
+  return g * g * (3 - 2 * g);
+}
+
+/* Availability off the same lifecycle the height scale comes from, so a perch or a shadow proxy can
+   never come back while the stem is still drawn as a shoot. */
+export function stemUsable(swallow, usable = SWALLOW_USABLE) {
+  const u = usable > 1 ? 1 : usable > 0 ? usable : 0;
+  return growScale(swallow) >= u;
+}
+
+/* Nearest approach in xz from a point to a spine polyline, with the offset that separates them.
+   `stride` samples every nth vertebra; the last segment always reaches the tail. */
+export function nearSpineXZ(pts, x, z, stride, out) {
+  const last = pts.length - 1;
+  let best = Infinity, bx = 1, bz = 0;
+  for (let i = 0; i < last; i += stride) {
+    const a = pts[i], b = pts[i + stride > last ? last : i + stride];
+    const ux = b.x - a.x, uz = b.z - a.z, l2 = ux * ux + uz * uz || 1e-9;
+    const t = Math.max(0, Math.min(1, ((x - a.x) * ux + (z - a.z) * uz) / l2));
+    const dx = x - (a.x + ux * t), dz = z - (a.z + uz * t);
+    const d2 = dx * dx + dz * dz;
+    if (d2 < best) { best = d2; bx = dx; bz = dz; }
+  }
+  const d = Math.sqrt(best);
+  out.d = d; out.dx = bx; out.dz = bz;
+  return d;
+}
+
+/* Normalized radius at which the quartic has fallen to `clearH`: the contour a body that can pass over
+   `clearH` of sand has to steer around, as a fraction of both semi-axes. Zero when the whole mound is
+   already passable, 1 when none of it is. The contour is the mound's own ellipse, so scaling the pair
+   keeps a long crest avoided along its length without closing the short-axis approach. */
+export function shoalAvoidFrac(s, clearH) {
+  if (!(s?.h > 0)) return 0;
+  if (!(clearH > 0)) return 1;
+  if (clearH >= s.h) return 0;
+  const q2 = 1 - Math.sqrt(clearH / s.h);
+  return q2 > 0 ? Math.sqrt(q2) : 0;
+}
+
+/* The conservative circle around that contour, for a caller that cannot carry the ellipse. */
+export function shoalAvoidRadius(s, clearH) {
+  const r = s ? Math.max(s.rx, s.rz) : 0;
+  return r > 0 ? shoalAvoidFrac(s, clearH) * r : 0;
+}
+
 // Shadow proxies
 export const SHADOW_SPREAD = 25 * D2R;
 export const SHADOW_LEAN = 0.78;             // moonlight at 52 degrees lands a tip this far along the azimuth

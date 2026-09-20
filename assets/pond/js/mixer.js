@@ -25,6 +25,9 @@ const ROWS = [
   { key: 'shortBub', label: 'short bubs', fire: (a) => a.shortBub() },
   { key: 'drip', label: 'pad drip', fire: (a) => a.drip() },
   { key: 'padSettle', label: 'pad settle', fire: (a) => a.padSettle() },
+  { key: 'drone', label: 'sam drone high', drone: 'awake' },
+  { key: 'droneLow', label: 'sam drone low' },
+  { key: 'droneRest', label: 'sam drone asleep (rel.)', drone: 'rest' },
 ];
 
 const CSS = `
@@ -97,6 +100,12 @@ export function attachMixer(audio) {
       const on = !b.classList.contains('on');
       b.classList.toggle('on', on);
       audio.swish(on);
+    }));
+    // An audition only: the pond's own latch takes the bed back the next time he arrives or parks.
+    if (def.drone) fires.push(btn('▶', (b) => {
+      const on = !b.classList.contains('on');
+      b.classList.toggle('on', on);
+      audio.guestDrone(on, { rest: def.drone === 'rest' });
     }));
     const [s, v] = slider(-40, 0, audio.mix.levels[def.key], (db) => audio.setLevel(def.key, db));
     panel.append(row(def.label, fires, s, v));

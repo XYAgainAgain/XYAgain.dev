@@ -31,6 +31,7 @@ const CLOSING_EPS = 0.02;     // world units of approach over the gape that coun
 const ALARM_N = 96, ALARM_REACH = 3, ALARM_TAU = 25, ALARM_STEP = 0.5, ALARM_RATE = 0.4;
 const ALARM_EVERY = 6, ALARM_WAKE = 0.6, ALARM_R = 0.6, ALARM_LIFE = 90, ALARM_SPOOK_EVERY = 2;
 const CALM_N = 24, CALM_CAP = 60, CALM_TAU = 300;
+const PRESENCE_REACH = 4;   // past this a fearless guest is scenery, not something to steer around
 // F6.
 const METERS = {
   poke: { need: 5, window: 12, refractory: 20, maxRaw: 1.2 },
@@ -97,7 +98,7 @@ class FearSystem {
       spike: new Map(),        // name → { amount, until }, the witnessed-slurp bonus
       lastD: new Map(),        // name → last distance, for the closing speed
       panic: 0, panicName: null, panicKind: null, panicX: 0, panicZ: 0,
-      out: [], pool: [],       // the danger writers handed to the braincell
+      out: [], pool: [], presencePool: [],   // the danger writers handed to the braincell
       alarmAt: -1, alarmW: [], alarmPool: [], localAlarm: 0, alarmX: 0, alarmZ: 0, alarmHas: false,
       alarmSpookAt: 0, alarmQuietUntil: -1e9,
       scatter: null,
@@ -282,6 +283,7 @@ class FearSystem {
     if (e.slurpedBy) { st.panic = 0; st.pending = null; st.out.length = 0; this.cancelContest(e, st); return; }
     this.decayTrust(sys, e, st, dt, now);
     this.buildPanic(sys, e, st, dt, now);
+    if (!isGuest) this.appendPresence(sys, e, st);
     // Staggered by index so the six samples land on six different ticks rather than all on one.
     if (st.alarmAt < 0 || (sys.ticks + (e.index ?? 0)) % ALARM_EVERY === 0) this.sampleAlarm(e, st, now);
     this.appendAlarm(st);
@@ -345,6 +347,32 @@ class FearSystem {
     };
     for (const o of sys.eels) bump(o);
     for (const g of sys.guests) bump(g);
+  }
+
+  /* A guest nobody fears still has a body in the way. One soft writer at his nearest spine sample joins
+     the danger ring alone, no panic or trust involved, so he reads as something to drift around, not a wall. */
+  appendPresence(sys, e, st) {
+    const k = sys.knobs.guest?.presence ?? 0;
+    if (!(k > 0)) return;
+    let n = 0;
+    for (const g of sys.guests) {
+      if (g === e || g.slurpedBy || !g.identity?.presence || !g.body?.visible) continue;
+      const near = this.nearestOf(e, g);
+      const r = (g.radius ?? 0.1) * 2;
+      if (near.d > PRESENCE_REACH + r) continue;
+      const rec = st.presencePool[n] ?? (st.presencePool[n] = { x: 0, z: 0, r: 0, strength: 0 });
+      n++;
+      rec.x = near.x; rec.z = near.z; rec.r = r; rec.strength = clamp01(k);
+      st.out.push(rec);
+    }
+  }
+
+  /* The live calmStep only banks rest time for a resting or tea-drinking resident; this is a direct
+     deposit, so a guest can leave calm behind him the way Eleanor leaves alarm. */
+  dropCalm(x, z, seconds) {
+    const i = this.cellOf(x, z);
+    if (i < 0 || !(seconds > 0)) return;
+    this.calm[i] = Math.min(CALM_CAP, this.calm[i] + seconds);
   }
 
   /* F1's other half: seeing the queen eat a friend costs her every second of trust she had earned,

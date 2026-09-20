@@ -14,6 +14,8 @@ const ORANGE = [1.00, 0.45, 0.10], PURPLE = [0.60, 0.20, 1.00], GREEN = [0.20, 1
 const PINK = [1.00, 0.40, 0.68], NEON_GREEN = [0.45, 1.00, 0.10], TURQUOISE = [0.15, 0.90, 0.82];
 const LIME_YELLOW = [0.80, 1.00, 0.15], MILLENNIAL_PINK = [1.00, 0.62, 0.60], GOLDENROD = [0.92, 0.66, 0.10];
 const GOLD = [1.00, 0.84, 0.25], BLACK = [0, 0, 0];
+// Sam's two: a K-type orange dwarf for the suns and the tail cloud's magenta undertone.
+const SUN_ORANGE = [1.00, 0.55, 0.18], NEBULA_MAGENTA = [1.00, 0.36, 0.42];
 // Matthew's census pair, stalker camo: dark-leaning but still lit, two variants each for variety.
 const FOREST = [0.10, 0.62, 0.20], MOSS = [0.30, 0.85, 0.25], DEEP_BLUE = [0.12, 0.32, 0.95], LAKE = [0.22, 0.55, 1.00];
 const POOL = [TEAL, MAGENTA, BLUE, YELLOW, ORANGE, PURPLE, GREEN, RED];
@@ -81,8 +83,8 @@ export const IDENTITIES = [
     quirks: { follows: 'Shelley', followWeight: 0.7, lifeBond: 'Shelley', lifeBondSeek: 0.5, lifeBondLead: 0.4, lifeBondAhead: 0 },
   },
   {
-    name: 'Shelley',   // jam marbled with cobalt, glittering with stars: Mom's own color chart. Fast,
-                       // often ahead of Jim; random rest stops, tiny attention span; life-bonded to him
+    name: 'Shelley',   // jam marbled with cobalt, glittering with stars: Mom's own color chart. An
+                       // herbivore who takes tea; fast, often ahead of Jim; life-bonded to him
     pronouns: 'she/her',
     nicks: [['Shelley', 60], ['Mom', 20], ['Shel', 10], ['My Literal Actual Mother', 10]],
     build: { length: [2.7, 3.1], radius: [0.095, 0.11] },   // big like Jim, a touch slimmer: she is the fast one
@@ -91,8 +93,9 @@ export const IDENTITIES = [
     // gain sits low on purpose: the whole body is lit, and jam past ~0.6 tone-maps to hot pink on screen.
     ramp: { stops: SHELLEY_SWIRL, jitter: 0.15, soften: 110, sat: 1, gain: 0.6, skin: 1 },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1], swirl: [1, 1, 1], stars: [1, 1, 1], glitter: [1, 1, 1] },
-    traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 } },
-    quirks: { follows: 'Jim', followWeight: 0.45, lifeBond: 'Jim', lifeBondSeek: 0.5, lifeBondLead: 0.6, lifeBondAhead: 0.5 },
+    // eats.crumb 0 like Morgan: a smelled crumb she will never bite must not stall her tea or the bond.
+    traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 }, eats: { crumb: 0 } },
+    quirks: { follows: 'Jim', followWeight: 0.45, lifeBond: 'Jim', lifeBondSeek: 0.5, lifeBondLead: 0.6, lifeBondAhead: 0.5, graze: true, herbivore: true, tea: true },
   },
   {
     name: 'Josh',   // longest, always some orange; bold, fast, sharp turns; crush on Eleanor
@@ -210,6 +213,25 @@ export const IDENTITIES = [
     colorsA: [PURPLE], colorsB: [TEAL],
     pattern: { stripe: [0.4, 0.3, 0.6], spot: [0.9, 0.6, 1], flank: [0.9, 0.6, 1], wavy: [1, 2.5] },
     traits: { spookMul: 0.3, cover: 0.4, turn: [1.2, 1.8], cruise: [0.3, 0.42], prowl: [0.15, 0.25], kind: 'eleanor', braincellUsage: 0.5, nose: 0.4, stim: 0.15, leap: 0, home: 'log', spinOdds: 0, fears: { eleanor: 0, finger: 0, eel: 0, sam: 0 } },
+  },
+  {
+    name: 'Sam',   // the space eel: a noodle-shaped hole in reality who shares Eleanor's slot, none of
+                   // her menace, and a singularity on his snout for a mouth
+    pronouns: 'he/him',
+    active: false,
+    nicks: [['Sam', 70], ['Samuel', 5], ['Samwise', 10], ['Galaxy Daddy', 10], ['Void Boi', 5]],
+    build: { length: [9.8, 11.0], radius: [0.24, 0.28] },   // Eleanor's girth at 1.3× her length, so every log she fits, he fits
+    colorsA: [SUN_ORANGE], colorsB: [NEBULA_MAGENTA],
+    // The void material owns the body; the ramp and pattern below only feed the fallback layer, the
+    // guest capsules, and the name tag, so they have to be ordinary and valid.
+    void: true,
+    wet: 0,            // no moonlit streak on a hole in spacetime
+    startle: false,    // no stage-owned site may emit a startle on his behalf
+    growsOnSlurp: false,
+    presence: true,    // a soft steering writer instead of a fear map entry
+    pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1] },
+    traits: { spookMul: 0, cover: 0.4, turn: [1.0, 1.5], cruise: [0.26, 0.34], prowl: [0.12, 0.2], kind: 'sam', braincellUsage: 0.9, nose: 0.6, stim: 0.15, leap: 0, home: 'log', spinOdds: 0, fears: { eleanor: 0, finger: 0, eel: 0, sam: 0 } },
+    quirks: {},
   },
 ];
 

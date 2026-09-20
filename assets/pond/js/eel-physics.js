@@ -11,6 +11,23 @@ const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.V
 let near = new Uint8Array(0);   // per-tick pair cull scratch, grown to the cast size
 const hitS = [], hitL = [];   // per-eel scenery cull scratch; reused so the broad-phase never allocates
 
+const MOUND_STEP = 0.06;   // most of a slide any one tick may spend, so a crest shoves rather than flings
+
+/* A body that has to read as a hole in the world cannot have sand standing inside its silhouette, and
+   its ceiling is the film, so there is no room to ride up: it slides off the crest instead. The test is
+   a radius uphill of the spine, because the silhouette's rim sits at the spine's own height. */
+function slideOffMound(p, clear, r) {
+  const gx = shoalHeightAt(p.x + r, p.z) - shoalHeightAt(p.x - r, p.z);
+  const gz = shoalHeightAt(p.x, p.z + r) - shoalHeightAt(p.x, p.z - r);
+  const g = Math.hypot(gx, gz);
+  if (g < 1e-5) return;
+  const ux = gx / g, uz = gz / g;
+  const over = floorHeightAt(p.x + ux * r, p.z + uz * r) - (p.y - clear);
+  if (over <= 0) return;
+  const d = Math.min(over * 2 * r / g, MOUND_STEP);
+  p.x -= ux * d; p.z -= uz * d;
+}
+
 export function segDist(px, pz, ax, az, bx, bz) {
   const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9;
   const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / l2));
@@ -157,6 +174,7 @@ export function collide(eels, colliders) {
     // from the snout back, so eel-air hands over how many points behind the head are under it yet.
     const front = ea.burrowFront ?? -1;
     const collar = ea.burrowSoft ?? 1;
+    const sandClear = ea.voidClear ?? 0;   // zero for every ordinary body, so the mound ride is untouched
     // Decide the pair cull once per eel, outside the 24×24 point loop it gates. Scenery gets the same
     // treatment: a collider that the body's whole bounding sphere clears cannot push any of its 24 points.
     const pad = ea.boundR + 0.6;   // margin: pair pushes earlier in this pass can move a point up to a radius or so
@@ -197,6 +215,8 @@ export function collide(eels, colliders) {
         if (mound > 0 && p.y < bFloor + mound) p.y = Math.min(bFloor + mound, bCeil - r * 0.5);
       }
       if (p.y > bCeil) p.y = bCeil;
+      // After both clamps, so the slide solves against the height this point actually ends the tick at.
+      if (sandClear > 0 && !ea.sandBound) slideOffMound(p, sandClear, r);
       if (front >= i) {
         const w = collar > 0 ? Math.min(1, (front - i) / collar) : 1;
         const cap = floorHeightAt(p.x, p.z) - r * BURY_CAP;
