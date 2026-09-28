@@ -1,13 +1,13 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, uniform, uniformArray, vec2, vec3, vec4, float, mix, asinh, smoothstep, sin, floor, fract,
-  positionWorld, exp, dot, step, If, TWO_PI,
+  positionWorld, exp, dot, step, If, Discard, TWO_PI,
 } from 'three/tsl';
 import { EEL_POINTS, DEPTH } from './config.js';
 import { valueNoise2Y, hash2 } from './shading.js';
 import {
   PLUME_ORANGE, QUEUE_SLOTS, ROPE_FREE, ROPE_POINTS, cycleColor, dialNum, easeRgb, feedReady, makeQueue,
-  makeRope, markFed, plumeSpan, queueMean, queuePush, queueStep, stepRope,
+  makeRope, markFed, plumeSpan, queueMean, queuePush, queueStep, ropeBox, stepRope,
 } from './eel-tail-cloud-core.js';
 
 /* Sam's nebula plume: a towed rope of six points, pinned to a skinny part of his tail and to the tip,
@@ -24,8 +24,9 @@ const SIGMA = [1.0, 1.35, 1.9];
 // The gas lattice repeats over this many cells along the scroll axis and the scroll phase wraps at exactly
 // that, so the wrap is silent. Octaves take integer multiples of it for the same reason.
 const GAS_PERIOD = 64, WARP_PERIOD = 32;
-// One draw's worth of bounding slack past the drawn gas, so a puff never meets the quad's own border.
-const QUAD_PAD = 1.25;
+// Slack past the widest half width. The gas is exactly zero at ratio 1 and under the 0.004 cut from
+// about 0.96, so 1.0 already holds every lit fragment and the rest is margin.
+const QUAD_PAD = 1.05;
 
 const tmpV = new THREE.Vector3(), tmpPiv = new THREE.Vector3();
 const rgb = [0, 0, 0];
@@ -47,7 +48,7 @@ export function makeTailCloud(e, U, V, ctx) {
   const uFlashLarge = uniform(0);                 // accumulated separately so two component wraps cannot flip it
   // Where in the pond the plume's base is, in gas cells: the gas hangs in the water and he drags through it.
   const uWorld = uniform(new THREE.Vector2());
-  // The queue: rgb plus its place along the plume, then its band half width, weight, and breakup phase.
+  // The queue: rgb plus its place along the plume, then its band half width, weight, warp lean, and seep start.
   const slotA = [], slotB = [];
   for (let i = 0; i < QUEUE_SLOTS; i++) {
     slotA.push(new THREE.Vector4(...PLUME_ORANGE, 9));
@@ -152,21 +153,24 @@ export function makeTailCloud(e, U, V, ctx) {
       const house = V.tailHouse.max(1e-3).toVar();
       const col = vec3(...PLUME_ORANGE).mul(house).toVar(), sum = house.toVar();
       const soften = V.tailSeepSoft.max(0.05).toVar();
-      const seepHi = V.tailSeepHi.max(V.tailSeepLo.add(0.05)).toVar();
+      const soft = V.tailBandSoft.max(0.01).toVar();
       for (let i = 0; i < QUEUE_SLOTS; i++) {
         const S = uSlotA.element(i), T = uSlotB.element(i);
-        const edge = T.x.max(0.02).toVar(), soft = V.tailBandSoft.max(0.01).toVar();
-        const band = smoothstep(edge, edge.add(soft), colorT.sub(S.w).abs()).oneMinus();
-        // Each slot leans on a different blend of the two warp fields, so no two arrive in the same
-        // pockets; the seed can only lean the blend, never break the field.
-        const pocket = soak.add(mix(w1, w2, sin(T.z).mul(0.5).add(0.5)).mul(0.5)).toVar();
-        // Scattered wisps first, merging as the slot gains weight. The transition is a whole puff wide,
-        // which is what lets two hues share a gradient rather than meet at an edge.
-        const seepAt = mix(seepHi, V.tailSeepLo, T.y).toVar();
-        const seep = smoothstep(seepAt, seepAt.add(soften), pocket);
-        const g = band.mul(seep).mul(T.y).pow(V.tailBandPow.max(0.1)).toVar();
-        sum.addAssign(g);
-        col.addAssign(S.xyz.mul(g));
+        // A weightless slot adds exactly zero, and T is a uniform, so skipping it cannot diverge.
+        If(T.y.greaterThan(0), () => {
+          const edge = T.x.max(0.02).toVar();
+          const band = smoothstep(edge, edge.add(soft), colorT.sub(S.w).abs()).oneMinus();
+          // Each slot leans on a different blend of the two warp fields, so no two arrive in the same
+          // pockets; the seed can only lean the blend, never break the field. T.z is that lean, from the CPU.
+          const pocket = soak.add(mix(w1, w2, T.z).mul(0.5)).toVar();
+          // Scattered wisps first, merging as the slot gains weight. The transition is a whole puff wide,
+          // which is what lets two hues share a gradient rather than meet at an edge. T.w is where it starts.
+          const seepAt = T.w.toVar();
+          const seep = smoothstep(seepAt, seepAt.add(soften), pocket);
+          const g = band.mul(seep).mul(T.y).pow(V.tailBandPow.max(0.1)).toVar();
+          sum.addAssign(g);
+          col.addAssign(S.xyz.mul(g));
+        });
       }
       col.divAssign(sum.max(1e-4));
       // Lean an overlap toward its own hues instead of the grey their average makes, then hand back the
@@ -231,8 +235,8 @@ export function makeTailCloud(e, U, V, ctx) {
       const lum = lit.r.max(lit.g).max(lit.b).max(1e-5).toVar();
       const k = V.tailStretchK.max(0.1);
       out.assign(lit.mul(asinh(lum.mul(k)).div(asinh(k)).div(lum).min(1)));
-    });
-    });
+    }).Else(() => { Discard(); });
+    }).Else(() => { Discard(); });
     return vec4(out, 0);
   })();
   // Additive with the destination alpha left alone: that alpha is scene depth for the compose pass.
@@ -245,6 +249,9 @@ export function makeTailCloud(e, U, V, ctx) {
   m.blendDstAlpha = THREE.OneFactor;
   m.depthWrite = false;
   m.side = THREE.DoubleSide;
+  // A transparent DoubleSide material is drawn twice in r185, back pass then front; a flat quad only
+  // ever lights one of them, so one cull-free pass draws the same pixels for half the draws.
+  m.forceSinglePass = true;
 
   const mesh = new THREE.Mesh(geo, m);
   mesh.rotation.x = -Math.PI / 2;        // the camera is straight down, so the quad lies in the pond plane
@@ -262,6 +269,7 @@ export function makeTailCloud(e, U, V, ctx) {
   const cfg = { bend: 0.7, kink: 0.55, smooth: 0.45, lag: 0.35, grade: 0.8, endScale: 1.65 };
   const colorCfg = { sat: 0.72, lum: 0.78, grey: 0.18 };
   const anchor = new THREE.Vector3();
+  const box = { x: 0, z: 0, sx: 1, sz: 1, angle: 0, ux: 1, uz: 0 };
   let primed = false, breathT = 0, lagSpeed = 0;
 
   /* One pickup pass over the cast, on the frame clock: anybody who brings a head within tailNear body
@@ -350,18 +358,16 @@ export function makeTailCloud(e, U, V, ctx) {
       const w0 = e.radius * V.tailW0.value, w1 = e.radius * V.tailW1.value, w2 = e.radius * V.tailW2.value;
       const wMax = Math.max(w0, w1, w2);
       const total = rope.s[ROPE_POINTS - 1];
-      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity, sumY = 0;
+      let sumY = 0;
       for (let i = 0; i < ROPE_POINTS; i++) {
         const j = i * 3;
         uRope.array[i].set(rope.p[j], rope.p[j + 2], rope.s[i], 0);
-        minX = Math.min(minX, rope.p[j]); maxX = Math.max(maxX, rope.p[j]);
-        minZ = Math.min(minZ, rope.p[j + 2]); maxZ = Math.max(maxZ, rope.p[j + 2]);
         sumY += rope.p[j + 1];
       }
-      const pad = wMax * QUAD_PAD;
-      mesh.position.set((minX + maxX) * 0.5, sumY / ROPE_POINTS + e.radius * V.tailLift.value,
-        (minZ + maxZ) * 0.5);
-      mesh.scale.set(maxX - minX + pad * 2, maxZ - minZ + pad * 2, 1);
+      ropeBox(rope, wMax * QUAD_PAD, box);
+      mesh.position.set(box.x, sumY / ROPE_POINTS + e.radius * V.tailLift.value, box.z);
+      mesh.rotation.set(-Math.PI / 2, 0, box.angle);
+      mesh.scale.set(box.sx, box.sz, 1);
       uTotal.value = Math.max(1e-3, total);
       const world = V.tailWorld.value * V.tailFreq.value;
       uWorld.value.set(anchor.x * world, anchor.z * world);
@@ -392,10 +398,13 @@ export function makeTailCloud(e, U, V, ctx) {
           dialNum(V.tailDripMin, 1, 600, 90), dialNum(V.tailDripMax, 1, 900, 180));
       }
       const band = dialNum(V.tailBand, 0.02, 1, 0.22);
+      // Per-slot constants the shader used to rebuild in every fragment: the warp lean off the seed and
+      // the seep threshold off the weight, read after GPU_BOUNDS has normalized both seep dials.
+      const seepLo = V.tailSeepLo.value, seepHi = Math.max(V.tailSeepHi.value, seepLo + 0.05);
       for (let i = 0; i < QUEUE_SLOTS; i++) {
         const s = queue.slots[i];
         uSlotA.array[i].set(s.r, s.g, s.b, s.pos);
-        uSlotB.array[i].set(band, s.w, s.seed, 0);
+        uSlotB.array[i].set(band, s.w, Math.sin(s.seed) * 0.5 + 0.5, seepHi + (seepLo - seepHi) * s.w);
       }
       queueMean(queue, queue.mean, V.tailHouse.value);
       easeRgb(smoothedLight, queue.mean, hm, dialNum(V.tailGlowEase, 0.05, 12, 2));

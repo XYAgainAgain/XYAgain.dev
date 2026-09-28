@@ -1,5 +1,5 @@
 import { DEPTH } from './config.js';
-import { paceWave } from './eel-behavior.js';
+import { paceWave, releaseSteer, retreatBL, wakeNapper } from './eel-behavior.js';
 import { pushTrail, retreatAlongTrail, growEel } from './eel-physics.js';
 
 /* The guest stage: what both guests share to get on and off it, parking, the teleport, the lair's three
@@ -39,8 +39,10 @@ export function onStage(sys, e) {
   return false;
 }
 
+/* The stage's stuck window has its own field: steer's per-tick stuck check owns e.stuckFor, and a guest
+   in rounds runs both. */
 export function resetProgress(e) {
-  e.stuckFor = 0;
+  e.stageStuck = 0;
   e.progT = 0;
   e.progX = e.head.x; e.progZ = e.head.z;
 }
@@ -66,12 +68,27 @@ export function teleport(e, x, z, ang, y = -DEPTH + e.radius + 0.1) {
    guaranteed to be off frame and hidden. e.onPark is the attach's hook; attach itself has none yet. */
 export function park(sys, e) {
   if (sys.debug && e.body?.visible && onStage(sys, e)) console.warn(`[guest] parked from on stage in ${e.state} (t=${sys.time.toFixed(2)})`);
+  // A guest that left steer without the controller noticing still owes its claims back before the swap.
+  if (e.steerHeld) releaseSteer(sys, e);
+  dropTailPerch(sys, e);
+  endGuestMeals(sys, e);
   e.onPark?.(sys, e);
   e.parkAng = e.rng.range(0, Math.PI * 2);
   setExit(e, null);
   e.nopePulse = 0;
   const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
   teleport(e, Math.cos(e.parkAng) * d, Math.sin(e.parkAng) * d, e.parkAng + Math.PI);
+}
+
+/* His small meals, ended wherever the controller loses him: a crumb mid-pull is already out of the world,
+   so it is dropped on the spot. Rounds waits a pull out; only a forced seam (a park, a collapse) cuts one. */
+export function endGuestMeals(sys, e) {
+  const c = e.crumbPull?.crumb;
+  e.crumbPull = null;
+  if (c) sys.dropFood?.(c);
+  e.samCrumb = null;
+  e.sweepUntil = 0;
+  e.sweeping = false;
 }
 
 /* Only ever called when a guest leaves the log; the exit's startle rides along here, silent for
@@ -100,6 +117,16 @@ export function parkOffstage(sys, e, now) {
   e.rescued = false;
   e.homeFails = 0;
   if (onStage(sys, e) && now < (e.forceParkAt ?? Infinity)) {
+    // A guest who can swallow himself does, on stage; his controller runs the collapse and the park after
+    // it, which is where the rest clocks get drawn (the roll inside the park would wipe them otherwise).
+    if (e.identity?.selfSwallow) {
+      e.exitStyle = 'collapse';
+      e.state = 'depart'; e.stateAt = now;
+      e.stuckStrikes = 0;
+      resetProgress(e);
+      setExit(e, null);
+      return;
+    }
     rest(e, now);
     if (e.forceParkAt === null) e.forceParkAt = now + 15;
     e.parkAng = Math.atan2(e.head.z, e.head.x);   // straight out the nearest rim, not across the pond
@@ -116,6 +143,16 @@ export function parkOffstage(sys, e, now) {
   // that parked with no cooldown left walks straight back on stage.
   rest(e, now);
   setVisible(sys, e, false);
+}
+
+/* The tail perch comes off the registry and everyone on it or swimming to it wakes the ordinary way.
+   Idempotent; the park calls it too, so no swap or surrender can leave a napper against nothing. */
+export function dropTailPerch(sys, e) {
+  const p = e.tailPerch;
+  if (!p) return;
+  e.tailPerch = null;
+  const held = sys.habitat?.removePerch(p.id) ?? [];
+  for (const r of held) if (r.coverSpot?.type === 'tail' && r.coverSpot.id === p.id) wakeNapper(r, sys.time);
 }
 
 /* The gap before the next visit. Without the coolAt the next tick picked a fresh one: hunt and graze
@@ -146,7 +183,8 @@ export function nopeTick(sys, e, dt, now) {
   e.reverse = true;
   e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
   paceWave(e, dt, false);
-  retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
+  // retreatBL caps a guest's backing pace at its cruise; half a ten-unit length a second read as a whip.
+  retreatAlongTrail(e, retreatBL(e, sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
   return true;
 }
 
@@ -158,8 +196,8 @@ export function exitTarget(sys, e, dt, now) {
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
     paceWave(e, dt, false);
     // The jam shove is spent over 0.2 s at the retreat's own pace; as one pop it moved the snout 0.1 L in a tick.
-    if (now < e.revPush) e.head.addScaledVector(e.heading, e.length * 0.5 * dt);
-    else retreatAlongTrail(e, (sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
+    if (now < e.revPush) e.head.addScaledVector(e.heading, retreatBL(e, 0.5) * e.length * dt);
+    else retreatAlongTrail(e, retreatBL(e, sys.motion.reduced ? 0.175 : 0.5) * e.length * dt);
     const behind = (e.head.x - e.lair.a.x) * e.lairDir.x + (e.head.z - e.lair.a.z) * e.lairDir.z;
     if (behind < -0.8) { setExit(e, null); return 'done'; }
     // A reverse eats the path it walks, so it can jam on the bore or simply run out of history. One
@@ -244,7 +282,8 @@ export function moveGuest(sys, e, dt, now, tx, tz, ty, wantBL, opts = null) {
   let diff = Math.atan2(az, ax) - Math.atan2(e.heading.z, e.heading.x);
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));
   // Slow = supple: near-stationary a guest can hairpin inside its own bore; the exit fold leans on this.
-  const supple = (1.6 - 0.6 * Math.min(1, e.speedBL / e.cruiseBL)) * (e.exiting === 'turn' ? 4 : 1);
+  // Against the identity's own cruise: a guest whose cruise is paced down for steer keeps the fold it had.
+  const supple = (1.6 - 0.6 * Math.min(1, e.speedBL / (e.baseCruiseBL ?? e.cruiseBL))) * (e.exiting === 'turn' ? 4 : 1);
   const maxTurn = e.turnRate * supple * dt;
   const yaw = Math.max(-maxTurn, Math.min(maxTurn, diff * Math.min(1, dt * 5)));
   const c = Math.cos(yaw), sn = Math.sin(yaw);
@@ -279,13 +318,13 @@ export function progressStrike(e, dt) {
     e.progT += dt;
     if (e.progT < PROG_WINDOW) return false;
     const moved = Math.hypot(head.x - e.progX, head.z - e.progZ);
-    if (moved < cmd * e.progT * 0.3) e.stuckFor += e.progT; else e.stuckFor = 0;
+    if (moved < cmd * e.progT * 0.3) e.stageStuck += e.progT; else e.stageStuck = 0;
     e.progT = 0; e.progX = head.x; e.progZ = head.z;
-    if (e.stuckFor > PROG_WINDOW * 2) { e.stuckFor = 0; e.stuckStrikes++; return true; }
+    if (e.stageStuck > PROG_WINDOW * 2) { e.stageStuck = 0; e.stuckStrikes++; return true; }
     return false;
   }
   e.progT = 0; e.progX = head.x; e.progZ = head.z;
-  e.stuckFor = Math.max(0, e.stuckFor - dt * 2);
+  e.stageStuck = Math.max(0, e.stageStuck - dt * 2);
   return false;
 }
 
@@ -349,6 +388,20 @@ export function resetGuest(e) {
   e.nextSwimBy = 0;
   e.slurpT = 0;
   e.exitStyle = 'swim';
+  // Slice B's own fields: the collapse clock and its one-tick flash, the pending lair-exit flop, the lean.
+  // droneCut is deliberately absent: main.js consumes it after the park this reset runs inside.
+  e.collapse = null;
+  e.collapseFlash = 0;
+  e.exitFlop = null;
+  e.leanOn = false;
+  e.tailPerch = null;
+  // Slice C's: the deferred crumb and its pull (park() already finished any pull), the sweep, the open-water mask.
+  e.samCrumb = null;
+  e.crumbPull = null;
+  e.deferAt = 0;
+  e.sweepUntil = 0;
+  e.sweeping = false;
+  e.openMask?.fill(0);
   e.tunnel = null;
   e.food = null;
   e.coverSpot = null;
@@ -365,6 +418,16 @@ export function resetGuest(e) {
   e.sunHeat = 1;
   e.horizon = 0;
   e.tailSpeed = 0;
+  // Steer's side of the body. A Sam-to-Sam re-roll keeps the same identity object, so quirkFor has to
+  // be wiped by hand or the next rounds inherits the last visit's quirk clocks.
+  e.guestPolicy = null;
+  e.steerHeld = false;
+  e.quirkFor = null;
+  e.baseCruiseBL = null;
+  e.baseProwlBL = null;
+  e.gait = 'prowl';
+  e.gaitUntil = 0;
+  e.retargetAt = 0;
   // park() re-rolls this per park, but a first depart-from-lair reads it first: undefined here fed
   // cos/sin a NaN that poisoned the whole chain until the stuck rescue finally parked her.
   e.parkAng = e.rng.range(0, Math.PI * 2);

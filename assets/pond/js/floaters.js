@@ -1,9 +1,10 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, attribute, uniform, uniformArray, varying, vec2, vec3, vec4, float, int, sin, cos, atan, length, smoothstep, mix, pow, step, dot, normalize, texture, uv, fwidth, positionGeometry } from 'three/tsl';
-import { WAKE_RES, MOON_ORBIT_SECONDS, INF_SLOTS } from './config.js';
+import { WAKE_RES, MOON_ORBIT_SECONDS, INF_SLOTS, EEL_COUNT } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { segDist } from './eel-physics.js';
 import { makeCurrent, makeSwell, valueNoise2, capsuleInfluenceCPU } from './shading.js';
+import { MEALS, horizonAt, spiralAt } from './sam-eel-core.js';
 import { layoutPollen, rainThinStep, pollenActive, upwindEdgeSpawn, adhesionBreaks, puffSettleSites, POLLEN_SIM, POLLEN_WASH, POLLEN_REFILL_BELOW, POLLEN_REFILL_N, POLLEN_EDGE_SHARE, POLLEN_MOTE_SHARE, POLLEN_MARGIN, POLLEN_RIM_SHARE, POLLEN_RIM_BAND } from './pollen-core.js';
 
 /* The surface-particle system: one config per layer, one InstancedBufferGeometry each. Phase 2 so far:
@@ -85,6 +86,10 @@ const CARVE_HEAL_TAU = 85;   // the furrow is ~95% closed in a little under four
 // A finger slices the same field she does, thinner and to a fixed depth: passing twice cannot dig
 // deeper than parted, where dwelling in her path can. A grazer eats on the same terms.
 export const FINGER_CARVE_R = 0.085, FINGER_CARVE = 0.46;
+// Sam's plow is a suck: while he sweeps, his snout carves the mat at Eleanor's width but 0.7 of her rate, and
+// any speck inside 1.5 of his radii falls into the open horizon on the accretion spiral (S4 item 4).
+const SWEEP_CARVE = 0.7, SWEEP_PULL = 1.5, SWEEP_TURNS = [1, 2];
+const SPECK_PARKED = 1e4;                  // an eaten speck's offset: off every frame until it grows back
 const POKE_MAX = 16;                       // sub-frame pointer samples honored per frame
 
 // The reserve: a temporary opacity notch along the finger's own wake channel, in case the RG push alone
@@ -231,6 +236,12 @@ export class FloaterSystem {
     this.memClump = null;
     this.carveAcc = 0;
     this.carveBox = null;   // scar-texel AABB of everything plowed and not yet healed
+    this.guests = null;     // the eels' guest roster, handed over by main: Sam's sweep and horizon read it
+    this.sweepPrev = null;  // his snout last frame, so the sweep carves a path instead of a string of dots
+    this.mouth = { x: 0, y: 0, z: 0, rh: 0, live: false };   // the last open horizon, where a spiral in flight ends
+    this.capTmp = { r0: 0, a0: 0, turn: 0 };
+    this.spiralOut = { x: 0, z: 0, r: 0, a: 0, u: 0, done: false };
+    this.driftTmp = { x: 0, z: 0 };
     this.rect = { ex: view.w / 2 + CLUMP_MARGIN, ez: view.h / 2 + CLUMP_MARGIN };
     // The real waterlines, sampled once: each emergent stone's lumpy rim around it (the disc's r is only
     // the chord the waves keep) and the bark per station. Mask B and A, the mat, the specks, and the
@@ -928,6 +939,13 @@ export class FloaterSystem {
     this.sClump = new Uint8Array(SPECK_POOL);
     this.sActive = new Uint8Array(SPECK_POOL);
     this.sLoose = new Float32Array(SPECK_POOL);
+    // The accretion spiral per speck: when it was caught (-1 free), its start radius and angle, the turn it
+    // takes, and (sGone) the frame time an eaten one grows back, 0 while it is in the mat.
+    this.sCapT = new Float32Array(SPECK_POOL).fill(-1);
+    this.sCapR0 = new Float32Array(SPECK_POOL);
+    this.sCapA0 = new Float32Array(SPECK_POOL);
+    this.sCapTurn = new Float32Array(SPECK_POOL);
+    this.sGone = new Float32Array(SPECK_POOL);
     this.specks.forEach((s, i) => {
       this.home.set([s.x, s.z], i * 2);
       this.seedArr.set([s.tint, s.rot, s.glint, s.frac], i * 4);
@@ -955,6 +973,7 @@ export class FloaterSystem {
     const uWeedLit = uniform(new THREE.Vector2(2.2, 0.25));   // the carpet's own Lambert gain and ambient floor
     const uWeedGlint = uniform(new THREE.Vector2(40, 0.3));   // exponent, gain
     const uWeedLoose = uniform(2.2);                          // extra current drift for a speck adrift
+    this.uWeedLoose = uWeedLoose;   // the spiral subtracts the drawn drift, so it has to read the same gain
     const uWeedTransTint = uniform(new THREE.Vector3(0.30, 1.0, 0.48));
     const uWeedTransGain = uniform(1.0);
     const uWeedFrondA = uniform(new THREE.Vector4(-0.22, 0.0, 1.0, 0.74));
@@ -1220,14 +1239,27 @@ export class FloaterSystem {
     }
   }
 
-  /* Eleanor is the only body wide enough to plow a mat in two; the residents pass under it. */
+  /* The visible void guest, if he is the one on stage; frame-side reads of his sim state only. */
+  voidGuest() {
+    for (const g of this.guests ?? []) if (g.identity?.void && g.body?.visible) return g;
+    return null;
+  }
+
+  /* Eleanor is the only body wide enough to plow a mat in two; the residents pass under it. Sam's two
+     capsules are as wide as hers, but he sucks rather than plows, so his carve is the sweep's alone. */
   carveGuests(dt) {
-    const U = this.U;
+    const U = this.U, sam = this.voidGuest();
     for (let s = 0; s < INF_SLOTS; s++) {
+      if (sam && (s === EEL_COUNT || s === EEL_COUNT + 1)) continue;
       const a = U.infA.array[s], b = U.infB.array[s];
       if (b.w <= 0 || a.w < CARVE_MIN_R || (a.y + b.y) * 0.5 < -CARVE_DEPTH) continue;
       this.carveCapsule(a.x, a.z, b.x, b.z, a.w * CARVE_WIDE, CARVE_RATE * dt, false);
     }
+    const p = sam?.sweeping ? sam.show[0] : null;
+    if (!p) { this.sweepPrev = null; return; }
+    const q = this.sweepPrev ?? (this.sweepPrev = { x: p.x, z: p.z });
+    this.carveCapsule(q.x, q.z, p.x, p.z, sam.radius * CARVE_WIDE, CARVE_RATE * SWEEP_CARVE * dt, false);
+    q.x = p.x; q.z = p.z;
   }
 
   /* Relax the carved region back toward clean water and re-upload, four times a second at most. The scar
@@ -1305,7 +1337,7 @@ export class FloaterSystem {
     this.rainWas = raining;
     this.pollenRain = rainThinStep(this.pollenRain, this.rain?.envelope ?? 0, dt);
     this.pollenMesh.geometry.instanceCount = pollenActive(this.pollenPool.length, this.pollenFraction, this.pollen, this.pollenRain);
-    this.stepSpecks(dt, true);
+    this.stepSpecks(dt, now);
     this.stepPollen(dt, now);
     this.poke0.n = 0;
     this.taps.length = 0;
@@ -1339,11 +1371,50 @@ export class FloaterSystem {
     }
   }
 
-  stepSpecks(dt) {
+  /* Where an open horizon of his is this frame, and the pull radius around his snout; false when shut. The
+     last one is kept, so a speck already spiraling ends where the hole was if it closes under it. */
+  openMouth() {
+    const g = this.voidGuest(), m = this.mouth;
+    const rh = g && g.horizon > 0 ? g.horizon * g.radius : 0;
+    if (!(rh > 0)) return false;
+    horizonAt(g.show[0], g.heading, g.radius, m);
+    m.rh = rh; m.live = true;
+    m.sx = g.show[0].x; m.sz = g.show[0].z;
+    m.pull = g.radius * SWEEP_PULL;
+    return true;
+  }
+
+  /* One captured speck's frame: its place on the spiral, written as the offset that draws it there. The
+     vertex stage adds its own current drift on top, so the CPU twin of that drift comes off first. */
+  spiralSpeck(i, i2, hx, hz, now) {
+    const m = this.mouth, cap = this.capTmp, out = this.spiralOut;
+    cap.r0 = this.sCapR0[i]; cap.a0 = this.sCapA0[i]; cap.turn = this.sCapTurn[i];
+    spiralAt(cap, now - this.sCapT[i], MEALS.crumbPull, m.x, m.z, m.rh, out);
+    if (out.done) {
+      this.sCapT[i] = -1;
+      // Grows back on roughly the scar's own heal clock, staggered by index so a furrow refills in patches.
+      this.sGone[i] = now + CARVE_HEAL_TAU * (0.6 + 0.8 * ((i * 0.6180339) % 1));
+      this.off[i2] = this.off[i2 + 1] = SPECK_PARKED;
+      this.vel[i2] = this.vel[i2 + 1] = 0;
+      return;
+    }
+    const U = this.U, dr = this.currentAt(hx, hz, U.time.value, this.driftTmp);
+    const k = this.uWeedDrift.value * (this.sLoose[i] * this.uWeedLoose.value + 1) * U.motionScale.value;
+    this.off[i2] = out.x - hx - dr.x * k;
+    this.off[i2 + 1] = out.z - hz - dr.z * k;
+    this.vel[i2] = this.vel[i2 + 1] = 0;
+  }
+
+  stepSpecks(dt, now = 0) {
     const pk = this.poke0, seg = this.pokeSegs;
     const n = Math.min(this.speckCount, this.speckMesh.geometry.instanceCount);
     if (n <= 0) return;
     const U = this.U, h = Math.min(dt, SPECK_DT_MAX), ms = U.motionScale.value;
+    const capT = this.sCapT, gone = this.sGone, mouth = this.mouth;
+    const open = this.openMouth();
+    const mx0 = open ? mouth.sx - mouth.pull : 1, mx1 = open ? mouth.sx + mouth.pull : -1;
+    const mz0 = open ? mouth.sz - mouth.pull : 1, mz1 = open ? mouth.sz + mouth.pull : -1;
+    const pull2 = open ? mouth.pull * mouth.pull : 0;
     // Eels stay an event under reduced motion; the wind is idle motion and follows motionScale.
     const eelK = SPECK_EEL_GAIN * (0.5 + 0.5 * ms);
     const w = U.wind.value, windK = SPECK_WIND_GAIN * w.z * ms * this.windCalm;
@@ -1374,7 +1445,24 @@ export class FloaterSystem {
       const i2 = i * 2, c2 = ci * 2;
       let ox = off[i2], oz = off[i2 + 1];
       const hx = home[i2] + drift[c2], hz = home[i2 + 1] + drift[c2 + 1];
+      // Eaten: parked off frame until its clock comes round, then back in the mat at rest.
+      if (gone[i] > 0) {
+        if (now < gone[i]) continue;
+        gone[i] = 0; ox = oz = 0; off[i2] = off[i2 + 1] = 0; vel[i2] = vel[i2 + 1] = 0;
+      }
+      if (capT[i] >= 0) { if (mouth.live) this.spiralSpeck(i, i2, hx, hz, now); continue; }
       let px = hx + ox, pz = hz + oz;
+      if (px >= mx0 && px <= mx1 && pz >= mz0 && pz <= mz1) {
+        const sx = px - mouth.sx, sz = pz - mouth.sz;
+        if (sx * sx + sz * sz < pull2) {
+          capT[i] = now;
+          this.sCapR0[i] = Math.hypot(px - mouth.x, pz - mouth.z);
+          this.sCapA0[i] = Math.atan2(pz - mouth.z, px - mouth.x);
+          this.sCapTurn[i] = Math.PI * 2 * (SWEEP_TURNS[0] + (SWEEP_TURNS[1] - SWEEP_TURNS[0]) * ((i * 0.7548777) % 1));
+          this.spiralSpeck(i, i2, hx, hz, now);
+          continue;
+        }
+      }
       const lw = 1 + loose[i] * 1.6;
       let fx = windX * lw, fz = windZ * lw;
       for (let s = 0; s < ns; s++) {

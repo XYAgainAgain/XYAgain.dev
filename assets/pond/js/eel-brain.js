@@ -1,7 +1,7 @@
 import { BRAIN_SLOTS, DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { retreatAlongTrail } from './eel-physics.js';
-import { tickHeldAbove, tunnelLog } from './eel-behavior.js';
+import { retreatBL, tickHeldAbove, tunnelLog } from './eel-behavior.js';
 import { makeRings, clearRings, addInterest, addDanger, addDangerArc, adapt, wrapPi, slotAngle, legalNudge, TAU } from './eel-brain-core.js';
 import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
 
@@ -27,6 +27,7 @@ const BRAIN_FLOOR = 0.2;         // fallback when the knob is missing; pond.eels
 const BORE_REACH = 2.5;          // fallback carve reach; pond.eels.knobs.tunnel.carve is the live dial
 const TANGENT_EPS = 1e-6;        // just clear of the silhouette, never a whole slot: a passable gap is often narrower
 const DEFAULT_EATS = { crumb: 1 };
+const NO_CROWNS = Object.freeze([]);
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -360,7 +361,8 @@ class Braincell {
       if (d < nd) { nd = d; near = s; }
     }
     if (near) st.gaze = { x: near.x, z: near.z, w: 1 - nd / SIDE_EYE_NEAR };
-    if (force && st.phantom && now <= st.phantom.until) {
+    // The phantom is a pull toward the next crumb, so a guest kept off food never feels it.
+    if (force && st.phantom && now <= st.phantom.until && (!e.guestPolicy || e.guestPolicy.food)) {
       const dx = st.phantom.x - head.x, dz = st.phantom.z - head.z;
       const d = Math.hypot(dx, dz);
       if (d > 1e-4) { force.x += (dx / d) * 0.4; force.z += (dz / d) * 0.4; }
@@ -445,7 +447,8 @@ class Braincell {
     const a = st.anchor;
     if (!a || a === 'unresolved') return null;
     if (!st.rng.chance(0.8 * clamp01(e.wits))) return null;
-    const r = 5 * e.length;
+    // Five body lengths is a neighborhood for a resident and the whole pond for a ten-unit guest.
+    const r = e.guestPolicy ? e.guestPolicy.homeReach : 5 * e.length;
     const ang = st.rng.range(0, TAU), d = r * Math.sqrt(st.rng.next());
     return { ux: (a.x + Math.cos(ang) * d) / ex, uz: (a.z + Math.sin(ang) * d) / ez };
   }
@@ -597,7 +600,10 @@ class Braincell {
     this.candidates.length = 0;
     this.obstAt = 0;
     const head = e.head, r = e.radius, focus = clamp01(e.focus);
-    const look = lerp(0.5, 2.0, focus) * e.length + 0.45 * (e.speedMul - 1);
+    const gp = e.guestPolicy;
+    let look = lerp(0.5, 2.0, focus) * e.length + 0.45 * (e.speedMul - 1);
+    // Body lengths again: a guest's ring would weigh every stone within twenty units and never be clear.
+    if (gp) look = Math.min(look, gp.lookCap);
     st.look = look;
     st.tolerance = lerp(0.35, 0, focus);
     // An absolute floor beside the relative tolerance: a far rock's weak skirt lifts the ring's
@@ -618,10 +624,27 @@ class Braincell {
       const thetaC = Math.atan2(dz, dx);
       this.writeObstacle(danger, thetaC, alpha, S, null);
       // The clear-water lift the legacy shove used to own; the depth reroll still overrides it later.
-      if (canClear && d < rc + 0.6) e.targetY = Math.max(e.targetY, top + r * 1.5);
+      if (canClear && d < rc + 0.6) e.targetY = Math.max(e.targetY, liftTo(e, top + r * 1.5));
     }
 
-    const berth = sys.lairGuest && e.quirks.follows !== sys.lairGuest.name ? 4 : 1;
+    // A guest's shoal crowns: sand he cannot swim over without wearing it. Each is the oriented ellipse
+    // the stage steers around, as a hard silhouette on the legality floor, never a soft field.
+    for (const o of e.shoalAvoid ?? NO_CROWNS) {
+      const dx = o.x - head.x, dz = o.z - head.z;
+      const d = Math.hypot(dx, dz);
+      if (d < 1e-4) continue;
+      const u = -dx * o.cosR + dz * o.sinR, w = -dx * o.sinR - dz * o.cosR;
+      const q = Math.hypot(u / o.rx, w / o.rz);
+      const rc = q > 1e-6 ? d / q : o.r;
+      const gap = d - rc - r;
+      if (gap > look) continue;
+      const S = clamp01(1 - Math.max(0, gap) / Math.max(look, 1e-4));
+      this.writeObstacle(danger, Math.atan2(dz, dx), Math.asin(Math.min(1, (rc + r + 0.1) / d)), S, null);
+    }
+
+    // His tail perch sits inside the berth, so a napper bound for it is let through as appendPresence does.
+    const onTail = e.coverSpot?.type === 'tail' && e.coverSpot.owner === sys.lairGuest;
+    const berth = sys.lairGuest && e.quirks.follows !== sys.lairGuest.name && !onTail ? 4 : 1;
     const bore = e.tunnel ? this.boreLog(sys, e) : null;
     for (const l of sys.colliders.logs) {
       const near = segNearest(head.x, head.z, l);
@@ -638,7 +661,7 @@ class Braincell {
       // Tunnel-aware: the bore this eel is running is legal, but its walls still write.
       const skip = l === bore ? this.boreCarve(e, l, look) : null;
       this.writeObstacle(danger, thetaC, alpha, S, skip);
-      if (canClear && d < l.rOuter + 0.6) e.targetY = Math.max(e.targetY, top + r * 1.5);
+      if (canClear && d < l.rOuter + 0.6) e.targetY = Math.max(e.targetY, liftTo(e, top + r * 1.5));
     }
 
     // Guarded rather than defaulted: an absent fear module would otherwise allocate an empty array a tick.
@@ -654,7 +677,7 @@ class Braincell {
     if (Math.abs(head.x) > sys.view.w * 0.7) this.writeArc(danger, head.x > 0 ? 0 : Math.PI, Math.PI / 2, 0.8);
     if (Math.abs(head.z) > sys.view.h * 0.7) this.writeArc(danger, head.z > 0 ? Math.PI / 2 : -Math.PI / 2, Math.PI / 2, 0.8);
 
-    const flockR = e.length;
+    const flockR = gp ? Math.min(e.length, gp.lookCap) : e.length;
     // Two loops rather than a concat: this runs per eel per tick and the array would be garbage.
     for (const o of sys.eels) this.writeNeighbor(danger, e, o, flockR);
     for (const o of sys.guests) this.writeNeighbor(danger, e, o, flockR);
@@ -848,7 +871,7 @@ class Braincell {
     e.reverse = true;
     e.stuckFor = 0;
     e.speedBL += (0 - e.speedBL) * Math.min(1, dt * 8);
-    const step = (sys.motion.reduced ? 0.28 : 0.8) * e.length * dt;
+    const step = retreatBL(e, sys.motion.reduced ? 0.28 : 0.8) * e.length * dt;
     retreatAlongTrail(e, step);
     esc.gone += step;
     e.wavePhase += Math.PI * 2 * 2.6 * dt;
@@ -932,6 +955,13 @@ function focusOf(sys, e, now) {
   const panic = clamp01(sys.fear?.panic?.(e) ?? 0);
   // Q-D's food-drunk multiplier, on this one line and nowhere else, so nothing compounds it.
   return clamp01(e.wits * wake * (1 - 0.6 * panic) * (foodDrunk(e) ? FOOD_DRUNK.focus : 1));
+}
+
+/* The clear-water lift, capped for a guest at the top of his own band so clearing a low stone never
+   lifts his back through the film. */
+function liftTo(e, y) {
+  const gp = e.guestPolicy;
+  return gp ? Math.min(y, -DEPTH + e.radius + gp.depth[1]) : y;
 }
 
 function segNearest(px, pz, l) {

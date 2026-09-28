@@ -356,7 +356,11 @@ class FearSystem {
     if (!(k > 0)) return;
     let n = 0;
     for (const g of sys.guests) {
-      if (g === e || g.slurpedBy || !g.identity?.presence || !g.body?.visible) continue;
+      // His own collapse keeps the soft writer on the curling loop, which the chain solver still skips;
+      // a body some other mouth has taken is gone.
+      if (g === e || (g.slurpedBy && g.slurpedBy !== g) || !g.identity?.presence || !g.body?.visible) continue;
+      // A resident heading for his tail perch, or napping on it, is not steered off the cloud it picked.
+      if (e.coverSpot?.type === 'tail' && e.coverSpot.owner === g) continue;
       const near = this.nearestOf(e, g);
       const r = (g.radius ?? 0.1) * 2;
       if (near.d > PRESENCE_REACH + r) continue;

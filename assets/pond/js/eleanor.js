@@ -8,7 +8,7 @@ import {
   pickExit, progressStrike, rescueLadder, resetGuest, resetProgress, setExit, setVisible,
   spit, startle, teleport,
 } from './guest-stage.js';
-import { brain as samBrain, enterSam, initSam } from './sam-eel.js';
+import { brain as samBrain, collapseModule, enterSam, initSam } from './sam-eel.js';
 
 /* The guest slot: one shared body, one of two identities rolled at each park. Eleanor is the original:
    log lair, feed-spree visits, hunts anyone near her size, and a stand-down when the pond runs hot,
@@ -60,6 +60,8 @@ export function attachGuest(sys, seed, opts = null) {
   if (!GUESTS[e.name].enter(sys, e, sys.time)) { park(sys, e); e.state = 'offstage'; }
   setVisible(sys, e, e.state === 'lair');
   sys.guests.push(e);
+  // His self-swallow runs from a prepass: a body marked swallowed is skipped by the brain loop itself.
+  sys.addModule?.(collapseModule);
   // Every later park rolls the next visit's identity, from inside the park itself.
   e.onPark = (s, g) => applyGuestIdentity(s, g, rollGuest(s, g));
   bindFollowers(sys, e);

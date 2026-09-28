@@ -28,6 +28,9 @@ const ROWS = [
   { key: 'drone', label: 'sam drone high', drone: 'awake' },
   { key: 'droneLow', label: 'sam drone low' },
   { key: 'droneRest', label: 'sam drone asleep (rel.)', drone: 'rest' },
+  { key: 'voidSlurp', label: 'sam slurp', fire: (a) => a.slurp({ ev: { kind: 'sam' } }) },
+  { key: 'voidEat', label: 'sam mouth loop', mouth: true },
+  { key: 'vanish', label: 'litter vanish', multi: [['xl', (a) => a.vanish({ mass: 0.0003 })], ['lt', (a) => a.vanish({ mass: 0.001 })], ['md', (a) => a.vanish({ mass: 0.01 })], ['hv', (a) => a.vanish({ mass: 0.1 })]] },
 ];
 
 const CSS = `
@@ -106,6 +109,13 @@ export function attachMixer(audio) {
       const on = !b.classList.contains('on');
       b.classList.toggle('on', on);
       audio.guestDrone(on, { rest: def.drone === 'rest' });
+    }));
+    // Held fully open while on, since the pond's own call each frame would otherwise shut it again.
+    if (def.mouth) fires.push(btn('▶', (b) => {
+      const on = !b.classList.contains('on');
+      b.classList.toggle('on', on);
+      audio.mouthAudition = on;
+      audio.guestMouth(on ? 1 : 0);
     }));
     const [s, v] = slider(-40, 0, audio.mix.levels[def.key], (db) => audio.setLevel(def.key, db));
     panel.append(row(def.label, fires, s, v));

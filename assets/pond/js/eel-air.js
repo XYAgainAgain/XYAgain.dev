@@ -6,8 +6,9 @@ import { floorHeightAt, floorSurfaceAt, sandColorAt, sandAlbedoAt } from './floo
 import { RELIEF_HEAL_TAU } from './relief-core.js';
 import {
   moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01,
-  burrowFront, buryDepth, digStamps, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
+  burrowFront, buryDepth, digStamps, airAllows, segDistSq, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
 } from './eel-air-core.js';
+import { logTaken } from './sam-eel-core.js';
 
 /* Verticality: every state that leaves the water column's comfort band. Peek, log flop, ballistic
    leap, burrow with dig puffs, and the moon bite, plus the per-eel moon mood the rest of the pond
@@ -112,12 +113,16 @@ export class AirStates {
 
   state(e) { return this.map.get(e) ?? null; }
 
-  /* Guests are ordinary eels to every other module, but not to this one: Eleanor has no air states
-     this wave, and the plan says so outright rather than leaning on her length. */
-  allows(e) {
+  /* Guests are ordinary eels to every other module, but not to this one: Eleanor has none, and Sam
+     has the list on his identity. Residents pass whatever the state, exactly as before. */
+  allows(e, state) {
     if (!this.sys.guests.includes(e)) return true;
-    return e.airStates === true || e.identity?.traits?.airStates === true;
+    return airAllows(e.airStates ?? e.identity?.traits?.airStates, state, !!this.sys.debug);
   }
+
+  /* A guest's peek creeps and rises at a fraction of the body-length rate, so ten units of void
+     breaches at about 0.15 units a second, not the half unit a resident-scale rate alone would give. */
+  pace(e) { return e.guestPolicy?.airPace ?? 1; }
 
   defaultFloor(e) { return -DEPTH + e.radius + 0.08; }
   defaultCeil(e) { return -e.radius * 0.5; }
@@ -278,9 +283,11 @@ export class AirStates {
 
   /* Everything a voluntary air state needs before it may begin: an open exemption anywhere refuses,
      and so does the shared cooldown and the stamina the peek and the leap both spend. */
-  ready(e, needStamina = true) {
+  ready(e, state, needStamina = true) {
     const sys = this.sys, st = this.map.get(e);
-    if (!st || st.state || e.slurpedBy || !this.allows(e)) return null;
+    if (!st || st.state || e.slurpedBy || !this.allows(e, state)) return null;
+    // A guest's controller only ticks this module through steer, so a state opened outside it would freeze.
+    if (e.guestPolicy && !e.steerHeld) return null;
     // A refuge contest owns both parties' ticks; starting an air state under one would run two
     // controllers on the same eel and pause the contest with its locks still held.
     if (sys.fear?.contesting?.(e)) return null;
@@ -296,7 +303,7 @@ export class AirStates {
   /* Reasons carry their own odds; a bare call from force() skips the roll entirely. The moon term
      and knobs.air.peek multiply everything, per the trigger table. */
   tryPeek(e, reason = 'pad', odds = null) {
-    const st = this.ready(e);
+    const st = this.ready(e, 'peek');
     if (!st) return false;
     if (e.tunnel) return false;
     const base = odds ?? (reason === 'ridge' ? 0.6 : reason === 'rain' ? 0.15 * (this.sys.rain?.envelope ?? 0) : 0.4);
@@ -319,7 +326,7 @@ export class AirStates {
 
   peekTick(sys, e, st, dt) {
     const now = sys.time;
-    const rise = PEEK_BL * e.length * (sys.motion?.reduced ? 0.5 : 1);
+    const rise = PEEK_BL * e.length * this.pace(e) * (sys.motion?.reduced ? 0.5 : 1);
     const ceil = this.defaultCeil(e);
     if (st.phase !== 'down') {
       // One spook scan feeds both the test and the record; scared() walks every live spook.
@@ -337,7 +344,10 @@ export class AirStates {
       if (e.head.y <= ceil) {
         // The scare was held under the peek; the nope itself waits for release(), since a 1.1 s
         // nopeUntil armed here would expire under a recovery that usually runs longer than that.
-        if (st.scared) { sys.emit('startle', e); st.deferNope = true; }
+        if (st.scared) {
+          if (e.identity?.startle !== false) sys.emit('startle', e);
+          st.deferNope = true;
+        }
         st.scared = false;
         this.startRecover(sys, e, st, 'air');
         return;
@@ -346,7 +356,7 @@ export class AirStates {
     const huffing = st.bitten && now < st.huffUntil;
     this.drive(sys, e, dt, {
       holdHeading: true,
-      speedBL: PEEK_BL,
+      speedBL: PEEK_BL * this.pace(e),
       ySet: st.yWant,
       squash: huffing ? 1.3 : 1,
       excite: huffing ? 0.6 : 0,
@@ -358,19 +368,25 @@ export class AirStates {
 
   logFits(e, log) { return log.rInner >= e.radius * 1.15 + 0.02; }
 
-  /* Eligibility plus the plan's odds. `target` is the destination the crossing was in the way of, so
-     the exit lands on the useful side of the log rather than wherever the head happened to point. */
-  tryFlop(e, log, target = null, force = false) {
+  /* Eligibility plus the plan's odds. `target` puts the exit on the log's far side from where the head
+     pointed. `rolled` is a voluntary flop whose odds a controller already drew (Sam's flop out of the lair). */
+  tryFlop(e, log, target = null, force = false, rolled = false) {
     const sys = this.sys;
-    const st = force ? this.map.get(e) : this.ready(e, false);
-    if (!st || !log || (force && (st.state || !this.allows(e)))) return false;
-    if (!this.allows(e) || e.tunnel) return false;
+    const st = force ? this.map.get(e) : this.ready(e, 'flop', false);
+    if (!st || !log || (force && (st.state || !this.allows(e, 'flop') || (e.guestPolicy && !e.steerHeld)))) return false;
+    if (!this.allows(e, 'flop') || e.tunnel) return false;
     // A crossing whose crest was drowned breaks no film, so it collects no air cooldown; without a
     // repeat guard the very next pickTarget rolls the same log again.
     if (!force && sys.time < st.flopUntil) return false;
+    const gp = e.guestPolicy;
+    // A guest never climbs a log somebody has run dibs on or is lying in, forced or not.
+    if (gp?.logEtiquette && logTaken(log, sys.eels, e)) return false;
     const path = this.flopPath(sys, e, log, target);
     if (!path) return false;
-    if (!force) {
+    // Voluntary guest flops are over dry wood, from close by: from a random retarget spot, ten units of
+    // body would U-turn out to the lead-in first and burn the whole give-up clock getting there.
+    if (gp && !force && (path.crestY <= 0 || Math.hypot(e.head.x - path.cx, e.head.z - path.cz) > path.rOuter + gp.flopReach)) return false;
+    if (!force && !rolled) {
       const focus = clamp01(e.focus ?? e.wits ?? 0.5);
       const dry = path.crestY > 0 ? 1 : 0.5;
       const env = sys.rain?.envelope ?? 0;
@@ -411,16 +427,24 @@ export class AirStates {
       cx = log.a.x + ax * t; cz = log.a.z + az * t;
     }
     let nx = head.x - cx, nz = head.z - cz;
+    // A guest near a log's end would otherwise take a normal along the axis and climb the wood lengthwise;
+    // the crossing is always square to the log for him, the side picked by his head or else his target.
+    if (e.guestPolicy) {
+      const along = (nx * ax + nz * az) / alen;
+      nx -= along * ax / alen; nz -= along * az / alen;
+      if (Math.hypot(nx, nz) < 0.2 && target) { nx = cx - target.x; nz = cz - target.z; const a2 = (nx * ax + nz * az) / alen; nx -= a2 * ax / alen; nz -= a2 * az / alen; }
+    }
     let nl = Math.hypot(nx, nz);
     if (nl < 1e-4) { nx = -az / alen; nz = ax / alen; nl = 1; }
     nx /= nl; nz /= nl;
     // The far side has to be the side the eel wanted; without a target the head's own normal decides.
     if (target && ((target.x - cx) * nx + (target.z - cz) * nz) > 0) { nx = -nx; nz = -nz; }
     const L = e.length, rO = log.rOuter;
+    const lead = e.guestPolicy ? e.guestPolicy.flopLead : 0.4 * L;
     return {
       log, cx, cz, nx, nz, rOuter: rO,
       crestY: log.a.y + rO,
-      approach: { x: cx + nx * (rO + 0.4 * L), z: cz + nz * (rO + 0.4 * L) },
+      approach: { x: cx + nx * (rO + lead), z: cz + nz * (rO + lead) },
       exit: { x: cx - nx * (rO + 0.5), z: cz - nz * (rO + 0.5) },
     };
   }
@@ -443,10 +467,14 @@ export class AirStates {
       return;
     }
     if (st.phase === 'approach') {
+      // Residents tick first, so one can take the log after he commits; still in the water, he just lets it go.
+      if (e.guestPolicy?.logEtiquette && logTaken(f.log, sys.eels, e)) { this.cancel(e); return; }
       // The approach point is where the climb lines up, not where the eel is going: arriving there
       // hands the target to the exit, or the head would park a body length short of the wood.
       const near = Math.hypot(head.x - f.approach.x, head.z - f.approach.z) < 0.5;
-      if (near || s > -f.rOuter) st.phase = 'cross';
+      // A guest already inside the lead-in crosses from there rather than backing ten units out to it.
+      const inside = !!e.guestPolicy && s > -(f.rOuter + e.guestPolicy.flopLead);
+      if (near || inside || s > -f.rOuter) st.phase = 'cross';
       this.drive(sys, e, dt, { tx: f.approach.x, tz: f.approach.z, speedBL: e.prowlBL, targetY: flank });
       return;
     }
@@ -476,6 +504,9 @@ export class AirStates {
     const repeat = st.stuckLog === log && now - st.stuckLogAt < FLOP_STUCK_WINDOW;
     st.stuckLog = log; st.stuckLogAt = now;
     if (!repeat || sys.fear?.contesting?.(e)) return false;
+    // The stuck detector's reach is 0.6 body lengths, six units on a guest: too far to call it climbing.
+    const gp = e.guestPolicy;
+    if (gp && segDistSq(e.head.x, e.head.z, log.a.x, log.a.z, log.b.x, log.b.z) > (log.rOuter + gp.flopReach) ** 2) return false;
     return this.tryFlop(e, log, e.target, true);
   }
 
@@ -485,7 +516,7 @@ export class AirStates {
      caller passes its own dt. */
   tryLeap(e, dt = 1 / 90) {
     const sys = this.sys;
-    const st = this.ready(e);
+    const st = this.ready(e, 'leap');
     if (!st || sys.motion?.reduced) return false;
     // An eel already throwing itself around is the one that leaves the water: a spin, a loop, or a
     // burst. Spin feeding is a meal, so the food gate yields to it; a leap can never start in a tunnel.
@@ -502,7 +533,7 @@ export class AirStates {
 
   /* The expansion contract's entry point: a firefly hunt hands a target instead of the roll. */
   leap(e, target = null) {
-    const st = this.ready(e);
+    const st = this.ready(e, 'leap');
     if (!st || this.sys.motion?.reduced) return false;
     return this.startLeap(e, st, target);
   }
@@ -624,7 +655,7 @@ export class AirStates {
      the body through something solid on its way down. */
   canBurrow(e) {
     const sys = this.sys, head = e.head, r3 = e.radius * 3;
-    if (e.tunnel || !this.allows(e)) return false;
+    if (e.tunnel || !this.allows(e, 'burrow')) return false;
     for (const s of sys.colliders.spheres) {
       // A submerged shoal has no sphere and invites a burrow; an emergent crest's wall is a wall.
       const rr = (s.rHit ?? s.r) + r3;
@@ -642,7 +673,7 @@ export class AirStates {
 
   tryBurrow(e, force = false) {
     const sys = this.sys, st = this.map.get(e);
-    if (!st || st.state || e.slurpedBy || !this.allows(e)) return false;
+    if (!st || st.state || e.slurpedBy || !this.allows(e, 'burrow')) return false;
     // One dig per hold bout, the way the coil and the sickle work: the asleep hold asks every tick,
     // and without this the eel climbs out and immediately digs back in for the whole bout.
     if (!force && st.burrowBout === e.gaitFrom) return false;
@@ -972,9 +1003,9 @@ export class AirStates {
 
   tryMoonBite(e, dt = 1 / 90, force = false) {
     const sys = this.sys;
-    const st = force ? this.map.get(e) : this.ready(e);
+    const st = force ? this.map.get(e) : this.ready(e, 'moonbite');
     if (!st || (force && st.state)) return false;
-    if (!this.allows(e) || e.tunnel || e.food || sys.time < e.fleeUntil) return false;
+    if (!this.allows(e, 'moonbite') || e.tunnel || e.food || sys.time < e.fleeUntil) return false;
     if (!force) {
       if (sys.time - st.biteAt < BITE_COOL) return false;
       const curious = e.traits?.curious ?? 1;
@@ -1076,7 +1107,11 @@ export class AirStates {
     const better = burrow ? val > R.watchVal + 1e-3 : val < R.watchVal - 1e-3;
     if (better) { R.watchVal = val; R.watchAt = now; }
     else if (now - R.watchAt > RECOVER_WATCH) { R.nudge += Math.PI / 6; R.watchAt = now; }
-    if (!R.extra && el > RECOVER_DEADLINE) { R.extra = true; R.at = now; }
+    // After a flop the whole body has to follow the head over the crest. A resident drains in seconds;
+    // a guest at a walking pace needs 1.25 body lengths of travel, or release() drapes him over the wood.
+    const gp = e.guestPolicy;
+    const deadline = gp ? Math.max(RECOVER_DEADLINE, 1.25 / Math.max(1e-3, e.cruiseBL)) : RECOVER_DEADLINE;
+    if (!R.extra && el > deadline) { R.extra = true; R.at = now; }
     if (R.extra && now - R.at > RECOVER_EXTRA) {
       // The plan prefers a rare kink to an eel parked above the film.
       this.logRecovery(sys, e, el, true);
@@ -1091,7 +1126,7 @@ export class AirStates {
     this.drive(sys, e, dt, {
       tx: e.head.x + Math.cos(ang) * reach,
       tz: e.head.z + Math.sin(ang) * reach,
-      speedBL: R.extra ? e.cruiseBL : e.prowlBL * RECOVER_SPEED,
+      speedBL: R.extra || gp ? e.cruiseBL : e.prowlBL * RECOVER_SPEED,
       targetY: ty,
       excite: now < (st.embarrassedUntil ?? 0) ? 0.6 : 0,
     });
@@ -1243,7 +1278,7 @@ export class AirStates {
     if (!state) return true;
     // A guest that has not opted in is refused here too, or a console poke would raise Eleanor's
     // ceiling and leave the largest body in the pond free to breach.
-    if (!this.allows(e)) return false;
+    if (!this.allows(e, state) || (e.guestPolicy && !e.steerHeld)) return false;
     if (state === 'peek') { this.startPeek(e, st, opts?.reason ?? 'forced'); return true; }
     if (state === 'leap') { st.airFor = 0; return this.startLeap(e, st, opts?.target ?? null, true); }
     if (state === 'burrow') return this.tryBurrow(e, true);

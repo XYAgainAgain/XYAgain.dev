@@ -254,7 +254,39 @@ export function createDetritusMeshes({
     rough: texNode(wood?.arm ? null : wood?.roughness),
   };
 
-  const uVoidSpan = uniform(0.8);        // seconds of the Space Eel's pull; reserved at voidT 0 in Part 1
+  const uVoidSpan = uniform(1.6);        // seconds of the Space Eel's pull; reserved at voidT 0 in Part 1
+  // The fall into the void is all render side: the sim only runs voidT, and these draws sit over the
+  // compose under a straight-down camera, so a drop in y would show nothing. Dark, tip, and fade instead.
+  const uVoidFade = uniform(0.7);        // fraction of the span by which the piece is black and gone
+  const uVoidTumble = uniform(1.5);      // radians of tip by then: a flat leaf ends nearly edge-on
+  const uVoidRim = uniform(new THREE.Vector4(0.55, 0.68, 1.0, 0.10));    // starlight rim color, strength
+  const uVoidRimWin = uniform(new THREE.Vector3(0.06, 0.18, 0.45));      // rim up by x, held to y, gone by z
+  const uVoidEdge = uniform(new THREE.Vector3(0.25, 0.55, 0.6));         // rim band: card alpha, stick side, lathe |n.xz|
+  const voidFall = (vt) => vt.div(uVoidSpan).clamp(0, 1);
+  const voidEase = (f) => { const e = f.div(uVoidFade).clamp(0, 1); return e.mul(e); };
+  const voidRot = (v, k, c, s) => v.mul(c).add(cross(k, v).mul(s)).add(k.mul(dot(k, v).mul(c.oneMinus())));
+  const voidSpin = () => fract(float(instanceIndex).mul(0.5)).mul(4).sub(1);
+  /* Tips a falling piece about a level axis through its center. At voidT 0 the If skips all of it, so the
+     placement and every frame vector stay exactly what the film gave them; `also` rides the same branch. */
+  const voidTumble = (fall, pivot, axis, p, vecs, also = null) => {
+    If(fall.greaterThan(0), () => {
+      const th = voidEase(fall).mul(uVoidTumble).mul(voidSpin()).mul(U.motionScale);
+      const c = cos(th), sn = sin(th);
+      p.assign(pivot.add(voidRot(p.sub(pivot), axis, c, sn)));
+      for (const v of vecs) v.assign(voidRot(v, axis, c, sn));
+      if (also) also();
+    });
+  };
+  /* The lit color going black and the coverage trailing it out, with a cold rim early in the fall. The
+     color is darkened before the premultiply, so the blend and the alpha contract are untouched. */
+  const voidShade = (fall, col, a, edge) => {
+    If(fall.greaterThan(0), () => {
+      const e = voidEase(fall);
+      const win = smoothstep(0, uVoidRimWin.x, fall).mul(smoothstep(uVoidRimWin.y, uVoidRimWin.z, fall).oneMinus());
+      col.assign(col.mul(e.oneMinus()).add(uVoidRim.xyz.mul(uVoidRim.w.mul(win).mul(edge))));
+      a.mulAssign(e.mul(e).oneMinus());
+    });
+  };
   // The camera looks straight down, so a floater's bob is invisible and only its tilt shades. Sliding
   // down the ride gradient is the part of following the water a viewer can actually see.
   const uSway = uniform(0.18);
@@ -342,6 +374,7 @@ export function createDetritusMeshes({
     const vTint = varying(vec3(0), 'vDtCTint');
     const vTan = varying(vec3(0), 'vDtCTan');
     const vBi = varying(vec3(0), 'vDtCBi');
+    const vFall = varying(float(0), 'vDtCFall');
 
     /* One card vertex's world placement. The lit draw and the silhouette pass both call it, so a leaf
        and its shadow can never end up on different ripples. */
@@ -350,7 +383,7 @@ export function createDetritusMeshes({
       const C2 = attribute('aDtC2', 'vec4'), C3 = attribute('aDtC3', 'vec4');
       const q = positionGeometry.xy;
       const kind = C1.x, age = C2.x.clamp(0, 1);
-      const shrink = C2.z.div(uVoidSpan).clamp(0, 1).oneMinus();
+      const fall = voidFall(C2.z), shrink = fall.oneMinus();
       // size is the half-length along the card's own axis and aspect is length over width.
       const halfL = C0.w.mul(shrink);
       const halfW = halfL.div(C1.y.max(uAspectMin));
@@ -368,21 +401,28 @@ export function createDetritusMeshes({
       const y = r.x.add(dot(off, g)).add(cu.x).add(uFloat);
       const gl = vec2(cu.y.mul(cr).add(cu.z.mul(sr)), cu.y.mul(sr).negate().add(cu.z.mul(cr))).add(g);
       const slide = g.mul(uSway);
-      return { C0, C1, C2, C3, kind, age, cr, sr, gl, fade: C2.y.clamp(0, 1),
+      return { C0, C1, C2, C3, kind, age, cr, sr, gl, fade: C2.y.clamp(0, 1), fall,
+        pivot: vec3(C0.x.sub(slide.x), r.x.add(uFloat), C0.y.sub(slide.y)), axis: vec3(sr, 0, cr),
         pos: vec3(C0.x.add(off.x).sub(slide.x), y, C0.y.add(off.y).sub(slide.y)) };
     };
 
     const mat = new THREE.NodeMaterial();
     mat.positionNode = Fn(() => {
       const s = place();
-      vN.assign(normalize(vec3(s.gl.x.negate(), 1, s.gl.y.negate())));
-      vTan.assign(vec3(s.cr, 0, s.sr.negate()));
-      vBi.assign(vec3(s.sr, 0, s.cr));
+      const p = s.pos.toVar();
+      const n = normalize(vec3(s.gl.x.negate(), 1, s.gl.y.negate())).toVar();
+      const tan = vec3(s.cr, 0, s.sr.negate()).toVar(), bi = vec3(s.sr, 0, s.cr).toVar();
+      // About the long axis: the midrib holds and the blade tips edge-on to the camera.
+      voidTumble(s.fall, s.pivot, s.axis, p, [n, tan, bi]);
+      vN.assign(n);
+      vTan.assign(tan);
+      vBi.assign(bi);
+      vFall.assign(s.fall);
       vRect.assign(tileRect(s.C2.w));
       vInfo.assign(vec4(s.fade, s.age, step(uKindEps.y, s.kind), float(instanceIndex)));
       // c3 is every kind's multiply now: the sim writes real palette values for leaves and chips too.
       vTint.assign(s.C3.rgb);
-      return s.pos;
+      return p;
     })();
 
     mat.fragmentNode = Fn(() => {
@@ -406,9 +446,10 @@ export function createDetritusMeshes({
       const ao = arm.r.mul(uAO).add(uAO.oneMinus());
       const albedo = src.rgb.mul(vTint).mul(mix(float(1), uLog.x, vInfo.y)).mul(ao);
       const ndl = dot(nn, U.moonDir).max(0);
-      const col = albedo.mul(U.moonColor).mul(ndl.mul(uLit.x).add(uLit.y)).mul(U.moonStrength).mul(uGain);
+      const col = albedo.mul(U.moonColor).mul(ndl.mul(uLit.x).add(uLit.y)).mul(U.moonStrength).mul(uGain).toVar();
       // Premultiplied, with the antialiasing confined to the fringe the cutout left standing.
-      const a = smoothstep(uCut, uCut.add(band), shape).mul(vInfo.x);
+      const a = smoothstep(uCut, uCut.add(band), shape).mul(vInfo.x).toVar();
+      voidShade(vFall, col, a, smoothstep(uCut, uCut.add(uVoidEdge.x), shape).oneMinus());
       return vec4(col.mul(a), a);
     })();
     setSurfaceBlend(mat);
@@ -421,9 +462,12 @@ export function createDetritusMeshes({
     const shadowMat = new THREE.NodeMaterial();
     shadowMat.positionNode = Fn(() => {
       const s = place();
+      const p = s.pos.toVar(), fade = s.fade.toVar();
+      // The shadow fades on 1 − e while the card's coverage trails on 1 − e², so it can never outlive it.
+      voidTumble(s.fall, s.pivot, s.axis, p, [], () => fade.mulAssign(voidEase(s.fall).oneMinus()));
       sRect.assign(tileRect(s.C2.w));
-      sInfo.assign(vec2(s.fade, float(instanceIndex)));
-      return s.pos;
+      sInfo.assign(vec2(fade, float(instanceIndex)));
+      return p;
     })();
     shadowMat.fragmentNode = Fn(() => {
       const local = uv();
@@ -486,6 +530,7 @@ export function createDetritusMeshes({
     const vUV = varying(vec2(0), 'vDtSUV');
     const vInfo = varying(vec4(0), 'vDtSInfo');   // distance from the nearest end, age, fade, shelter
     const vSnap = varying(float(0), 'vDtSSnap');  // world distance from the snap, huge on an unsnapped stick
+    const vFall = varying(float(0), 'vDtSFall');
 
     /* One ribbon vertex's world placement, shared by the lit draw and the silhouette pass. widthFloor
        is the silhouette's minimum half-width: a twig thinner than a texel aliases out of that target. */
@@ -495,7 +540,7 @@ export function createDetritusMeshes({
       const S4 = attribute('aDtS4', 'vec4');
       const rib = positionGeometry, tip = attribute('uv', 'vec2').x;
       const kRow = rib.x, side = rib.y, isStub = rib.z;
-      const shrink = S3.z.div(uVoidSpan).clamp(0, 1).oneMinus();
+      const fall = voidFall(S3.z), shrink = fall.oneMinus();
       const L = S0.w.mul(shrink).max(1e-4);
       const HW = S1.x.mul(shrink);
       const capT = HW.mul(uCap).div(L).min(uCapMax).max(1e-4);
@@ -551,24 +596,30 @@ export function createDetritusMeshes({
         .add(t.sub(0.5).mul(rB.x.sub(rA.x)))
         .add(dot(p.sub(S0.xy), perp).mul(dot(gMean, perp)))
         .add(lat.y).add(uFloat);
-      return { S0, S1, S2, S3, side, sideDir, perp3, tan3, cr, sr, t, L, snapped, snapD,
-        fade: S3.y.clamp(0, 1), pos: vec3(p.x, y, p.y) };
+      return { S0, S1, S2, S3, side, sideDir, perp3, tan3, cr, sr, t, L, snapped, snapD, fall,
+        pivot: vec3(S0.x.sub(slide.x), rA.x.add(rB.x).mul(0.5).add(uFloat), S0.y.sub(slide.y)),
+        axis: vec3(perp.x, 0, perp.y), fade: S3.y.clamp(0, 1), pos: vec3(p.x, y, p.y) };
     };
 
     const mat = new THREE.NodeMaterial();
     mat.positionNode = Fn(() => {
       const s = place(float(0));
+      const p = s.pos.toVar(), frame = s.sideDir.toVar();
+      const norm = s.perp3.mul(s.sr.negate()).add(vec3(0, 1, 0).mul(s.cr)).toVar(), tan = s.tan3.toVar();
+      // About the lateral axis, since a round stick spun on its own length shows nothing: one end dives.
+      voidTumble(s.fall, s.pivot, s.axis, p, [frame, norm, tan]);
       vSide.assign(s.side);
-      vFrame.assign(s.sideDir);
-      vNorm.assign(s.perp3.mul(s.sr.negate()).add(vec3(0, 1, 0).mul(s.cr)));
-      vTan.assign(s.tan3);
+      vFrame.assign(frame);
+      vNorm.assign(norm);
+      vTan.assign(tan);
+      vFall.assign(s.fall);
       vUV.assign(vec2(s.t.mul(s.L).mul(uTile.x).add(s.S1.z.mul(uPhase.x)),
         s.side.mul(uTile.y).add(s.S1.z.mul(uPhase.y))));
       // flags bit 0 is the shelter mark: the six long sticks the eels rest under, never cut by the ladder.
       vInfo.assign(vec4(min(s.t, s.t.oneMinus()).mul(s.L), s.S3.x.clamp(0, 1), s.fade,
         step(0.25, fract(s.S3.w.mul(0.5)))));
       vSnap.assign(mix(float(1e3), s.snapD, s.snapped));
-      return s.pos;
+      return p;
     })();
 
     mat.fragmentNode = Fn(() => {
@@ -601,7 +652,8 @@ export function createDetritusMeshes({
       const glint = pow(dot(nn, normalize(U.moonDir.add(vec3(0, 1, 0)))).max(0), uMen.w)
         .mul(smoothstep(0, uMen.y, abs(aSide.sub(uMen.x))).oneMinus()).mul(uMen.z).mul(rough.oneMinus().max(0.2));
       lit.addAssign(U.moonColor.mul(glint));
-      const a = vInfo.z;
+      const a = vInfo.z.toVar();
+      voidShade(vFall, lit, a, smoothstep(uVoidEdge.y, 1, aSide));
       return vec4(lit.mul(a), a);
     })();
     setSurfaceBlend(mat);
@@ -613,8 +665,10 @@ export function createDetritusMeshes({
     const shadowMat = new THREE.NodeMaterial();
     shadowMat.positionNode = Fn(() => {
       const s = place(uShadowTexel);
-      sFade.assign(s.fade);
-      return s.pos;
+      const p = s.pos.toVar(), fade = s.fade.toVar();
+      voidTumble(s.fall, s.pivot, s.axis, p, [], () => fade.mulAssign(voidEase(s.fall).oneMinus()));
+      sFade.assign(fade);
+      return p;
     })();
     shadowMat.fragmentNode = Fn(() => vec4(sFade))();
     setShadowBlend(shadowMat);
@@ -665,6 +719,7 @@ export function createDetritusMeshes({
     const vTanU = varying(vec3(0), 'vDtKTanU');
     const vUV = varying(vec4(0), 'vDtKUV');       // bark uv, then the raw lathe (u, v)
     const vInfo = varying(vec3(0), 'vDtKInfo');   // kindT, fade, height above the film
+    const vFall = varying(float(0), 'vDtKFall');
 
     /* One lathe vertex's world placement, shared by the lit draw and the silhouette pass. */
     const place = () => {
@@ -672,7 +727,7 @@ export function createDetritusMeshes({
       const g = positionGeometry;
       const v = g.x, uAround = g.y, code = g.z;
       const kindT = K1.x.clamp(0, 1);
-      const shrink = K1.w.div(uVoidSpan).clamp(0, 1).oneMinus();
+      const fall = voidFall(K1.w), shrink = fall.oneMinus();
       const size = K0.w.mul(shrink);
       const prof = mix(uConeRings, uAcornRings, kindT);
       // One profile vec4 scales the four rings, so one topology reads as a cone or an acorn.
@@ -715,20 +770,25 @@ export function createDetritusMeshes({
       const dY = vHi.sub(vLo).mul(tall).max(1e-5);
       const n2 = normalize(vec2(dY, dR.negate()));
       const nSide = normalize(vec3(radial.x.mul(n2.x), n2.y, radial.y.mul(n2.x)));
-      return { K0, K1, kindT, size, radial, isCap, code, v, uAround, off, gMean, yLocal,
-        nSide, fade: K1.z.clamp(0, 1), pos: vec3(xz.x, waterY.add(yLocal), xz.y) };
+      return { K0, K1, kindT, size, radial, isCap, code, v, uAround, off, gMean, yLocal, nSide, fall,
+        pivot: vec3(K0.x.sub(slide.x), waterY, K0.y.sub(slide.y)), axis: vec3(perpLean.x, 0, perpLean.y),
+        fade: K1.z.clamp(0, 1), pos: vec3(xz.x, waterY.add(yLocal), xz.y) };
     };
 
     const mat = new THREE.NodeMaterial();
     mat.positionNode = Fn(() => {
       const s = place();
-      vN.assign(mix(s.nSide, vec3(0, sign(s.code), 0), s.isCap));
-      vRad.assign(vec3(s.radial.x, 0, s.radial.y));
-      vTanU.assign(vec3(s.radial.y.negate(), 0, s.radial.x));
+      const p = s.pos.toVar(), n = mix(s.nSide, vec3(0, sign(s.code), 0), s.isCap).toVar();
+      const rad = vec3(s.radial.x, 0, s.radial.y).toVar(), tanU = vec3(s.radial.y.negate(), 0, s.radial.x).toVar();
+      voidTumble(s.fall, s.pivot, s.axis, p, [n, rad, tanU]);
+      vN.assign(n);
+      vRad.assign(rad);
+      vTanU.assign(tanU);
+      vFall.assign(s.fall);
       vUV.assign(vec4(vec2(s.uAround, s.v).mul(s.size).mul(uTile).add(s.K1.y.mul(uPhase)), s.uAround, s.v));
       // Height above the film at this fragment's own xz, so the waterline follows the ripple slope.
       vInfo.assign(vec3(s.kindT, s.fade, s.yLocal.sub(dot(s.off, s.gMean))));
-      return s.pos;
+      return p;
     })();
 
     mat.fragmentNode = Fn(() => {
@@ -756,7 +816,9 @@ export function createDetritusMeshes({
       const ndl = dot(nn, U.moonDir).max(0);
       const lit = albedo.mul(ao).mul(U.moonColor).mul(ndl.mul(uLit.x).add(uLit.y)).mul(U.moonStrength).mul(uGain).toVar();
       lit.addAssign(U.moonColor.mul(smoothstep(0, uMen.x, abs(vInfo.z)).oneMinus().mul(uMen.y).mul(rough.oneMinus().max(0.2))));
-      const a = vInfo.y;
+      const a = vInfo.y.toVar();
+      // Seen straight down, the silhouette is wherever the body's normal lies level.
+      voidShade(vFall, lit, a, smoothstep(uVoidEdge.z, 1, length(nn.xz)));
       return vec4(lit.mul(a), a);
     })();
     setSurfaceBlend(mat);
@@ -768,8 +830,10 @@ export function createDetritusMeshes({
     const shadowMat = new THREE.NodeMaterial();
     shadowMat.positionNode = Fn(() => {
       const s = place();
-      sFade.assign(s.fade);
-      return s.pos;
+      const p = s.pos.toVar(), fade = s.fade.toVar();
+      voidTumble(s.fall, s.pivot, s.axis, p, [], () => fade.mulAssign(voidEase(s.fall).oneMinus()));
+      sFade.assign(fade);
+      return p;
     })();
     shadowMat.fragmentNode = Fn(() => vec4(sFade))();
     setShadowBlend(shadowMat);
@@ -947,6 +1011,7 @@ export function createDetritusMeshes({
     knobs: {
       sticks: S.knobs, cards: C.knobs, chunky: K.knobs, tray: T.knobs,
       handoff: uHandoffU, handoffId: uHandoffId, dither: uDitherCells, voidSpan: uVoidSpan,
+      fall: { fade: uVoidFade, tumble: uVoidTumble, rim: uVoidRim, rimWindow: uVoidRimWin, edge: uVoidEdge },
       sway: uSway, litterShadow: U.litterShadow ?? null,
       kindEps: uKindEps, atlasOn: uAtlasOn, atlasGrid: uAtlasGrid, atlasInset: uAtlasInset, atlasBias: uAtlasBias,
     },

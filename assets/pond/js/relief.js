@@ -24,6 +24,7 @@ export class ReliefField {
     // World units between the two gradient taps, so the shader can turn a byte difference into a slope.
     this.uStep = uniform((2 * extent) / this.grid.res);
     this.uStrength = uniform(1);
+    this.uActive = uniform(0);
     this.strength = 1;
     this.acc = 0;
     this.stamped = false;
@@ -63,6 +64,7 @@ export class ReliefField {
   heightAt(x, z) { return heightAt(this.grid, x, z) * this.strength; }
 
   update(dt) {
+    this.uActive.value = this.grid.box ? 1 : 0;
     if (!this.grid.box) return;
     // A stamp moves the float field alone, and floorSurfaceAt reads that at once; the texture catches up
     // here, this frame, instead of waiting on the heal, or a grain lands on a mound nothing is drawing.
@@ -72,6 +74,7 @@ export class ReliefField {
     const el = Math.min(this.acc, 1);
     this.acc = 0;
     if (heal(this.grid, el, RELIEF_HEAL_TAU)) this.tex.needsUpdate = true;
+    this.uActive.value = this.grid.box ? 1 : 0;
   }
 
   dispose() { this.tex.dispose(); }

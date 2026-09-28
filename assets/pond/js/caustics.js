@@ -175,10 +175,8 @@ export class CausticsPass {
     const prevAlpha = r.getClearAlpha();
     r.setClearColor(0x000000, 1);
     r.setRenderTarget(this.rt);
-    r.clearColor();   // no depth attachment on these targets, so only the color clear is valid
     r.render(this.scene, this.camera);
     r.setRenderTarget(this.rtRefl);
-    r.clearColor();
     r.render(this.sceneRefl, this.camera);
     r.setRenderTarget(this.accB);
     this.accQuad.render(r);

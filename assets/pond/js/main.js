@@ -32,6 +32,7 @@ import { PuffCloud } from './puff-cloud.js';
 import { AlgaeTufts } from './algae.js';
 import { Rushes } from './reeds.js';
 import { createDetritus } from './detritus.js';
+import { HORIZON_SLURP } from './sam-eel.js';
 import { createDetritusMeshes } from './detritus-render.js';
 import { PondInput, detectLoop } from './input.js';
 import { readEelChoice, writeEelChoice, setupIdleFade, askAboutEels, bindSoundButton, bindEelToggle, bindNamesToggle, bindJunk } from './ui.js';
@@ -132,6 +133,7 @@ async function boot() {
   U.reliefTexel = relief.uTexel;
   U.reliefStep = relief.uStep;
   U.reliefStrength = relief.uStrength;
+  U.reliefActive = relief.uActive;
   setRelief(relief);
   const habitat = new Habitat();
 
@@ -145,6 +147,10 @@ async function boot() {
   // a bare ?cast= freezes the seeded draw as-is.
   const cast = params.has('cast') ? (params.get('cast') ?? '').split(',').map((s) => s.trim()).filter(Boolean) : null;
   const eels = new EelSystem(underScene, U, shading, seed, extent, colliders, sim, motion, view, { cast, debug: params.get('debug') === '1' });
+  // Sam's sky reads the finger, his peek, and the view through this: render-side reads only.
+  eels.renderer.sys = eels;
+  // The nebula tile bakes with the GPU renderer, off screen, the moment both exist.
+  eels.renderer.attachGpu(renderer);
   // ?brain= and ?moon= pin a 0–1 scalar for testing; a bare or junk value is no pin at all.
   const pin = (name) => { const raw = params.get(name); return raw === null || raw.trim() === '' ? null : finite01(Number(raw), null); };
   eels.pins = { brain: pin('brain'), moon: pin('moon') };
@@ -370,6 +376,12 @@ async function boot() {
     floorAt: floorHeightAt,
   });
   rain.onFeatureDrop = (x, z, strength, radius) => detritus.ring(x, z, strength, radius);
+  // Sam's sweep, his horizon's accretion, and his body vacuum read the guest body from the frame side, and a
+  // feature drop landing on him while he peeks is a star instead of a ring.
+  floaters.guests = detritus.guests = eels.guests;
+  detritus.effects = effects;
+  detritus.onVanish = (x, z, mass) => audio.vanish({ mass, pan: toPan(x) });
+  rain.voidCatch = (x, z) => eels.voidCatch(x, z, { rain: true });
   // The atlas arrives as the manifest's own set, whose albedo carries the cutout in its alpha; passing it
   // as `atlas` would look for an albedoOpacity key and silently fall back to the plain leaf map.
   const detritusMeshes = createDetritusMeshes({ U, sim, textures, buffers: detritus.buffers, pads, shading });
@@ -410,6 +422,8 @@ async function boot() {
     },
     4: {
       on: () => {
+        // Sam's cheap void items go here, before rung 5 drops the whole pond's resolution.
+        eels.renderer.setVoidTier(1);
         algae.setQuality({ tuftFraction: 0.5 });
         pads.setQuality({ lilyFraction: 0.4, puffScale: 0.5 });
         U.algaeDetail.value = 0;
@@ -423,6 +437,7 @@ async function boot() {
         detritusMeshes.setShadow(0);
       },
       off: () => {
+        eels.renderer.setVoidTier(0);
         algae.setQuality({ tuftFraction: 1 });
         pads.setQuality({ lilyFraction: 1, puffScale: 1 });
         treats.setQuality({ shadow: true });
@@ -443,14 +458,15 @@ async function boot() {
       on: () => {
         // Textures are pinned for the visit now; a settled rung 6 picks the smaller tier on the next boot.
         sim.setResolution(384); caustics.setResolution(512);
-        eels.renderer.setVoidQuality({ nebOct: 2, galaxies: 4, twinkleMin: 0.65, corona: 0, sheets: 2, tailOct: 2 });
+        eels.renderer.setVoidTier(2);
       },
-      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); eels.renderer.setVoidQuality({}); },
+      off: () => { sim.setResolution(SIM_RES); caustics.setResolution(CAUSTIC_RES); eels.renderer.setVoidTier(1); },
     },
     // 7 halves the caustic update rate in the frame loop; 8 only derives eels.perfHot, which both guests already read.
   };
 
   function applyRung(rung, prev) {
+    if (params.get('debug') === '1') console.log(`Pond: quality rung ${prev} → ${rung}`);
     if (rung > prev) for (let r = prev + 1; r <= rung; r++) RUNGS[r]?.on();
     else for (let r = prev; r > rung; r--) RUNGS[r]?.off();
     eels.perfHot = rung >= 8;
@@ -812,7 +828,6 @@ async function boot() {
     if (U.litterShadow.value > 0) detritusMeshes.renderShadow(renderer);
     renderer.setRenderTarget(underRT);
     renderer.setClearColor(0x000000, 1);
-    renderer.clear();
     renderer.render(underScene, camera);
     if (debugQuad) { debugQuad.update(); renderer.setRenderTarget(null); debugQuad.render(renderer); }
     else {
@@ -839,12 +854,17 @@ async function boot() {
       if (guest.body?.visible) audio.setTrackPan(guest.index, toPan(guest.head.x));
       // Latched only once the bed has loaded: guestDrone is a no-op before that, and the file may never exist.
       const wantDrone = !!(guest.body?.visible && guest.identity?.void);
-      const droneRest = wantDrone && guest.state === 'lair' && guest.returnLeg >= 2;
+      // A collapse out of the lair keeps the bed at rest until the cut, rather than swelling it through the 2 s collapse.
+      const droneRest = wantDrone && ((guest.state === 'lair' && guest.returnLeg >= 2) || (guest.state === 'collapse' && droneResting));
       if ((wantDrone !== droneOn || droneRest !== droneResting) && audio.players.drone?.loaded) {
         droneOn = wantDrone; droneResting = droneRest;
-        audio.guestDrone(wantDrone, { track: guest.index, rest: droneRest });
+        // A self-swallow cuts the bed dead; the controller latches droneCut and this consumes it.
+        audio.guestDrone(wantDrone, { track: guest.index, rest: droneRest, instant: !wantDrone && !!guest.droneCut });
+        guest.droneCut = false;
       }
-    }
+      // The mouth's loop rides the eased size the renderer draws, so it swells and shrinks with the hole.
+      audio.guestMouth(wantDrone ? (guest._hole ?? 0) / HORIZON_SLURP : 0, guest.index);
+    } else if (audio.unlocked) audio.guestMouth(0);
     if (eels.enabled && t - lastCrackle > 4 && Math.random() < dt * 0.08) {
       lastCrackle = t;
       const e = eels.eels[Math.floor(Math.random() * eels.eels.length)];
@@ -853,8 +873,9 @@ async function boot() {
     if (t > 1) eels.endPrewarm();
   }
 
+  let booted = false;   // a tab shown mid warm-up must not start the loop over the forced prewarm state
   function start() {
-    if (running || document.hidden) return;
+    if (running || !booted || document.hidden) return;
     running = true;
     renderer.setAnimationLoop(frame);
   }
@@ -876,14 +897,18 @@ async function boot() {
   applyMotion();
   /* One hidden pass through the real draw order behind the loader, so the first visible frame compiles
      nothing. Nothing here steps the water, the wake, or the relief: those carry state the eels read. */
-  function warmPasses() {
+  const yieldFrame = () => new Promise((r) => (document.hidden ? setTimeout(r, 0) : requestAnimationFrame(() => r())));
+  async function warmPasses() {
+    // A frame between passes: each builds its own targets' pipelines, and together they were a 1 s stall.
     caustics.render();
+    await yieldFrame();
     if (U.litterShadow.value > 0) detritusMeshes.renderShadow(renderer);
     renderer.setRenderTarget(underRT);
     renderer.setClearColor(0x000000, 1);
-    renderer.clear();
     renderer.render(underScene, camera);
+    await yieldFrame();
     surface.render();
+    await yieldFrame();
     if (overScene.children.length) {
       const prevAutoClear = renderer.autoClear;
       renderer.autoClear = false;
@@ -906,9 +931,16 @@ async function boot() {
       const cast = eels.eels;
       if (cast[0]) undo.push(eels.renderer.prewarmLate(cast[0], 'jelly'));
       undo.push(eels.renderer.prewarmLate(cast[1] ?? guest, 'void'));
-      await renderer.compileAsync(underScene, camera);
-      await renderer.compileAsync(overScene, camera);
-      warmPasses();
+      // r185's compileAsync already yields between render items, so one call per scene is the finest slice
+      // it offers. Each compiles under the target it draws into, or WebGPU keys the wrong pipelines.
+      const prevTarget = renderer.getRenderTarget();
+      try {
+        renderer.setRenderTarget(underRT);
+        await renderer.compileAsync(underScene, camera);
+        renderer.setRenderTarget(null);
+        await renderer.compileAsync(overScene, camera);
+      } finally { renderer.setRenderTarget(prevTarget); }
+      await warmPasses();
     } catch (err) {
       console.warn('Pond: warm-up incomplete', err);
     } finally {
@@ -922,6 +954,7 @@ async function boot() {
   // Warm-up sits between the Timer's construction and its first update, and that whole gap would
   // otherwise arrive as frame one's delta and drag the quality ladder up before a frame was drawn.
   timer.reset();
+  booted = true;
   start();
 
   if (params.get('debug') === '1') {
@@ -959,6 +992,53 @@ async function boot() {
         await stats(caustics.rt, 'caustics');
         await stats(underRT, 'under');
         await stats(wake.rtA, 'wake');
+        await stats(caustics.accA, 'causticAcc');
+        await stats(sim.maskRT, 'mask');
+        await stats(detritusMeshes.shadowRT, 'litterShadow (bytes)');
+      },
+      /* For the black-floor hunt: re-renders the under pass with one suspect switched off at a time and logs
+         the screen-center brightness each gives, so whichever row comes back bright is the culprit. */
+      hunt: async () => {
+        // State the hunters flagged, read before anything is re-rendered: a leaked autoClear, his open lens.
+        console.log('autoClear', renderer.autoClear, 'hole', guest._hole ?? 0, 'lens capture', !!guest.voidSet?.hole.capture.visible, 'rung', gov.rung);
+        await stats(sim.maskRT, 'mask');
+        await stats(detritusMeshes.shadowRT, 'litterShadow (bytes)');
+        stop();
+        const lum = async () => {
+          renderer.setRenderTarget(underRT);
+          renderer.render(underScene, camera);
+          renderer.setRenderTarget(null);
+          const w = 64, h = 64;
+          const raw = await renderer.readRenderTargetPixelsAsync(underRT, (underRT.width - w) >> 1, (underRT.height - h) >> 1, w, h);
+          let s = 0;
+          for (let i = 0; i < raw.length; i += 4) for (let c = 0; c < 3; c++) s += raw instanceof Uint16Array ? halfToFloat(raw[i + c]) : raw[i + c];
+          return +(s / (raw.length / 4) / 3).toFixed(4);
+        };
+        const rows = [{ suspect: 'nothing (baseline)', lum: await lum() }];
+        const tryU = async (name, u, v) => {
+          if (!u) return;
+          const was = u.value; u.value = v;
+          rows.push({ suspect: `U.${name} = ${v} (was ${was})`, lum: await lum() });
+          u.value = was;
+        };
+        await tryU('coverStrength', U.coverStrength, 0);
+        await tryU('litterShadow', U.litterShadow, 0);
+        await tryU('reliefActive', U.reliefActive, 0);
+        await tryU('coverWobble', U.coverWobble, 0);
+        await tryU('algaeGain', U.algaeGain, 0);
+        const names = new Map([[eels.renderer.group, 'eels'], [effects.mesh, 'effects'], [sediment.mesh, 'sediment'],
+          [detritusMeshes.sinkTray, 'sink tray'], [algae.mesh, 'algae tufts'], [algae.cloudMesh, 'algae haze']]);
+        for (const c of underScene.children) {
+          if (!c.visible) continue;
+          c.visible = false;
+          // The floor is the one unnamed group buildFloor adds; anything else unnamed shows its type and id.
+          const label = names.get(c) ?? c.name ?? '';
+          rows.push({ suspect: `hide ${label || (c.isGroup && c.id === underScene.children.find((k) => k.isGroup)?.id ? 'floor' : c.type)} #${c.id}`, lum: await lum() });
+          c.visible = true;
+        }
+        console.table(rows);
+        start();
+        return rows;
       },
     };
     eels.on('swap', (p) => console.log('pond: ' + p.food.from + ' swam off, ' + p.food.to + ' swam in'));

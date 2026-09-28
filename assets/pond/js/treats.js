@@ -179,6 +179,8 @@ class TreatSystem {
     // A high-contrast object crossing the screen twice a second during a held feed is exactly what
     // reduced motion is for; with the eels off nothing advances the flight, so it cannot fly either.
     if (this.motion.reduced || !sys.enabled) {
+      // Lands this instant, so this is the film: straight through his body if he is under it.
+      if (sys.voidCatch?.(x, z)) return null;
       const crumb = sys.feed(x, z, amount, { ...base, t: t0 });
       sys.emitAt('drop', crumb.x, crumb.y, crumb.z, { detail: { amount, held, tossed: false }, dropId: crumb.dropId, t: crumb.t });
       return crumb;
@@ -347,7 +349,12 @@ class TreatSystem {
       this.touchdown(tr);
       return;
     }
-    if (!pad) { this.touchdown(tr); return; }
+    if (!pad) {
+      // A pad above him catches it first; open water over his body is a hole in the pond.
+      if (sys.voidCatch?.(tr.crumb.x, tr.crumb.z)) { sys.unfeed(tr.crumb); this.retire(tr); return; }
+      this.touchdown(tr);
+      return;
+    }
     const mode = padContact(tr.vHoriz, this.knobs.padBounceV, this.knobs.padRestV);
     // A flat, fast arrival skips off the rim without the pad ever registering the hit.
     if (mode === 'bounce') { this.skip(tr, now, pad); return; }

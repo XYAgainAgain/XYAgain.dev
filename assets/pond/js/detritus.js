@@ -7,14 +7,16 @@ import {
   detritusKnobs, layoutDetritus, makeContactOut, stepItem, respawnItem, offFrame, age01, itemFinite,
   makeRingList, pushRing, pruneRings, ringPush, swellSlope, matEdge, resolveStations,
   makeTray, trayLive, offerSink, stepCardLife,
-  driftWake, impactWake, resolveStickPairs, handPush,
+  driftWake, impactWake, resolveStickPairs, handPush, vacuumEligible, vacuumStep, itemMass,
 } from './detritus-core.js';
+import { drainPoint } from './sam-eel-core.js';
 
 /* Floating litter, CPU side: the 47-item cast's drift, turning, contact, and sink, filling the instance
    buffers detritus-render.js draws. No scene objects live here. */
 
 const EEL_FORCE = 0.55;                        // units/s² a passing body lends a floating piece
 const POKE_MAX = 16;                           // sub-frame pointer samples honored per tick
+const SPARK = [1.0, 0.55, 0.18];               // the optional vacuum pinprick, in his suns' orange
 
 class DetritusSystem {
   constructor({
@@ -25,6 +27,17 @@ class DetritusSystem {
     this.seed = seed;
     this.t = 0;
     this.respawned = 0;
+    this.vacuumed = 0;
+    this.guests = null;       // the eels' guest roster, handed over by main: Sam's body is the drain
+    this.effects = null;      // the additive pool, for knobs.guest.vacuumFlash only
+    this.onVanish = null;     // (x, z, mass) the moment a drawn piece starts its fall: main hangs the sound here
+    this.rootKnobs = knobs;   // knobs.guest lives beside knobs.detritus
+    this.drainOut = { x: 0, y: 0, z: 0, d: 0 };
+    this.wellOut = { x: 0, y: 0, z: 0, d: 0 };
+    this.wellA = { x: 0, z: 0 };
+    this.wellB = { x: 0, z: 0 };
+    this.wellR = 0; this.wellG = 0;
+    this.wellEel = null; this.wellHX = 0; this.wellHZ = 0; this.wellV = 0;
     this.tray = makeTray();
     // The dials live in whatever knob bag the caller keeps (pond.eels.knobs.detritus once main hands
     // over eels.knobs), so a taste pass retunes the flow, the turning, and the sink without a reload.
@@ -233,11 +246,91 @@ class DetritusSystem {
     return true;
   }
 
-  stepPool(pool, ctx, h, now, ns, dirK, drawn = pool.length) {
+  /* The visible void guest, if he is the one on stage; frame-side reads of his sim state only. */
+  voidGuest() {
+    for (const g of this.guests ?? []) if (g.identity?.void && g.body?.visible && g.openMask) return g;
+    return null;
+  }
+
+  /* The drain's reach from his spine, in world units, off knobs.guest.vacuum (a multiple of his radius). */
+  vacuumReach(g) {
+    const v = this.rootKnobs?.guest?.vacuum;
+    return (Number.isFinite(v) && v >= 0 ? v : 1.6) * g.radius;
+  }
+
+  /* His gravity well for this tick, off knobs.guest: reach in radii, pull at the horizon in units/s², and
+     the smoothed head speeds across which a flyby lets go (full pull at or under the first, none past the second). */
+  updateWell(g, h) {
+    const k = this.rootKnobs?.guest ?? {};
+    const hx = g.head.x, hz = g.head.z;
+    if (this.wellEel === g && h > 0) {
+      // Clamped so a stage entrance, which moves the head in one tick, never reads as a flyby.
+      const v = Math.min(6, Math.hypot(hx - this.wellHX, hz - this.wellHZ) / h);
+      this.wellV += (v - this.wellV) * Math.min(1, h * 4);
+    } else this.wellV = 0;
+    this.wellEel = g; this.wellHX = hx; this.wellHZ = hz;
+    const r = Number.isFinite(k.well) && k.well >= 0 ? k.well : 9;
+    const G = Number.isFinite(k.wellPull) && k.wellPull >= 0 ? k.wellPull : 2.4;
+    const esc = Array.isArray(k.wellEscape) && k.wellEscape[1] > k.wellEscape[0] ? k.wellEscape : [1, 2];
+    const f = Math.min(1, Math.max(0, (this.wellV - esc[0]) / (esc[1] - esc[0])));
+    this.wellR = Math.max(this.vacuumReach(g), r * g.radius);
+    this.wellG = G * (1 - f * f * (3 - 2 * f));
+  }
+
+  /* The well's pull at one point, added into out: toward the nearest open spine, from nothing at the rim
+     (a smoothstep, so the edge is the weakest part) up to the full pull at the horizon. */
+  wellAt(sam, x, z, reach, out) {
+    const at = drainPoint(sam.pts, sam.openMask, x, z, this.wellR, this.wellOut);
+    if (!at || at.d < 1e-6) return;
+    const s = Math.min(1, Math.max(0, (this.wellR - at.d) / Math.max(1e-6, this.wellR - reach)));
+    const a = this.wellG * s * s * (3 - 2 * s) / at.d;
+    out.x += (at.x - x) * a; out.z += (at.z - z) * a;
+  }
+
+  /* Used up: the pinprick flash if vacuumFlash calls for one, then back into the pool like a sunk leaf. */
+  swallowed(it, ctx) {
+    const f = this.rootKnobs?.guest?.vacuumFlash;
+    if (Number.isFinite(f) && f > 0) this.effects?.spawn(it.x, -0.05, it.z, 'spark', { color: SPARK });
+    respawnItem(it, this.rng, ctx, true);
+    this.vacuumed++;
+  }
+
+  stepPool(pool, ctx, h, now, ns, dirK, drawn = pool.length, sam = null) {
     const k = this.knobs;
     const mf = this.matField;
+    const reach = sam ? this.vacuumReach(sam) : 0;
+    const well = sam ? this.wellR : 0;
+    // Broad phase: the open spine's box grown by the well, so most litter skips the segment walk entirely.
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    if (sam) {
+      const pts = sam.pts, m = sam.openMask;
+      for (let j = 0; j < pts.length; j++) {
+        if (!m?.[j]) continue;
+        const p = pts[j];
+        if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x; if (p.z < z0) z0 = p.z; if (p.z > z1) z1 = p.z;
+      }
+      x0 -= well; x1 += well; z0 -= well; z1 += well;
+    }
     for (let i = 0; i < pool.length; i++) {
       const it = pool[i];
+      // Mid-fall into the void: none of the film's business (drift, contact, the hand, wakes, the sink tray,
+      // the frame-edge respawn) touches it. With him gone it just finishes shrinking where it is.
+      if (it.voidT > 0) {
+        const at = sam ? drainPoint(sam.pts, sam.openMask, it.x, it.z, Infinity, this.drainOut) : null;
+        if (vacuumStep(it, at, h, ctx.ms > 0.5)) this.swallowed(it, ctx);
+        continue;
+      }
+      let pulled = false;
+      if (sam && it.x >= x0 && it.x <= x1 && it.z >= z0 && it.z <= z1 && vacuumEligible(it)) {
+        const at = drainPoint(sam.pts, sam.openMask, it.x, it.z, well, this.drainOut);
+        if (at && at.d <= reach) {
+          // itemMass is planform area, which makes a broad leaf outweigh a twig; a card is a tenth as dense.
+          if (i < drawn) this.onVanish?.(it.x, it.z, itemMass(it) * (it.card ? 0.1 : 1));
+          if (vacuumStep(it, at, h, ctx.ms > 0.5)) this.swallowed(it, ctx);
+          continue;
+        }
+        pulled = !!at && this.wellG > 0;
+      }
       if (it.card && !stepCardLife(it, this.tray, ctx, this.rng, h)) continue;
       const long = it.stick || it.long;
       const halfLen = it.stick ? it.len * 0.5 : it.halfL;
@@ -259,12 +352,28 @@ class DetritusSystem {
         ctx.dirFx = (pax + B.x) * 0.5 * dirK;
         ctx.dirFz = (paz + B.z) * 0.5 * dirK;
         ctx.dirTorque = ((pax - B.x) * uz - (paz - B.z) * ux) * dirK * 0.5 / lenFor;
+        if (pulled) {
+          // Each end falls on its own, so the near end leads and a branch swings round onto him.
+          const wA = this.wellA, wB = this.wellB;
+          wA.x = wA.z = wB.x = wB.z = 0;
+          this.wellAt(sam, ax, az, reach, wA);
+          this.wellAt(sam, bx, bz, reach, wB);
+          ctx.dirFx += (wA.x + wB.x) * 0.5 * dirK;
+          ctx.dirFz += (wA.z + wB.z) * 0.5 * dirK;
+          ctx.dirTorque += ((wA.x - wB.x) * uz - (wA.z - wB.z) * ux) * dirK * 0.5 / lenFor;
+        }
       } else {
         const c = this.current(it.x, it.z, now, this.curOut);
         ctx.curX = c.x; ctx.curZ = c.z;
         ctx.curTorque = 0;
         const A = this.pushAt(it.x, it.z, ns, this.pushA);
         ctx.dirFx = A.x * dirK; ctx.dirFz = A.z * dirK; ctx.dirTorque = 0;
+        if (pulled) {
+          const wA = this.wellA;
+          wA.x = wA.z = 0;
+          this.wellAt(sam, it.x, it.z, reach, wA);
+          ctx.dirFx += wA.x * dirK; ctx.dirFz += wA.z * dirK;
+        }
       }
       // The hand reads the item's real silhouette, so it adds to the push the bodies already wrote.
       if (this.poke0.n) handPush(it, this.poke0, ctx);
@@ -307,9 +416,11 @@ class DetritusSystem {
     pruneRings(this.rings, this.t, this.knobs.ringSpeed);
     this.wakeN = 0;
     const ns = this.packSlots();
-    this.stepPool(this.sticks, ctx, h, this.t, ns, dirK, this.draw.sticks);
-    this.stepPool(this.cards, ctx, h, this.t, ns, dirK, this.draw.cards);
-    this.stepPool(this.chunky, ctx, h, this.t, ns, dirK, this.draw.chunky);
+    const sam = this.voidGuest();
+    if (sam) this.updateWell(sam, h); else this.wellEel = null;
+    this.stepPool(this.sticks, ctx, h, this.t, ns, dirK, this.draw.sticks, sam);
+    this.stepPool(this.cards, ctx, h, this.t, ns, dirK, this.draw.cards, sam);
+    this.stepPool(this.chunky, ctx, h, this.t, ns, dirK, this.draw.chunky, sam);
     // After the pools move, so a pair is separated where they actually ended the tick, and only over what
     // the ladder is drawing: an invisible twig must not bat a branch across the pond.
     resolveStickPairs(this.sticks, ctx, this.draw.sticks);
@@ -375,7 +486,7 @@ class DetritusSystem {
       detritus: {
         pool: this.sticks.length + this.cards.length + this.chunky.length,
         draw: { ...this.draw }, quality: { ...this.quality },
-        retired: this.tray.claimed, respawned: this.respawned, sunk: this.tray.sunk,
+        retired: this.tray.claimed, respawned: this.respawned, sunk: this.tray.sunk, vacuumed: this.vacuumed,
         sinking: trayLive(this.tray), rings: this.rings.n, wakes: this.wakeN, t: this.t,
       },
     };

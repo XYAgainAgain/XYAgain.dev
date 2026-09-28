@@ -229,8 +229,12 @@ export const IDENTITIES = [
     startle: false,    // no stage-owned site may emit a startle on his behalf
     growsOnSlurp: false,
     presence: true,    // a soft steering writer instead of a fear map entry
+    selfSwallow: true, // a forced exit on stage is the collapse into his own singularity, not a swim-off
+    // His rounds run steer under GUEST_POLICY (sam-eel-core.js), plus bore runs, crest perches, the lean,
+    // and his two small meals: the crumb nobody wanted and the duckweed sweep.
+    guestSteer: { tunnels: true, ridges: true, lean: true, defer: true, sweep: true },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1] },
-    traits: { spookMul: 0, cover: 0.4, turn: [1.0, 1.5], cruise: [0.26, 0.34], prowl: [0.12, 0.2], kind: 'sam', braincellUsage: 0.9, nose: 0.6, stim: 0.15, leap: 0, home: 'log', spinOdds: 0, fears: { eleanor: 0, finger: 0, eel: 0, sam: 0 } },
+    traits: { spookMul: 0, cover: 0.4, turn: [1.0, 1.5], cruise: [0.26, 0.34], prowl: [0.12, 0.2], kind: 'sam', braincellUsage: 0.9, nose: 0.6, stim: 0.15, leap: 0, home: 'log', spinOdds: 0, airStates: ['peek', 'flop'], fears: { eleanor: 0, finger: 0, eel: 0, sam: 0 } },
     quirks: {},
   },
 ];

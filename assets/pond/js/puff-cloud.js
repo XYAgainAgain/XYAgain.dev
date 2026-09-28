@@ -23,6 +23,7 @@ export class PuffCloud {
     this.U = U;
     this.time = 0;
     this.next = 0;
+    this.latestDeath = 0;
     this.pool = Math.max(1, pool | 0);
     const n = this.pool;
     this.a = new Float32Array(n * 4);   // originX, originZ, birth, life
@@ -65,7 +66,7 @@ export class PuffCloud {
       const B = attribute('aPuffB', 'vec4');
       const life = A.w.max(1e-3);
       const age = this.uTime.sub(A.z).toVar();
-      // An unborn or expired card collapses to nothing, which is what makes a spent pool free.
+      // Expired cards collapse while other slots remain alive; the CPU skips an entirely spent pool.
       const live = step(float(0), age).mul(step(life, age).oneMinus());
       const t = age.max(0).toVar();
       const p = A.xy.add(B.xy.mul(B.z).mul(t)).toVar();
@@ -128,6 +129,8 @@ export class PuffCloud {
   setTime(t) {
     this.time = t;
     this.uTime.value = t;
+    // Leave a conservative float32 margin; keep the bound so a debug clock rewind can revive cards.
+    this.mesh.visible = t < this.latestDeath + Math.max(0.01, Math.abs(this.latestDeath) * 1e-6);
   }
 
   /* One flower's cloud, born at its downwind petal rim. Ring buffer: a sixth simultaneous burst takes
@@ -147,8 +150,10 @@ export class PuffCloud {
       this.next = (this.next + 1) % this.pool;
       this.a[o] = rimX + c.offX * size; this.a[o + 1] = rimZ + c.offZ * size;
       this.a[o + 2] = birth; this.a[o + 3] = c.life;
+      this.latestDeath = Math.max(this.latestDeath, this.a[o + 2] + this.a[o + 3]);
       this.b[o] = c.dirX; this.b[o + 1] = c.dirZ; this.b[o + 2] = c.speed; this.b[o + 3] = c.seed;
     }
+    if (cards.length) this.mesh.visible = true;
     if (y !== undefined) this.uPuffY.value = y;
     this.aA.needsUpdate = this.aB.needsUpdate = true;
     return cards.length;

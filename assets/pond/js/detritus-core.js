@@ -653,6 +653,8 @@ export function resolveStickPairs(sticks, ctx, count = sticks.length) {
   let hits = 0;
   for (let i = 0; i < n; i++) {
     const A = sticks[i];
+    // A piece falling into the void has left the film; nothing on it may shove, or be shoved by, a neighbor.
+    if (A.voidT > 0) continue;
     stickEnds(A, eA);
     const mA = itemMass(A);
     // A kinked tip swings well off the straight chord, so the box has to carry that lateral offset too or
@@ -660,6 +662,7 @@ export function resolveStickPairs(sticks, ctx, count = sticks.length) {
     const latA = Math.abs(stickLat(A, 1));
     for (let j = i + 1; j < n; j++) {
       const B = sticks[j];
+      if (B.voidT > 0) continue;
       const reach = (A.len + B.len) * 0.5 + A.halfWidth + B.halfWidth + latA + Math.abs(stickLat(B, 1));
       if (Math.abs(A.x - B.x) > reach || Math.abs(A.z - B.z) > reach) continue;
       stickEnds(B, eB);
@@ -1038,6 +1041,39 @@ export function itemFinite(item) {
   return Number.isFinite(item.x) && Number.isFinite(item.z)
     && Number.isFinite(item.vx) && Number.isFinite(item.vz)
     && Number.isFinite(item.angle) && Number.isFinite(item.av);
+}
+
+// The body vacuum (Sam the Space Eel, B5 item 4): voidT runs in seconds to VOID_SPAN, which is the render
+// side's uVoidSpan, and the long axis swings onto his spine over the first VOID_TILT of it.
+export const VOID_SPAN = 1.6, VOID_TILT = 0.6;
+
+/* Any floating piece may go in: every kind here is inanimate. A card already sinking is under the film. */
+export function vacuumEligible(item) {
+  return !!item && !(item.voidT > 0) && (!item.card || item.sink === SINK.NONE) && itemFinite(item);
+}
+
+/* One step of the fall into the void: it closes on `target` (null once he is gone) over the time it has
+   left, so it lands there exactly at VOID_SPAN. Returns true on the one step it is used up. */
+export function vacuumStep(item, target, h, turn = true) {
+  const t0 = Math.max(0, item.voidT || 0);
+  const t1 = Math.min(VOID_SPAN, t0 + Math.max(0, h));
+  if (target && Number.isFinite(target.x) && Number.isFinite(target.z)) {
+    const dx = target.x - item.x, dz = target.z - item.z;
+    if (turn && t0 < VOID_TILT && dx * dx + dz * dz > 1e-8) {
+      // Yaw 0 runs along +z. A long piece may point either end at him, so it takes the smaller swing.
+      let d = wrapAngle(Math.atan2(dx, dz) - item.angle);
+      if (d > Math.PI / 2) d -= Math.PI; else if (d < -Math.PI / 2) d += Math.PI;
+      const fa = t1 >= VOID_TILT ? 1 : (t1 - t0) / (VOID_TILT - t0);
+      item.angle = wrapAngle(item.angle + d * fa);
+    }
+    const fp = t1 >= VOID_SPAN ? 1 : (t1 - t0) / (VOID_SPAN - t0);
+    item.x += dx * fp;
+    item.z += dz * fp;
+  }
+  // The film lets go of it: no drift, no spin, nothing carried into the respawn.
+  item.vx = 0; item.vz = 0; item.av = 0;
+  item.voidT = t1 > 0 ? t1 : 1e-6;
+  return t1 >= VOID_SPAN;
 }
 
 export function offFrame(item, rect) {

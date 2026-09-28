@@ -7,6 +7,7 @@ import { EelRenderer } from './eel-render.js';
 import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPattern, rollNickname } from './eel-identity.js';
 import { GLITTER_SCROLL_WRAP } from './eel-stars-core.js';
 import { pushFingerSample, seedFingerHistory, tumbleFor } from './treats-core.js';
+import { drainPoint } from './sam-eel-core.js';
 
 // How long a spook stays in sys.spooks. eel-fear.js ages its per-eel "already counted" ids on the same
 // clock, because an id that nothing can re-observe anymore has no duplicate left to suppress.
@@ -171,7 +172,7 @@ export class EelSystem {
       // The bore run: seconds without progress before a run gives up, the per-eel gap between runs
       // (snakeCool multiplies it for the grid swimmer), the odds per unit of cover, the crowding divisor,
       // and how far ahead the bore carve samples.
-      tunnel: { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, carve: 2.5, snakeCool: 2 },
+      tunnel: { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, carve: 2.5, snakeCool: 2, samCool: 90 },
       // The falling crumb (treats.js). Gravity is slowed because the real number reads as a teleport at
       // pond scale; toss takes no cap, and the pad thresholds are horizontal speeds in units/s.
       treat: {
@@ -204,6 +205,14 @@ export class EelSystem {
         samOdds: 0.8, samStay: 1, samCap: 1, samGrows: 0, samWait: 45, samCruise: 0.8,
         samRounds: [90, 150], samNap: [120, 240],
         presence: 0.35, calm: 4, bow: 0.08, bowReach: 0.5,
+        // Slice B: the flop out of the lair, and residents napping against his lit tail while he sleeps.
+        samExitFlop: 0.35, perchOdds: 0.35, perchNap: [10, 25],
+        // Slice C: seconds a crumb sits unwanted before it is his, the vacuum's reach in his radii, and
+        // the optional pinprick where a piece of litter goes in (0 is silent).
+        samDefer: 4, vacuum: 1.6, vacuumFlash: 1,
+        // His gravity well on the litter: reach in radii (9 is 4.5 body widths), pull at the horizon in
+        // units/s², and the head speeds (units/s) across which a flyby slips free of it.
+        well: 9, wellPull: 2.4, wellEscape: [1, 2],
       },
     };
     this.pins = { brain: null, moon: null };   // ?brain= and ?moon=, filled by main through finite01
@@ -467,6 +476,43 @@ export class EelSystem {
       if (e.food === crumb) e.food = null;
       if (e.bonkFood === crumb) e.bonkFood = null;
     }
+  }
+
+  /* A treat reaching the film over his open body, or a feature raindrop over a peeking one, falls through:
+     no splash and no food, one permanent star where it went in. True even when the sky refused the star. */
+  voidCatch(x, z, opts = null) {
+    if (!this.enabled || !Number.isFinite(x) || !Number.isFinite(z)) return false;
+    const rain = !!opts?.rain;
+    for (const g of this.guests) {
+      if (!g.identity?.void || !g.body?.visible || !g.openMask) continue;
+      if (rain && this.air?.state(g)?.state !== 'peek') continue;
+      // Rain only lands on what the peek lifted to the film; the rest of him is under a hand of water.
+      if (!drainPoint(g.pts, g.openMask, x, z, g.radius, this.voidHit ??= { x: 0, y: 0, z: 0, d: 0 }, rain ? -g.radius - 0.05 : -Infinity)) continue;
+      this.renderer.addSessionStar?.(x, z, rain ? { rain: true } : { warm: true });
+      return true;
+    }
+    return false;
+  }
+
+  /* His pull takes a crumb out of the world the moment it starts, so nobody can claim it mid-flight, but
+     leaves its mesh for his controller to stretch; dropFood below finishes it. */
+  takeFood(crumb) {
+    if (!crumb) return;
+    this.unscent(crumb);
+    this.braincell?.forget(crumb);
+    const i = this.foods.indexOf(crumb);
+    if (i >= 0) this.foods.splice(i, 1);
+    crumb.claims = 0;
+    for (const e of this.allOfCast()) {
+      if (e.food === crumb) e.food = null;
+      if (e.bonkFood === crumb) e.bonkFood = null;
+    }
+  }
+
+  dropFood(crumb) {
+    if (!crumb) return;
+    if (crumb.mesh) { this.group.remove(crumb.mesh); crumb.mesh = null; }
+    crumb.amount = 0;
   }
 
   /* The food cap goes out through the full removal path: an evicted crumb left claimed keeps its

@@ -182,6 +182,38 @@ export function finiteRope(r) {
   return true;
 }
 
+/* The plume quad, boxed along the rope's chord: an axis-aligned box on a diagonal rope wastes up to twice
+   the pixels; a chord too short to aim keeps the last axis. `angle` is rotation.z under rotation.x = -PI/2,
+   which puts local +x on world (ux, uz) and local +y on (uz, -ux). */
+export function ropeBox(r, pad, out) {
+  const { p, n } = r;
+  const t = (n - 1) * 3;
+  let ux = p[t] - p[0], uz = p[t + 2] - p[2];
+  const L = Math.hypot(ux, uz);
+  if (L > 1e-6 && Number.isFinite(L)) { ux /= L; uz /= L; }
+  else if (Number.isFinite(out.ux) && Number.isFinite(out.uz) && Math.hypot(out.ux, out.uz) > 0.5) { ux = out.ux; uz = out.uz; }
+  else { ux = 1; uz = 0; }
+  const vx = uz, vz = -ux;
+  let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const dx = p[i * 3] - p[0], dz = p[i * 3 + 2] - p[2];
+    const u = dx * ux + dz * uz, v = dx * vx + dz * vz;
+    if (u < u0) u0 = u;
+    if (u > u1) u1 = u;
+    if (v < v0) v0 = v;
+    if (v > v1) v1 = v;
+  }
+  const pd = Number.isFinite(pad) && pad > 0 ? pad : 0;
+  const um = (u0 + u1) * 0.5, vm = (v0 + v1) * 0.5;
+  out.x = p[0] + ux * um + vx * vm;
+  out.z = p[2] + uz * um + vz * vm;
+  out.sx = u1 - u0 + pd * 2;
+  out.sz = v1 - v0 + pd * 2;
+  out.angle = Math.atan2(-uz, ux);
+  out.ux = ux; out.uz = uz;
+  return out;
+}
+
 /* The widest angle any two consecutive segments make on screen, which is the one number the kink cap has
    to hold. Measured in x and z, because that is the curve the gas is drawn around. */
 export function ropeMaxAngle(r) {

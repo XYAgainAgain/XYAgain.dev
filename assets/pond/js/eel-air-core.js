@@ -14,6 +14,17 @@ export function knob(v, fallback = 1) {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
+/* A guest's air gate. `true` admits every state, an array only its own, anything else none. The state
+   is required: an omitted one is a caller bug, never "any", so it throws under debug and refuses otherwise. */
+export function airAllows(list, state, strict = false) {
+  if (typeof state !== 'string' || !state) {
+    if (strict) throw new Error('[air] a guest air check was made without naming the state');
+    return false;
+  }
+  if (list === true) return true;
+  return Array.isArray(list) && list.includes(state);
+}
+
 /* Brightness from the orbit clock, per eel. The wrap and the max() are load-bearing: an unwrapped
    offset takes sin negative at the boundary, and a negative base to the 1.5 power is NaN. */
 export function moonBrightAt(phase01, moonOff = 0, pin = null) {

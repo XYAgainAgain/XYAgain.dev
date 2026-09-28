@@ -1,8 +1,9 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, vec2, vec3, vec4, float, uv, sin, atan, mix, smoothstep, step, dot, length, exp, normalize, cameraViewMatrix, positionWorld, normalWorld, normalLocal, screenUV, screenSize, If, TWO_PI } from 'three/tsl';
+import { Fn, uniform, vec2, vec3, vec4, float, uv, sin, atan, mix, smoothstep, step, dot, length, exp, normalize, cameraViewMatrix, positionWorld, normalWorld, normalLocal, screenUV, screenSize, viewportTexture, texture, If, Discard, TWO_PI } from 'three/tsl';
 import { DEPTH } from './config.js';
 import { valueNoise2, fbm2Y } from './shading.js';
 import { makeTailCloud } from './eel-tail-cloud.js';
+import { NEB_PERIOD } from './void-sky-core.js';
 
 /* Sam the Space Eel's look: a noodle-shaped hole in reality, two orange dwarf eyes, and a nebula tail,
    with a singularity he only opens to eat. Opaque materials write depth to alpha; additive ones don't. */
@@ -29,6 +30,13 @@ const FLARE_CELLS = 20;                   // noise cells around the accretion ri
 export const FLARE_WRAP = Math.PI * 16;
 // The sun clock's ping-pong turning point, in seconds: far enough out that a reversal is a curiosity.
 export const SUN_WRAP = 2048;
+
+// ?voiddebug=nostars,nogal,noneb,notail,nocorona,nobody (and nometeor, nocomet, nowave, nosession, noflash,
+// nolens) seeds the show* dials below with that layer off, so a frame-time drop can be pinned on its owner.
+const VOID_DEBUG = new Set(String(new URLSearchParams(globalThis.location?.search ?? '').get('voiddebug') ?? '')
+  .split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+const seedOn = (token) => (VOID_DEBUG.has(token) ? 0 : 1);
+const tmpSize = new THREE.Vector2();
 
 /* Every taste constant in the void, live as pond.eels.knobs.void.<dial>.value. Uniform dials land on
    the next frame; the plain {value} entries are CPU-side and land on the next sync. */
@@ -125,19 +133,44 @@ export function makeVoidDials() {
     // The singularity: the ring's reach past the horizon, its spin, and the two ease clocks in seconds.
     ringGain: uniform(1.0), ringSpin: uniform(1.5), ringScale: uniform(2.5),
     holeOpen: { value: 0.4 }, holeClose: { value: 0.6 },
+    // The self-swallow's last frame: the ring at collapseScale times its size, held collapseHold seconds
+    // (0 is exactly one frame).
+    collapseScale: { value: 3 }, collapseHold: { value: 0 },
+    // The lens at his mouth: pull is the bend at the horizon's edge in screen heights, times the meal's
+    // scale; eps is the depth slack a bent sample needs to count as behind the hole.
+    lensPull: { value: 0.06 }, lensEps: uniform(0.01),
+    // Meteors: the mean wait in seconds between streaks (20 to 60 s at 40, doubled under reduced motion,
+    // 0 for none), then the streak's look. One in twelve is a comet; its tail and spread are screen heights.
+    meteors: { value: 40 }, meteorGain: uniform(2.5), meteorWidth: { value: 1.1 },
+    cometGain: uniform(1.2), cometComa: { value: 2.4 }, cometTail: { value: 0.09 }, cometSpread: uniform(0.02),
+    // Session stars and the pinprick each one is born with; flashSize is the flash's core in pixels.
+    sessionGain: uniform(4), flashGain: uniform(3), flashSize: uniform(2.2),
+    // The finger's gravity wave: displacement at the crest and its width, both in screen heights, the
+    // seconds it takes to cross his body and to settle after, and how close to him counts as a touch.
+    waveAmp: { value: 0.02 }, waveWidth: uniform(0.04), waveCross: { value: 0.6 }, waveSettle: { value: 0.4 },
+    waveReach: { value: 1.3 },
+    // How far the moon's reflection leans toward his peeking head, in world units, full inside half a unit
+    // and gone at two. Negative leans it away, which is the other reading of the plan.
+    moonPull: { value: 0.04 },
+    // Profiling switches, 1 on and 0 off. The three sky layers are uniform Ifs that skip their math; tail,
+    // corona, and body take their draws off the render list on the next sync, while the stage keeps them.
+    showStars: uniform(seedOn('nostars')), showGal: uniform(seedOn('nogal')), showNeb: uniform(seedOn('noneb')),
+    showTail: { value: seedOn('notail') }, showCorona: { value: seedOn('nocorona') }, showBody: { value: seedOn('nobody') },
+    // Slice D's terms, each a uniform If that is false at rest; the lens is a draw.
+    showMeteor: uniform(seedOn('nometeor')), showComet: uniform(seedOn('nocomet')), showWave: uniform(seedOn('nowave')),
+    showSession: uniform(seedOn('nosession')), showFlash: uniform(seedOn('noflash')), showLens: { value: seedOn('nolens') },
   };
 }
 
-/* Three octaves of iterated domain warp with the clock in the domain: the cloud never repeats and never
-   stops evolving. Rung 6 branches past the third fetch. */
-function nebula(p, V, time, live) {
-  const t = time.mul(V.nebDrift).mul(live);
-  const q = p.mul(V.nebFreq).add(vec2(t, t.mul(0.6))).toVar();
-  const a = valueNoise2(q);
-  const b = valueNoise2(q.mul(2.1).add(vec2(a.mul(V.nebWarp), a.mul(V.nebWarp).mul(-1.3))).add(17.3));
+/* Three octaves of iterated domain warp, baked once per page into a repeating tile (void-nebula.js) and
+   read here in one fetch. `scroll` is the CPU's accumulated drift through it, wrapped at a whole tile. */
+function nebula(p, V, scroll, tile) {
+  const q = p.mul(V.nebFreq).add(scroll);
+  const s = texture(tile, q.div(NEB_PERIOD)).toVar();
+  const a = s.x, b = s.y;
   const c = b.toVar(), f = a.mul(0.6).add(b.mul(0.4)).toVar();
   If(V.nebOct.greaterThan(2.5), () => {
-    c.assign(valueNoise2(q.mul(4.4).add(vec2(b.mul(V.nebWarp), b.mul(V.nebWarp).mul(0.8))).add(41.7)));
+    c.assign(s.z);
     f.assign(a.mul(0.5).add(b.mul(0.33)).add(c.mul(0.17)));
   });
   // Coverage still carves real black sky; the fetched octave differences only choose which gas is visible.
@@ -171,29 +204,65 @@ function nebula(p, V, time, live) {
   return mix(old, physical, V.nebReal.clamp(0, 1)).mul(cov).mul(V.nebula);
 }
 
+/* What the body used to rebuild every fragment, now set once per render on the CPU: the universe's rotation
+   and drift offset, the spike axis, and the target's aspect. Done on the render, not in syncVoid, so an
+   arrival frame or a motion flip can never draw last visit's sky. */
+function voidFrame(V, firmament) {
+  const f = {};
+  const rot = uniform(new THREE.Vector4(1, 0, 0, 0)).onRenderUpdate((_, u) => {
+    // The same function the CPU uses to place a drop, so a star lands where the shader will draw it. It
+    // only reads the loop: a render can run more than once a frame, and renderer.sync owns the step.
+    firmament.frame(f);
+    u.value.set(f.c, f.s, f.ox, f.oy);
+  });
+  const spike = uniform(new THREE.Vector2(1, 0)).onRenderUpdate((_, u) => {
+    u.value.set(Math.cos(V.spikeAngle.value), Math.sin(V.spikeAngle.value));
+  });
+  const aspect = targetAspect((a) => { if (firmament) firmament.aspect = a; });
+  return { rot, spike, aspect };
+}
+
+/* ScreenNode's own rule for screenSize: the bound target's size, else the drawing buffer's. */
+function targetAspect(onValue = null) {
+  return uniform(1).onRenderUpdate(({ renderer }) => {
+    const rt = renderer.getRenderTarget();
+    const w = rt ? rt.width : renderer.getDrawingBufferSize(tmpSize).x;
+    const h = rt ? rt.height : tmpSize.y;
+    const a = h > 0 ? w / h : 1;
+    onValue?.(a);
+    return a;
+  });
+}
+
 /* The body. No light, no caustic, no cover shadow: whatever part of the fixed universe sits under this
    pixel, bent a little at the rim. Two crossing coils show the same stars, which is the whole trick. */
 export function makeVoidMaterial(e, U, ctx) {
-  const { position, vNormal, vWorld, firmament, V } = ctx;
+  const { position, vNormal, vWorld, firmament, V, nebTile } = ctx;
+  const F = voidFrame(V, firmament);
   const m = new THREE.NodeMaterial();
   m.positionNode = position;
   m.fragmentNode = Fn(() => {
-    const time = U.time;
-    const live = step(0.5, U.motionScale);   // reduced motion parks the universe; it keeps its stars
+    const live = step(0.5, U.motionScale);   // reduced motion halves the twinkle; the CPU freezes the motion
     const n = normalize(vNormal);
-    const aspect = screenSize.x.div(screenSize.y);
-    const sp = vec2(screenUV.x.sub(0.5).mul(aspect), screenUV.y.sub(0.5)).toVar();
+    const sp = vec2(screenUV.x.sub(0.5).mul(F.aspect), screenUV.y.sub(0.5)).toVar();
     // The jelly's toward-center warp, applied to the sampling coordinate instead of the scene: stars
     // bend inward at the silhouette. lens is in pixels, so it divides by the screen's short side.
     const nView = cameraViewMatrix.mul(vec4(n, 0)).xyz;
     // Only the silhouette bends: across the rest of the girth he is a flat window, so a coil crossing a coil shows one sky.
     const edge = smoothstep(V.lensBand.min(0.999), 1.0, dot(n, vec3(0, 1, 0)).abs().oneMinus());
     sp.assign(sp.sub(nView.xy.mul(V.lens).mul(edge).div(screenSize.y)));
-    const p = firmament.uv(sp, V, time, live).toVar();
-    // Stars are sized in pixels, so the field keeps its look at any viewport or device ratio.
-    const col = firmament.stars(p, screenSize.y, V, time, live)
-      .add(firmament.galaxies(p, V, time))
-      .add(nebula(p, V, time, live)).toVar();
+    const p = firmament.uv(sp, F.rot).toVar();
+    // The finger's ring bends the universe itself, so every layer below rides it.
+    firmament.warp(p, V);
+    // Stars are sized in pixels, so the field keeps its look at any viewport or device ratio. Each layer
+    // sits behind its show dial as a uniform If, so switching one off drops its whole cost.
+    const col = vec3(0).toVar();
+    If(V.showStars.greaterThan(0.5), () => { col.addAssign(firmament.stars(p, screenSize.y, V, live, F.spike)); });
+    col.addAssign(firmament.galaxies(p, V));
+    If(V.showNeb.greaterThan(0.5), () => { col.addAssign(nebula(p, V, firmament.uNebScroll, nebTile)); });
+    // Each of these is behind its own uniform If and costs one compare until something happens.
+    col.addAssign(firmament.session(p, screenSize.y, V, live));
+    col.addAssign(firmament.meteor(p, screenSize.y, V));
     // FrontSide hands this camera the tube's far wall, so the rim band takes |n.y| the way the sheen does.
     const rim = smoothstep(0.15, 0.85, dot(n, vec3(0, 1, 0)).abs().oneMinus());
     col.mulAssign(mix(vec3(1), vec3(V.rimGain), rim));
@@ -248,6 +317,12 @@ export function makeCoronaMaterial(e, U, V, seed) {
     const p = uv().sub(0.5).mul(2);
     const d = length(p).toVar();
     const disc = float(2).div(V.coronaSize.max(1e-3)).toVar();   // the eye's radius, in this quad's half-width
+    // The quad is additive, so the face has to be masked off or the glow would flatten the granules.
+    const seat = smoothstep(disc.mul(0.86), disc, d).mul(smoothstep(0.93, 1.0, d).oneMinus()).toVar();
+    const out = vec3(0).toVar();
+    // The seat is exactly zero over the face and in the quad's corners: the branch skips the harmonics
+    // there (WebGPU demotes a discard and runs on), and the discard skips the blend.
+    If(seat.greaterThan(0), () => {
     // Height above the limb in disc radii. Everything below is a function of it, so reach is a number
     // rather than whatever a thresholded field happened to leave standing.
     const h = d.div(disc).sub(1).max(0).toVar();
@@ -269,19 +344,19 @@ export function makeCoronaMaterial(e, U, V, seed) {
     const H = f.max(1e-4).pow(V.flarePeak.max(0.5)).mul(V.flare).mul(heat).max(1e-4).toVar();
     const prom = h.div(H).oneMinus().max(0).pow(1.6);
     const glow = h.div(V.limbFall.max(1e-3)).oneMinus().max(0).pow(2);
-    // The quad is additive, so the face has to be masked off or the glow would flatten the granules.
-    const seat = smoothstep(disc.mul(0.86), disc, d).mul(smoothstep(0.93, 1.0, d).oneMinus());
     const a = glow.mul(V.limbGain).add(prom.mul(V.promGain)).mul(seat);
     const col = mix(vec3(...FLARE_HOT), vec3(...FLARE_RIM), smoothstep(0, 0.35, h));
-    return vec4(col.mul(a).mul(V.coronaGain).mul(V.corona).mul(heat), 0);
+    out.assign(col.mul(a).mul(V.coronaGain).mul(V.corona).mul(heat));
+    }).Else(() => { Discard(); });
+    return vec4(out, 0);
   })();
   additive(m);
   m.uAng = uAng;
   return m;
 }
 
-/* The horizon sphere and its accretion ring. The lens quad and the orbiting specks are a later slice;
-   these two are the meal itself. The renderer places and scales them from the eased open. */
+/* The horizon sphere, its accretion ring, and the lens. The renderer places and scales all three from
+   the eased open; the orbiting specks belong to floaters.js. */
 export function makeSingularity(e, U, V) {
   const geoHorizon = new THREE.SphereGeometry(1, 12, 8);
   const geoRing = new THREE.PlaneGeometry(1, 1);
@@ -305,18 +380,89 @@ export function makeSingularity(e, U, V) {
   })();
   additive(matRing);
   matRing.side = THREE.DoubleSide;
+  // r185 draws a transparent DoubleSide twice, back pass then front; a flat quad lights only one of them.
+  matRing.forceSinglePass = true;
 
+  const lens = makeLens(V);
   const horizon = new THREE.Mesh(geoHorizon, matHorizon);
   const ring = new THREE.Mesh(geoRing, matRing);
-  ring.rotation.x = -Math.PI / 2;        // the camera is straight down, so the quad lies in the pond plane
+  const lensMesh = new THREE.Mesh(geoRing, lens.material);
+  const capture = new THREE.Mesh(geoRing, lens.capture);
+  // The camera is straight down, so both quads lie in the pond plane.
+  ring.rotation.x = lensMesh.rotation.x = -Math.PI / 2;
   ring.renderOrder = 5;
-  horizon.frustumCulled = ring.frustumCulled = false;
-  horizon.visible = ring.visible = false;
+  // Drawn after the jellies' 2 and their depth pass's 2.5, clear of the tufts' 3; what it bends is the
+  // capture taken before the first jelly.
+  lensMesh.renderOrder = 2.9;
+  // After every opaque and before the first jelly; nothing else in the under-scene sits between 1 and 2.
+  capture.renderOrder = 1.9;
+  // Its triangles cover no pixel: the draw exists only so its copy runs at that point in the frame.
+  capture.scale.setScalar(0);
+  horizon.frustumCulled = ring.frustumCulled = lensMesh.frustumCulled = capture.frustumCulled = false;
+  horizon.visible = ring.visible = lensMesh.visible = capture.visible = false;
   return {
-    horizon, ring, uRingAng,
+    horizon, ring, uRingAng, lens: lensMesh, capture, uLens: lens.uLens,
     spin(dt, live) { uRingAng.value = (uRingAng.value + dt * V.ringSpin.value * (live ? 1 : 0.2)) % (Math.PI * 2); },
-    dispose() { geoHorizon.dispose(); geoRing.dispose(); matHorizon.dispose(); matRing.dispose(); },
+    dispose() {
+      geoHorizon.dispose(); geoRing.dispose(); matHorizon.dispose(); matRing.dispose();
+      lens.material.dispose(); lens.capture.dispose();
+      // r185 copies into a per-target clone of the texture, which the tap holds as its value after a draw.
+      if (lens.grab.value !== lens.frame) lens.grab.value?.dispose();
+      lens.frame.dispose();
+    },
   };
+}
+
+/* The jelly's framebuffer tap, bent toward the hole. The quad is 4 horizon radii and the horizon its inner
+   quarter; a pixel at d samples strength × r_h / d nearer the center, which folds the floor's far side
+   around the rim the way a real lens does. Only the opaque under-target is in the copy. */
+function makeLens(V) {
+  // x: the pull at the horizon's edge in screen heights; y: the horizon's own depth, for the validity test.
+  const uLens = uniform(new THREE.Vector2(0, 0));
+  const aspect = targetAspect();
+  // Its own texture, never the shared one: each jelly rewrites that singleton just before its own draw,
+  // so by order 3 it holds every jelly but the last. Half float, as the under-target is.
+  const frame = new THREE.FramebufferTexture();
+  frame.type = THREE.HalfFloatType;
+  frame.minFilter = THREE.LinearFilter;
+  frame.generateMipmaps = false;
+  const grab = viewportTexture(screenUV, null, frame);
+  // The capture's draw copies at order 1.9. The lens's clone resolves to the same per-target texture,
+  // which is also r185's dedupe key, so at order 2.9 it finds the copy done and takes none of its own.
+  const capture = new THREE.NodeMaterial();
+  capture.fragmentNode = Fn(() => vec4(grab.rgb.mul(0), 0))();
+  capture.colorWrite = false;
+  capture.depthWrite = false;
+  capture.depthTest = false;
+  capture.transparent = true;
+  capture.side = THREE.DoubleSide;
+  capture.forceSinglePass = true;
+  const m = new THREE.NodeMaterial();
+  m.fragmentNode = Fn(() => {
+    const s = uv().sub(0.5).mul(2).toVar();
+    const d = length(s).toVar();
+    // Quad +x is screen right and quad +y is world -z, which is screen up: toward the center is (-x, +y).
+    const disp = uLens.x.mul(0.25).div(d.max(0.25));
+    const toward = vec2(s.x.negate().div(aspect), s.y).div(d.max(1e-4));
+    const bent = grab.sample(screenUV.add(toward.mul(disp)));
+    // A bent sample that lands on something nearer than the hole would drag foreground through it.
+    const valid = step(uLens.y.sub(V.lensEps), bent.a);
+    // Inside the horizon the black sphere has to show; past 4 r_h are the quad's empty corners.
+    If(step(0.25, d).mul(step(d, 1)).mul(valid).lessThan(0.5), () => { Discard(); });
+    return vec4(bent.rgb, smoothstep(0.25, 1.0, d).oneMinus());
+  })();
+  // The jelly's blend: src-alpha over, destination alpha (scene depth) left alone.
+  m.transparent = true;
+  m.blending = THREE.CustomBlending;
+  m.blendEquation = THREE.AddEquation;
+  m.blendSrc = THREE.SrcAlphaFactor;
+  m.blendDst = THREE.OneMinusSrcAlphaFactor;
+  m.blendSrcAlpha = THREE.ZeroFactor;
+  m.blendDstAlpha = THREE.OneFactor;
+  m.depthWrite = false;
+  m.side = THREE.DoubleSide;
+  m.forceSinglePass = true;
+  return { material: m, capture, frame, grab, uLens };
 }
 
 /* Additive RGB with the destination alpha left alone: an additive material that writes alpha would make
@@ -353,25 +499,41 @@ export function makeVoidSet(e, U, ctx) {
   for (const c of coronas) { c.rotation.x = -Math.PI / 2; c.renderOrder = 5; c.frustumCulled = false; c.visible = false; }
   const cloud = makeTailCloud(e, U, V, ctx);
   const hole = makeSingularity(e, U, V);
-  ctx.group.add(coronas[0], coronas[1], hole.horizon, hole.ring);
+  ctx.group.add(coronas[0], coronas[1], hole.horizon, hole.ring, hole.lens, hole.capture);
   let coronaVisible = false;
   const setCoronaVisible = (v) => {
     if (coronaVisible === v) return;
     coronaVisible = v;
     for (const c of coronas) c.visible = v;
   };
+  const lit = (d) => !(Number(d.value) < 0.5);   // junk reads as on: a debug switch never hides by accident
   return {
     body, suns, coronaMats, coronas, cloud, hole, setCoronaVisible,
+    /* The show* switches for the three meshes, once per sync. material.visible takes a draw off the render
+       list without touching mesh visibility, which show() and the stage own, and it survives every swap. */
+    layers() {
+      body.visible = lit(V.showBody);
+      cloud.mesh.material.visible = lit(V.showTail);
+      for (const m of coronaMats) m.visible = lit(V.showCorona);
+      hole.lens.material.visible = hole.capture.material.visible = lit(V.showLens);
+    },
+    // The warm-up has to see every pipeline whatever the switches or a persisted rung 6 say; layers()
+    // and the next show() put them back, since setCoronaVisible keeps its cache in step.
+    allLayers() {
+      body.visible = cloud.mesh.material.visible = hole.lens.material.visible = hole.capture.material.visible = true;
+      for (const m of coronaMats) m.visible = true;
+      setCoronaVisible(true);
+    },
     show(v) {
       cloud.show(v);
       setCoronaVisible(v && V.corona.value > 0);
-      if (!v) hole.horizon.visible = hole.ring.visible = false;
+      if (!v) hole.horizon.visible = hole.ring.visible = hole.lens.visible = hole.capture.visible = false;
     },
     dispose() {
       body.dispose(); hole.dispose(); cloud.dispose(); coronaGeo.dispose();
       for (const m of suns) m.dispose();
       for (const m of coronaMats) m.dispose();
-      ctx.group.remove(coronas[0], coronas[1], hole.horizon, hole.ring);
+      ctx.group.remove(coronas[0], coronas[1], hole.horizon, hole.ring, hole.lens, hole.capture);
     },
   };
 }

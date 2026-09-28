@@ -9,6 +9,8 @@ import { floorHeightAt } from './floor.js';
 import { Firmament } from './firmament.js';
 import { makeVoidDials, makeVoidSet, FLARE_WRAP, SUN_WRAP } from './eel-void.js';
 import { CLOUD_LIGHT, dialNum } from './eel-tail-cloud-core.js';
+import { touchesBody, farthestFrom, peekLift, nebulaSeed, wrapTo, sceneDelta } from './void-sky-core.js';
+import { NebulaBake } from './void-nebula.js';
 
 const RINGS = 48, SIDES = 12;
 const DEG = Math.PI / 180;
@@ -38,8 +40,21 @@ const VOID_BOUNDS = [
   ['starScale', 1e-3, 64, 1], ['spikeLen', 1e-3, 128, 11], ['galCells', 1e-3, 64, 5],
   ['galScale', 1e-4, 4, 0.045], ['galArmSharp', 0, 64, 1.7], ['galDiskFall', 0, 128, 2.6],
   ['galCoreFall', 0, 128, 6.5], ['ringScale', 1.001, 16, 2.5], ['holeOpen', 1e-3, 60, 0.4],
-  ['holeClose', 1e-3, 60, 0.6],
+  ['holeClose', 1e-3, 60, 0.6], ['showStars', 0, 1, 1], ['showGal', 0, 1, 1], ['showNeb', 0, 1, 1],
+  ['showMeteor', 0, 1, 1], ['showComet', 0, 1, 1], ['showWave', 0, 1, 1], ['showSession', 0, 1, 1],
+  ['showFlash', 0, 1, 1], ['meteors', 0, 3600, 40], ['meteorWidth', 0.3, 20, 1.1], ['cometComa', 0.5, 20, 2.4],
+  ['cometTail', 0, 1, 0.09], ['cometSpread', 1e-4, 1, 0.02], ['flashSize', 0.3, 32, 2.2], ['waveAmp', 0, 0.2, 0.02],
+  ['waveWidth', 1e-4, 1, 0.04], ['waveCross', 0.05, 10, 0.6], ['waveSettle', 0.01, 10, 0.4], ['waveReach', 0, 10, 1.3],
+  ['moonPull', -1, 1, 0.04], ['lensPull', -1, 1, 0.06], ['collapseScale', 0, 20, 3], ['collapseHold', 0, 5, 0],
+  ['nebWarp', -4, 4, 0.9], ['flareSpeed', -20, 20, 1],
 ];
+// The ladder's void column in three steps: nothing shed, the cheap items (rung 4), everything (rung 6).
+const VOID_TIERS = [
+  {},
+  { twinkleMin: 0.65, sheets: 2, tailOct: 2 },
+  { nebOct: 2, galaxies: 4, twinkleMin: 0.65, corona: 0, sheets: 2, tailOct: 2, lens: false },
+];
+const tmpU = {}, tmpV = {};
 /* TSL's hue() on the CPU: the same rotation about the grey axis, so the sand light turns with the body. */
 function rotateHue(col, ang, w) {
   const cs = Math.cos(ang), sn = Math.sin(ang) * 0.57735, m = (col.r + col.g + col.b) / 3 * (1 - cs);
@@ -128,6 +143,14 @@ export class EelRenderer {
     // are built on his first visit, so a pond that only ever sees Eleanor pays nothing for him.
     this.voidU = makeVoidDials();
     this.firmament = null;
+    // The guest body, whoever is wearing it: the void set is warmed on it, since a set is its own graph.
+    this.guest = null;
+    // The eel system, wired by main.js: the finger, the air states, and the view the sky needs.
+    this.sys = null;
+    this.skyLive = false;
+    // The WebGPURenderer, wired by main.js through attachGpu: the nebula tile is baked with it.
+    this.gpu = null;
+    this.neb = null;
     this.group = new THREE.Group();
     scene.add(this.group);
     this.geometry = makeTubeGeometry();
@@ -144,9 +167,36 @@ export class EelRenderer {
 
   endPrewarm() { if (this.warmFood) { this.group.remove(this.warmFood); this.warmFood = null; } }
 
+  /* The renderer arrives after the eel system, so a void set built at boot bakes its nebula here. */
+  attachGpu(gpu) {
+    this.gpu = gpu;
+    this.ensureNebula();
+  }
+
+  /* A fresh nebula seed for this page (or ?nebseed=N), logged under ?debug=1 so a good one can be kept. */
+  makeNebula() {
+    const search = globalThis.location?.search ?? '';
+    const seed = nebulaSeed(search);
+    if (new URLSearchParams(search).get('debug') === '1') console.info(`[void] nebula seed ${seed} (pin with ?nebseed=${seed})`);
+    return new NebulaBake({ seed });
+  }
+
+  /* Bake the tile if it never was, or again (same seed) when nebWarp, the one dial it bakes in, moves.
+     Called at build, attach, and warm-up, all off screen, so his first frame never pays for it. */
+  ensureNebula() {
+    const neb = this.neb;
+    if (!neb || !this.gpu) return;
+    const warp = dialNum(this.voidU.nebWarp, -4, 4, 0.9);
+    if (neb.baked && neb.warp === warp) return;
+    neb.bake(this.gpu, warp);
+  }
+
   /* Builds a lazy pipeline on one eel and shows it for the loader's warm-up render, then puts the
      bundle back. Render state only: no seeded roll, no pose, no clock. `what` is 'jelly' or 'void'. */
   prewarmLate(e, what) {
+    // Node graphs key on node ids, so a set built on a resident shares GPU programs with his but still
+    // leaves his own eight materials to build on the reveal frame. His set is warmed on the guest body.
+    if (what !== 'jelly' && this.guest?.body) e = this.guest;
     if (!e?.body) return () => {};
     const was = { visible: e.body.visible, material: e.body.material };
     if (what === 'jelly') {
@@ -155,28 +205,39 @@ export class EelRenderer {
       if (e.jellyDepth) e.jellyDepth.visible = true;
     } else {
       e.voidSet ??= e._mkVoid();
+      this.ensureNebula();
       e.body.material = e.voidSet.body;
       e.voidSet.show(true);
+      e.voidSet.allLayers();
       // show(true) never opens the singularity or swaps the eyes to suns; both are otherwise never
       // attached to a visible mesh, so compileAsync would skip their pipelines entirely.
       was.eyeMats = e.eyes.map((m) => m.material);
-      e.eyes.forEach((m, i) => { m.material = e.voidSet.suns[i]; });
+      // A parked guest's eyes are hidden with him, so they're forced visible for this pass too.
+      was.eyeVis = e.eyes.map((m) => m.visible);
+      e.eyes.forEach((m, i) => { m.material = e.voidSet.suns[i]; m.visible = true; });
       const hole = e.voidSet.hole;
-      was.hole = { horizon: hole.horizon.visible, ring: hole.ring.visible };
-      hole.horizon.visible = hole.ring.visible = true;
+      was.hole = { horizon: hole.horizon.visible, ring: hole.ring.visible, lens: hole.lens.visible, capture: hole.capture.visible };
+      hole.horizon.visible = hole.ring.visible = hole.lens.visible = hole.capture.visible = true;
     }
     e.body.visible = true;
     return () => {
       e.body.visible = was.visible;
       e.body.material = was.material;
       e.voidSet?.show(false);
-      if (was.eyeMats) e.eyes.forEach((m, i) => { m.material = was.eyeMats[i]; });
-      if (was.hole) { e.voidSet.hole.horizon.visible = was.hole.horizon; e.voidSet.hole.ring.visible = was.hole.ring; }
+      e.voidSet?.layers();
+      if (was.eyeMats) e.eyes.forEach((m, i) => { m.material = was.eyeMats[i]; m.visible = was.eyeVis[i]; });
+      if (was.hole) {
+        const hole = e.voidSet.hole;
+        hole.horizon.visible = was.hole.horizon; hole.ring.visible = was.hole.ring;
+        hole.lens.visible = was.hole.lens; hole.capture.visible = was.hole.capture;
+      }
       this.syncBundleVisibility(e);
     };
   }
 
   buildMesh(e) {
+    // Residents are 0 to EEL_COUNT - 1; the guest body is built past them and owns the slots after them.
+    if (e.index >= EEL_COUNT) this.guest = e;
     const spine = [];
     for (let i = 0; i < EEL_POINTS; i++) spine.push(e.pts[i].clone());
     e.uSpine = uniformArray(spine);
@@ -588,6 +649,9 @@ export class EelRenderer {
       const sceneCopy = viewportSharedTexture();
       // The under-target is half float; the shared framebuffer copy must match or both backends refuse the blit.
       sceneCopy.value.type = THREE.HalfFloatType;
+      // The base and each sample() clone copy under their own keys, so two taps paid three copies of one
+      // frame. Keyed to the base they pay one.
+      const tapKey = () => sceneCopy;
       m.fragmentNode = Fn(() => {
         const n = normalize(vNormal);
         const nView = cameraViewMatrix.mul(vec4(n, 0)).xyz;
@@ -597,8 +661,8 @@ export class EelRenderer {
         ).sub(0.5).mul(J.wobble);
         // Toward-center sampling magnifies, the way a water-filled tube actually lenses.
         const warpedUV = screenUV.add(wobPx.sub(nView.xy.mul(J.warp)).div(screenSize));
-        const bent = sceneCopy.sample(warpedUV);
-        const straight = sceneCopy.sample(screenUV);
+        const bent = sceneCopy.sample(warpedUV).onReference(tapKey);
+        const straight = sceneCopy.sample(screenUV).onReference(tapKey);
         const depthFrac = vWorld.y.negate().div(DEPTH).clamp(0, 1);
         const valid = step(depthFrac.sub(J.depthEps), bent.a);
         const background = mix(straight.rgb, bent.rgb, valid);
@@ -654,12 +718,15 @@ export class EelRenderer {
     // once an identity declares the void.
     e.voidSet = null;
     e._mkVoid = () => {
-      this.firmament ??= new Firmament();
-      return makeVoidSet(e, U, {
+      this.firmament ??= new Firmament({ U, V: this.voidU });
+      this.neb ??= this.makeNebula();
+      const set = makeVoidSet(e, U, {
         position: buildPosition(1),
         vNormal, vWorld, vUV, geometry: this.geometry, group: this.group,
-        firmament: this.firmament, V: this.voidU,
+        firmament: this.firmament, V: this.voidU, nebTile: this.neb.texture,
       });
+      this.ensureNebula();
+      return set;
     };
 
     e.body = new THREE.Mesh(this.geometry, bodyMat);
@@ -699,6 +766,7 @@ export class EelRenderer {
       e._voidAt = undefined;
       e._tailPrev = null;
       e.tailSpeed = 0;
+      this.quietSky(true);
     }
     if (e.matEye) for (const m of e.eyes) m.material = e.matEye;
     // His suns turn with his head; an ordinary eye is a flat dot, so the pose has to come back with it.
@@ -795,10 +863,18 @@ export class EelRenderer {
     this.syncBodyMaterial(e);
   }
 
-  /* The ladder's void column. Like every other setQuality here it resets what it is not given, so the
-     whole desired state goes over on each call. */
-  setVoidQuality({ nebOct = 3, galaxies = 6, twinkleMin = 0, corona = 1, sheets = 3, tailOct = 3 } = {}) {
+  /* The ladder's void column by step, 0 to 2: the cheap items go at rung 4, before rung 5 drops the whole
+     pond's resolution, and the rest at rung 6. */
+  setVoidTier(level) {
+    this.setVoidQuality(VOID_TIERS[Math.max(0, Math.min(VOID_TIERS.length - 1, level | 0))]);
+  }
+
+  /* Like every other setQuality here it resets what it is not given, so the whole desired state goes
+     over on each call. */
+  setVoidQuality({ nebOct = 3, galaxies = 6, twinkleMin = 0, corona = 1, sheets = 3, tailOct = 3, lens = true } = {}) {
     const V = this.voidU;
+    // The lens's framebuffer copy is the costliest thing in a self-swallow, so the top tier sheds it.
+    this.voidLens = lens;
     V.nebOct.value = nebOct;
     V.galaxies.value = galaxies;
     V.twinkleMin.value = twinkleMin;
@@ -813,7 +889,7 @@ export class EelRenderer {
   setEnabled(on) {
     this.group.visible = on;
     // The system stops syncing while disabled, so nothing would overwrite a stale lit capsule.
-    if (!on) for (let i = 0; i < INF_SLOTS; i++) this.clearSlot(i);
+    if (!on) { for (let i = 0; i < INF_SLOTS; i++) this.clearSlot(i); this.quietSky(true); }
   }
 
   /* One influence capsule: spine points 2 and 16 of 24, the lit trunk minus snoot and whippy tail. */
@@ -879,7 +955,7 @@ export class EelRenderer {
   /* Sam lights the sand with two things and nothing between: his face and his tail cloud. The head is a
      point capsule flickering on the suns' own sizzle; the tail third brightens as it churns. */
   writeVoidSlots(e) {
-    const U = this.U, time = U.time.value, ms = U.motionScale.value;
+    const U = this.U;
     const v = e.speedBL * e.length;
     const heat = Math.min(1, Math.max(0, e.sunHeat ?? 1));
     const infC = U.infC.array;
@@ -894,8 +970,8 @@ export class EelRenderer {
     U.infA.array[EEL_COUNT + 1].set(tmpCap.a.x, tmpCap.a.y, tmpCap.a.z, e.radius * 2.2);
     U.infB.array[EEL_COUNT + 1].set(tmpCap.b.x, tmpCap.b.y, tmpCap.b.z, 1);
     infC[EEL_COUNT + 1].set(e.heading.x * v, e.heading.y * v, e.heading.z * v, e.uExcite.value);
-    // The shader's sizzle on the CPU, so the sand flickers in the same cycle the suns do.
-    const tw = (time * ms) % (Math.PI * 2);
+    // The suns' own sizzle phase, so the sand flickers in the same cycle they do.
+    const tw = e.uSizzleT?.value ?? 0;
     const sizzle = 1 + (Math.sin(tw * 37 + e.uSeed.value) * 0.04 + Math.sin(tw * 91) * 0.02) * heat;
     const face = (0.35 + heat * 0.55) * sizzle;
     U.eelCol.array[EEL_COUNT].setRGB(1.0, 0.50, 0.18).multiplyScalar(face);
@@ -910,6 +986,10 @@ export class EelRenderer {
   sync(eels, foods, alpha) {
     // Held for the guest pass below it: the plume reads these eels' ramps when one swims up to his face.
     this.plumeCast = eels;
+    // The sky's loop steps every frame, on stage or not, so it never depends on who was last seen.
+    this.firmament?.advance();
+    // Stars added since the last frame go up in one upload, whoever is on stage.
+    this.firmament?.flush();
     for (const e of eels) {
       for (let i = 0; i < EEL_POINTS; i++) e.uSpine.array[i].copy(e.show[i].copy(e.pose0[i]).lerp(e.pts[i], alpha));
       this.syncBury(e);
@@ -956,8 +1036,10 @@ export class EelRenderer {
     // and its sweep over the cast would all run for something nobody can see.
     if (e.identity?.void && e.voidSet) {
       if (e.body.visible) this.syncVoid(e, tmpA);
-      else { e._voidAt = undefined; e._tailPrev = null; e.tailSpeed = 0; }
+      else { e._voidAt = undefined; e._tailPrev = null; e.tailSpeed = 0; this.quietSky(); }
     }
+    // Outside the identity test: a collapse can park him and roll Eleanor on the very tick it flashes.
+    if (e.voidSet) this.collapseFlash(e);
     if (e.body.visible) this.writeGuestSlots(e);
     else { this.clearSlot(EEL_COUNT); this.clearSlot(EEL_COUNT + 1); }
   }
@@ -967,9 +1049,13 @@ export class EelRenderer {
   syncVoid(e, fwd) {
     const S = e.voidSet, U = this.U, V = this.voidU;
     for (const [dial, lo, hi, fallback] of VOID_BOUNDS) dialNum(V[dial], lo, hi, fallback);
+    // Only a live nebWarp edit ever lands here; the bake itself happened off screen.
+    this.ensureNebula();
     S.setCoronaVisible(e.body.visible && V.corona.value > 0);
+    S.layers();
     const now = U.time.value, ms = U.motionScale.value;
-    const dt = Math.min(0.1, Math.max(0, now - (e._voidAt ?? now)));
+    // Across the scene clock's wrap too, so that frame is a real step rather than a stall.
+    const dt = sceneDelta(e._voidAt, now);
     e._voidAt = now;
     // Lateral travel of the tail against the body it hangs off, smoothed over 0.3 s so one frame of
     // solver jitter cannot flash the whole cloud.
@@ -983,14 +1069,17 @@ export class EelRenderer {
     e.tailSpeed = smoothed + (raw - smoothed) * (dt > 0 ? 1 - Math.exp(-dt / 0.3) : 0);
     const heat = Math.min(1, Math.max(0, e.sunHeat ?? 1));
     e.uSunHeat.value = heat;
-    e.uSizzleT.value = (this.U.time.value * this.U.motionScale.value) % (Math.PI * 2);
-    e.uFlareT.value = (this.U.time.value * this.U.motionScale.value * V.flareSpeed.value) % FLARE_WRAP;
+    // Accumulated, not read off the scene clock, whose 4,096 s wrap would jump both. Every harmonic of
+    // either is an integer, so their own wraps are silent.
+    e.uSizzleT.value = wrapTo(e.uSizzleT.value + dt * ms, Math.PI * 2);
+    e.uFlareT.value = wrapTo(e.uFlareT.value + dt * ms * V.flareSpeed.value, FLARE_WRAP);
     // Accumulated and ping-ponged rather than wrapped: the sun face reads non-periodic noise, so a modulo
     // of its clock would jump the whole granulation.
     e._sunT = (e._sunT ?? 0) + dt * ms;
     e.uSunT.value = SUN_WRAP - Math.abs((e._sunT % (SUN_WRAP * 2)) - SUN_WRAP);
     // The cast is what his plume picks colors up from; sync() runs over it just before this one.
     S.cloud.sync(dt, heat, this.plumeCast);
+    this.syncSky(e, dt);
     // His suns are eyeballs: the surface graph reads the local normal, so the mesh itself has to carry
     // the head's frame, and the flares take the same turn as an angular offset.
     tmpB.crossVectors(fwd, UP).normalize();
@@ -1013,7 +1102,12 @@ export class EelRenderer {
     const rate = Math.max(want, cur, 1e-3) / tau;
     e._hole = cur + Math.sign(want - cur) * Math.min(Math.abs(want - cur), rate * dt);
     const open = e._hole > 1e-3 && e.body.visible;
+    // The lens rides the eased open, not the target: cut the instant e.horizon drops, it would snap a bend
+    // of up to lensPull off the floor while the black sphere is still shrinking.
+    // The capture rides with the lens: its copy is the one the lens reads, and at rest neither draws. The
+    // top void tier and a hot pond leave the black sphere and the ring alone.
     S.hole.horizon.visible = S.hole.ring.visible = open;
+    S.hole.lens.visible = S.hole.capture.visible = open && this.voidLens !== false && !this.sys?.perfHot;
     if (!open) return;
     const rad = e._hole * e.radius;
     S.hole.horizon.position.copy(e.show[0]).addScaledVector(fwd, e.radius * 0.5);
@@ -1021,7 +1115,91 @@ export class EelRenderer {
     S.hole.ring.position.copy(S.hole.horizon.position);
     S.hole.ring.position.y = liftY;
     S.hole.ring.scale.setScalar(rad * V.ringScale.value * 2);
+    S.hole.lens.position.copy(S.hole.ring.position);
+    S.hole.lens.scale.setScalar(rad * 8);
+    S.hole.uLens.value.set(V.lensPull.value * e._hole, Math.min(1, Math.max(0, -S.hole.horizon.position.y / DEPTH)));
     S.hole.spin(dt, ms > 0.5);
+  }
+
+  /* The sky's frame-clock side while he is on screen: flashes, meteors, the finger's wave, and the moon
+     pull. The anchor is his midpoint in the universe, which is where a streak is aimed. */
+  syncSky(e, dt) {
+    const F = this.firmament, V = this.voidU, sys = this.sys, view = sys?.view;
+    if (!F || !(view?.w > 0) || !(view?.h > 0)) return;
+    this.skyLive = true;
+    const mid = e.show[Math.floor(e.show.length / 2)];
+    const anchor = F.worldToUniverse(mid.x, mid.z, view, tmpU);
+    F.tick(dt, anchor, e.length / view.h);
+    // One ring per gesture, fired the moment a poke or a drag first lands on him.
+    const f = sys.finger;
+    if (f && (f.mode === 'poke' || f.mode === 'drag') && f.gestureId !== e._waveGesture
+      && touchesBody(e.show, f.x, f.z, e.radius * V.waveReach.value)) {
+      e._waveGesture = f.gestureId;
+      const c = F.worldToUniverse(f.x, f.z, view, tmpV);
+      F.startWave(c.x, c.y, farthestFrom(e.show, f.x, f.z) / view.h);
+    }
+    // The moon leans toward his head only while a peek has it above the water.
+    const vh = this.U.voidHead;
+    if (vh) {
+      const lift = sys.air?.state(e)?.state === 'peek' ? peekLift(e.show[0].y, e.radius) : 0;
+      vh.value.set(e.show[0].x, e.show[0].z, lift * V.moonPull.value);
+    }
+  }
+
+  /* Park, swap to Eleanor, or the pond switched off: whatever is in flight ends and the moon lets go.
+     The session's stars stay. `force` skips the idle check for the one-off callers. */
+  quietSky(force = false) {
+    if (!this.skyLive && !force) return;
+    this.skyLive = false;
+    this.firmament?.quiet();
+    if (this.U.voidHead) this.U.voidHead.value.z = 0;
+  }
+
+  /* The self-swallow's last frame: draws a ring at e.flashPending (his head, cleared right after) for one
+     frame or collapseHold seconds; runs after the tick so a same-tick park, hide, or Eleanor swap can't hide it first. */
+  collapseFlash(e) {
+    const S = e.voidSet, V = this.voidU, ring = S.hole.ring;
+    const now = this.U.time.value;
+    const dt = sceneDelta(e._flashClock, now);
+    e._flashClock = now;
+    const at = e.flashPending;
+    if (at) {
+      e.flashPending = null;
+      if (Number.isFinite(at.x) && Number.isFinite(at.y) && Number.isFinite(at.z)) {
+        // Lifted like the ring always is, so no body's depth can swallow it from straight above.
+        ring.position.set(at.x, at.y + e.radius * 1.5, at.z);
+        e._flashFresh = true;
+        // Read through the guards here too: syncVoid clamps the dials only while he is on screen.
+        e._flashLeft = dialNum(V.collapseHold, 0, 5, 0);
+      }
+    }
+    if (e._flashFresh || e._flashLeft > 0) {
+      if (!e._flashFresh) e._flashLeft -= dt;
+      e._flashFresh = false;
+      // The slurp-scale ring, 1.2 horizon radii, times the flash's own scale.
+      ring.scale.setScalar(e.radius * 1.2 * dialNum(V.ringScale, 1.001, 16, 2.5) * 2 * dialNum(V.collapseScale, 0, 20, 3));
+      ring.visible = true;
+      e._flashShown = true;
+      return;
+    }
+    if (e._flashShown) {
+      e._flashShown = false;
+      // If he's on screen, his own sync already set the ring this frame; anyone else keeps it dark.
+      if (!e.body.visible || !e.identity?.void) ring.visible = false;
+    }
+  }
+
+  /* A new star where a treat fell through him, at world (x, z), permanent for the session. `rain` thins
+     to one drop in four at a third of the brightness. Returns whether a star was written. */
+  addSessionStar(x, z, { rain = false, warm = true, brightness = 1 } = {}) {
+    const view = this.sys?.view;
+    if (!(view?.w > 0) || !(view?.h > 0) || !Number.isFinite(x) || !Number.isFinite(z)) return false;
+    // Before his first visit there is no firmament yet; building one is CPU work and a 64 KB texture.
+    this.firmament ??= new Firmament({ U: this.U, V: this.voidU });
+    // A treat can land before this frame's sync; the step is idempotent, so the star uses this frame's sky.
+    this.firmament.advance();
+    const u = x / view.w + 0.5, v = z / view.h + 0.5, fa = view.w / view.h;
+    return !!(rain ? this.firmament.addRainStar(u, v, warm, fa) : this.firmament.addStar(u, v, brightness, warm, fa));
   }
 
   dispose(eels) {
@@ -1034,6 +1212,7 @@ export class EelRenderer {
       e.eyes?.[0]?.geometry.dispose(); e.matEye?.dispose();
     }
     this.firmament?.dispose();
+    this.neb?.dispose();
     this.foodGeo.dispose(); this.foodMat.dispose();
   }
 }

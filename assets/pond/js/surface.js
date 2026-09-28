@@ -29,6 +29,12 @@ export class SurfacePass {
     // Crest glint: ripple flanks tilted toward the moon catch it as silver, pond-wide, not just at the disc.
     this.uCrestEdge = uniform(new THREE.Vector2(0.962, 0.998));   // flat water sits at cos 19° = 0.945, so it stays dark
     this.uCrest = uniform(0.2);
+    // A dry pixel (a rock top, a log's back, a peeking head) shows what is straight under it; 0 restores
+    // the old refracted read, for an A/B from the console as pond.surface.uDryStraight.value.
+    this.uDryStraight = uniform(1);
+    // Sam's peeking head: xz and how far the moon's reflection leans toward it. The eel renderer writes it
+    // and zeroes it whenever he is not peeking; shading.js builds U, so it is added here.
+    U.voidHead ??= uniform(new THREE.Vector3(0, 0, 0));
     const texel = sim.uTexel;
     const under = texture(underRT.texture);
     const eta = float(1 / IOR_WATER);
@@ -109,7 +115,15 @@ export class SurfacePass {
       // The virtual moon sees the full-noise normal: a shower should shatter the disc into glitter.
       const az = normalize(vec2(moon.x, moon.z));
       const spot = az.mul(this.uMoonSpot);
-      const toMoon = normalize(vec3(spot.x.sub(x), this.uMoonHeight, spot.y.sub(z)));
+      // Pushing the lookup away from his head is what draws the moon's image toward it, full inside half a
+      // unit and gone at two. The branch is on a uniform, so a frame with no peek skips it outright.
+      const mxz = xz.toVar();
+      If(U.voidHead.z.notEqual(0), () => {
+        const dv = xz.sub(U.voidHead.xy).toVar();
+        const dist = length(dv).toVar();
+        mxz.addAssign(dv.div(dist.max(1e-4)).mul(U.voidHead.z).mul(smoothstep(0.5, 2.0, dist).oneMinus()));
+      });
+      const toMoon = normalize(vec3(spot.x.sub(mxz.x), this.uMoonHeight, spot.y.sub(mxz.y)));
       const cosV = dot(reflect(I, n), toMoon).max(0);
       const disc = smoothstep(this.uMoonCos.x, this.uMoonCos.y, cosV).mul(this.uMoonDisc);
       const glint = pow(cosV, 300).mul(this.uMoonGlint).add(pow(cosV, 40).mul(this.uMoonGlint.mul(0.25)));
@@ -128,7 +142,8 @@ export class SurfacePass {
       const fresnel = F0.add(F0.oneMinus().mul(dot(nR, vec3(0, 1, 0)).max(0).oneMinus().pow(5)));
       const water = mix(below, sky, fresnel.clamp(0, 0.6)).add(sky.mul(this.uSkyGain)).add(U.moonColor.mul(crest));
       // depthFrac 0 means the pixel is above the waterline (a rock top): no refraction, no sky film.
-      const color = mix(water, sample.rgb, step(depthFrac0, float(0.001))).toVar();
+      const dryRgb = mix(sample.rgb, straight.rgb, this.uDryStraight);
+      const color = mix(water, dryRgb, step(depthFrac0, float(0.001))).toVar();
       const vig = length(suv.sub(0.5)).mul(1.25).pow(2.2).oneMinus().clamp(0.25, 1);
       color.mulAssign(vig.mul(this.uExposure));
       color.mulAssign(mix(0.45, 1.0, this.uReveal));

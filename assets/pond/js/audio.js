@@ -17,14 +17,17 @@ const SETS = {
   shortBubs: seq('sfx/short-bubs', 5),
   tinyBubs: seq('sfx/tiny-bubs', 8),
   sips: ['sfx/sippy.ogg'],
+  voidSlurp: ['sfx/void-slurp.ogg'],
+  voidEat: ['sfx/void-eat.ogg'],
+  vanish: ['sfx/vanish.ogg'],
 };
 // Sounds the eels make ride the eel bus; player-made water and pond environment ride env.
-const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', 'tinyBubs', 'sips']);
+const EEL_SETS = new Set(['startles', 'eleanor', 'crackles', 'eats', 'slurps', 'tinyBubs', 'sips', 'voidSlurp', 'vanish']);
 // Rain's lowpass sweep: a shut-in patter at the first drops, wide open in a downpour.
 const RAIN_LP = [700, 7000];
 
-/* The space eel's voice is Eleanor's, reversed and half an octave down, through the space reverb.
-   The envelope carries kind 'sam'; his identity is also the only void one, so either proves him. */
+/* His bubbles are Eleanor's, reversed and half an octave down, through the space reverb; his slurp, his
+   open mouth, and the litter's vanish are his own files, played dry. Kind 'sam' or a void identity proves him. */
 const SPACE_RATE = 0.707;
 const isSam = (ev) => ev?.kind === 'sam' || ev?.eel?.identity?.void === true;
 // His bed loop: 4 s in on arrival, 4 s out on departure, and 6 dB down under his own one-shots.
@@ -42,6 +45,7 @@ const DEFAULT_MIX = {
     crackleLil: -2.5, crackleMed: -2.5, crackleBig: -2.5,
     eat: -3, slurp: -3, tinyBub: -18, shortBub: -15, sip: 4,
     drip: -17, padSettle: -8, drone: -5, droneLow: -10, droneRest: -3,
+    voidSlurp: 0, voidEat: 0, vanish: 0,
   },
 };
 
@@ -408,11 +412,11 @@ export class PondAudio {
     if (pl) this.crackleAt = now + (pl.buffer.duration / pl.playbackRate) * 0.8;
   }
 
-  /* size 1 = big treat, 2 = crumb, 3 = tiny; rate 0.5 drops Eleanor's an octave. His voice is hers,
-     so a Sam meal starts from her rate whatever the caller passed, then the space voice slows it again. */
+  /* size 1 = big treat, 2 = crumb, 3 = tiny; rate 0.5 drops Eleanor's an octave. His meals are silent
+     here: the open mouth's loop (guestMouth) is the sound of him eating. */
   eat(size = 2, { pan = null, rate = 1, db = 0, ev = null } = {}) {
     const key = Math.min(3, Math.max(1, size)) - 1;
-    if (isSam(ev)) return this.guestShot('eats', key, 'eat', { jitter: 0.3, pan, db, ...this.spaceOpts(0.5) });
+    if (isSam(ev)) return null;
     return this.shot('eats', key, 'eat', { jitter: 0.3, rate, pan, db });
   }
 
@@ -424,7 +428,7 @@ export class PondAudio {
 
   slurp({ pan = null, ev = null } = {}) {
     const key = Math.floor(Math.random() * SETS.slurps.length);
-    if (isSam(ev)) return this.guestShot('slurps', key, 'slurp', { jitter: 0.2, trim: true, pan, ...this.spaceOpts() });
+    if (isSam(ev)) return this.guestShot('voidSlurp', 0, 'voidSlurp', { jitter: 0, pan });
     return this.shot('slurps', key, 'slurp', { jitter: 0.2, trim: true, pan });
   }
 
@@ -576,6 +580,53 @@ export class PondAudio {
     this.droneStopAt = setTimeout(() => { if (!this.droneOn && p.state === 'started') p.stop(); }, fade * 1000 + 400);
   }
 
+  /* His open mouth: void-eat.ogg looping at an amplitude that follows the singularity's size (`open`, 0–1
+     of its widest), panned with him. It restarts from the top on each opening, so its own fade-in plays. */
+  guestMouth(open, track = null) {
+    const g = this.mouthAudition ? 1 : Math.max(0, Math.min(1, Number.isFinite(open) ? open : 0));
+    if (!this.mouthPl) {
+      if (!(g > 0) || !this.unlocked) return;
+      const src = this.players.voidEat?.player('0');
+      if (!src?.loaded) return;
+      this.mouthGain = new Tone.Gain(0).connect(this.buses.eel);
+      this.mouthPl = new Tone.Player(src.buffer).connect(this.mouthGain);
+      this.mouthPl.loop = true;
+      this.mouthPl.volume.value = this.mix.levels.voidEat ?? 0;
+    }
+    if (track != null && this.mouthTrack !== track) {
+      this.mouthTrack = track;
+      this.mouthGain.disconnect();
+      this.mouthGain.connect(this.trackPanner(track));
+    }
+    // A shut mouth always lands on exactly 0, or a sub-threshold remainder would keep the loop from stopping.
+    const lv = this.mouthLevel ?? 0;
+    if (g !== lv && (g === 0 || Math.abs(g - lv) > 1e-3)) { this.mouthLevel = g; this.mouthGain.gain.rampTo(g, 0.05); }
+    const p = this.mouthPl;
+    if (g > 0) {
+      clearTimeout(this.mouthStopAt); this.mouthStopAt = null;
+      if (p.state !== 'started') p.start();
+    } else if (p.state === 'started' && !this.mouthStopAt) {
+      this.mouthStopAt = setTimeout(() => { this.mouthStopAt = null; if (!(this.mouthLevel > 0) && p.state === 'started') p.stop(); }, 300);
+    }
+  }
+
+  /* A piece of litter starting its fall into him. The heavier it is the lower it sits, by up to 1.5
+     semitones either way; a GrainPlayer moves the pitch without moving the file's 1.8 s. */
+  vanish({ mass = 0.01, pan = null } = {}) {
+    if (!this.unlocked) return;
+    const src = this.players.vanish?.player('0');
+    if (!src?.loaded) return;
+    const m = Math.max(1e-4, Number.isFinite(mass) ? mass : 0.01);
+    const detune = Math.max(-150, Math.min(150, -150 * (Math.log10(m) + 2)));
+    const gp = new Tone.GrainPlayer({ url: src.buffer, grainSize: 0.1, overlap: 0.05, detune });
+    gp.volume.value = this.mix.levels.vanish ?? 0;
+    const panner = new Tone.Panner(Math.max(-1, Math.min(1, pan ?? 0))).connect(this.buses.eel);
+    gp.connect(panner);
+    this.live.add(gp);
+    gp.start();
+    setTimeout(() => { this.live.delete(gp); gp.dispose(); panner.dispose(); }, (src.buffer.duration + 0.5) * 1000);
+  }
+
   /* His one-shots duck the bed under them for exactly as long as they sound. */
   duckDrone(seconds) {
     if (!this.droneOn || !this.droneOut) return;
@@ -613,6 +664,7 @@ export class PondAudio {
     if (key === 'droneRest' && this.droneOn && this.droneRest) this.droneGain.gain.rampTo(Tone.dbToGain(db), 0.1);
     // swishPl stays non-null through its fade tail (onstop clears it), so this also catches fades.
     if (key === 'swish' && this.swishPl) this.swishPl.volume.value = db;
+    if (key === 'voidEat' && this.mouthPl) this.mouthPl.volume.value = db;
     this.saveMix();
   }
 
@@ -645,6 +697,7 @@ export class PondAudio {
     if (this.players.rain) this.players.rain.volume.value = this.mix.levels.rain;
     if (this.droneLfo) { this.droneLfo.max = Tone.dbToGain(this.mix.levels.drone); this.droneLfo.min = Tone.dbToGain(this.mix.levels.droneLow); }
     if (this.swishPl) this.swishPl.volume.value = this.mix.levels.swish;
+    if (this.mouthPl) this.mouthPl.volume.value = this.mix.levels.voidEat;
     for (const n of Object.keys(this.buses ?? {})) this.applyBus(n);
   }
 }

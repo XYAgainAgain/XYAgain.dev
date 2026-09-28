@@ -1,21 +1,26 @@
 import { DEPTH } from './config.js';
-import { paceWave } from './eel-behavior.js';
+import { boreBackout, dropCover, headInBore, paceWave, releaseSteer, steerGuest } from './eel-behavior.js';
 import { growEel } from './eel-physics.js';
 import {
-  SLURP_AT, begin, capture, deriveLair, exitTarget, moveGuest, nopeTick, onStage, park, parkOffstage,
-  pickExit, progressStrike, rescueLadder, resetProgress, rest, setExit, setVisible, spit, teleport,
+  SLURP_AT, begin, capture, deriveLair, dropTailPerch, endGuestMeals, exitTarget, moveGuest, nopeTick, onStage, park,
+  parkOffstage, pickExit, progressStrike, rescueLadder, resetProgress, rest, setExit, setVisible, spit, teleport,
 } from './guest-stage.js';
-import { insideBore, logFitsGuest, logTaken, spaghettiPoints } from './sam-eel-core.js';
+import {
+  buildGuestPolicy, collapseStep, crumbClaimed, crumbWanted, curlSide, deferClock, deferReady, horizonAt,
+  insideBore, logFitsGuest, logTaken, openMask, ouroborosPoints, spaghettiPoints, spiralAt, spiralStart,
+  tailSlots, COLLAPSE, MEALS,
+} from './sam-eel-core.js';
 import { shoalAvoidFrac } from './reeds-core.js';
+import { crumbScale } from './treats-core.js';
 
-/* Sam the Space Eel, wave one: the controller behind the void. He rides Eleanor's stage and repossession
-   trigger, shares none of her temper (zero threat, calm not alarm, patience for a log instead of taking
-   it), and the singularity opens only for a repossession. The tunnel run, sweep, treats, tail perch, body
-   vacuum, and self-swallow are wave two; this pass has no steerGuest adapter, just local targets. */
+/* Sam the Space Eel: the controller behind the void. He rides Eleanor's stage and repossession trigger,
+   shares none of her temper (zero threat, calm not alarm, patience for a log instead of taking it), and
+   the singularity opens only for a repossession or for himself. His rounds are a resident's tick through
+   steerGuest, gated by the policy his identity builds; a forced exit on stage swallows him whole. */
 
 const SUN_ORANGE = [1.0, 0.55, 0.18];
 const STRETCH = 1.2;        // how far past its own length a swallowed body is drawn out toward the horizon
-const HORIZON_SLURP = 1.2;  // the meal scale the renderer eases the mouth open to, in body radii
+export const HORIZON_SLURP = 1.2;  // the meal scale the renderer eases the mouth open to, in body radii
 const MEAL_HOLD = 0.9;      // the calm beat between the last segment going in and the spit
 const REACH = 0.9;          // jaw range, Eleanor's
 const GIVE_UP = 25;         // seconds of approach before a repossession is abandoned
@@ -27,6 +32,10 @@ const ALARM_FREE = 0.001;
 const DUNE_MAX = 0.085;     // the floor's two dune terms at their worst, on top of whatever a shoal adds
 const SAND_CLEAR = 0.06;    // default: how far under his center the sand has to stay to stay out of him
 const AVOID_MIN = 0.05;     // a crown narrower than this is not worth steering around
+const EXIT_FLOP_FOR = 20;   // seconds after the lair's exit fold in which the flop over that log may still start
+const EXIT_FLOP_OUT = 1.2;  // units off the bark where he lines up beside the log before going over it
+const ORIGIN = { x: 0, y: 0, z: 0 }, UNIT_X = { x: 1, y: 0, z: 0 };
+const tmpH = { x: 0, y: 0, z: 0 };
 
 const dial = (sys) => sys.knobs.guest ?? {};
 
@@ -73,7 +82,14 @@ function nearSpine(e, x, z) {
   return best;
 }
 
+/* The release runs in the same tick as the transition out of rounds: the air module's prepass trigger
+   (the still finger) reads steerHeld before this controller ticks again. */
 export function brain(sys, e, dt) {
+  tick(sys, e, dt);
+  if (e.steerHeld && e.state !== 'rounds') releaseSteer(sys, e);
+}
+
+function tick(sys, e, dt) {
   const now = sys.time;
   const k = dial(sys);
   // Zero in every state, so threatOf returns 0, guestAlarm deposits nothing, and no fear map ever
@@ -81,9 +97,15 @@ export function brain(sys, e, dt) {
   e.threat = 0;
   e.threatOn = null;
   shoalGuard(sys, e, k);
-  // The mouth belongs to the meal: any seam that ends a capture early (a surrender, a hot pond) has
-  // to leave a closed horizon behind it, and this is cheaper than remembering every one of them.
-  if (e.state !== 'collect') e.horizon = 0;
+  pace(e, k);
+  // His small meals live only in rounds: whatever took him out of it ended them, whichever seam it was.
+  if (e.state !== 'rounds') endGuestMeals(sys, e);
+  e.openMask = openMask(e.pts, sys.colliders.logs, !!e.body?.visible && e.state !== 'offstage', e.openMask);
+  deferTrack(sys, e, now);
+  pullTick(sys, e, dt);
+  // The mouth belongs to the meal: any seam that ends one early (a surrender, a hot pond, a repossession
+  // mid-sweep) leaves the horizon closed behind it.
+  if (!(e.state === 'collect' && e.phase !== 'approach')) e.horizon = mealHorizon(e, now);
   // Only the log residents can reach is expressible to them, so a nap in the second log berths nobody.
   const home = e.state === 'lair' && e.lair === sys.colliders.logs[0];
   sys.lairGuest = home ? e : null;
@@ -91,20 +113,26 @@ export function brain(sys, e, dt) {
   calmTrail(sys, e, k);
   bowStep(sys, e, dt, k);
   sparkStep(sys, e, now);
+  tailPerchTick(sys, e);
   if (sys.perfHot) e.coolAt = now + 10;
+  // The surrender marks a forced exit and hands the tick straight back; the collapse starts here.
+  if (e.state === 'depart' && e.exitStyle === 'collapse') { startCollapse(sys, e, now); return; }
+  // An air state owns him until it lets go: leaving rounds under one would freeze the peek or the flop
+  // with its bounds open, since moveGuest never ticks the air module. Every air state has its own deadline.
+  if (e.state === 'rounds' && sys.air?.busy(e)) { steerGuest(sys, e, dt, e.guestPolicy); return; }
 
   if (e.state === 'lair' && e.returnLeg >= 2) { restTick(sys, e, dt, now); return; }
   if (e.state === 'offstage') { offstageTick(sys, e, dt, now); return; }
 
   if (rescueLadder(sys, e, now, capFor(sys, e.stageCap ?? 45))) return;
   if (nopeTick(sys, e, dt, now)) return;
-  // A meal in progress finishes before any performance retreat; the whole capture caps under 4 s.
-  if (sys.perfHot && e.state !== 'depart' && !(e.state === 'collect' && e.phase !== 'approach')) toDepart(sys, e, now);
+  // A meal in progress finishes before any performance retreat; the whole capture caps under 4 s. A hot
+  // pond is a forced exit, so he swallows himself rather than swimming off the rim.
+  if (sys.perfHot && e.state !== 'depart' && !(e.state === 'collect' && e.phase !== 'approach')) { startCollapse(sys, e, now); return; }
 
   e.reverse = false;
-  // Gaits are in body lengths, and ten units of eel at a resident's cruise crosses the pond in three
-  // seconds; his pace is a world speed, so it reads the same whatever length he rolled.
-  const cruise = Math.min(e.cruiseBL, (k.samCruise ?? 0.8) / e.length), prowl = Math.min(e.prowlBL, cruise * 0.6);
+  // Already paced to the dial by pace() above, so these read as world speeds whatever length he rolled.
+  const cruise = e.cruiseBL, prowl = e.prowlBL;
   let tx = 0, tz = 0, ty = -DEPTH + e.radius + 0.1, wantBL = cruise;
   let homing = null;
 
@@ -160,8 +188,13 @@ export function brain(sys, e, dt) {
     tx = e.roamX; tz = e.roamZ;
     if (Math.hypot(tx - e.head.x, tz - e.head.z) < 1.5) { toRounds(sys, e, now); return; }
   } else {
-    if (roundsTick(sys, e, now, k)) return;
-    tx = e.roamX; tz = e.roamZ;
+    if (roundsTick(sys, e, now)) return;
+    // Open water is a resident's tick: steer owns the heading and the pose commit, the stage only watches.
+    if (!steerGuest(sys, e, dt, e.guestPolicy)) { toDepart(sys, e, now); return; }
+    deferTick(sys, e, now);
+    exitFlopTick(sys, e, now);
+    roundsStrike(sys, e, dt, now);
+    return;
   }
 
   // Read after the fold, not before: a fold that arrived this tick hands the walls back to avoidance.
@@ -171,7 +204,11 @@ export function brain(sys, e, dt) {
     if (e.stuckStrikes >= 2) {
       e.stuckStrikes = 0;
       if (e.forceParkAt !== null) parkOffstage(sys, e, now);
-      else toRounds(sys, e, now);
+      else {
+        // A jammed walk to a log spends the leg, or rounds sees the same free log and walks straight back.
+        if (e.state === 'lair' || e.state === 'wait') e.leg++;
+        toRounds(sys, e, now);
+      }
     } else e.nopePulse = now + 1.3;   // no startle: the stage policy is silence for him
   }
 }
@@ -201,20 +238,20 @@ function restTick(sys, e, dt, now) {
   if (fidget && fidget.ampMul !== null) e.ampMul = fidget.ampMul;
   if (now <= e.checkAt) return;
   e.checkAt = now + 1;
-  // A hot pond empties even the lair, and he goes quietly.
-  if (sys.perfHot) { wake(sys, e, now); toDepart(sys, e, now); return; }
+  // A hot pond empties even the lair: a forced exit, so the collapse starts from inside the log.
+  if (sys.perfHot) { startCollapse(sys, e, now); return; }
   if (now > e.napUntil) { wake(sys, e, now); toRounds(sys, e, now); }
 }
 
-/* A rounds leg: wander the open water, look in on the log, and take the one repossession the pond
-   actually needs. Returns true when the tick has been handed to another state. */
-function roundsTick(sys, e, now, k) {
-  if (now > e.retargetAt) {
-    e.retargetAt = now + e.rng.range(6, 12);
-    e.roamX = e.rng.range(-sys.view.w * 0.35, sys.view.w * 0.35);
-    e.roamZ = e.rng.range(-sys.view.h * 0.35, sys.view.h * 0.35);
-  }
+/* A rounds leg's once-a-second checks: look in on the log, and take the one repossession the pond
+   actually needs. Steer does the wandering. Returns true when the tick has been handed to another state. */
+function roundsTick(sys, e, now) {
   if (now <= e.checkAt) return false;
+  // A committed run owns him until it clears the far mouth: every exit from here would hand a body still
+  // in the bore to moveGuest, whose log shove does not know he is inside it.
+  if (e.tunnel && e.tunnel.stage >= 1) return false;
+  // A crumb mid-pull is half a second from the horizon; leaving rounds now would pop it out of the air.
+  if (e.crumbPull) return false;
   e.checkAt = now + 1;
   if (!sys.perfHot && now > e.coolAt) {
     const gnarly = sys.eels.filter((r) => r.length > SLURP_AT && !r.slurpedBy);
@@ -227,6 +264,8 @@ function roundsTick(sys, e, now, k) {
       return true;
     }
   }
+  // A run never becomes a nap: lining up at a mouth is exactly what the near-log test reads as arriving.
+  if (e.tunnel) return false;
   // One lair leg a visit: rounds, a nap, rounds, gone. Past the first nap there is nothing to walk to.
   const want = e.leg > 0 ? null : freeLair(sys, e, true);
   const near = !!want && logNear(want, e.head) < NEAR_LAIR;
@@ -281,6 +320,16 @@ function collectTick(sys, e, dt, now) {
   return true;
 }
 
+/* The stage keeps watching under steer, or a wedged guest never surrenders. A strike is a fresh plan
+   (then steer's paced reverse), never a stage-clock reset: that is what let wave one re-arm forever. */
+function roundsStrike(sys, e, dt, now) {
+  if (!progressStrike(e, dt)) return;
+  // Wedged inside a bore: back out to the mouth he came in by. A fresh plan here would aim through the wood.
+  if (e.tunnel && headInBore(e)) { e.stuckStrikes = 0; boreBackout(sys, e, now); return; }
+  e.attnReset = true;
+  if (e.stuckStrikes >= 2) { e.stuckStrikes = 0; e.nopeUntil = Math.max(e.nopeUntil, now + 0.7); }
+}
+
 // Transitions
 
 function toRounds(sys, e, now) {
@@ -329,18 +378,261 @@ function sleep(sys, e, now) {
 
 function wake(sys, e, now) {
   e.returnLeg = 0;
+  dropTailPerch(sys, e);   // his nappers wake with him, the ordinary way
   setExit(e, pickExit(sys, e));   // silent for him: the stage reads his startle policy
   e.stateAt = now;
+  // B6: now and then the way out of the lair is over the top of it, when the crest is dry. The side he
+  // climbs from is drawn here too, so the whole choice is made on one tick.
+  const l = e.lair, odds = dial(sys).samExitFlop;
+  const dry = !!l && l.a.y + l.rOuter > 0 && l.b.y + l.rOuter > 0;
+  e.exitFlop = dry && e.rng.chance(Number.isFinite(odds) ? Math.min(1, Math.max(0, odds)) : 0.35)
+    ? { log: l, side: e.rng.chance(0.5) ? 1 : -1, until: null } : null;
+}
+
+/* The flop out of the lair, once the exit fold has handed him to steer: line up beside the middle of the
+   log he slept in, then go over it from wherever alongside he got to. Gives up after EXIT_FLOP_FOR. */
+function exitFlopTick(sys, e, now) {
+  const f = e.exitFlop;
+  if (!f || e.exiting || !sys.air) return;
+  const l = f.log;
+  const ax = l.b.x - l.a.x, az = l.b.z - l.a.z, len = Math.hypot(ax, az) || 1e-4;
+  const ux = ax / len, uz = az / len, px = -uz, pz = ux;
+  const mx = (l.a.x + l.b.x) * 0.5, mz = (l.a.z + l.b.z) * 0.5;
+  // A run, a peek, or anything else the air module holds him for ends the offer, and so does the clock.
+  // Checked before the target write: a run's stage machine steers by e.target and must keep its own.
+  if ((f.until !== null && now > f.until) || e.tunnel || sys.air.busy(e)) { e.exitFlop = null; return; }
+  if (f.until === null) {
+    f.until = now + EXIT_FLOP_FOR;
+    // Any pad or crest the first wander just claimed would read the flank point as its own arrival.
+    dropCover(sys, e);
+    const out = l.rOuter + EXIT_FLOP_OUT;
+    e.target.set(mx + px * f.side * out, 0, mz + pz * f.side * out);
+    e.retargetAt = f.until;
+  }
+  const t = ((e.head.x - l.a.x) * ux + (e.head.z - l.a.z) * uz) / len;
+  const lat = (e.head.x - l.a.x) * px + (e.head.z - l.a.z) * pz;
+  if (t < 0.15 || t > 0.85 || Math.abs(lat) > l.rOuter + e.guestPolicy.flopReach) return;
+  const out = l.rOuter + 3, sd = lat >= 0 ? -1 : 1;
+  const across = { x: mx + px * sd * out, z: mz + pz * sd * out };
+  if (sys.air.tryFlop(e, l, across, false, true)) e.exitFlop = null;
+}
+
+// B5's small meals
+
+/* The horizon's target, in body radii, from whichever small meal is open; a capture writes its own. */
+function mealHorizon(e, now) {
+  if (e.state !== 'rounds') return 0;
+  return Math.max(e.crumbPull ? MEALS.crumbHorizon : 0, now < (e.sweepUntil ?? 0) ? MEALS.sweepHorizon : 0);
+}
+
+/* Every landed crumb's defer clock, every tick: "unwanted for four seconds" has to be watched, not guessed. */
+function deferTrack(sys, e, now) {
+  if (!e.guestPolicy?.defer) return;
+  for (const f of sys.foods) if (f.amount > 0 && !f.airborne && !f.onPad) deferClock(f, now, crumbWanted(f, sys.eels));
+}
+
+/* A crumb in a log's footprint is under wood or in a bore, and he takes no runs for food. */
+function underLog(sys, x, z) {
+  for (const l of sys.colliders.logs) {
+    const ax = l.b.x - l.a.x, az = l.b.z - l.a.z, l2 = ax * ax + az * az || 1e-9;
+    const t = Math.max(0, Math.min(1, ((x - l.a.x) * ax + (z - l.a.z) * az) / l2));
+    if (Math.hypot(x - l.a.x - ax * t, z - l.a.z - az * t) < l.rOuter + 0.1) return true;
+  }
+  return false;
+}
+
+/* B5 item 2, the approach half, after steer has moved him: a crumb nobody has wanted for samDefer seconds,
+   let go the moment a resident claims it, and the pull opened at crumbReach. */
+function deferTick(sys, e, now) {
+  if (!e.guestPolicy?.defer || e.crumbPull) return;
+  const c = e.samCrumb;
+  if (c) {
+    // Eaten, capped away, or claimed after all: he lets it go without a word and wanders on.
+    if (!(c.amount > 0) || !sys.foods.includes(c) || crumbClaimed(c, sys.eels)) { standDown(e); return; }
+    if (now - e.samCrumbAt > MEALS.crumbGiveUp) { c.samRefused = true; standDown(e); return; }
+    if (Math.hypot(c.x - e.head.x, c.z - e.head.z) < MEALS.crumbReach) startPull(sys, e, c);
+    return;
+  }
+  if (now < (e.deferAt ?? 0)) return;
+  e.deferAt = now + 1;
+  if (e.tunnel || e.exitFlop || e.leanOn || sys.air?.busy(e)) return;
+  const v = dial(sys).samDefer, defer = Number.isFinite(v) && v >= 0 ? v : 4;
+  let best = null, bd = Infinity;
+  for (const f of sys.foods) {
+    if (!deferReady(f, now, sys.eels, defer) || underLog(sys, f.x, f.z)) continue;
+    const d = Math.hypot(f.x - e.head.x, f.z - e.head.z);
+    if (d < bd) { bd = d; best = f; }
+  }
+  if (!best) return;
+  e.samCrumb = best;
+  e.samCrumbAt = now;
+  // A pad loiter or a crest rest would hold the retarget shut under him on the way.
+  dropCover(sys, e);
+}
+
+function standDown(e) {
+  e.samCrumb = null;
+  e.retargetAt = 0;
+}
+
+/* The pull starts: the crumb leaves the world, so no claim can reach it from here on, and spirals into the
+   crumb-scale horizon. Residents ticked first, so a claim made on this very tick is already counted. */
+function startPull(sys, e, c) {
+  if (crumbClaimed(c, sys.eels)) { standDown(e); return; }
+  sys.takeFood(c);
+  const h = horizonAt(e.head, e.heading, e.radius, tmpH);
+  e.crumbPull = { crumb: c, t: 0, y0: c.y, cap: spiralStart(c.x, c.z, h.x, h.z, MEALS.crumbTurn), at: {} };
+  standDown(e);
+}
+
+/* Controller-owned, like the repossession's stretch: the crumb rides the spiral to his moving mouth, drawn
+   out along the pull, and is gone at the horizon. Out of foods, the renderer no longer places its mesh. */
+function pullTick(sys, e, dt) {
+  const p = e.crumbPull;
+  if (!p) return;
+  p.t += dt;
+  const h = horizonAt(e.head, e.heading, e.radius, tmpH);
+  const s = spiralAt(p.cap, p.t, MEALS.crumbPull, h.x, h.z, MEALS.crumbHorizon * e.radius, p.at);
+  const c = p.crumb, k = s.u * s.u;
+  c.x = c.mx = s.x; c.z = c.mz = s.z;
+  c.y = h.y + (p.y0 - h.y) * (1 - k);
+  if (c.mesh) {
+    const [along, across] = MEALS.crumbStretch, sc = crumbScale(c.amount);
+    c.mesh.position.set(c.x, c.y, c.z);
+    // Local x onto the line to the hole, turned about y only: the camera looks straight down.
+    c.mesh.rotation.set(0, Math.atan2(-(h.z - c.z), h.x - c.x), 0);
+    const wide = sc * (1 + (across - 1) * s.u);
+    c.mesh.scale.set(sc * (1 + (along - 1) * s.u), wide, wide);
+  }
+  if (!s.done) return;
+  e.crumbPull = null;
+  sys.dropFood(c);
+  sys.emit('eat', e, c);
 }
 
 // The two plain fields the renderer reads, and the deference the residents feel
 
+/* The tail perch (B4): two slots riding the lit tail while he sleeps. A hot-swap or a slurp in eels.js
+   nulls a napper's spot without handing the claim back, so forgotten claims are swept here every tick. */
+function tailPerchTick(sys, e) {
+  const h = sys.habitat;
+  const asleep = e.state === 'lair' && e.returnLeg >= 2 && !!e.body?.visible;
+  const at = asleep && h ? tailSlots(e.pts, e.radius, e.lair, e.tailAt) : null;
+  if (!at) { dropTailPerch(sys, e); return; }
+  e.tailAt = at;
+  if (!e.tailPerch) {
+    e.tailPerch = h.addPerch({ x: at.x, y: at.y, z: at.z, type: 'tail', radius: e.radius * 3, cap: 2, owner: e, slots: at.slots });
+  }
+  const p = e.tailPerch;
+  p.x = at.x; p.y = at.y; p.z = at.z; p.slots = at.slots;
+  for (const r of h.claimants(p.id)) {
+    if (r.slurpedBy || r.coverSpot?.type !== 'tail' || r.coverSpot.id !== p.id) h.release(p.id, r);
+  }
+}
+
+// The self-swallow (S4)
+
+/* A forced exit on stage. Marked swallowed by its own mouth, the body is skipped by the brain loop, the
+   chain solver, and every resident; the collapse module below drives it until the park. */
+function startCollapse(sys, e, now) {
+  e.exitStyle = 'collapse';
+  // The small meals end, and his body closes to the water: litter and treats pass over the curling ring.
+  endGuestMeals(sys, e);
+  e.openMask?.fill(0);
+  // Never with someone in the jaws, whichever seam forced the exit.
+  if (e.prey?.slurpedBy === e) spit(sys, e, now, { growPredator: false });
+  e.prey = null;
+  e.phase = null;
+  if (e.steerHeld) releaseSteer(sys, e);
+  dropTailPerch(sys, e);
+  setExit(e, null);
+  e.exitFlop = null;
+  // Nobody sees a collapse off the rim: an ordinary park does the same job.
+  if (!onStage(sys, e)) {
+    e.state = 'offstage';
+    setVisible(sys, e, false);
+    park(sys, e);
+    rest(e, now);
+    return;
+  }
+  sys.lairGuest = null;
+  const fx = e.heading.x, fz = e.heading.z, lead = COLLAPSE.lead;
+  e.collapse = {
+    t: 0, phase: 'swallow', w: 0, s: 1, flash: 0, L: e.length,
+    mouth: { x: e.head.x - fx * lead, y: e.head.y, z: e.head.z - fz * lead },
+    fwd: { x: fx, z: fz }, side: curlSide(e.pts, e.heading),
+    from: e.pts.map((q) => ({ x: q.x, y: q.y, z: q.z })), dist: [], loop: [],
+  };
+  e.state = 'collapse';
+  e.stateAt = now;
+  e.speedBL = 0;
+  e.reverse = false;
+  e.horizon = HORIZON_SLURP;
+  e.collapseFlash = 0;
+  e.slurpedBy = e;
+}
+
+/* One tick of the collapse, from the module prepass (the brain loop skips a swallowed body). The tick
+   the last point goes in carries collapseFlash 1; the next one hides, parks, and rolls the next visit. */
+export function collapseSelfTick(sys, e, dt) {
+  const c = e.collapse;
+  collapseStep(c, dt);
+  // The brain loop skips a swallowed body, so a collapse out of the lair would go in on embers.
+  e.sunHeat = Math.min(1, (e.sunHeat ?? 1) + SUN_WAKE * dt);
+  if (c.phase === 'done') { finishCollapse(sys, e, sys.time); return; }
+  e.collapseFlash = c.flash;
+  // Render-only and never read here: two ticks in one frame would clear the flash before any draw saw it.
+  if (c.flash) e.flashPending = { x: e.head.x, y: e.head.y, z: e.head.z };
+  e.horizon = HORIZON_SLURP;
+  spaghettiPoints(e.pts, ORIGIN, UNIT_X, c.L, c.s, c.dist);
+  ouroborosPoints(c.dist, c.L, c.mouth, c.fwd, c.side, c.loop);
+  for (let i = 0; i < e.pts.length; i++) {
+    const f = c.from[i], q = c.loop[i];
+    e.pts[i].set(f.x + (q.x - f.x) * c.w, f.y + (q.y - f.y) * c.w, f.z + (q.z - f.z) * c.w);
+  }
+}
+
+function finishCollapse(sys, e, now) {
+  e.collapseFlash = 0;
+  e.horizon = 0;
+  e.collapse = null;
+  // Before the park: the identity roll's unbind and module init loops run inside it.
+  e.slurpedBy = null;
+  e.state = 'offstage';
+  setVisible(sys, e, false);
+  // Off the rim before the park, whose roll refuses to redress a body still on stage.
+  const d = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
+  teleport(e, Math.cos(e.parkAng) * d, Math.sin(e.parkAng) * d, e.parkAng + Math.PI);
+  park(sys, e);
+  rest(e, now);
+  // main.js cuts the drone on this rather than fading it; the roll's reset leaves it alone on purpose.
+  e.droneCut = true;
+}
+
+/* Registered by the guest attach. Runs every collapsing guest; a no-op for everyone else. */
+export const collapseModule = {
+  prepass(sys, dt) {
+    for (const g of sys.guests) if (g.state === 'collapse' && g.collapse) collapseSelfTick(sys, g, dt);
+  },
+};
+
+const SUN_WAKE = 0.5;   // heat per second on the way back up
+
 /* Awake is 1. Asleep in the lair the suns cool to embers over three seconds and re-ignite over two. */
 function sunHeat(e, dt) {
   const want = e.state === 'lair' && e.returnLeg >= 2 ? 0 : 1;
-  const rate = want > e.sunHeat ? 0.5 : 1 / 3;
+  const rate = want > e.sunHeat ? SUN_WAKE : 1 / 3;
   const step = rate * dt;
   e.sunHeat = want > e.sunHeat ? Math.min(want, e.sunHeat + step) : Math.max(want, e.sunHeat - step);
+}
+
+/* Every shared module reads gaits in body lengths, and at a resident's rate ten units of void crosses
+   the pond in three seconds. Paced to the dial each tick; baseCruiseBL keeps the rolled rate. */
+function pace(e, k) {
+  if (e.baseCruiseBL == null) return;
+  const c = Number.isFinite(k.samCruise) && k.samCruise > 0 ? k.samCruise : 0.8;
+  e.cruiseBL = Math.min(e.baseCruiseBL, c / e.length);
+  e.prowlBL = Math.min(e.baseProwlBL, e.cruiseBL * 0.6);
 }
 
 /* The sand he cannot wear: the solver's clearance and the crowns he steers around, both off one dial.
@@ -378,7 +670,8 @@ function calmTrail(sys, e, k) {
 function bowStep(sys, e, dt, k) {
   const drop = k.bow ?? 0;
   const reach = k.bowReach ?? 0.5;
-  if (drop <= 0 || reach <= 0 || !e.body?.visible) return;
+  // A bow is for him passing over; asleep in the log it would press his tail's nappers into the sand.
+  if (drop <= 0 || reach <= 0 || !e.body?.visible || (e.state === 'lair' && e.returnLeg >= 2)) return;
   for (const r of sys.eels) {
     if (r.slurpedBy || r.tunnel) continue;
     if (nearSpine(e, r.head.x, r.head.z) > reach) continue;
@@ -443,13 +736,24 @@ export function enterSam(sys, e, now) {
 /* Called by the guest attach once the build is his: both logs he fits are lair candidates. */
 export function initSam(sys, e) {
   e.lairs = sys.colliders.logs.filter((l) => logFitsGuest(l, e.radius));
+  // Before the modules' initEel: the fear, air, and brain modules read the policy from the first prepass.
+  e.guestPolicy = buildGuestPolicy(e.identity);
+  e.baseCruiseBL = e.cruiseBL;
+  e.baseProwlBL = e.prowlBL;
   e.leg = 0;
   e.phase = null;
   e.napUntil = 0;
   e.roundsUntil = 0;
   e.roamX = 0; e.roamZ = 0;
   e.lairWanted = null;
+  e.samCrumb = null;
+  e.samCrumbAt = 0;
+  e.deferAt = 0;
   e.sparkle = null;
+  e.exitFlop = null;
+  e.tailAt = null;
+  // The run cooldown belongs to a visit: a Sam-to-Sam re-roll keeps the body and would inherit it.
+  e.boreAt = -1e9;
   e.stageCap = 60;
   e.calmX = undefined;
   e.slurpDir = { x: 1, y: 0, z: 0 };

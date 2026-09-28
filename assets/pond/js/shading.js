@@ -321,8 +321,10 @@ export function makeUnderwaterShading(U) {
     const c = entry.div(U.maskExtent).add(0.5);
     // U.simTexel is sim.uTexel (assigned in main beside simTex), so the stencil follows rung 6.
     const step2 = azim.mul(U.simTexel.mul(2));
-    const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
-    entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
+    If(U.coverWobble.notEqual(0), () => {
+      const dh = U.simTex.sample(c.add(step2)).r.sub(U.simTex.sample(c.sub(step2)).r);
+      entry.addAssign(azim.mul(dh.mul(U.coverWobble).mul(kWobbleGain)));
+    });
     return entry.div(U.maskExtent).add(0.5);
   });
   const shade = Fn(([albedo, n, p, roughnessIn]) => {
@@ -364,8 +366,12 @@ export function makeUnderwaterShading(U) {
       // toVar, or both fetches below inline the whole stencil and pay for its sim taps twice.
       const entryUV = shadowEntryUV(L, p).toVar();
       const under = smoothstep(-0.02, 0.02, p.y).oneMinus().toVar();
-      cover.assign(U.coverTex.sample(entryUV).g.mul(U.coverStrength).mul(under));
-      litter.assign(U.litterTex.sample(entryUV).r.mul(U.litterShadow).mul(under));
+      If(U.coverStrength.notEqual(0), () => {
+        cover.assign(U.coverTex.sample(entryUV).g.mul(U.coverStrength).mul(under));
+      });
+      If(U.litterShadow.notEqual(0), () => {
+        litter.assign(U.litterTex.sample(entryUV).r.mul(U.litterShadow).mul(under));
+      });
     });
     const shadow = cover.oneMinus().mul(litter.oneMinus());
     direct.mulAssign(shadow);

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, PI } from 'three/tsl';
+import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, PI, If } from 'three/tsl';
 import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX, SHOAL_MAX } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
@@ -225,14 +225,17 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
     // Dig relief. Straight down through an ortho camera a real height change shows only in the
     // lighting, so the height's central difference leans the normal and its sign shades the sand.
     if (withRelief) {
-      const rc = p.xz.div(U.reliefExtent).add(0.5);
-      const o = U.reliefTexel;
-      const hn = (d) => U.reliefTex.sample(rc.add(d)).r.sub(RELIEF_MID).mul(RELIEF_DECODE);
-      const gx = hn(vec2(o, 0)).sub(hn(vec2(o.negate(), 0)));
-      const gz = hn(vec2(0, o)).sub(hn(vec2(0, o.negate())));
-      const lean = U.reliefStrength.mul(uReliefBump).mul(uReliefMax).div(U.reliefStep);
-      n = normalize(n.add(vec3(gx.negate(), 0, gz.negate()).mul(lean)));
-      albedo = albedo.mul(hn(vec2(0, 0)).mul(U.reliefStrength.mul(uReliefShade)).add(1).clamp(0.4, 1.5));
+      n = n.toVar(); albedo = albedo.toVar();
+      If(U.reliefActive.greaterThan(0).and(U.reliefStrength.notEqual(0)), () => {
+        const rc = p.xz.div(U.reliefExtent).add(0.5);
+        const o = U.reliefTexel;
+        const hn = (d) => U.reliefTex.sample(rc.add(d)).r.sub(RELIEF_MID).mul(RELIEF_DECODE);
+        const gx = hn(vec2(o, 0)).sub(hn(vec2(o.negate(), 0)));
+        const gz = hn(vec2(0, o)).sub(hn(vec2(0, o.negate())));
+        const lean = U.reliefStrength.mul(uReliefBump).mul(uReliefMax).div(U.reliefStep);
+        n.assign(normalize(n.add(vec3(gx.negate(), 0, gz.negate()).mul(lean))));
+        albedo.mulAssign(hn(vec2(0, 0)).mul(U.reliefStrength.mul(uReliefShade)).add(1).clamp(0.4, 1.5));
+      });
     }
 
     // Algae cover, cached in the wake buffer's B channel: four taps, two noise octaves, no texture set.
@@ -249,12 +252,15 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       // Value noise lives on a square lattice: axis-aligned, and multiplied into a steep curve, its cells
       // were the mosaic Sam saw. Rotated 0.6 rad and added at low gain it reads as grain instead.
       const rq = vec2(p.x.mul(uAlgaeRot.x).sub(p.z.mul(uAlgaeRot.y)), p.x.mul(uAlgaeRot.y).add(p.z.mul(uAlgaeRot.x)));
-      const detail = valueNoise2(rq.mul(uAlgaeDetailScale)).sub(0.5).mul(U.algaeDetail);
+      const detail = float(0).toVar(), streak = float(0).toVar();
+      If(U.algaeDetail.notEqual(0), () => {
+        detail.assign(valueNoise2(rq.mul(uAlgaeDetailScale)).sub(0.5).mul(U.algaeDetail));
+        streak.assign(valueNoise2(rq.mul(uAlgaeGrainScale)).sub(0.5).mul(U.algaeDetail));
+      });
       algae = smoothstep(0.12, 0.78, b.add(detail.mul(0.22)))
         .mul(smoothstep(-0.06, 0.02, p.y).oneMinus())           // submerged only; nothing above the waterline furs up
         .mul(mix(0.45, 1.0, geomN.y.clamp(0, 1)))               // settles on tops more than undersides
         .mul(uAlgaeMat).mul(U.algaeGain).clamp(0, 1);
-      const streak = valueNoise2(rq.mul(uAlgaeGrainScale)).sub(0.5).mul(U.algaeDetail);
       const tone = algae.add(streak.mul(0.35)).clamp(0, 1);
       algaeCol = mix(U.algaeColThin, U.algaeColDense, tone);
       albedo = mix(albedo, algaeCol, algae);
@@ -569,10 +575,11 @@ export async function buildFloor(scene, shading, extent, seed, view, habitat = n
   const buildLog = (li, prev) => {
     const stubCaps = [];
     // Hollow log: an open cylinder rendered from both sides, lying on the sand near the view.
-    // Seeded size variance: mostly ordinary, sometimes snug, rarely grand (a future Eleanor-sized bore).
+    // Seeded size variance: mostly ordinary, sometimes snug, often grand enough for a guest. At these odds
+    // about 55% of seeds lay down a log Sam or Eleanor fits (it was about 30%, too few naps for either).
     const sizeRng = createRng(deriveSeed(seed, 4243 + li * 20));
-    const grand = sizeRng.chance(0.15);
-    let sizeMul = grand ? sizeRng.range(1.25, 1.5) : sizeRng.chance(0.3) ? sizeRng.range(0.72, 0.9) : sizeRng.range(0.9, 1.15);
+    const grand = sizeRng.chance(0.35);
+    let sizeMul = grand ? sizeRng.range(1.25, 1.5) : sizeRng.chance(0.3) ? sizeRng.range(0.72, 0.9) : sizeRng.range(0.9, 1.3);
     // A second log has to read as a different tree: girth and length both land well away from the first.
     if (prev && Math.abs(sizeMul - prev.sizeMul) < 0.2) sizeMul = prev.sizeMul > 1.05 ? Math.min(sizeMul, prev.sizeMul - 0.25) : prev.sizeMul + 0.25;
     // The bore rolls independently of girth so a tight bore makes the eels' fit check a real sorting rule.

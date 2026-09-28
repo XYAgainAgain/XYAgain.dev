@@ -6,8 +6,11 @@ export class Habitat {
   constructor() {
     this.pads = [];      // { id, x, z, r }
     this.clumps = [];    // { id, x, z, r, warp(theta) -> 0..1 radius factor, growth }
-    this.perches = [];   // { id, x, y, z, type, radius }
+    this.perches = [];   // { id, x, y, z, type, radius }, plus cap and slots on a shared perch
     this.claims = new Map();
+    // A shared perch (cap above 1) keeps one fixed-length slot array in claims, so a napper keeps its
+    // side of the tail when the other one leaves. Every other perch is a single claimant, as it always was.
+    this.shared = new Map();
     this.nextId = 1;
     // Cover sources fill the shadow bake; sim.setCover replaces both arrays wholesale, so only
     // composeCover may call it, or a later phase's rebake would erase an earlier phase's shadows.
@@ -23,7 +26,23 @@ export class Habitat {
   // dx, dz are the live drift of a mat's center; every query below reads x + dx, never the seed point.
   addClump(clump) { const c = { id: this.nextId++, growth: 1, dx: 0, dz: 0, warp: () => 1, ...clump }; this.clumps.push(c); return c; }
 
-  addPerch(perch) { const p = { id: this.nextId++, ...perch }; this.perches.push(p); return p; }
+  addPerch(perch) {
+    const p = { id: this.nextId++, ...perch };
+    this.perches.push(p);
+    if ((p.cap | 0) > 1) this.shared.set(p.id, p);
+    return p;
+  }
+
+  /* A perch that moves off the registry (a guest's tail when he wakes). Hands back everyone who held a
+     claim on it, so the owner can wake them rather than leave them napping against nothing. */
+  removePerch(perchId) {
+    const i = this.perches.findIndex((p) => p.id === perchId);
+    if (i >= 0) this.perches.splice(i, 1);
+    const held = this.claimants(perchId);
+    this.claims.delete(perchId);
+    this.shared.delete(perchId);
+    return held;
+  }
 
   /* fn(discs, capsules) pushes { x, z, r, strength } and { ax, az, bx, bz, r, strength }. */
   addCoverSource(fn) { this.coverSources.push(fn); }
@@ -85,16 +104,57 @@ export class Habitat {
     for (const p of this.perches) {
       if (p.gone) continue;   // its stem is swallowed; nothing may perch where there is no stem
       if (type && p.type !== type) continue;
-      if (freeOnly && this.claims.has(p.id)) continue;
+      if (freeOnly && !this.hasRoom(p.id)) continue;
       const dx = x - p.x, dz = z - p.z, d = dx * dx + dz * dz;   // squaring preserves order, so the winner is the same
       if (d < bestD) { bestD = d; best = p; }
     }
     return best;
   }
 
-  claim(perchId, who) { if (this.claims.has(perchId)) return false; this.claims.set(perchId, who); return true; }
+  hasRoom(perchId) {
+    const s = this.shared.get(perchId);
+    if (!s) return !this.claims.has(perchId);
+    const slots = this.claims.get(perchId);
+    return !slots || slots.includes(null);
+  }
 
-  release(perchId) { this.claims.delete(perchId); }
+  claim(perchId, who) {
+    const s = this.shared.get(perchId);
+    if (!s) { if (this.claims.has(perchId)) return false; this.claims.set(perchId, who); return true; }
+    let slots = this.claims.get(perchId);
+    if (!slots) this.claims.set(perchId, slots = new Array(s.cap | 0).fill(null));
+    if (slots.includes(who)) return true;
+    const i = slots.indexOf(null);
+    if (i < 0) return false;
+    slots[i] = who;
+    return true;
+  }
 
-  claimant(perchId) { return this.claims.get(perchId) ?? null; }
+  /* `who` is only needed on a shared perch; a single-claimant perch lets go whoever holds it, as before. */
+  release(perchId, who = null) {
+    const slots = this.shared.has(perchId) ? this.claims.get(perchId) : null;
+    if (!slots) { this.claims.delete(perchId); return; }
+    if (who === null) { this.claims.delete(perchId); return; }
+    const i = slots.indexOf(who);
+    if (i >= 0) slots[i] = null;
+    if (slots.every((c) => c === null)) this.claims.delete(perchId);
+  }
+
+  claimant(perchId) {
+    const c = this.claims.get(perchId) ?? null;
+    return Array.isArray(c) ? c.find((x) => x !== null) ?? null : c;
+  }
+
+  claimants(perchId) {
+    const c = this.claims.get(perchId);
+    if (c === undefined) return [];
+    return Array.isArray(c) ? c.filter((x) => x !== null) : [c];
+  }
+
+  /* Which of a shared perch's slots `who` holds, or -1. */
+  slotOf(perchId, who) {
+    const c = this.claims.get(perchId);
+    if (Array.isArray(c)) return c.indexOf(who);
+    return c === who ? 0 : -1;
+  }
 }

@@ -3,6 +3,7 @@ import { DEPTH, EEL_POINTS } from './config.js';
 import { segDist, retreatAlongTrail, growEel } from './eel-physics.js';
 import { FOOD_DRUNK, foodDrunk } from './eel-quirks.js';
 import { wrapPi } from './eel-brain-core.js';
+import { MEALS, chainNear, leanPoint, logTaken, runYields } from './sam-eel-core.js';
 
 const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpC = new THREE.Vector3();
 
@@ -20,12 +21,17 @@ const NAP_REACH = 3.5, NAP_GAIN = 0.3, NAP_CAP = 0.6, NAP_DEEP = 1.5, NAP_LONG =
 // a double helix, three a challah. The guide crawls toward the leader's own wander target.
 const TWINE_R = 0.24, TWINE_RY = 0.15, TWINE_OMEGA = Math.PI * 2 / 3.2, TWINE_LEN = [8, 16], TWINE_REACH = 1.6, TWINE_CHANCE = 0.1;
 const SICKLE_SKIN = new THREE.Color(1, 0.85, 0.2), SICKLE_GLOW = new THREE.Color(1, 0.2, 0.15);
-const TUNNEL_DIALS = { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, snakeCool: 2 };   // fallback; pond.eels.knobs.tunnel is the live copy
+const TUNNEL_DIALS = { stall: 6, cooldown: 45, odds: 0.3, crowd: 1.5, snakeCool: 2, samCool: 90 };   // fallback; pond.eels.knobs.tunnel is the live copy
 const tunnelDial = (sys, key) => sys?.knobs?.tunnel?.[key] ?? TUNNEL_DIALS[key];
 const RUNOUT_STEPS = 8;
 // A hold bout the eel is actually holding. The nominal gait alone is not a rest: grazing and the tea
 // ritual both write one while the eel is still travelling.
 const HOLD_STILL = 0.2;
+const NO_SPOOKS = Object.freeze([]);
+// A sleeping guest's tail perch is worth a swim from this far, and a napper holds it this long by default.
+const TAIL_REACH = 8, TAIL_NAP = [10, 25];
+// The lean-in: inside this of the hold point he stops creeping, and he eases in over the last unit.
+const LEAN_STILL = 0.2, LEAN_EASE = 1;
 
 /* Every field a census knob or quirk owns, wiped whenever the eel wearing them changes. A hot-swap
    re-runs applyIdentity and drops the plan, but it cannot know about state invented out here. */
@@ -92,6 +98,13 @@ export function tunnelLog(colliders, t) {
   return colliders.logs[0] ?? null;
 }
 
+/* A guest mid-run holds its log for the whole run, not only while laired. No draw is spent, and Eleanor
+   never runs a tunnel, so with her as guest this is always false. */
+function guestRunIn(sys, log) {
+  for (const g of sys?.guests ?? []) if (g.tunnel && tunnelLog(g.colliders, g.tunnel) === log) return true;
+  return false;
+}
+
 function runoutClear(e, pt, bore) {
   for (const o of e.colliders.spheres) {
     if (Math.hypot(pt.x - o.x, pt.z - o.z) < (o.rHit ?? o.r) + e.radius) return false;
@@ -143,7 +156,7 @@ function tailClear(e) {
 
 /* Is the head inside the bore this run belongs to? A run abandoned there turns the body through the
    log wall, so it is the one place the retarget gate may not fire. */
-function headInBore(e) {
+export function headInBore(e) {
   const l = tunnelLog(e.colliders, e.tunnel);
   if (!l) return false;
   return segDist(e.head.x, e.head.z, l.a.x, l.a.z, l.b.x, l.b.z) < l.rInner;
@@ -151,8 +164,10 @@ function headInBore(e) {
 
 export function pickTarget(sys, e, now) {
   const rng = e.rng;
-  // A ridge claim lives in the habitat, so re-picking has to hand it back before forgetting it.
+  const gp = e.guestPolicy;
+  // A ridge or tail claim lives in the habitat, so re-picking has to hand it back before forgetting it.
   if (e.coverSpot?.type === 'ridge') sys?.habitat?.release(e.coverSpot.id);
+  else if (e.coverSpot?.type === 'tail') sys?.habitat?.release(e.coverSpot.id, e);
   e.coverSpot = null;
   const flock = e.flock || [];
   // Eels move on wet nights, so a shower thins the appetite for cover. It only ever reweights an
@@ -168,7 +183,10 @@ export function pickTarget(sys, e, now) {
   const moonCover = sys.air?.coverMul(e) ?? 1;
   // The bore is the one stretch a snake cannot swim on cardinals, so Jaz waits longer between runs.
   const cooldown = tunnelDial(sys, 'cooldown') * (e.quirks.snake ? tunnelDial(sys, 'snakeCool') : 1);
-  if (log && !lairBlocked && e.tunnel === null && logFits(e, log) && now - e.boreAt > cooldown && !sys?.bond?.inBout(e)) {
+  if (gp) {
+    if (gp.tunnels && e.tunnel === null && now - e.boreAt > tunnelDial(sys, 'samCool') && guestRun(sys, e, now, act, moonCover)) return;
+  } else if (log && !lairBlocked && e.tunnel === null && logFits(e, log) && now - e.boreAt > cooldown && !sys?.bond?.inBout(e)
+    && !guestRunIn(sys, log)) {
     // Crowding counts live runs rather than the coverSpot label, which one eel drops the moment its
     // own run ends; the moon reweights the bore the way it already reweights every other cover branch.
     const logClaims = flock.reduce((n, o) => n + (o !== e && o.tunnel ? 1 : 0), 0);
@@ -191,7 +209,18 @@ export function pickTarget(sys, e, now) {
   const pads = sys?.habitat?.pads ?? [];
   const rocks = e.colliders.spheres;
   let covered = false;
-  if (pads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act) * moonCover)) {
+  // A sleeping guest's lit tail, picked like a warm rock. Looked up before any draw, so a pond with no
+  // tail perch registered rolls exactly what it always did.
+  const tail = !gp && sys?.habitat ? sys.habitat.nearestPerch(e.head.x, e.head.z, 'tail', true) : null;
+  const perchOdds = sys?.knobs?.guest?.perchOdds ?? 0.35;
+  if (tail && tail.slots && Math.hypot(tail.x - e.head.x, tail.z - e.head.z) < TAIL_REACH
+    && rng.chance(Math.min(0.6, perchOdds * e.traits.cover / act)) && sys.habitat.claim(tail.id, e)) {
+    const slot = Math.max(0, sys.habitat.slotOf(tail.id, e));
+    e.target.set(tail.slots[slot].x, 0, tail.slots[slot].z);
+    // holdUntil 0 means "on the way", as under a pad; the owner is how a guest swap finds the spot.
+    e.coverSpot = { type: 'tail', id: tail.id, slot, owner: tail.owner ?? null, holdUntil: 0 };
+    covered = true;
+  } else if ((!gp || gp.pads) && pads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act) * moonCover)) {
     const claims = pads.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'pad' && o.coverSpot.idx === i ? 1 : 0), 0));
     const least = Math.min(...claims);
     const idx = rng.pick(pads.map((_, i) => i).filter((i) => claims[i] === least));
@@ -199,16 +228,19 @@ export function pickTarget(sys, e, now) {
     // holdUntil 0 means "on the way"; arrival in steer() sets the loiter and its end.
     e.coverSpot = { type: 'pad', idx, holdUntil: 0 };
     covered = true;
-  } else if (sys?.habitat && rng.chance(Math.min(0.35, 0.15 * e.traits.cover / act) * moonCover)) {
+  } else if ((!gp || gp.ridges) && sys?.habitat && rng.chance(Math.min(0.35, 0.15 * e.traits.cover / act) * moonCover)) {
     // The dry crest of a log is cover of its own: the eel rests along it with its head out.
-    const perch = sys.habitat.nearestPerch(e.head.x, e.head.z, 'log', true);
+    const crest = gp ? guestCrest(sys, e) : null;
+    const perch = gp ? crest?.perch : sys.habitat.nearestPerch(e.head.x, e.head.z, 'log', true);
     if (perch && sys.habitat.claim(perch.id, e)) {
       e.target.set(perch.x, 0, perch.z);
       // peeked flips on arrival in steer(); the peek is a reward for reaching the crest, not for picking it.
       e.coverSpot = { type: 'ridge', id: perch.id, x: perch.x, y: perch.y, z: perch.z, peeked: false };
+      // A guest keeps the log itself too: the etiquette re-check and his wider arrival both read it.
+      if (crest) { e.coverSpot.log = crest.log; e.coverSpot.holdUntil = 0; }
       covered = true;
     }
-  } else if (rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover / act) * moonCover)) {
+  } else if ((!gp || gp.rockCover) && rocks.length && rng.chance(Math.min(0.6, 0.2 * e.traits.cover / act) * moonCover)) {
     covered = rockCover(sys, e, rocks, flock, rng, now);
   }
   if (!covered) {
@@ -219,7 +251,7 @@ export function pickTarget(sys, e, now) {
     const party = e.census.party;
     if (drop) e.target.set(drop.x, 0, drop.z);
     // B4: nothing in the water, hungry, and smart enough to go check where dinner was last time.
-    else if (sys.braincell?.pickMemory(e, now)) { /* the memory trip owns the target */ }
+    else if ((!gp || gp.food) && sys.braincell?.pickMemory(e, now)) { /* the memory trip owns the target */ }
     else {
       // Home fidelity biases the draw; the party and patrol re-rolls then apply to that same draw.
       const a = sys.braincell?.anchorDraw(e, ex, ez) ?? null;
@@ -240,9 +272,70 @@ export function pickTarget(sys, e, now) {
   e.retargetAt = now + rng.range(e.traits.attention[0], e.traits.attention[1]);
   // Over the log rather than through it, when the line to the target just drawn crosses one. The
   // module owns the odds, the eligibility, and its own repeat cooldown.
-  if (log && !lairBlocked && sys.air && routeCrossesLog(e, log)) sys.air.tryFlop(e, log, e.target);
+  if (gp) {
+    // B6: over either log for a guest, first in collider order; stubs are solid wood, never a crossing.
+    for (const l of e.colliders.logs) if (l.rInner > 0 && sys.air && routeCrossesLog(e, l)) { sys.air.tryFlop(e, l, e.target); break; }
+  } else if (log && !lairBlocked && sys.air && routeCrossesLog(e, log)) sys.air.tryFlop(e, log, e.target);
   // Rain: the investigate startle styles and Andy read a ticking film as something worth a look.
   if (env > 0 && (e.census.startle === 'investigate' || e.quirks.rippleChase)) sys.air?.tryPeek(e, 'rain');
+}
+
+/* Sam's bore run (B4): any log that takes his girth, nearest mouth first, never one a resident has run
+   dibs on or is lying in, and never a far side too short for the whole body (startTunnel unforced). */
+function guestRun(sys, e, now, act, moonCover) {
+  const logs = e.colliders.logs, head = e.head;
+  let pick = -1, pd = Infinity;
+  for (let i = 0; i < logs.length; i++) {
+    const l = logs[i];
+    if (!(l.rInner > 0) || !logFits(e, l) || logTaken(l, sys.eels, e)) continue;
+    const d = Math.min(Math.hypot(l.a.x - head.x, l.a.z - head.z), Math.hypot(l.b.x - head.x, l.b.z - head.z));
+    if (d < pd) { pd = d; pick = i; }
+  }
+  if (pick < 0) return false;
+  if (!e.rng.chance(Math.min(0.85, tunnelDial(sys, 'odds') * e.traits.cover / act) * moonCover)) return false;
+  const l = logs[pick];
+  const nearA = Math.hypot(l.a.x - head.x, l.a.z - head.z) <= Math.hypot(l.b.x - head.x, l.b.z - head.z);
+  const m0 = nearA ? l.a : l.b, m1 = nearA ? l.b : l.a;
+  if (!startTunnel(e, m0, m1, now) && !startTunnel(e, m1, m0, now)) return false;
+  e.coverSpot = { type: 'log', idx: pick };
+  return true;
+}
+
+/* A guest's crest perch: the nearest free one on a log nobody has claimed or is lying in. */
+function guestCrest(sys, e) {
+  const h = sys.habitat, logs = e.colliders.logs;
+  let best = null, bd = Infinity;
+  for (const p of h.perches) {
+    if (p.type !== 'log' || p.gone || !h.hasRoom(p.id)) continue;
+    const d = Math.hypot(p.x - e.head.x, p.z - e.head.z);
+    if (d >= bd) continue;
+    const log = logs.find((l) => l.rInner > 0 && segDist(p.x, p.z, l.a.x, l.a.z, l.b.x, l.b.z) <= l.rOuter + 0.05);
+    if (!log || logTaken(log, sys.eels, e)) continue;
+    best = { perch: p, log }; bd = d;
+  }
+  return best;
+}
+
+/* The ordinary wake-from-rest, with no startle in it: whatever the spot was, it is gone, and a hold ends
+   now. Shared by the tail perch's own check and its owner waking up. */
+export function wakeNapper(e, now) {
+  e.coverSpot = null;
+  if (e.gait === 'hold') { e.gaitUntil = Math.min(e.gaitUntil, now); if (e.restPose) e.restPose.kind = ''; }
+  if (e.snuggle) e.snuggle.with = null;
+  e.retargetAt = Math.min(e.retargetAt, now);
+}
+
+/* A guest wedged mid-bore backs out down his own trail to the mouth he came in by, sized to reach it:
+   dropping the run there instead would hand a wander target to a head that is still inside the wood. */
+export function boreBackout(sys, e, now) {
+  const t = e.tunnel;
+  if (!t) return;
+  const d = Math.hypot(t.entry.x - e.head.x, t.entry.z - e.head.z) + e.radius * 2 + 0.5;
+  const pace = retreatBL(e, sys.motion.reduced ? 0.28 : 0.8) * e.length;
+  e.nopeUntil = now + Math.min(20, d / Math.max(0.05, pace));
+  e.nopeZig = 0;
+  e.retargetAt = 0;
+  e.boreAt = now;
 }
 
 /* Does the straight line to the target pass through the log's outer capsule? Eight samples along the
@@ -260,7 +353,10 @@ function routeCrossesLog(e, log) {
 export function dropCover(sys, e) {
   const t = e.coverSpot?.type;
   if (t === 'ridge') sys.habitat?.release(e.coverSpot.id);
-  if (t === 'pad' || t === 'ridge' || t === 'rock') e.coverSpot = null;
+  else if (t === 'tail') sys.habitat?.release(e.coverSpot.id, e);
+  if (t === 'pad' || t === 'ridge' || t === 'rock' || t === 'tail') e.coverSpot = null;
+  // A guest's pad or crest rest is a hold that would outlive its spot, so it ends here as wakeNapper's does.
+  if (e.guestPolicy && e.gait === 'hold') e.gaitUntil = Math.min(e.gaitUntil, sys.time);
 }
 
 /* B6's scored crevice pick. The random angle past one rock's radius survives as the fallback for a
@@ -287,6 +383,8 @@ function updateGait(sys, e, now, act) {
   const rng = e.rng, t = e.traits;
   e.gaitFrom = now;   // bout length, which is what the deep-rest poses key off
   if (e.gait === 'hold') { e.gait = rng.chance(0.75 / act) ? 'prowl' : 'cruise'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
+  // A guest with no open-water naps only ever travels; his rest is the lair, which the controller owns.
+  else if (e.guestPolicy && !e.guestPolicy.naps) { e.gait = rng.chance(0.35) ? 'cruise' : 'prowl'; e.gaitUntil = now + rng.range(t.travelTime[0], t.travelTime[1]); }
   else {
     // The nap field: one draw either way, so the odds only move when somebody nearby is resting.
     let nap = 0, napper = null, best = 0;
@@ -475,6 +573,10 @@ export function tickHeldAbove(e, tier) {
 export function commitPose(e) {
   const p = e.pose;
   if (p.speed !== null) e.speedBL = p.speed;
+  // A guest's hard ceiling, here because steer and the air module's drive both commit through this line
+  // before the head moves: no burst, stim, or recovery whips a ten-unit body across the pond.
+  const gp = e.guestPolicy;
+  if (gp && e.speedBL > e.cruiseBL * gp.speedCap) e.speedBL = e.cruiseBL * gp.speedCap;
   if (p.targetY !== null) e.targetY = p.targetY;
   if (p.ampMul !== null) e.ampMul = p.ampMul;
   if (p.squash !== null) e.squash = p.squash;
@@ -482,6 +584,18 @@ export function commitPose(e) {
   if (p.roll !== null) e.roll = p.roll;
   e.uSquash.value = e.squash;
   if (e.uRoll) e.uRoll.value = ((e.roll % FULL_TURN) + FULL_TURN) % FULL_TURN;
+}
+
+/* A guest's center height at fraction u of his policy band, measured up from the floor. */
+function guestY(e, gp, u) {
+  return -DEPTH + e.radius + gp.depth[0] + (gp.depth[1] - gp.depth[0]) * u;
+}
+
+/* The retreat rates (nope, reverse escape) move the chain straight down its trail and never reach
+   commitPose, so a guest's speed ceiling has to be applied to them here. Residents get `bl` back. */
+export function retreatBL(e, bl) {
+  const gp = e.guestPolicy;
+  return gp ? Math.min(bl, e.cruiseBL * gp.speedCap) : bl;
 }
 
 /* Every owner that takes Jaz's grid off, in one place. Air states and the reverse escape return from
@@ -615,7 +729,7 @@ function nopingTick(sys, e, dt) {
   e.wavePhase += Math.PI * 2 * f * dt;
   if (e.wavePhase > WRAP) e.wavePhase -= WRAP;
   e.ampMul += (1 - e.ampMul) * Math.min(1, dt * 6);
-  retreatAlongTrail(e, (sys.motion.reduced ? 0.28 : 0.8) * e.length * dt);
+  retreatAlongTrail(e, retreatBL(e, sys.motion.reduced ? 0.28 : 0.8) * e.length * dt);
   e.uExcite.value += (1 - e.uExcite.value) * Math.min(1, dt * 3);
   e.squash += (1 - e.squash) * Math.min(1, dt * 5);
   e.uSquash.value = e.squash;
@@ -627,6 +741,7 @@ export function steer(sys, e, dt) {
   const head = e.head;
 
   if (e.quirkFor !== e.identity) initQuirkState(e);
+  const gp = e.guestPolicy;
   // Tick Contract tier 2, above the tunnel and above the nope: a committed air state or its recovery
   // owns the eel outright and handles an interrupting scare itself, submerging before it lets go.
   if (sys.air?.tick(sys, e, dt)) return;
@@ -677,18 +792,31 @@ export function steer(sys, e, dt) {
 
   // F3 and F4. Below the reverse escape on purpose: an eel backing out of a bore clears the mouth
   // before the burst. A scatter does interrupt a tunnel run, exactly as today's nope already does.
-  const scatter = sys.fear?.scatterTick(sys, e, dt) ?? null;
+  const scatter = gp && !gp.fear ? null : (sys.fear?.scatterTick(sys, e, dt) ?? null);
   if (scatter) {
     claimTick(e, 'scatter', 'scatter');
     speedMul = Math.max(speedMul, scatter.speedMul);
     excite = Math.max(excite, scatter.excite);
   }
-  const contest = sys.fear?.contestTick(sys, e, dt) ?? null;
+  const contest = gp && !gp.fear ? null : (sys.fear?.contestTick(sys, e, dt) ?? null);
   if (contest) {
     claimTick(e, 'contest', 'contest');
     if (contest.burst) speedMul = Math.max(speedMul, contest.burst);
   }
 
+  // B4: a resident who claims his log while he is still lining up wins, and he lets the run go without a
+  // fuss. The cooldown already started at startTunnel, so the same log cannot be re-picked straight back.
+  if (gp?.logEtiquette && e.tunnel && runYields(e.tunnel, tunnelLog(e.colliders, e.tunnel), sys.eels, e)) {
+    e.tunnel = null;
+    if (e.coverSpot?.type === 'log') e.coverSpot = null;
+    e.retargetAt = 0;
+  }
+  // The same courtesy on the way to a crest perch; once he is resting on the wood, it is his spot.
+  if (gp?.logEtiquette && e.coverSpot?.type === 'ridge' && e.coverSpot.log && !e.coverSpot.peeked
+    && logTaken(e.coverSpot.log, sys.eels, e)) {
+    dropCover(sys, e);
+    e.retargetAt = 0;
+  }
   // Hiding freezes the run mid-bore; the timer clears and the run resumes on its own.
   const berthed = !!(sys.lairGuest && e.quirks.follows !== sys.lairGuest.name);
   const hiding = !!(e.tunnel && e.tunnel.hideUntil && now > e.tunnel.hideFrom && now < e.tunnel.hideUntil);
@@ -720,12 +848,15 @@ export function steer(sys, e, dt) {
   sys.braincell?.preSteer(sys, e, dt, force);
   // F6's one deliberate reaction. It yields to a scatter, a contest, and a slurp, and the tiers above
   // it own the tick outright, so it can never cancel a run or a recovery.
-  const telling = !scatter && !contest && (sys.fear?.tellTick(sys, e, dt, tickHeldAbove(e, 'voluntary')) ?? false);
+  const telling = !scatter && !contest && (!gp || gp.fear) && (sys.fear?.tellTick(sys, e, dt, tickHeldAbove(e, 'voluntary')) ?? false);
   if (telling) claimTick(e, 'voluntary', 'overit');
   // Q-A. Below every tier that can own the eel outright, so only an idle hold lets a fidget start.
   // The tier is passed in rather than imported, so eel-quirks.js stays free of a cycle with this file.
+  // B5's deferred crumb: his controller picks it and lets it go; here it is only the swim to it. Read before
+  // the fidget, which may not start a bout under a meal the tier claim below has not landed yet.
+  const deferCrumb = gp?.defer && e.samCrumb && !e.tunnel ? e.samCrumb : null;
   const stimming = !scatter && !contest && !telling
-    && (sys.stim?.tick(sys, e, dt, tickHeldAbove(e, 'voluntary')) ?? false);
+    && (sys.stim?.tick(sys, e, dt, tickHeldAbove(e, 'voluntary') || !!deferCrumb) ?? false);
   if (stimming) claimTick(e, 'voluntary', 'stim');
   // V8's approach is a voluntary trip rather than a committed air state, so it arbitrates down here:
   // anything holding the eel, or a crumb it can already smell, cancels the swim to the reflection.
@@ -736,12 +867,26 @@ export function steer(sys, e, dt) {
   }
   if (biting) return;
   const memHold = e.coverSpot?.type === 'memory' && now < (e.coverSpot.holdUntil ?? 0);
+  // The tail perch's anchor rides a sleeping guest's tail, so the target is re-read every tick. A perch
+  // that is gone (he woke, left, or collapsed) or a claim that was swept lets the napper go, no startle.
+  let tailSpot = e.coverSpot?.type === 'tail' ? e.coverSpot : null;
+  let tailSlot = null;
+  if (tailSpot) {
+    const perch = sys.habitat?.perches.find((p) => p.id === tailSpot.id) ?? null;
+    const at = perch && sys.habitat.slotOf(perch.id, e);
+    tailSlot = perch?.slots && at >= 0 ? perch.slots[at] : null;
+    if (!tailSlot) { if (perch) sys.habitat.release(perch.id, e); wakeNapper(e, now); tailSpot = null; }
+    else e.target.set(tailSlot.x, 0, tailSlot.z);
+  }
+  const tailHolding = !!(tailSpot && now < tailSpot.holdUntil);
+  const ridgeHolding = !!(gp && e.coverSpot?.type === 'ridge' && now < (e.coverSpot.holdUntil ?? 0));
+  const lean = gp?.lean ? leanTick(sys, e) : null;
   // A quirk holding the target this tick blocks the retarget exactly the way a pad loiter does.
   // Gait-driven state is read one tick late: updateGait runs below, where its rng stream already lives.
   const looping = e.gait === 'loop' && now < e.gaitUntil && !e.tunnel && !e.food;
   const snug = e.snuggle.with && now < e.snuggle.until && e.snuggle.with.gait === 'hold' && !e.snuggle.with.slurpedBy ? e.snuggle.with : null;
   if (!snug) e.snuggle.with = null;
-  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e) || !!sys.bond?.active(e);
+  const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e) || !!sys.bond?.active(e) || !!lean || !!deferCrumb;
   // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
   // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
   const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
@@ -750,18 +895,37 @@ export function steer(sys, e, dt) {
     const until = now + rng.range(6, 18);
     padSpot.holdUntil = until;
     e.gait = 'hold'; e.gaitUntil = until;
-    e.targetY = Math.max(-0.35, -DEPTH + e.radius * 2.2);
+    e.targetY = gp ? guestY(e, gp, 1) : Math.max(-0.35, -DEPTH + e.radius * 2.2);
     e.retargetYAt = until; e.retargetAt = until;
     sys.air?.tryPeek(e, 'pad');
   }
-  // Reaching the claimed crest is the ridge peek's trigger, rolled once per claim.
-  else if (e.coverSpot?.type === 'ridge' && !e.coverSpot.peeked && !e.tunnel && Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6) {
+  // A napper settling against the tail: a hold at the cloud's own depth, clamped into its band.
+  else if (tailSpot && tailSpot.holdUntil === 0 && !e.tunnel && Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6) {
+    const nap = sys.knobs?.guest?.perchNap;
+    const [lo, hi] = Array.isArray(nap) && nap[0] > 0 && nap[1] >= nap[0] ? nap : TAIL_NAP;
+    const until = now + rng.range(lo, hi);
+    tailSpot.holdUntil = until;
+    e.gait = 'hold'; e.gaitUntil = until;
+    e.targetY = Math.max(-DEPTH + e.radius * 2.2, Math.min(-e.radius * 1.6, tailSlot.y));
+    e.retargetYAt = until; e.retargetAt = until;
+  }
+  // Reaching the claimed crest is the ridge peek's trigger, rolled once per claim. A guest's snout stops a
+  // bark-and-girth away from the crest line, so his arrival is measured from there.
+  else if (e.coverSpot?.type === 'ridge' && !e.coverSpot.peeked && !e.tunnel
+    && Math.hypot(e.target.x - head.x, e.target.z - head.z) < (gp && e.coverSpot.log ? e.coverSpot.log.rOuter + e.radius + 0.35 : 0.6)) {
     e.coverSpot.peeked = true;
+    if (gp) {
+      // He rests where he arrived, beside the wood; a target left on the crest would push him into it.
+      const until = now + rng.range(6, 14);
+      e.coverSpot.holdUntil = until;
+      e.target.set(head.x, 0, head.z);
+      e.gait = 'hold'; e.gaitUntil = until; e.retargetAt = until;
+    }
     sys.air?.tryPeek(e, 'ridge');
   }
   // Never abandon a run mid-bore: turning around inside the log drags the body through its wall. Out
   // in the water a run is ordinary again, so a stall or the attention span can end one.
-  else if (!padHolding && !memHold && !quirkTarget && !(e.tunnel && headInBore(e))
+  else if (!padHolding && !tailHolding && !ridgeHolding && !memHold && !quirkTarget && !(e.tunnel && headInBore(e))
     && (now > e.retargetAt || stalled || (!e.tunnel && head.distanceTo(e.target) < 0.6))) {
     pickTarget(sys, e, now);
     // A run that gave up here is a wander now, and the claim above must not keep labeling it tunnel-owned.
@@ -769,6 +933,7 @@ export function steer(sys, e, dt) {
   }
 
   if (padHolding) claimTick(e, 'voluntary', 'pad');
+  else if (tailHolding || ridgeHolding) claimTick(e, 'voluntary', 'perch');
   else if (memHold) claimTick(e, 'voluntary', 'memory');
 
   // Quirk targets, in the order they outrank each other; each parks e.target for this tick only. A
@@ -854,22 +1019,40 @@ export function steer(sys, e, dt) {
   }
   // The crush gag (eel-crush.js) parks its lane point here: social tier, a target write and nothing
   // else, so the turn-rate clamp is what makes the follower miss Jaz's corners.
-  if (!busy) { const m = sys.crush?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
+  if (!busy && (!gp || gp.social)) { const m = sys.crush?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
   // The life bond (eel-bond.js) parks the seek, the hello, the stroll lane, and the vigil here, the
   // same way and in the same tier. The rest phase writes nothing: the snuggle block above owns it.
-  if (!busy) { const m = sys.bond?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
+  if (!busy && (!gp || gp.social)) { const m = sys.bond?.pickTarget(sys, e, now) ?? 0; if (m > 0) speedMul = Math.max(speedMul, m); }
+  if (lean && !busy) {
+    claimTick(e, 'voluntary', 'lean');
+    e.target.set(lean.x, 0, lean.z);
+  }
+  if (deferCrumb) {
+    claimTick(e, 'meal', 'defer');
+    e.target.set(deferCrumb.x, 0, deferCrumb.z);
+  }
+  // B5 item 1: crossing a mat holds the small singularity open. A label and a pace, never a heading: the
+  // specks, the carve, and the hole itself are drawn off e.sweeping by the floaters and the renderer.
+  if (gp?.sweep) {
+    if (!e.tunnel && e.gait !== 'hold' && sys.habitat?.duckweedAt?.(head.x, head.z)) e.sweepUntil = now + MEALS.sweepGrace;
+    e.sweeping = now < (e.sweepUntil ?? 0);
+    if (e.sweeping) claimTick(e, 'meal', 'sweep');
+  }
 
   tmpB.subVectors(e.target, head); tmpB.y = 0;
+  // Leaning in: the pull lets go at the hold point, or the snout would circle the finger it is holding off.
+  const leanD = lean && !busy ? tmpB.length() : Infinity;
   // A hold that has reached its spot stops pulling and (below) stops creeping: at creep speed the turn
   // radius is a hair, so a target under the snout spins the head in place and winds the body into a ball.
-  const settled = e.gait === 'hold' && now < e.gaitUntil && !e.food && !busy && !memHold
+  const settled = e.gait === 'hold' && now < e.gaitUntil && !e.food && !deferCrumb && !busy && !memHold
     && (snug ? !snugFar : !quirkTarget && tmpB.length() < 0.6);
   tmpB.normalize();
-  force.addScaledVector(tmpB, hiding || settled ? 0 : e.tunnel ? 1.4 : 0.6);
+  force.addScaledVector(tmpB, hiding || settled || leanD < LEAN_STILL ? 0 : e.tunnel ? 1.4 : 0.6);
 
   // Spooks: strong, short-lived push away, with a speed burst.
   const startle = e.census.startle;
-  for (const s of sys.spooks) {
+  // A guest with spooks off neither flinches nor feeds the poke meter, whose tell nothing would ever clear.
+  for (const s of gp && !gp.spooks ? NO_SPOOKS : sys.spooks) {
     if (s.except === e) continue;   // her own headbutt does not startle her
     if (s.only && s.only !== e) continue;   // a refuge lunge is aimed at one visitor and invisible to everyone else
     const age = now - s.t;
@@ -957,7 +1140,7 @@ export function steer(sys, e, dt) {
   }
 
   // Twining. The leader starts it: fond eels swimming alongside get pulled into a braid for a while.
-  if (!e.twine && twineFree(sys, e, now) && rng.chance(TWINE_CHANCE * dt * (sys.bond?.twineMul(e) ?? 1))) {
+  if (!e.twine && (!gp || gp.twine) && twineFree(sys, e, now) && rng.chance(TWINE_CHANCE * dt * (sys.bond?.twineMul(e) ?? 1))) {
     let members = null;
     for (const o of e.flock) {
       if (o === e || !twineFree(sys, o, now) || (affection(e, o, now) < 0.6 && !sys.bond?.bonded(e, o))) continue;
@@ -1008,7 +1191,7 @@ export function steer(sys, e, dt) {
   if (e.quirks.herbivore) {
     // Crumbs are off the herbivore's menu entirely, claims included; a gourmet grazes and hunts both.
     if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
-  } else if (smelled.length && !scatter && !mealBlocked && (sys.braincell?.mayHunt(e) ?? true)) {
+  } else if (smelled.length && !scatter && !mealBlocked && (!gp || gp.food) && (sys.braincell?.mayHunt(e) ?? true)) {
     const log = sys.colliders.logs[0];
     const fits = log ? logFits(e, log) : false;
     // Doordash: dinner is whatever drifts into her face. Anything farther out does not exist.
@@ -1246,16 +1429,22 @@ export function steer(sys, e, dt) {
     : e.tunnel ? 'cruise'
     : (rescuing || butting) ? 'cruise'
     : e.food ? ((stalking || e.foodDist < e.length) ? 'prowl' : 'cruise')
+    : deferCrumb ? 'cruise'
     : (padSpot && now < padSpot.holdUntil) ? 'hold'
+    : (tailHolding || ridgeHolding) ? 'hold'
+    : leanD < Infinity ? 'prowl'
     : (snug && snugFar) ? 'prowl'
     : e.twine ? 'prowl'
+    : e.sweeping ? 'cruise'
     : e.gait;
 
   // Depth wandering: bottom-hugging by default; only a cruise ranges the whole column.
   if (now > e.retargetYAt) {
     // Floor over chair: Morgan never takes the upper bands, cruising or not.
-    const lo = -DEPTH + e.radius * 2.2;
+    let lo = -DEPTH + e.radius * 2.2;
     let top = e.quirks.floor ? -DEPTH * 0.85 : gait === 'cruise' ? -e.radius * 1.6 : -DEPTH * 0.3;
+    // A guest's band is his own: at his girth the resident band sits so high his back meets the film.
+    if (gp) { lo = guestY(e, gp, 0); top = guestY(e, gp, 1); }
     // A bright moon pushes the band deeper; the module clamps it off the floor bound for us.
     top = sys.air?.depthBand(e, lo, top) ?? top;
     e.targetY = rng.range(lo, top);
@@ -1276,6 +1465,8 @@ export function steer(sys, e, dt) {
   if (sys.braincell) gaitBL *= sys.braincell.brakeFor(e);
   if (sys.braincell?.boxed(e)) gaitBL = Math.min(gaitBL, e.prowlBL * 0.5);
   if (e.restPose.kind) gaitBL = Math.max(gaitBL, e.prowlBL);   // the shape only draws if she keeps moving
+  // Like a cat into a hand: easing off over the last unit, and still once he is there.
+  if (leanD < Infinity) gaitBL = leanD < LEAN_STILL ? 0 : Math.min(gaitBL, e.prowlBL * Math.min(1, leanD / LEAN_EASE));
   if (crowd > 0.3 && gait === 'hold') gaitBL = Math.max(gaitBL, e.prowlBL * 0.6);   // shuffle out of a pile
   if (crowd > 0.6 && e.gait === 'hold' && !snug) { e.gaitUntil = Math.min(e.gaitUntil, now); }   // a real shove wakes a napper
   // Strolling at the couple's pace, not their own: the quicker partner throttles so neither swims alone.
@@ -1348,7 +1539,8 @@ export function steer(sys, e, dt) {
       // duty. It takes the whole episode: no zig-zag, and nothing left armed for the reverse escape.
       const stuckLog = sys.air && sys.colliders.logs.find((l) => l.rInner > 0
         && segDist(head.x, head.z, l.a.x, l.a.z, l.b.x, l.b.z) < l.rOuter + e.length * 0.6);
-      if (!(stuckLog && sys.air.stuckFlop(e, stuckLog))) {
+      if (gp && e.tunnel && headInBore(e)) boreBackout(sys, e, now);
+      else if (!(stuckLog && sys.air.stuckFlop(e, stuckLog))) {
         e.nopeZig = 1;
         e.attnReset = true;
         e.tunnel = null;
@@ -1360,4 +1552,70 @@ export function steer(sys, e, dt) {
   // Both roll for the tick after this one, so nothing already running is disturbed by them.
   sys.air?.tryLeap(e, dt);
   sys.air?.tryMoonBite(e, dt);
+}
+
+/* S1 item 10, behavior only: a touch on his body draws his snout in, holding leanGap body radii off the
+   finger while it stays down and near, then he resumes. Nothing here reads fear or familiarity. */
+function leanTick(sys, e) {
+  const f = sys.finger, gp = e.guestPolicy;
+  const down = !!f && f.mode !== 'none' && Number.isFinite(f.x) && Number.isFinite(f.z);
+  if (!down || e.tunnel) { e.leanOn = false; return null; }
+  if (!e.leanOn) {
+    if (chainNear(e.pts, f.x, f.z) > e.radius + gp.leanTouch) return null;
+    e.leanOn = true;
+    // A pad loiter or a crest rest ends for the hand; both would hold the retarget shut under him.
+    if (e.coverSpot?.type === 'pad' || e.coverSpot?.type === 'ridge') dropCover(sys, e);
+  } else if (Math.hypot(f.x - e.head.x, f.z - e.head.z) > gp.leanKeep) { e.leanOn = false; return null; }
+  return leanPoint(e.head, f, e.radius * gp.leanGap, e.leanAt ??= { x: 0, z: 0 });
+}
+
+/* The one door a guest's tick takes into steer. It guarantees what steer assumes of a resident body
+   and installs the policy every gate above reads; the controller decides when, this decides how. */
+export function steerGuest(sys, e, dt, policy) {
+  if (!policy) {
+    if (sys.debug) throw new Error(`[guest] steerGuest called for ${e.name} without a policy`);
+    return false;
+  }
+  e.guestPolicy = policy;
+  if (e.quirkFor !== e.identity) initQuirkState(e);
+  // Guests are born with no flock; the pad crowding count and the other flock walks want the residents.
+  e.flock ??= sys.eels;
+  // The braincell's prepass senses every guest already; this only covers a pond running without it.
+  if (!e.sensedFoods) sys.braincell?.sense(e);
+  e.steerHeld = true;
+  steer(sys, e, dt);
+  return true;
+}
+
+/* Everything steer may still hold when the controller takes the tick back: a cover claim, a crumb, a
+   braid, a run, the reflex clocks. Idempotent; the park calls it too, before the next identity lands. */
+export function releaseSteer(sys, e) {
+  e.steerHeld = false;
+  if (sys.air?.busy?.(e)) {
+    // The controller defers every exit while an air state runs, so reaching this is a broken invariant.
+    if (sys.debug) console.warn(`[guest] ${e.name} left steer with an air state open (t=${sys.time.toFixed(2)})`);
+    sys.air.cancel(e);
+  }
+  sys.air?.cancelApproach?.(e);
+  dropCover(sys, e);
+  e.coverSpot = null;
+  if (e.food) { e.food.claims = Math.max(0, e.food.claims - 1); e.food = null; }
+  if (e.twine) endTwine(e.twine);
+  e.tunnel = null;
+  if (e.restPose) e.restPose.kind = '';
+  if (e.snuggle) e.snuggle.with = null;
+  if (e.snack) e.snack.until = 0;
+  e.nopeUntil = 0; e.nopeZig = 0; e.freezeUntil = 0; e.laterAt = 0;
+  e.attnReset = false;
+  e.leanOn = false;
+  // A crumb mid-pull is the controller's to finish (it needs the food list); the swim and the sweep end here.
+  e.samCrumb = null;
+  e.sweepUntil = 0; e.sweeping = false;
+  e.gait = 'prowl'; e.gaitUntil = 0;
+  e.reverse = false;
+  // moveGuest never writes these, so whatever steer last committed would ride through the lair.
+  e.squash = 1;
+  e.speedMul = 1;
+  if (e.uSquash) e.uSquash.value = 1;
+  if (e.uExcite) e.uExcite.value = 0;
 }
