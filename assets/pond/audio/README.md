@@ -17,4 +17,8 @@ All files OGG Opus under `assets/pond/audio/`. A file that fails to load warns o
 | `sfx/slurp-1..4.ogg` | The BIG SLURP | Random pick, pitch + trim variance, when Eleanor inhales a resident |
 | `sfx/short-bubs-1..5.ogg` | Pond bubbles | Stray ambient bubble every 7–20 s with a tiny ripple in view |
 | `sfx/tiny-bubs-1..8.ogg` | Eel bubbles | Nibbling at crumbs and Eleanor's shallow swim-bys |
-| `sfx/sippy.ogg` | Matthew's tea sip | One “sshpp” per sip at a pad notch; playbackRate squishes pitch and time together, random spread plus a climb through each cup |
+| `sfx/sippy.ogg` | Matthew's tea sip | One "sshpp" per sip at a pad notch; playbackRate squishes pitch and time together, random spread plus a climb through each cup |
+| `sam-drone.ogg` | My eel's bed | Seamless loop while his void body is on stage: 4 s fades, a slow swell between two mixer levels, dropped while he sleeps in the lair, ducked under his one-shots, panned with him |
+| `sfx/void-slurp.ogg` | My eel's slurp | Dry at 0 dB when his singularity takes a shrunken resident; residents keep `slurp-1..4` |
+| `sfx/void-eat.ogg` | My eel's open mouth | 14 s loop while his singularity is open, amplitude following the hole's size (full size 0 dB), restarting from the top each opening; replaces his crumb eats |
+| `sfx/vanish.ogg` | Litter into the void | Fixed 1.8 s as a piece starts its fall into him, pitched up to 1.5 semitones either way by mass through a GrainPlayer |
