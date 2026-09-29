@@ -10,6 +10,7 @@ export class PondInput {
     this.h = handlers;              // poke, dragStart, dragMove, dragEnd, feed, feedDragMove, feedDragEnd, recolor, activity
     this.pointers = new Map();
     this.mode = null;               // 'left' | 'right' | null
+    this.leadId = null;             // the finger that owns a one-finger swish
     this.path = [];
     this.lastMoveAt = 0;
     this.movedAcc = 0;
@@ -64,10 +65,11 @@ export class PondInput {
       if (n === 1) {
         this.touchStart = { x: e.clientX, y: e.clientY, t: performance.now() };
         clearTimeout(this.touchTimer);
+        const id = e.pointerId;
         this.touchTimer = setTimeout(() => {
           const t = this.touchStart;
           this.touchStart = null;
-          if (t && this.pointers.size === 1 && !this.mode) this.begin('left', t.x, t.y);
+          if (t && this.pointers.size === 1 && !this.mode) this.begin('left', t.x, t.y, id);
         }, 140);
       } else if (n === 2 && !this.mode) {
         clearTimeout(this.touchTimer);
@@ -84,9 +86,10 @@ export class PondInput {
     else if (e.button === 2) this.begin('right', e.clientX, e.clientY);
   }
 
-  begin(mode, cx, cy) {
+  begin(mode, cx, cy, leadId = null) {
     const [x, z] = this.toWorld(cx, cy);
     this.mode = mode;
+    this.leadId = leadId;
     this.path = [{ x, z, t: performance.now() }];
     this.lastMoveAt = performance.now();
     this.movedAcc = 0;
@@ -133,6 +136,7 @@ export class PondInput {
     const p = this.pointers.get(e.pointerId);
     p.x = e.clientX; p.y = e.clientY;
     if (!this.mode) return;
+    if (this.mode === 'left' && this.leadId !== null && e.pointerId !== this.leadId) return;
     let cx = e.clientX, cy = e.clientY;
     if (e.pointerType === 'touch' && this.mode === 'right' && this.pointers.size >= 2) {
       const pts = [...this.pointers.values()];
@@ -187,9 +191,10 @@ export class PondInput {
     this.pointers.delete(e.pointerId);
     if (e.pointerType === 'touch') {
       clearTimeout(this.touchTimer);
-      // A one-finger drag waits for the last finger, but a two-finger feed is over the moment it
-      // stops being two: waiting left the hold live and it kept dropping crumbs.
-      if (this.pointers.size > 0 && this.mode !== 'right') return;
+      // A one-finger drag ends with its own finger and shrugs off strays, but a two-finger feed is over
+      // the moment it stops being two: waiting left the hold live and it kept dropping crumbs.
+      const lead = this.mode === 'left' && e.pointerId === this.leadId;
+      if (this.pointers.size > 0 && this.mode !== 'right' && !lead) return;
       // A tap released inside the hold-off never reached begin(), so fire it here or it is eaten.
       if (!this.mode && this.touchStart && this.pointers.size === 0) {
         const t = this.touchStart;
@@ -206,7 +211,7 @@ export class PondInput {
   endMode() {
     if (!this.mode) return;
     const mode = this.mode, path = this.path;
-    this.mode = null; this.path = [];
+    this.mode = null; this.path = []; this.leadId = null;
     this.release();
     if (mode === 'left') this.h.dragEnd?.(path);
     else this.h.feedDragEnd?.(path);

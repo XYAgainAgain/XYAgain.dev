@@ -8,7 +8,7 @@ import { createRng, deriveSeed } from './rng.js';
 import { capsuleInfluenceCPU } from './shading.js';
 import { floorHeightAt } from './floor.js';
 import {
-  layoutTussocks, shadowCapsules, shoalHeight, SHADOW_CAPS, SHADOW_LEAN,
+  layoutTussocks, shadowCapsules, shadowRanks, pickShadowStems, shoalHeight, SHADOW_CAPS, SHADOW_LEAN,
   growScale, nearSpineXZ, swallowEase, stemUsable,
   SWALLOW_FALL, SWALLOW_GROW, SWALLOW_MARGIN, SWALLOW_PUSH, SWALLOW_PUSH_R, SWALLOW_STRIDE,
   SWALLOW_SNAP, SWALLOW_USABLE,
@@ -164,7 +164,7 @@ export class Rushes {
     // visible overshoots a parted clump shows before it settles.
     this.spring = {
       omega: 3.6, zeta: 0.12, contact: 1.4, massSoft: 0.6, finger: 1.2, fingerR: 0.55,
-      gain: this.motion?.reduced ? 0.5 : 1,
+      gain: 1,
     };
     // The swallow, all CPU: how far past a hull a root still counts as under it, the fold and the
     // regrowth clocks, and the wider shove the stems just outside that hull get instead.
@@ -306,22 +306,23 @@ export class Rushes {
   /* Two shapes, one knob. Per stem (the default) a displaced shadow is the strongest standing-up cue a
      straight-down camera has; the two rest-pose proxies per tussock never disagree with a parting stem. */
   publishShadows(habitat) {
-    this.shadowStems = this.stems.map((s, i) => {
-      if (s.dead) return null;
-      const tip = restPoint(s, 1);
-      return { i, x: s.x, z: s.z, tipX: tip.x, tipZ: tip.z, tipY: Math.max(0, tip.y) };
-    }).filter(Boolean);
+    this.shadowRank = shadowRanks(this.tussocks, this.stems);
+    this.shadowPick = [];
+    this.shadowStems = [];
+    for (const i of this.shadowRank) {
+      const s = this.stems[i], tip = restPoint(s, 1);
+      this.shadowStems[i] = { x: s.x, z: s.z, tipX: tip.x, tipZ: tip.z, tipY: Math.max(0, tip.y) };
+    }
     habitat.addCoverSource((discs, caps) => {
       const m = this.U.moonDir.value;
       const h = Math.hypot(m.x, m.z) || 1;
       const mx = m.x / h, mz = m.z / h;
       const before = caps.length;
       if (this.knobs.shadowPerStem) {
-        for (const s of this.shadowStems) {
-          if (caps.length - before >= PER_STEM_CAPS) break;
-          if (this.gone[s.i]) continue;   // a swallowed stem casts nothing, whenever the bake next runs
-          const lift = SHADOW_LEAN * s.tipY;
-          caps.push({ ax: s.x, az: s.z, bx: s.tipX + mx * lift, bz: s.tipZ + mz * lift, r: STEM_CAP_R, strength: STEM_CAP_S });
+        // A swallowed stem casts nothing, whenever the bake next runs; the next rank takes its slot.
+        for (const i of pickShadowStems(this.shadowRank, this.gone, PER_STEM_CAPS, this.shadowPick)) {
+          const s = this.shadowStems[i], lift = SHADOW_LEAN * s.tipY;
+          caps.push({ ax: s.x, az: s.z, bx: s.tipX - mx * lift, bz: s.tipZ - mz * lift, r: STEM_CAP_R, strength: STEM_CAP_S });
         }
       } else {
         for (const t of this.tussocks) {
@@ -470,7 +471,7 @@ export class Rushes {
         fx += (dx / Math.max(d, 1e-4) * 0.4 + q.vx * inv * 0.6) * wgt * S.finger;
         fz += (dz / Math.max(d, 1e-4) * 0.4 + q.vz * inv * 0.6) * wgt * S.finger;
       }
-      const g = S.contact * S.gain;
+      const g = S.contact * S.gain * (this.motion?.reduced ? 0.5 : 1);
       const ax = fx * g * w2 - w2 * this.springX[i] - damp * this.velX[i];
       const az = fz * g * w2 - w2 * this.springZ[i] - damp * this.velZ[i];
       this.velX[i] += ax * step; this.velZ[i] += az * step;

@@ -324,11 +324,13 @@ export class EelRenderer {
     // pink tail photophore with a rare red flash (the pelican eel's real trick), not the pattern mix.
     // Two graphs from one builder: the halo shell skips the glitter, since a 2–3 px fleck magnified
     // 2.4× is bloom noise, not bloom.
-    const emissionFor = (detail) => e.identity?.dorsalGlow ? Fn(() => {
+    // Keyed on the slot, not the identity: a boot roll can dress the guest as Sam before this builds.
+    const dorsalGraph = e.index >= EEL_COUNT || !!e.identity?.dorsalGlow;
+    const emissionFor = (detail) => dorsalGraph ? Fn(() => {
       const t = vUV.x, ang = vUV.y;
       const time = U.time;
       const wander = sin(t.mul(7).sub(time.mul(0.2)).add(e.uSeed)).mul(0.5);
-      const ridge = (mu, w, gain) => smoothstep(w, 0.0, abs(sin(ang.sub(mu).sub(wander).mul(0.5)))).mul(gain);
+      const ridge = (mu, w, gain) => smoothstep(0.0, w, abs(sin(ang.sub(mu).sub(wander).mul(0.5)))).oneMinus().mul(gain);
       const lines = ridge(0, 0.18, 1.0).add(ridge(2.4, 0.12, 0.35)).add(ridge(-2.4, 0.12, 0.35));
       const drift = sin(time.mul(0.11).add(t.mul(3)).add(e.uSeed)).mul(0.2).add(0.8);
       const tip = smoothstep(0.9, 1.0, t);
@@ -336,8 +338,8 @@ export class EelRenderer {
       // Double warning blink every ~4 s, the way real photophore flashes come in bursts; a charging
       // pulse rides the strips tailward each cycle so the tip's blink reads as its arrival.
       const cyc = time.mul(0.25).add(e.uSeed).fract();
-      const travel = smoothstep(0.16, 0.0, abs(t.sub(cyc))).mul(1.4);
-      const blink = (c) => smoothstep(0.0, 0.02, cyc.sub(c)).mul(smoothstep(0.07, 0.05, cyc.sub(c)));
+      const travel = smoothstep(0.0, 0.16, abs(t.sub(cyc))).oneMinus().mul(1.4);
+      const blink = (c) => smoothstep(0.0, 0.02, cyc.sub(c)).mul(smoothstep(0.05, 0.07, cyc.sub(c)).oneMinus());
       const flash = blink(0.05).add(blink(0.16)).mul(2.6);
       const body = mix(e.uColA, e.uColB, sin(t.mul(2).add(time.mul(0.05))).mul(0.5).add(0.5)).mul(lines).mul(drift.mul(0.5).add(travel));
       const tail = vec3(1.0, 0.3, 0.55).mul(tip).mul(tipPulse.mul(1.25)).add(vec3(1.0, 0.05, 0.1).mul(tip).mul(flash));
@@ -381,18 +383,18 @@ export class EelRenderer {
       const rseed = e.uSeed.add(e.uRace.y.mul(40));   // rolls with raceOff, so a reroll re-lays the segments
       const zoneF = t.mul(3).add(rseed.mul(0.37).fract());
       const style = fract(sin(floor(zoneF).mul(12.9898).add(rseed)).mul(43758.5453));
-      const solid = smoothstep(0.36, 0.22, abs(dd));
-      const hatch = smoothstep(0.44, 0.3, abs(dd)).mul(step(0.5, fract(t.mul(16).add(dd.mul(3)))));
-      const pins = smoothstep(0.1, 0.04, abs(abs(dd).sub(0.24)));
-      const segGap = smoothstep(0.0, 0.08, fract(zoneF)).mul(smoothstep(1.0, 0.92, fract(zoneF)));
+      const solid = smoothstep(0.22, 0.36, abs(dd)).oneMinus();
+      const hatch = smoothstep(0.3, 0.44, abs(dd)).oneMinus().mul(step(0.5, fract(t.mul(16).add(dd.mul(3)))));
+      const pins = smoothstep(0.04, 0.1, abs(abs(dd).sub(0.24))).oneMinus();
+      const segGap = smoothstep(0.0, 0.08, fract(zoneF)).mul(smoothstep(0.92, 1.0, fract(zoneF)).oneMinus());
       const race = mix(mix(solid, hatch, smoothstep(0.3, 0.45, style)), pins, smoothstep(0.65, 0.8, style))
         .mul(segGap).mul(smoothstep(0.03, 0.12, t));
       // Ridge lights, Eleanor's trick at resident scale: a wandering dorsal line with two side lines low
       // enough to still show from above, and a charge pulse riding tailward every four seconds.
       const wander = sin(t.mul(7).sub(time.mul(0.2)).add(e.uSeed)).mul(0.35);
-      const ridgeAt = (mu, w, gain) => smoothstep(w, w * 0.3, abs(dorsal.sub(mu).sub(wander))).mul(gain);
+      const ridgeAt = (mu, w, gain) => smoothstep(w * 0.3, w, abs(dorsal.sub(mu).sub(wander))).oneMinus().mul(gain);
       const cyc = time.mul(0.25).add(e.uSeed).fract();
-      const travel = smoothstep(0.16, 0.0, abs(t.sub(cyc))).mul(1.2);
+      const travel = smoothstep(0.0, 0.16, abs(t.sub(cyc))).oneMinus().mul(1.2);
       // Side lines at 0.75 rad: at 1.2 they sat on a resident's silhouette and read as a blurry edge.
       const ridge = ridgeAt(0, 0.4, 1.0).add(ridgeAt(0.75, 0.25, 0.5)).mul(travel.add(0.7));
       // Plaid: straight bands along the body crossed with bands around it; the crossings glow hardest.
@@ -432,7 +434,7 @@ export class EelRenderer {
         const levels = mix(e.uFamB.y, SP.levelsForce, step(2.5, SP.levelsForce));
         const scaled = n.mul(levels);
         fieldSplotch.assign(floor(scaled).div(levels.sub(1).max(1)).clamp(0, 1));
-        const edge = smoothstep(SP.edgeW, 0.0, abs(fract(scaled).sub(0.5).abs().sub(0.5)));
+        const edge = smoothstep(0.0, SP.edgeW, abs(fract(scaled).sub(0.5).abs().sub(0.5))).oneMinus();
         // Picks between dim plateaus with neon outlines and lit plateau interiors, per splotchLit.
         maskSplotch.assign(mix(edge, fieldSplotch, e.uGlowModeB.z).mul(wSplotch));
       });
@@ -561,7 +563,7 @@ export class EelRenderer {
           // lit cell is a square, and squares are not foil.
           const jit = vec2(fract(hAz.mul(17.17)), fract(hTilt.mul(23.31))).sub(0.5).mul(0.12);
           const local = vec2(fract(gT), fract(gA)).sub(0.5).sub(jit);
-          const shape = smoothstep(0.42, 0.16, abs(local.x).add(abs(local.y).mul(1.4)));
+          const shape = smoothstep(0.16, 0.42, abs(local.x).add(abs(local.y).mul(1.4))).oneMinus();
           // First-order hue rotation about the grey axis: the holographic wobble real craft glitter has,
           // for a handful of ALU instead of an RGB to HSV round trip.
           const w = gh(0.089, 0.523).sub(0.5).mul(2).mul(F.glitter.hueWobble);
@@ -659,8 +661,9 @@ export class EelRenderer {
           valueNoise2(vec2(vUV.x.mul(5).add(U.time.mul(0.13)), vUV.y.mul(0.8).add(e.uSeed))),
           valueNoise2(vec2(vUV.y.mul(0.9).add(U.time.mul(0.11)), vUV.x.mul(4).add(e.uSeed).add(7)))
         ).sub(0.5).mul(J.wobble);
-        // Toward-center sampling magnifies, the way a water-filled tube actually lenses.
-        const warpedUV = screenUV.add(wobPx.sub(nView.xy.mul(J.warp)).div(screenSize));
+        // Toward-center sampling magnifies, the way a water-filled tube actually lenses. nView.y runs up
+        // while screenUV.y runs down, hence the flip.
+        const warpedUV = screenUV.add(wobPx.sub(vec2(nView.x, nView.y.negate()).mul(J.warp)).div(screenSize));
         const bent = sceneCopy.sample(warpedUV).onReference(tapKey);
         const straight = sceneCopy.sample(screenUV).onReference(tapKey);
         const depthFrac = vWorld.y.negate().div(DEPTH).clamp(0, 1);

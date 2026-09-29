@@ -283,6 +283,7 @@ export class Grazing {
 
   chew(sys, e, now) {
     e.gait = 'hold';
+    e.gaitFrom = now;
     e.gaitUntil = now + CHEW;
     e.uExcite.value = Math.max(e.uExcite.value, EXCITE_BITE);
     sys.emit('nibble', e);

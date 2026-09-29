@@ -577,7 +577,7 @@ export class EelSystem {
     const from = e.name, oldLen = e.length;
     e.gen++;   // the body is reused; the generation is what tells the outgoing eel's records apart
     // A braid does not survive one of its strands turning into someone else.
-    if (e.twine) { for (const m of e.twine.members) if (m.twine === e.twine) m.twine = null; }
+    if (e.twine) { const tw = e.twine; for (const m of tw.members) if (m.twine === tw) m.twine = null; }
     e.identity = to;
     applyIdentity(e, to, e.rng);
     // applyIdentity rolls the new length straight onto the eel; growEel is the only path that carries

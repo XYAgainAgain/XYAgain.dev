@@ -77,6 +77,7 @@ const BUSVOL_KEY = 'xy.busvol';
 export class PondAudio {
   constructor() {
     this.unlocked = false;
+    this.transition = null;   // the in-flight visibility suspend or resume
     this.master = null;
     this.buses = null;
     this.players = {};
@@ -119,7 +120,11 @@ export class PondAudio {
   async unlock() {
     try {
       this.unlockP ??= this.buildGraph();
+      // A parked resume finishes under a later gesture; re-asking is harmless once the context runs.
+      if (!this.unlocked) Tone.start().catch(() => {});
       await this.unlockP;
+      const ctx = Tone.getContext()?.rawContext;
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && !document.hidden) ctx.resume?.().catch(() => {});
     } catch (err) {
       // A rejected latch would wedge every later gesture on the same dead promise; clear it to retry.
       this.unlockP = null;
@@ -153,6 +158,8 @@ export class PondAudio {
     this.droneGain.connect(this.droneOut);
     this.loadAll();
     this.watchVisibility();
+    // A tab hidden during the await never saw the watcher; park the context so the beds don't loop unheard.
+    this.syncVisibility(Tone.getContext()?.rawContext);
     this.onState?.();
   }
 
@@ -160,12 +167,19 @@ export class PondAudio {
      on by a drag) until it is revisited. Suspending the raw context freezes every playhead in place. */
   watchVisibility() {
     document.addEventListener('visibilitychange', () => {
-      if (!this.unlocked) return;
-      const ctx = Tone.getContext()?.rawContext;
-      if (!ctx?.suspend) return;
-      // A browser can refuse to resume without a fresh gesture; the next unlock gesture retries.
-      if (document.hidden) { if (ctx.state === 'running') ctx.suspend().catch(() => {}); }
-      else if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      if (this.unlocked) this.syncVisibility(Tone.getContext()?.rawContext);
+    });
+  }
+
+  /* A pending suspend still reads 'running', so a quick hide→show would skip its resume. One transition
+     at a time; a settle re-syncs only if visibility flipped, so a refused resume waits for the next gesture. */
+  syncVisibility(ctx) {
+    if (this.transition || !ctx?.suspend || ctx.state === 'closed') return;
+    const hide = document.hidden;
+    if (hide ? ctx.state !== 'running' : ctx.state === 'running') return;
+    this.transition = (hide ? ctx.suspend() : ctx.resume()).catch(() => {}).then(() => {
+      this.transition = null;
+      if (document.hidden !== hide) this.syncVisibility(ctx);
     });
   }
 

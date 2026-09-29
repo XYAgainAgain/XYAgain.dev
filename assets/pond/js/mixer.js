@@ -117,7 +117,7 @@ export function attachMixer(audio) {
       audio.mouthAudition = on;
       audio.guestMouth(on ? 1 : 0);
     }));
-    const [s, v] = slider(-40, 0, audio.mix.levels[def.key], (db) => audio.setLevel(def.key, db));
+    const [s, v] = slider(-40, 6, audio.mix.levels[def.key], (db) => audio.setLevel(def.key, db));
     panel.append(row(def.label, fires, s, v));
   }
 

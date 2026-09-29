@@ -195,12 +195,11 @@ html.is-idle .chrome:focus-within {
 }
 .volume-row {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   font-size: 0.75rem;
   color: var(--ink);
-  white-space: nowrap;
 }
 .volume-row:first-child { color: var(--ink-strong); }
 .volume-row jelly-slider { width: 130px; height: 26px; }
@@ -278,7 +277,15 @@ html[data-junk="tons"].is-idle .chrome { opacity: 1; }
 html[data-junk="none"].moon-unseen.is-idle .chrome-controls { opacity: 1; }
 /* In moon mode the drawer header trades its label for the live stats readout. */
 .head-stats { display: none; font-variant-numeric: tabular-nums; }
-html[data-junk="none"] .head-controls { display: none; }
+/* Visually hidden, not display:none, so the collapsible header keeps its accessible name. */
+html[data-junk="none"] .head-controls {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 html[data-junk="none"] .head-stats { display: inline; }
 /* Popped out, the moon docks on the drawer's top-right corner: the condenser condenses with it.
    .chrome is already position:absolute, so the cluster is the containing block as-is. */
@@ -299,7 +306,7 @@ html[data-junk="none"] #controls-drawer::part(header):hover { background: transp
   #moon:hover { scale: none; }
 }
 /* The moon must stay findable when it is the only chrome left. */
-html[data-junk="none"].is-idle .chrome-controls { opacity: 0.3; }
+html[data-junk="none"].is-idle .chrome-controls:not(:hover, :focus-within) { opacity: 0.3; }
 #volume-dock .volume-rows {
   border: 0;
   border-radius: 0;

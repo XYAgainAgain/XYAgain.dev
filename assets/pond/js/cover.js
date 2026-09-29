@@ -1,4 +1,5 @@
 import { COVER_DISCS, COVER_CAPS } from './config.js';
+const COVER_MAX_R = 3;   // clears the biggest full-grown mat (about 2.4) and keeps a runaway local
 
 /* The one CPU-side list of what floats, shades, and can be sat on. Every cover or perch query in the
    pond comes here rather than keeping its own shapes; no GPU data ever flows in. */
@@ -51,6 +52,15 @@ export class Habitat {
     const d = this.coverDiscs, c = this.coverCaps;
     d.length = 0; c.length = 0;
     for (const fn of this.coverSources) fn(d, c);
+    // One NaN or runaway radius would saturate mask G pond-wide: non-finite records never reach the bake,
+    // and a finite radius is clamped rather than dropped, so a real but oversized shadow still casts.
+    const ok = (o, ...k) => k.every((n) => Number.isFinite(o[n]));
+    const cap = (o) => (o.r > COVER_MAX_R ? { ...o, r: COVER_MAX_R } : o);
+    let n = 0;
+    for (const o of d) if (ok(o, 'x', 'z', 'r', 'strength')) d[n++] = cap(o);
+    d.length = n; n = 0;
+    for (const o of c) if (ok(o, 'ax', 'az', 'bx', 'bz', 'r', 'strength')) c[n++] = cap(o);
+    c.length = n;
     if ((d.length > COVER_DISCS || c.length > COVER_CAPS) && !this.coverWarned) {
       this.coverWarned = true;
       console.warn(`Pond: cover bake truncated (${d.length}/${COVER_DISCS} discs, ${c.length}/${COVER_CAPS} capsules)`);
@@ -64,6 +74,7 @@ export class Habitat {
     // Squared distances, not Math.hypot: the radius is never negative, so the square root changes
     // nothing here, and graze and tea scan every pad every tick, so skipping it saves real work.
     for (const p of this.pads) {
+      if (p.r <= 0.01) continue;   // eaten down to nothing
       const dx = x - p.x, dz = z - p.z, rr = p.r + margin;
       if (dx * dx + dz * dz <= rr * rr) return p;
     }
@@ -88,6 +99,7 @@ export class Habitat {
   nearestCover(x, z) {
     let best = null;
     for (const p of this.pads) {
+      if (p.r <= 0.01) continue;
       const d = Math.hypot(x - p.x, z - p.z) - p.r;
       if (!best || d < best.d) best = { kind: 'pad', shape: p, d };
     }

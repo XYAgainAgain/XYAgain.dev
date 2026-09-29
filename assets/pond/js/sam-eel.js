@@ -106,6 +106,7 @@ function tick(sys, e, dt) {
   // The mouth belongs to the meal: any seam that ends one early (a surrender, a hot pond, a repossession
   // mid-sweep) leaves the horizon closed behind it.
   if (!(e.state === 'collect' && e.phase !== 'approach')) e.horizon = mealHorizon(e, now);
+  e.sweeping = now < (e.sweepUntil ?? 0);
   // Only the log residents can reach is expressible to them, so a nap in the second log berths nobody.
   const home = e.state === 'lair' && e.lair === sys.colliders.logs[0];
   sys.lairGuest = home ? e : null;
@@ -200,7 +201,8 @@ function tick(sys, e, dt) {
   // Read after the fold, not before: a fold that arrived this tick hands the walls back to avoidance.
   const inBore = !!e.exiting || (e.state === 'lair' && e.returnLeg === 1);
   moveGuest(sys, e, dt, now, tx, tz, ty, wantBL, { inBore, homing, shoals: e.shoalAvoid });
-  if (progressStrike(e, dt)) {
+  // Floor scaled to his prowl and reduced motion, or the watch never arms at 0.48 BL.
+  if (progressStrike(e, dt, Math.min(0.5, 0.5 * e.prowlBL * e.length * (sys.motion.reduced ? 0.35 : 1)))) {
     if (e.stuckStrikes >= 2) {
       e.stuckStrikes = 0;
       if (e.forceParkAt !== null) parkOffstage(sys, e, now);

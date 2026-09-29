@@ -1482,7 +1482,7 @@ export class FloaterSystem {
           if (d < bd) { bd = d; brx = rx; brz = rz; }
         }
         if (bd < POKE_OUTER) {
-          const inv = 1 / Math.max(1e-4, bd), gk = smoothstep01(POKE_OUTER, POKE_INNER, bd) * POKE_GAIN;
+          const inv = 1 / Math.max(1e-4, bd), gk = smoothstep01(POKE_OUTER, POKE_INNER, bd) * POKE_GAIN * h * 240;
           vx += (brx * inv + pk.vx * POKE_VEL) * gk;
           vz += (brz * inv + pk.vz * POKE_VEL) * gk;
         }
@@ -1745,6 +1745,9 @@ export class FloaterSystem {
           sx = (brx * inv * K.pokeRadial + pk.vx * K.poke) * gk; sz = (brz * inv * K.pokeRadial + pk.vz * K.poke) * gk;
         }
       }
+      // The finger's shove is tuned per 240 Hz frame. The break test keeps that fixed size, or a 60 Hz finger
+      // would tear the crust four times as easily; only the velocity gets the rest of this frame's share.
+      const fk = h * 240 - 1, extraX = sx * fk, extraZ = sz * fk;
       // A tap is a splash: one frame's radial shove past the break, so a crust bursts open in a ring.
       for (let s = 0; s < taps.length; s++) {
         const dx = px - taps[s].x, dz = pz - taps[s].z, d = Math.sqrt(dx * dx + dz * dz);
@@ -1766,7 +1769,7 @@ export class FloaterSystem {
       // The field is a target speed the grain eases toward, so the wind never slings; the finger is an
       // impulse on top, so a swish flings a grain a unit or two before the drag settles it.
       const tx = fx + cur.x * curK, tz = fz + cur.z * curK;
-      let vx = vel[i2] + (tx - vel[i2]) * ease + sx, vz = vel[i2 + 1] + (tz - vel[i2 + 1]) * ease + sz;
+      let vx = vel[i2] + (tx - vel[i2]) * ease + sx + extraX, vz = vel[i2 + 1] + (tz - vel[i2 + 1]) * ease + sz + extraZ;
       const v2 = vx * vx + vz * vz;
       if (v2 > K.vmax * K.vmax) { const s = K.vmax / Math.sqrt(v2); vx *= s; vz *= s; }
       const ppx = px, ppz = pz;

@@ -134,7 +134,7 @@ export class PadSystem {
       p.habitatId = p.habitatPad.id;
       p.perch = habitat.addPerch({ x: p.x, y: 0.01, z: p.z, type: 'pad', radius: p.r * 0.7 });
     }
-    habitat.addCoverSource((discs) => { for (const p of this.pads) discs.push({ x: p.x, z: p.z, r: p.r, strength: 1 }); });
+    habitat.addCoverSource((discs) => { for (const p of this.pads) if (p.r > 0.01) discs.push({ x: p.x, z: p.z, r: p.r, strength: 1 }); });
     U.coverStrength.value = 0.85;
   }
 

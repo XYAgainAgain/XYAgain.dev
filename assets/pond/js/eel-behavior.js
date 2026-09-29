@@ -207,6 +207,8 @@ export function pickTarget(sys, e, now) {
   // Half the time head for cover: under a lily pad or beside a rock. Otherwise wander the viewport
   // and a little past it, so they drift in and out but never leave for long.
   const pads = sys?.habitat?.pads ?? [];
+  // An eaten pad keeps its slot but shrinks to nothing; it is no cover.
+  const livePads = pads.map((_, i) => i).filter((i) => pads[i].r > 0.01);
   const rocks = e.colliders.spheres;
   let covered = false;
   // A sleeping guest's lit tail, picked like a warm rock. Looked up before any draw, so a pond with no
@@ -220,10 +222,10 @@ export function pickTarget(sys, e, now) {
     // holdUntil 0 means "on the way", as under a pad; the owner is how a guest swap finds the spot.
     e.coverSpot = { type: 'tail', id: tail.id, slot, owner: tail.owner ?? null, holdUntil: 0 };
     covered = true;
-  } else if ((!gp || gp.pads) && pads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act) * moonCover)) {
+  } else if ((!gp || gp.pads) && livePads.length && rng.chance(Math.min(0.5, 0.2 * e.traits.cover / act) * moonCover)) {
     const claims = pads.map((_, i) => flock.reduce((n, o) => n + (o !== e && o.coverSpot?.type === 'pad' && o.coverSpot.idx === i ? 1 : 0), 0));
-    const least = Math.min(...claims);
-    const idx = rng.pick(pads.map((_, i) => i).filter((i) => claims[i] === least));
+    const least = Math.min(...livePads.map((i) => claims[i]));
+    const idx = rng.pick(livePads.filter((i) => claims[i] === least));
     e.target.set(pads[idx].x, 0, pads[idx].z);
     // holdUntil 0 means "on the way"; arrival in steer() sets the loiter and its end.
     e.coverSpot = { type: 'pad', idx, holdUntil: 0 };
@@ -889,12 +891,21 @@ export function steer(sys, e, dt) {
   const quirkTarget = looping || !!e.restPose.kind || now < e.snack.until || !!e.rescueTo || !!e.buttTo || !!snug || !!e.twine || !!scatter || !!contest || telling || stimming || !!sys.crush?.active(e) || !!sys.bond?.active(e) || !!lean || !!deferCrumb;
   // Under a pad: arrival (an xz test, since the target sits at the surface and the eel does not)
   // starts a loiter near the surface, and the re-pick and depth reroll wait until it ends.
-  const padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
+  let padSpot = e.coverSpot?.type === 'pad' ? e.coverSpot : null;
+  const padAt = padSpot ? sys.habitat.pads[padSpot.idx] : null;
+  // A pad eaten out from under the claim keeps its slot at no radius: let it go, loiter and all, and re-pick.
+  if (padSpot && !(padAt?.r > 0.01)) {
+    if (now < padSpot.holdUntil && e.gait === 'hold') e.gaitUntil = Math.min(e.gaitUntil, now);
+    dropCover(sys, e);
+    e.retargetAt = Math.min(e.retargetAt, now); e.retargetYAt = Math.min(e.retargetYAt, now);
+    padSpot = null;
+  }
   const padHolding = !!(padSpot && now < padSpot.holdUntil);
-  if (padSpot && !e.tunnel && padSpot.holdUntil === 0 && Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6) {
+  if (padSpot && !e.tunnel && padSpot.holdUntil === 0 && Math.hypot(padAt.x - head.x, padAt.z - head.z) < 0.6) {
     const until = now + rng.range(6, 18);
     padSpot.holdUntil = until;
-    e.gait = 'hold'; e.gaitUntil = until;
+    e.target.set(padAt.x, 0, padAt.z);
+    e.gait = 'hold'; e.gaitFrom = now; e.gaitUntil = until;
     e.targetY = gp ? guestY(e, gp, 1) : Math.max(-0.35, -DEPTH + e.radius * 2.2);
     e.retargetYAt = until; e.retargetAt = until;
     sys.air?.tryPeek(e, 'pad');
@@ -905,28 +916,28 @@ export function steer(sys, e, dt) {
     const [lo, hi] = Array.isArray(nap) && nap[0] > 0 && nap[1] >= nap[0] ? nap : TAIL_NAP;
     const until = now + rng.range(lo, hi);
     tailSpot.holdUntil = until;
-    e.gait = 'hold'; e.gaitUntil = until;
+    e.gait = 'hold'; e.gaitFrom = now; e.gaitUntil = until;
     e.targetY = Math.max(-DEPTH + e.radius * 2.2, Math.min(-e.radius * 1.6, tailSlot.y));
     e.retargetYAt = until; e.retargetAt = until;
   }
   // Reaching the claimed crest is the ridge peek's trigger, rolled once per claim. A guest's snout stops a
   // bark-and-girth away from the crest line, so his arrival is measured from there.
   else if (e.coverSpot?.type === 'ridge' && !e.coverSpot.peeked && !e.tunnel
-    && Math.hypot(e.target.x - head.x, e.target.z - head.z) < (gp && e.coverSpot.log ? e.coverSpot.log.rOuter + e.radius + 0.35 : 0.6)) {
+    && Math.hypot(e.coverSpot.x - head.x, e.coverSpot.z - head.z) < (gp && e.coverSpot.log ? e.coverSpot.log.rOuter + e.radius + 0.35 : 0.6)) {
     e.coverSpot.peeked = true;
     if (gp) {
       // He rests where he arrived, beside the wood; a target left on the crest would push him into it.
       const until = now + rng.range(6, 14);
       e.coverSpot.holdUntil = until;
       e.target.set(head.x, 0, head.z);
-      e.gait = 'hold'; e.gaitUntil = until; e.retargetAt = until;
+      e.gait = 'hold'; e.gaitFrom = now; e.gaitUntil = until; e.retargetAt = until;
     }
     sys.air?.tryPeek(e, 'ridge');
   }
-  // Never abandon a run mid-bore: turning around inside the log drags the body through its wall. Out
-  // in the water a run is ordinary again, so a stall or the attention span can end one.
+  // Never abandon a run mid-bore: turning around inside the log drags the body through its wall. Arrival
+  // is plan distance, since a 3D test against the y = 0 target never let a bottom-hugger arrive.
   else if (!padHolding && !tailHolding && !ridgeHolding && !memHold && !quirkTarget && !(e.tunnel && headInBore(e))
-    && (now > e.retargetAt || stalled || (!e.tunnel && head.distanceTo(e.target) < 0.6))) {
+    && (now > e.retargetAt || stalled || (!e.tunnel && Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6))) {
     pickTarget(sys, e, now);
     // A run that gave up here is a wander now, and the claim above must not keep labeling it tunnel-owned.
     if (!e.tunnel) releaseTick(e, 'tunnel');
@@ -1160,7 +1171,7 @@ export function steer(sys, e, dt) {
       // its wander target; the leader's own target is the helix now, so the goal has to live on the group.
       if (e === lead) {
         tmpB.set(g.goal.x - g.guide.x, 0, g.goal.z - g.guide.z);
-        if (tmpB.lengthSq() < 0.36) { pickTarget(sys, lead, now); g.goal.copy(lead.target); tmpB.set(g.goal.x - g.guide.x, 0, g.goal.z - g.guide.z); }
+        if (tmpB.lengthSq() < 0.36) { pickTarget(sys, lead, now); dropCover(sys, lead); g.goal.copy(lead.target); tmpB.set(g.goal.x - g.guide.x, 0, g.goal.z - g.guide.z); }
         tmpB.normalize();
         g.dir.lerp(tmpB, Math.min(1, dt * 1.5)).normalize();
         g.guide.addScaledVector(g.dir, lead.prowlBL * lead.length * 0.9 * dt);
@@ -1479,7 +1490,7 @@ export function steer(sys, e, dt) {
   const rate = wantBL > e.speedBL ? (stim > 0.5 ? 6 : 1.3) : 2.5;
   e.speedBL += Math.max(-rate * dt, Math.min(rate * dt, wantBL - e.speedBL));
   // The squash half of Q-D is a default with the lowest priority there is: a real pose override wins.
-  const squashTo = 1 + (e.speedMul - 1) * 0.18;
+  const squashTo = 1 + Math.max(0, e.speedMul - 1) * 0.18;
   e.squash += ((drunk ? Math.max(squashTo, FOOD_DRUNK.squash) : squashTo) - e.squash) * Math.min(1, dt * 5);
 
   const f = paceWave(e, dt, gait === 'hold');

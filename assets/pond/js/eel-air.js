@@ -2,11 +2,11 @@ import * as THREE from 'three/webgpu';
 import { DEPTH } from './config.js';
 import { createRng, deriveSeed } from './rng.js';
 import { paceWave, commitPose, claimTick, releaseTick } from './eel-behavior.js';
-import { floorHeightAt, floorSurfaceAt, sandColorAt, sandAlbedoAt } from './floor.js';
+import { floorHeightAt, floorSurfaceAt, shoalHeightAt, sandColorAt, sandAlbedoAt } from './floor.js';
 import { RELIEF_HEAL_TAU } from './relief-core.js';
 import {
   moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01,
-  burrowFront, buryDepth, digStamps, airAllows, segDistSq, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
+  burrowFront, burrowClearY, liftFloor, buryDepth, digStamps, airAllows, segDistSq, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
 } from './eel-air-core.js';
 import { logTaken } from './sam-eel-core.js';
 
@@ -28,6 +28,7 @@ const RECOVER_TOL = 0.005;
 const RECOVER_WATCH = 1.5;
 const RECOVER_DEADLINE = 6;
 const RECOVER_EXTRA = 3;      // the defined fallback: one body length deeper at cruise, then snap
+const RECOVER_LIFT = 1.5;     // a burrow's last resort: the floor walks a mound-trapped tail out, then releases
 const FLOP_SPEED = 1.2;       // times prowl
 const FLOP_SCARE = 1.6;
 const FLOP_GIVEUP = 12;
@@ -83,7 +84,6 @@ const tmp = new THREE.Vector3();
 const sandRGB = [0, 0, 0];
 
 function maxY(e) { let m = -Infinity; for (const p of e.pts) if (p.y > m) m = p.y; return m; }
-function minY(e) { let m = Infinity; for (const p of e.pts) if (p.y < m) m = p.y; return m; }
 function wrapPi(a) { a %= Math.PI * 2; return a > Math.PI ? a - Math.PI * 2 : a < -Math.PI ? a + Math.PI * 2 : a; }
 
 export function attachAir(sys, seed) {
@@ -228,7 +228,7 @@ export class AirStates {
      pushed deeper, clamped so the band never collapses onto the floor bound. */
   depthBand(e, lo, top) {
     const shift = 0.2 * this.moonBright(e) * this.kMoon() * e.length;
-    return Math.max(lo + 0.05, top - shift);
+    return Math.min(top, Math.max(lo + 0.05, top - shift));
   }
   coverMul(e) { return 1 + 0.3 * this.moonBright(e) * this.kMoon(); }
   travelMul(e) { return Math.max(0.1, 1 - 0.2 * this.moonBright(e) * this.kMoon()); }
@@ -749,10 +749,10 @@ export class AirStates {
     // Waking is the dig in reverse: rise into the floor band and swim out along the trail.
     this.puffBudget(e, st, el / 0.8, DIG_BUDGET.wake);
     // Off the sand under the head, not the flat default: on a shoal the flat height is inside the mound.
-    const want = sand + e.radius * 2.2 + 0.08;
+    const want = Math.min(sand + e.radius * 2.2 + 0.08, this.defaultCeil(e) - e.radius * 0.5);
     const rise = e.prowlBL * e.length * Math.sin(DIG_SLOPE) * dt;
     this.drive(sys, e, dt, { heading: d.ang, speedBL: e.prowlBL, ySet: Math.min(want, head.y + rise), ampMul: 1 });
-    if (head.y >= want - 0.01) this.startRecover(sys, e, st, 'burrow');
+    if (head.y >= want - 0.01 || el > RECOVER_DEADLINE) this.startRecover(sys, e, st, 'burrow');
   }
 
   /* The hole. The snout drives at the sand steeper than the run that follows and nothing is drawn
@@ -1057,21 +1057,30 @@ export class AirStates {
      before the bound closes, because collide() clamps every point at once. */
   startRecover(sys, e, st, kind) {
     st.state = 'recover'; st.phase = kind; st.t0 = sys.time;
-    st.recover = { watchAt: sys.time, watchVal: kind === 'burrow' ? minY(e) : maxY(e), nudge: 0, extra: false };
+    st.recover = { watchAt: sys.time, watchVal: kind === 'burrow' ? this.burrowGap(e) : maxY(e), nudge: 0, extra: false };
     st.flop = null; st.leap = null;
     this.finishRecover(sys, e, st);
   }
 
   /* Completion is evaluated here, at the top of the eel's tick, which is after the previous tick's
      collide() and constrain(): the only place the chain's real extremes are known. */
-  finishRecover(sys, e, st, val = st.phase === 'burrow' ? minY(e) : maxY(e)) {
+  finishRecover(sys, e, st, val = st.phase === 'burrow' ? this.burrowGap(e) : maxY(e)) {
     const done = st.phase === 'burrow'
-      ? val >= this.defaultFloor(e) - RECOVER_TOL
+      ? val >= -RECOVER_TOL
       : val <= this.defaultCeil(e) + RECOVER_TOL;
     if (!done) return false;
     this.logRecovery(sys, e, sys.time - st.t0, false);
     this.release(e, st);
     return true;
+  }
+
+  /* How far the worst point sits above its own floor, mound included: negative while any point is still
+     inside a shoal it dug under. The flat default floor is inside the mound, so it cannot judge this. */
+  burrowGap(e) {
+    const fl = this.defaultFloor(e), ce = this.defaultCeil(e);
+    let g = Infinity;
+    for (const p of e.pts) g = Math.min(g, p.y - burrowClearY(fl, ce, e.radius, shoalHeightAt(p.x, p.z)));
+    return g;
   }
 
   logRecovery(sys, e, took, hitDeadline) {
@@ -1101,7 +1110,7 @@ export class AirStates {
     const now = sys.time, R = st.recover, burrow = st.phase === 'burrow';
     // Watchdog: no progress in the offending extreme for 1.5 s nudges the route 30 degrees. One scan
     // feeds both the completion test and the watchdog; they read the same extreme.
-    const val = burrow ? minY(e) : maxY(e);
+    const val = burrow ? this.burrowGap(e) : maxY(e);
     if (this.finishRecover(sys, e, st, val)) return;
     const el = now - st.t0;
     const better = burrow ? val > R.watchVal + 1e-3 : val < R.watchVal - 1e-3;
@@ -1112,17 +1121,30 @@ export class AirStates {
     const gp = e.guestPolicy;
     const deadline = gp ? Math.max(RECOVER_DEADLINE, 1.25 / Math.max(1e-3, e.cruiseBL)) : RECOVER_DEADLINE;
     if (!R.extra && el > deadline) { R.extra = true; R.at = now; }
-    if (R.extra && now - R.at > RECOVER_EXTRA) {
-      // The plan prefers a rare kink to an eel parked above the film.
-      this.logRecovery(sys, e, el, true);
-      this.release(e, st);
-      return;
+    if (R.lift) {
+      const k = (now - R.lift.at) / RECOVER_LIFT;
+      if (k >= 1) { this.logRecovery(sys, e, el, true); this.release(e, st); return; }
+      e.floorY = liftFloor(this.defaultFloor(e), R.lift.gap, k);
+    } else if (R.extra && now - R.at > RECOVER_EXTRA) {
+      if (burrow && val < -RECOVER_TOL) {
+        // Dropping sandBound at the plain floor would snap every trapped point up its mound in one tick.
+        R.lift = { at: now, gap: val };
+        e.sandBound = false;
+        e.floorY = liftFloor(this.defaultFloor(e), val, 0);
+      } else {
+        // A rare kink beats an eel parked above the film.
+        this.logRecovery(sys, e, el, true);
+        this.release(e, st);
+        return;
+      }
     }
     const ang = Math.atan2(e.heading.z, e.heading.x) + R.nudge;
     const reach = e.length * (R.extra ? 1 : 0.8);
+    // A burrow aims above the mound under the head: the flat floor sits inside a shoal it woke under.
+    const ce = this.defaultCeil(e);
     const ty = burrow
-      ? this.defaultFloor(e) + e.radius * 1.5
-      : this.defaultCeil(e) - e.radius * (R.extra ? 3 : 1.5);
+      ? Math.min(burrowClearY(this.defaultFloor(e), ce, e.radius, shoalHeightAt(e.head.x, e.head.z)) + e.radius * 1.5, ce)
+      : ce - e.radius * (R.extra ? 3 : 1.5);
     this.drive(sys, e, dt, {
       tx: e.head.x + Math.cos(ang) * reach,
       tz: e.head.z + Math.sin(ang) * reach,
@@ -1205,6 +1227,7 @@ export class AirStates {
     e.buried = false;
     e.burrowing = 0;
     e.burrowFront = -1;
+    e.sandBound = false;
     if (e.uHaloMul) e.uHaloMul.value = this.haloBase(e);
     // Parity with release(): a deferred nope left armed here fires at the end of an unrelated later state.
     if (st) {

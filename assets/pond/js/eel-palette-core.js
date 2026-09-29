@@ -146,7 +146,7 @@ const RAMP_TEXELS = 256;
 /* Fills `data` (any array-like of 256 × 4 bytes; values are clamped and rounded here, so a plain
    Uint8Array works) and returns the half means the influence capsule mixes head to tail. */
 export function bakeRampData(data, stops, opts = {}, rng) {
-  const { rotate = false, jitter = 0, sat = 1, gain = 1, soften = 1, edge = 3 } = opts;
+  const { rotate = false, jitter = 0, sat = 1, gain = 1, soften = 1, edge = 3, wrap = true } = opts;
   const n = stops.length;
   let list = stops.map((s) => ({ color: s.color, width: s.width }));
 
@@ -168,8 +168,10 @@ export function bakeRampData(data, stops, opts = {}, rng) {
   for (let i = 0; i < n; i++) { acc += list[i].width; edges[i + 1] = (acc / total) * RAMP_TEXELS; }
   edges[n] = RAMP_TEXELS;
 
-  const half = soften * 0.5;
   const sums = [0, 0, 0, 0, 0, 0];
+  const wid = (k) => edges[k + 1] - edges[k];
+  // A blend never reaches past the middle of either band it joins, so zones cannot overlap and wrap.
+  const halfAt = (k, m) => Math.min(soften, wid(k), wid(m)) * 0.5;
   let j = 0;
   for (let x = 0; x < RAMP_TEXELS; x++) {
     const p = x + 0.5;
@@ -177,9 +179,10 @@ export function bakeRampData(data, stops, opts = {}, rng) {
     let col = colors[j];
     if (soften > 0 && n > 1) {
       const toLo = p - edges[j], toHi = edges[j + 1] - p;
-      // Wrapping neighbors, so the last-to-first seam softens like every other boundary.
-      if (toLo < half && toLo <= toHi) col = mixRgb(colors[(j - 1 + n) % n], col, (toLo + half) / soften);
-      else if (toHi < half) col = mixRgb(col, colors[(j + 1) % n], (half - toHi) / soften);
+      const lo = (j - 1 + n) % n, hi = (j + 1) % n;
+      const hLo = wrap || j > 0 ? halfAt(j, lo) : 0, hHi = wrap || j < n - 1 ? halfAt(j, hi) : 0;
+      if (toLo < hLo) col = mixRgb(colors[lo], col, (toLo + hLo) / (2 * hLo));
+      else if (toHi < hHi) col = mixRgb(col, colors[hi], (hHi - toHi) / (2 * hHi));
     }
     const o = x * 4, s = x < RAMP_TEXELS / 2 ? 0 : 3;
     for (let c = 0; c < 3; c++) {

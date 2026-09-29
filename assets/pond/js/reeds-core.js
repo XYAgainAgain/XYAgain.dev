@@ -376,6 +376,36 @@ export function layoutTussocks(rng, shoals, view, opts = {}) {
   return { tussocks, stems };
 }
 
+/* Every living stem once, in the order the per-stem shadow budget spends on them: one from each tussock
+   per round, each tussock bit-reversed through its fan, so any prefix is an even spread of the whole bed. */
+export function shadowRanks(tussocks, stems) {
+  const lists = tussocks.map((t) => {
+    const live = [];
+    for (let k = t.start; k < t.start + t.count; k++) if (!stems[k].dead) live.push(k);
+    const n = live.length, bits = Math.max(1, Math.ceil(Math.log2(Math.max(2, n)))), out = [];
+    for (let j = 0; j < 1 << bits; j++) {
+      let r = 0;
+      for (let b = 0; b < bits; b++) if (j & (1 << b)) r |= 1 << (bits - 1 - b);
+      if (r < n) out.push(live[r]);
+    }
+    return out;
+  });
+  const ranks = [];
+  for (let round = 0, more = true; more; round++) {
+    more = false;
+    for (const l of lists) if (round < l.length) { ranks.push(l[round]); more = true; }
+  }
+  return ranks;
+}
+
+/* The first `max` ranked stems still standing. A swallowed stem hands its slot to the next rank down and
+   every other pick stays put, so a bake never swaps proxies it did not have to. */
+export function pickShadowStems(ranks, gone, max, out = []) {
+  out.length = 0;
+  for (let k = 0; k < ranks.length && out.length < max; k++) if (!gone[ranks[k]]) out.push(ranks[k]);
+  return out;
+}
+
 /* Two rest-pose fan capsules per tussock, from its center to the mean air-projected tip. Rest pose on
    purpose: the cover bake runs every 2 s while stems part instantly, so a live shadow would jump. */
 export function shadowCapsules(t, moonAz, strength = 0.3, out = []) {
@@ -383,8 +413,8 @@ export function shadowCapsules(t, moonAz, strength = 0.3, out = []) {
     const a = t.runner + sgn * SHADOW_SPREAD;
     out.push({
       ax: t.x, az: t.z,
-      bx: t.x + Math.cos(a) * t.meanHoriz + moonAz.x * SHADOW_LEAN * t.meanTipY,
-      bz: t.z + Math.sin(a) * t.meanHoriz + moonAz.z * SHADOW_LEAN * t.meanTipY,
+      bx: t.x + Math.cos(a) * t.meanHoriz - moonAz.x * SHADOW_LEAN * t.meanTipY,
+      bz: t.z + Math.sin(a) * t.meanHoriz - moonAz.z * SHADOW_LEAN * t.meanTipY,
       r: t.shadowR, strength,
     });
   }

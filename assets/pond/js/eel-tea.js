@@ -88,7 +88,7 @@ export class TeaTime {
     if (deep && st.seenBout !== e.gaitFrom) {
       st.seenBout = e.gaitFrom;
       // Bedtime cup: hijack a fresh deep rest unless one just happened; rest() resumes the bout after.
-      if (now - st.lastTeaAt > k.grace && !e.snuggle.with && !e.restPose.kind && !st.want) {
+      if (now - st.lastTeaAt > k.grace && !e.snuggle.with && !e.restPose.kind && !st.want && !sys.bond?.inBout(e)) {
         st.want = 'rest';
         st.restLen = Math.max(8, e.gaitUntil - now);
         e.gaitUntil = now;

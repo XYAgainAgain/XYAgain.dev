@@ -93,7 +93,9 @@ async function boot() {
   pondLoad.stage('renderer-ready');
   const liveCanvas = renderer.domElement;
   root.dataset.backend = renderer.backend?.isWebGPUBackend ? 'webgpu' : 'webgl2';
-  renderer.onDeviceLost = (info) => { console.error('Pond: device lost', info); renderer.setAnimationLoop(null); root.classList.add('no-renderer'); };
+  // Three's own handler owns the lost latch its render paths check; deviceLost keeps start() from reviving the loop.
+  let deviceLost = false;
+  renderer.onDeviceLost = (info) => { renderer._onDeviceLost(info); deviceLost = true; renderer.setAnimationLoop(null); root.classList.add('no-renderer'); };
 
   const { w: viewW, h: viewH } = viewSize();
   const extent = POOL_SCALE * Math.max(viewW, viewH);
@@ -499,7 +501,7 @@ async function boot() {
   let swishUntil = 0;
   let lastCrackle = 0;
   // A finger through the water leaves a wake too; the frame loop hands the drag segment to the wake buffer.
-  const finger = { x: 0, z: 0, px: 0, pz: 0, vx: 0, vz: 0, at: -1, moveAt: 0, path: null, idx: 0 };
+  const finger = { x: 0, z: 0, px: 0, pz: 0, pt: 0, vx: 0, vz: 0, at: -1, moveAt: 0, path: null, idx: 0 };
   // One handler set: PondInput drives it live and eels.playInput drives the same functions, so a
   // recorded gesture makes the same water, sounds, and spooks a hand does.
   const hand = {
@@ -519,7 +521,7 @@ async function boot() {
       audio.swish(true);
       audio.swishPan(toPan(x));
       // The frame loop walks path from finger.idx, so every coalesced sub-sample reaches the specks.
-      if (finger.at < 0) { finger.px = x; finger.pz = z; finger.idx = path.length - 1; }
+      if (finger.at < 0) { finger.px = x; finger.pz = z; finger.pt = performance.now(); finger.idx = path.length - 1; }
       finger.path = path;
       finger.x = x; finger.z = z; finger.at = performance.now();
     },
@@ -589,9 +591,14 @@ async function boot() {
     applyChoice(choice);
     revealTarget = 1;
     root.classList.add('is-ready');
-    // Return visits skip the gate, so the first tap on the water doubles as the audio unlock.
-    // unlock() honors the stored mute preference, so a deliberately muted pond stays quiet.
-    liveCanvas.addEventListener('pointerdown', () => audio.unlock(), { once: true });
+    // Return visits skip the gate, so the first tap or key doubles as the audio unlock (a stored mute still holds).
+    // A touch pointerdown grants no activation; pointerup and keydown do, so both listen until an unlock lands.
+    const onGesture = () => audio.unlock().then(() => {
+      liveCanvas.removeEventListener('pointerup', onGesture);
+      window.removeEventListener('keydown', onGesture);
+    }, () => {});
+    liveCanvas.addEventListener('pointerup', onGesture);
+    window.addEventListener('keydown', onGesture);
   } else {
     eels.setEnabled(false);
     pondLoad.ready.then(() => askAboutEels(dialog)).then(async (v) => {
@@ -784,7 +791,9 @@ async function boot() {
     // The drag segment since the last frame becomes a pointer capsule; a flick is capped so it shoves, not teleports.
     const nowMs = performance.now();
     if (finger.at >= 0 && nowMs - finger.at < 120) {
-      let vx = (finger.x - finger.px) / Math.max(dt, 1e-3), vz = (finger.z - finger.pz) / Math.max(dt, 1e-3);
+      // The displacement spans the pointer samples, not the frame, so divide by their own interval as dragEnd does.
+      const sampleDt = Math.max(1e-3, (finger.at - finger.pt) / 1000);
+      let vx = (finger.x - finger.px) / sampleDt, vz = (finger.z - finger.pz) / sampleDt;
       const sp = Math.hypot(vx, vz);
       if (sp > 3) { vx *= 3 / sp; vz *= 3 / sp; }
       // The pointer handler is throttled well below the frame rate, so most frames of a real drag see no
@@ -818,7 +827,7 @@ async function boot() {
       // The litter collides with the hand rather than sampling a field, so it needs one on every frame of
       // a drag, not only the frames a new pointer sample landed on.
       if (!fed) detritus.poke(finger.px, finger.pz, finger.x, finger.z, vx, vz);
-      finger.px = finger.x; finger.pz = finger.z;
+      finger.px = finger.x; finger.pz = finger.z; finger.pt = finger.at;
     }
     // After eels.update wrote this frame's influence slots, before anything samples the field.
     wake.update(dt);
@@ -864,7 +873,10 @@ async function boot() {
       }
       // The mouth's loop rides the eased size the renderer draws, so it swells and shrinks with the hole.
       audio.guestMouth(wantDrone ? (guest._hole ?? 0) / HORIZON_SLURP : 0, guest.index);
-    } else if (audio.unlocked) audio.guestMouth(0);
+    } else if (audio.unlocked) {
+      if (droneOn) { audio.guestDrone(false, { track: guest.index }); droneOn = false; droneResting = false; }
+      audio.guestMouth(0);
+    }
     if (eels.enabled && t - lastCrackle > 4 && Math.random() < dt * 0.08) {
       lastCrackle = t;
       const e = eels.eels[Math.floor(Math.random() * eels.eels.length)];
@@ -875,7 +887,7 @@ async function boot() {
 
   let booted = false;   // a tab shown mid warm-up must not start the loop over the forced prewarm state
   function start() {
-    if (running || !booted || document.hidden) return;
+    if (deviceLost || running || !booted || document.hidden) return;
     running = true;
     renderer.setAnimationLoop(frame);
   }

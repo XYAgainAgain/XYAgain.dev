@@ -307,7 +307,7 @@ export function makeTailCloud(e, U, V, ctx) {
     const r = Math.abs((Math.sin(queue.cycle * 12.9898) * 43758.5453) % 1);
     queue.drip = dripMin + (hi - dripMin) * r;
     cycleColor(queue.cycle++, rgb);
-    queuePush(queue, rgb[0], rgb[1], rgb[2]);
+    queuePush(queue, rgb[0], rgb[1], rgb[2], colorCfg);
   }
 
   return {

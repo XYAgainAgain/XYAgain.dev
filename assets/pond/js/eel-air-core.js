@@ -88,6 +88,18 @@ export function crestHeight(s, rOuter, crestY, r) {
   return crestY - rOuter + Math.sqrt(Math.max(0, R * R - a * a));
 }
 
+/* The lowest a point may sit once the dig lets go: the flat floor plus its shoal mound, capped under
+   the ceiling exactly like the solver's mound ride, so a tall crest cannot demand the impossible. */
+export function burrowClearY(floor, ceil, r, mound) {
+  return Math.min(floor + Math.max(0, mound), ceil - r * 0.5);
+}
+
+/* The released floor, lowered by the worst point's deficit and walked back up as k runs 0 → 1, so a
+   tail still inside a mound at the deadline climbs out over the lift instead of popping in one tick. */
+export function liftFloor(base, gap0, k) {
+  return base + (Number.isFinite(gap0) ? Math.min(0, gap0) : 0) * (1 - clamp01(k));
+}
+
 // The nose-first burrow
 
 export const BURY_SOFT = 2;    // spine points the sand takes to close: the collar around the hole

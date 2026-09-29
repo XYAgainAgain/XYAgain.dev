@@ -2,6 +2,7 @@ import { createRng, deriveSeed } from './rng.js';
 import { nope, affection, dropCover } from './eel-behavior.js';
 import { SPOOK_LIFE } from './eels.js';
 import { TICK } from './eel-physics.js';
+import { APPEARANCE_KEYS } from './eel-identity.js';
 
 /* Fear (Part Two, F1-F6): who scares whom, how scary they are being right now, and what a frightened
    eel does about it. Mounted as sys.fear; everything keys by name or kind, never by "eel" or a guest. */
@@ -43,12 +44,6 @@ const FAM_DEAF = 0.7;   // past this the hand is a friend: it stops feeding the 
 const ROLL_FOR = 1.5, ROLL_BACK = 1, DEADPAN_FOR = 3, DIZZY_FOR = 1.5, RETREAT_FOR = 15;
 const DRAG_REACH = 2;   // pointer capsule overlaps the body within radius × this
 const DRAG_BUCKET = 0.25;   // contact accrues into quarter-second entries, not one record a tick
-// The comfort stop puts back exactly what the appearance rolls wrote, nothing else on the eel.
-const APPEARANCE = [
-  'colA', 'colB', 'flagBands', 'skinMul', 'rampStops', 'rampOpts', 'jelly', 'nameStyle', 'nick',
-  'stripeFreq', 'spotFreq', 'wStripe', 'wSpot', 'wBand', 'wRace', 'raceOff', 'wPlaid', 'plaidFreq',
-  'wRidge', 'wFlank', 'wavy', 'pulseRate', 'repeats', 'glowMode',
-];
 
 export function attachFear(sys, seed) {
   const mod = new FearSystem(seed);
@@ -898,12 +893,12 @@ class FearSystem {
 
 function snapshot(e) {
   const s = {};
-  for (const k of APPEARANCE) s[k] = e[k];
+  for (const k of APPEARANCE_KEYS) s[k] = e[k];
   return s;
 }
 
 function restore(e, s) {
-  for (const k of APPEARANCE) e[k] = s[k];
+  for (const k of APPEARANCE_KEYS) e[k] = s[k];
 }
 
 function segPoint(px, pz, ax, az, bx, bz) {

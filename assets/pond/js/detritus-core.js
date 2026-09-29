@@ -727,7 +727,13 @@ export function handResist(item, knobs) {
 export function handNearest(item, hand, ctx, out) {
   out.d = Infinity;
   if (!hand || !hand.n) return out;
-  const reach = HAND_RADIUS + HAND_REACH + item.halfWidth;
+  // The stations run out to the tips (half length, bow, kink, and the side limb), so the reject pads by that too.
+  // A kink bends either way and only past kinkT, so its reach is |kinkAmp| × len × (1 − kinkT).
+  const ext = item.stick
+    ? item.len * 0.5 + Math.abs(item.bow) + Math.abs(item.bow2) + Math.abs(item.kinkAmp) * item.len * (1 - item.kinkT)
+      + (item.stubLen || 0)
+    : (item.long ? item.halfL : 0);
+  const reach = HAND_RADIUS + HAND_REACH + item.halfWidth + ext;
   if (item.x < hand.x0 - reach || item.x > hand.x1 + reach
     || item.z < hand.z0 - reach || item.z > hand.z1 + reach) return out;
   const st = ctx.stations;

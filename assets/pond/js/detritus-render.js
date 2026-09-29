@@ -19,7 +19,7 @@ export { TRAY_SLOTS };
 const STICK_ROWS = 10;                   // six rows cannot draw a kink: 10 × 2 sides = 20 vertices, 18 triangles
 const STUB_ROWS = 2;                     // the welded sliver: 4 vertices, 2 triangles
 const CARD_GRID = 3;                     // 3 × 3 = 9 vertices, 8 triangles
-const LATHE_SIDES = 6, LATHE_RINGS = 4;  // 24 side + two 7-vertex cap fans = 38 vertices, 48 triangles
+const LATHE_SIDES = 6, LATHE_RINGS = 4;  // 28 side + two 8-vertex cap fans = 44 vertices, 48 triangles
 const ATLAS_COLS = 4, ATLAS_ROWS = 2;    // tiles 0–3 leaves, 4–5 chips, 6 petal, 7 spare
 const SHADOW_RES = 1024;                 // the litter silhouette the floor reads through U.litterTex
 const SLOT_KEYS = {
@@ -130,12 +130,12 @@ function makeLatheGeometry() {
       const v = r / (LATHE_RINGS - 1), u = s / LATHE_SIDES;
       pos.push(v, u, 0); uvs.push(u, v);
     }
+    pos.push(r / (LATHE_RINGS - 1), 1, 0); uvs.push(1, r / (LATHE_RINGS - 1));   // seam column: u reaches 1, never wraps back to 0
   }
   for (let r = 0; r < LATHE_RINGS - 1; r++) {
     for (let s = 0; s < LATHE_SIDES; s++) {
-      const s2 = (s + 1) % LATHE_SIDES;
-      const a = r * LATHE_SIDES + s, b = r * LATHE_SIDES + s2;
-      const c = (r + 1) * LATHE_SIDES + s, d = (r + 1) * LATHE_SIDES + s2;
+      const a = r * (LATHE_SIDES + 1) + s, b = a + 1;
+      const c = a + LATHE_SIDES + 1, d = c + 1;
       // Outward-facing: the other winding turns the whole body inside out and frontFacing then lights
       // every cone from underneath.
       idx.push(a, d, b, a, c, d);
@@ -145,9 +145,9 @@ function makeLatheGeometry() {
     const v = top ? 1 : 0, code = top ? 1 : -1;
     const hub = pos.length / 3;
     pos.push(v, 0, code * 2); uvs.push(0, v);
-    for (let s = 0; s < LATHE_SIDES; s++) { pos.push(v, s / LATHE_SIDES, code); uvs.push(s / LATHE_SIDES, v); }
+    for (let s = 0; s <= LATHE_SIDES; s++) { pos.push(v, s / LATHE_SIDES, code); uvs.push(s / LATHE_SIDES, v); }
     for (let s = 0; s < LATHE_SIDES; s++) {
-      const a = hub + 1 + s, b = hub + 1 + ((s + 1) % LATHE_SIDES);
+      const a = hub + 1 + s, b = a + 1;
       if (top) idx.push(hub, b, a); else idx.push(hub, a, b);
     }
   }

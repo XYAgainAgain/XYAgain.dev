@@ -201,7 +201,8 @@ export class Quirks {
     const reduced = !!this.sys.motion?.reduced;
     if (reduced && (kind === 'spin' || kind === 'lazy')) return false;
     if (st.roll && !st.roll.easing) return false;
-    const from = phaseOf(e);
+    // Mid-unwind the body is between turns; the ease's own target is the level phase to return to.
+    const from = st.roll?.easing ? st.roll.legs[0].to : phaseOf(e);
     const half = reduced ? HALF_TILT : Math.PI;
     let legs = null, speed = null;
     if (kind === 'spin') {

@@ -246,11 +246,11 @@ export function makeVoidMaterial(e, U, ctx) {
     const n = normalize(vNormal);
     const sp = vec2(screenUV.x.sub(0.5).mul(F.aspect), screenUV.y.sub(0.5)).toVar();
     // The jelly's toward-center warp, applied to the sampling coordinate instead of the scene: stars
-    // bend inward at the silhouette. lens is in pixels, so it divides by the screen's short side.
+    // bend inward at the silhouette. lens is in pixels; nView.y runs up while screenUV.y runs down.
     const nView = cameraViewMatrix.mul(vec4(n, 0)).xyz;
     // Only the silhouette bends: across the rest of the girth he is a flat window, so a coil crossing a coil shows one sky.
     const edge = smoothstep(V.lensBand.min(0.999), 1.0, dot(n, vec3(0, 1, 0)).abs().oneMinus());
-    sp.assign(sp.sub(nView.xy.mul(V.lens).mul(edge).div(screenSize.y)));
+    sp.assign(sp.sub(vec2(nView.x, nView.y.negate()).mul(V.lens).mul(edge).div(screenSize.y)));
     const p = firmament.uv(sp, F.rot).toVar();
     // The finger's ring bends the universe itself, so every layer below rides it.
     firmament.warp(p, V);

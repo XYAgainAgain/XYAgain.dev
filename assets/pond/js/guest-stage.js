@@ -72,6 +72,11 @@ export function park(sys, e) {
   if (e.steerHeld) releaseSteer(sys, e);
   dropTailPerch(sys, e);
   endGuestMeals(sys, e);
+  // The identity roll refuses while the body is in frame, so leave along its own bearing first (no rng).
+  if (e.body && onStage(sys, e)) {
+    const a = Math.atan2(e.head.z, e.head.x), d0 = Math.max(sys.view.w, sys.view.h) * 0.9 + e.length;
+    teleport(e, Math.cos(a) * d0, Math.sin(a) * d0, a + Math.PI);
+  }
   e.onPark?.(sys, e);
   e.parkAng = e.rng.range(0, Math.PI * 2);
   setExit(e, null);
@@ -311,10 +316,10 @@ export function moveGuest(sys, e, dt, now, tx, tz, ty, wantBL, opts = null) {
 
 /* Stuck: commanded speed and no ground covered over a window. Per tick, a body this size reads every
    scrape along a log as a jam; the caller's ladder decides what two bad windows mean. */
-export function progressStrike(e, dt) {
+export function progressStrike(e, dt, floor = 0.5) {
   const head = e.head;
   const cmd = e.speedBL * e.length;
-  if (cmd > 0.5 && !e.exiting) {
+  if (cmd > floor && !e.exiting) {
     e.progT += dt;
     if (e.progT < PROG_WINDOW) return false;
     const moved = Math.hypot(head.x - e.progX, head.z - e.progZ);
@@ -333,6 +338,7 @@ export function progressStrike(e, dt) {
    repossession has to turn it off here rather than by being unfrightening. */
 export function capture(sys, e, p, now, opts = null) {
   p.slurpedBy = e;
+  if (p.food) { p.food.claims = Math.max(0, p.food.claims - 1); p.food = null; }
   // The slurp owns the pose from here: no air exemption may outlive the jaws closing on it.
   sys.air?.cancel(p);
   e.slurpT = 0;

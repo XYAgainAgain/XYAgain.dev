@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, sign, atan, PI, If } from 'three/tsl';
+import { Fn, vec2, vec3, vec4, float, positionWorld, normalWorld, texture, mix, normalize, smoothstep, uniform, atan, PI, If } from 'three/tsl';
 import { DEPTH, WAKE_RES, MOON_COLOR, RELIEF_MAX, SHOAL_MAX } from './config.js';
 import { fbm2, valueNoise2 } from './shading.js';
 import { createRng, deriveSeed } from './rng.js';
@@ -188,7 +188,7 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       if (set.normal) {
         // GL-convention map on a +y plane: u runs along +x, v along +z.
         const tn = texture(set.normal, tuv).rgb.mul(2).sub(1);
-        n = normalize(vec3(tn.x.mul(uBump), tn.z, tn.y.mul(uBump)));
+        n = normalize(geomN.mul(tn.z).add(vec3(tn.x.mul(uBump), 0, tn.y.mul(uBump))));
       } else if (set.height) {
         const sl = slopeAt(tuv);
         n = normalize(geomN.add(vec3(sl.x.negate(), 0, sl.y.negate()).mul(uBump.mul(6))));
@@ -203,13 +203,13 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       albedo = set.albedo ? tri(set.albedo).rgb : placeholder.albedo(p);
       rough = set.arm ? tri(set.arm).g : set.roughness ? tri(set.roughness).r : placeholder.roughness();
       if (set.normal) {
-        // Per-plane tangent frames (u, v) = X: (+z, +y), Y: (+x, +z), Z: (+x, +y), flipped on back-facing sides.
+        // Per-plane tangent frames (u, v) = X: (+z, +y), Y: (+x, +z), Z: (+x, +y).
         const tx = texture(set.normal, uvX).rgb.mul(2).sub(1);
         const ty = texture(set.normal, uvY).rgb.mul(2).sub(1);
         const tz = texture(set.normal, uvZ).rgb.mul(2).sub(1);
-        const bend = vec3(0, tx.y, tx.x.mul(sign(geomN.x))).mul(w.x)
-          .add(vec3(ty.x.mul(sign(geomN.y)), 0, ty.y).mul(w.y))
-          .add(vec3(tz.x.mul(sign(geomN.z)), tz.y, 0).mul(w.z));
+        const bend = vec3(0, tx.y, tx.x).mul(w.x)
+          .add(vec3(ty.x, 0, ty.y).mul(w.y))
+          .add(vec3(tz.x, tz.y, 0).mul(w.z));
         n = normalize(geomN.add(bend.mul(uBump)));
       } else if (set.height) {
         const sx = slopeAt(uvX), sy = slopeAt(uvY), sz = slopeAt(uvZ);

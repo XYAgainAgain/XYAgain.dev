@@ -41,7 +41,7 @@ export function stamp(g, x, z, r, h) {
   if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(h) || !Number.isFinite(r) || !(r > 0) || h === 0) return 0;
   const cap = h > 0 ? Math.min(h, RELIEF_MAX) : Math.max(h, -RELIEF_MAX);
   const N = g.res, step = g.extent / N, half = g.extent * 0.5, work = g.work;
-  const reach = r * 2;
+  const reach = r * 2.8;   // exp(-2.8²/2) is the 0.02 cutoff below
   const ix0 = Math.max(0, Math.floor((x - reach + half) / step - 0.5));
   const ix1 = Math.min(N - 1, Math.ceil((x + reach + half) / step - 0.5));
   const iz0 = Math.max(0, Math.floor((z - reach + half) / step - 0.5));

@@ -339,9 +339,9 @@ function brain(sys, e, dt) {
   if (!progressStrike(e, dt)) return;
   if (e.stuckStrikes < 2) { e.nopePulse = now + 1.3; startle(sys, e); return; }
   e.stuckStrikes = 0;
-  // The old rescue for a jammed return was another return, and goHome resets the visit clock,
-  // so the hard park never fired. A second failed trip home now surrenders the visit instead.
-  if (e.forceParkAt !== null || (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2)) parkOffstage(sys, e, now);
+  // goHome resets the visit clock, so answering a jam with another trip never reaches the hard park:
+  // a jammed depart, or a second failed trip home, surrenders the visit instead.
+  if (e.forceParkAt !== null || e.state === 'depart' || (e.state === 'return' && (e.homeFails = (e.homeFails ?? 0) + 1) >= 2)) parkOffstage(sys, e, now);
   else goHome(sys, e, now);
 }
 

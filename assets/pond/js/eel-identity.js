@@ -91,7 +91,7 @@ export const IDENTITIES = [
     // The ramp is her truth; colA/colB only feed the fallback layer and the guest capsules.
     colorsA: [COBALT], colorsB: [JAM],
     // gain sits low on purpose: the whole body is lit, and jam past ~0.6 tone-maps to hot pink on screen.
-    ramp: { stops: SHELLEY_SWIRL, jitter: 0.15, soften: 110, sat: 1, gain: 0.6, skin: 1 },
+    ramp: { stops: SHELLEY_SWIRL, jitter: 0.15, soften: 110, wrap: false, sat: 1, gain: 0.6, skin: 1 },
     pattern: { stripe: [0, 0, 0], spot: [0, 0, 0], flank: [0, 0, 0], wavy: [0, 1], swirl: [1, 1, 1], stars: [1, 1, 1], glitter: [1, 1, 1] },
     // eats.crumb 0 like Morgan: a smelled crumb she will never bite must not stall her tea or the bond.
     traits: { cruise: [0.95, 1.1], attention: [2, 5], holdChance: 0.6, holdTime: [0.5, 3], travelTime: [1, 4], curious: 1.4, braincellUsage: 0.6, nose: 1.0, stim: 0.6, leap: 0.4, home: 'roam', fears: { eleanor: 0.6 }, eats: { crumb: 0 } },
@@ -390,6 +390,16 @@ function chaosKit(rng) {
    eel from one generator, so an appended draw would move the nickname after it and everyone downstream. */
 const bits = (v) => Math.round(v * 1e6) | 0;
 const subStream = (e, salt) => createRng(deriveSeed(bits(e.wavy) ^ bits(e.pulseRate) ^ bits(e.spotFreq), salt));
+
+// Every field the appearance rolls write; the recolor comfort stop snapshots and restores exactly these.
+export const APPEARANCE_KEYS = [
+  'colA', 'colB', 'flagBands', 'skinMul', 'rampStops', 'rampOpts', 'jelly', 'nameStyle', 'nick',
+  'stripeFreq', 'spotFreq', 'wStripe', 'wSpot', 'wBand', 'wRace', 'raceOff', 'wPlaid', 'plaidFreq',
+  'wRidge', 'wFlank', 'wavy', 'pulseRate', 'repeats', 'glowMode',
+  'wStars', 'starClass', 'starMetal', 'starSeed', 'wSwirl', 'swirlFreq', 'swirlSeed', 'wGlitter',
+  'glitterSeed', 'facetTilt', 'tigerDeclared', 'tigerBreak', 'splotchDeclared', 'wSplotch',
+  'splotchFreq', 'splotchLevels', 'splotchLit', 'sheenDeclared', 'wSheen', 'sheenDrift', 'wTailOwn', 'wRgb',
+];
 
 /* Pattern spec per family is [chance, lo, hi]: the chance gates the family, lo–hi bounds its weight. */
 export function rollIdentityPattern(e, id, rng) {

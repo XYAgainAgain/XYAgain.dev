@@ -296,7 +296,10 @@ export class Firmament {
         const lit = lvl.mul(V.sessionGain).mul(twinkleMod(tw, phase, amt));
         // starTint at 0.45 and 0.07, precomputed: a literal through it folds to an abstract smoothstep naga rejects.
         const col = mix(vec3(1.0, 1.0, 1.0), vec3(1.0, 0.61, 0.386), warm);
-        acc.addAssign(col.mul(lit).mul(moffat(d, mix(float(0.9), float(1.5), lvl))));
+        // The wings fade out before the cell wall: the next cell's texel is empty, so a cut would show as a straight edge.
+        const inCell = fract(g).sub(0.5).abs();
+        const wall = smoothstep(0.3, 0.5, inCell.x.max(inCell.y)).oneMinus();
+        acc.addAssign(col.mul(lit).mul(moffat(d, mix(float(0.9), float(1.5), lvl))).mul(wall));
       });
     });
     // Sixteen unrolled records, each behind its own uniform test, so a quiet slot costs one compare.

@@ -150,7 +150,8 @@ export class WaterSim {
       const uProfA = uniformArray(v4(MAXC)), uProfB = uniformArray(v4(MAXC));
       const uProfW = uniformArray(new Array(MAXC * PROF_FLOATS).fill(0));
       // Per disc: a stone's waterline radius around it; uDiscs.w says whether the disc has one.
-      const uRimW = uniformArray(new Array(MAXD * RIM_FLOATS).fill(0));
+      // Packed four per Vector4: a float array pads each element to a vec4, overflowing WebGL2's 16 KiB block minimum.
+      const uRimW = uniformArray(v4(Math.ceil(MAXD * RIM_FLOATS / 4)));
       const uCovD = uniformArray(v4(COVER_DISCS)), uCovC = uniformArray(v4(COVER_CAPS * 2));
       const uExtent = uniform(this.extent);
       // A hard step bakes stair-steps into the wall, and every wave that bounces off it shows them;
@@ -173,7 +174,11 @@ export class WaterSim {
           const i0 = f.floor();
           const base = int(i).mul(RIM_FLOATS);
           const k0 = base.add(int(i0)), k1 = base.add(int(i0.add(1).min(float(RIM_N))));
-          const rim = mix(uRimW.element(k0), uRimW.element(k1), f.sub(i0));
+          const pick = (k) => {
+            const lane = k.bitAnd(3);
+            return uRimW.element(k.shiftRight(2)).dot(vec4(...[0, 1, 2, 3].map((n) => lane.equal(n).select(1, 0))));
+          };
+          const rim = mix(pick(k0), pick(k1), f.sub(i0));
           const rr = mix(o.z, rim, o.w);
           const tightDisc = smoothstep(rr.sub(uEdge), rr.add(uEdge), dist).oneMinus();
           tight.addAssign(tightDisc);
@@ -201,7 +206,7 @@ export class WaterSim {
           const k1 = base.add(int(i0.add(1).min(float(PROF_N))).mul(2)).add(side);
           const w0 = uProfW.element(k0), w1 = uProfW.element(k1);
           const wid = mix(w0, w1, f.sub(i0));
-          const shaped = smoothstep(wid.sub(uEdge), wid.add(uEdge), perp.abs()).oneMinus().mul(inSpan);
+          const shaped = smoothstep(wid.sub(uEdge), wid.add(uEdge), perp.abs()).oneMinus().mul(inSpan).mul(step(float(1e-4), wid));
           tight.addAssign(mix(plain, shaped, B.y));
           open.addAssign(mix(plain, shaped.mul(smoothstep(B.z.sub(uEdge), B.z.add(uEdge), perp.abs())), B.y));
         });
@@ -227,7 +232,10 @@ export class WaterSim {
     for (let i = 0; i < MAXD; i++) {
       const o = discs[i], rim = this.rims?.[i];
       uDiscs.array[i].set(o?.x ?? 0, o?.z ?? 0, o?.r ?? -1, rim ? 1 : 0);
-      if (rim) for (let k = 0; k < RIM_FLOATS; k++) uRimW.array[i * RIM_FLOATS + k] = rim[k] ?? 0;
+      for (let k = 0; k < RIM_FLOATS; k++) {
+        const n = i * RIM_FLOATS + k;
+        uRimW.array[n >> 2].setComponent(n & 3, rim ? rim[k] ?? 0 : 0);
+      }
     }
     for (let i = 0; i < MAXC; i++) {
       const o = capsules[i];
@@ -238,7 +246,8 @@ export class WaterSim {
       const pr = this.profiles?.[i];
       if (!pr) { uProfB.array[i].set(0, 0, 0, 0); continue; }
       uProfA.array[i].set(pr.ax, pr.az, pr.ux, pr.uz);
-      uProfB.array[i].set(pr.len, 1, pr.bore ?? 0, 0);
+      // -1, not 0: a zero bore bakes a half-open slit down a solid trunk (the step on wid covers drowned stations).
+      uProfB.array[i].set(pr.len, 1, pr.bore > 0 ? pr.bore : -1, 0);
       for (let k = 0; k < PROF_FLOATS; k++) uProfW.array[i * PROF_FLOATS + k] = pr.w[k] ?? 0;
     }
     const cd = this.cover.discs, cc = this.cover.capsules;

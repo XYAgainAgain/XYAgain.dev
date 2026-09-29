@@ -341,7 +341,7 @@ class Braincell {
       } else if (Math.hypot(e.target.x - head.x, e.target.z - head.z) < 0.6) {
         const until = now + st.rng.range(2, 3);
         spot.holdUntil = until;
-        e.gait = 'hold'; e.gaitUntil = until;
+        e.gait = 'hold'; e.gaitFrom = now; e.gaitUntil = until;
         e.targetY = -DEPTH + e.radius * 2.2;
         e.retargetYAt = until; e.retargetAt = until;
         // Nose down and swing: the site is forgotten the moment the sniff starts, so it is checked once.

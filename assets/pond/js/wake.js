@@ -14,6 +14,7 @@ const ALGAE_SCOUR_TAU = 12.0;   // losing cover is quicker than growing it, so a
 // A single frame's step at that tau is ~1e-4, under the half-float ulp at 0.5, so a per-frame ease
 // would round away to nothing and freeze the field. The cover eases on its own coarse tick instead.
 const ALGAE_STEP = 0.5;
+const FINGER_STEP = 1 / 120;
 const SUB_DISCS = 16;   // substrate the algae clings to: every rock, nearest the middle of the pool first
 const SUB_CAPS = 6;     // log trunks first, then whatever branch stubs still fit
 
@@ -61,6 +62,7 @@ export class WakeBuffer {
     this.uAlgaeRateDown = uniform(0);
     this.uAlgaeOn = uniform(0);            // 1 only on a coarse tick; off-tick the whole target solve is dead work
     this.algaeAccum = 0;
+    this.fingerAccum = 0;
     // Substrate: (x, z, radius, 0) discs and (ax, az, bx, bz) + (rOuter, 0, 0, 0) capsules. An empty slot
     // parks at radius -10, far enough negative that its falloff can never reach a texel.
     this.uSubDisc = uniformArray(Array.from({ length: SUB_DISCS }, () => new THREE.Vector4(0, 0, -10, 0)));
@@ -214,7 +216,11 @@ export class WakeBuffer {
     // CPU-computed so the shader never holds an all-literal exp() (Naga rejects those on Firefox).
     this.uDecay.value = Math.exp(-dt / TAU);
     this.uGain.value = dt * GAIN;
-    this.uFingerDecay.value = Math.exp(-dt / FINGER_TAU);
+    // Same half-float trap as the algae: the finger eases on a coarse tick and multiplies by exactly 1 between.
+    this.fingerAccum += dt;
+    const fingerTick = this.fingerAccum >= FINGER_STEP;
+    this.uFingerDecay.value = fingerTick ? Math.exp(-this.fingerAccum / FINGER_TAU) : 1;
+    if (fingerTick) this.fingerAccum = 0;
     this.algaeAccum += dt;
     const algaeTick = this.algaeAccum >= ALGAE_STEP;
     // The rate carries the whole elapsed span, so the field converges the same at 30 and 240 fps.

@@ -39,10 +39,13 @@ export function askAboutEels(dialog) {
   return new Promise((resolve) => {
     const yes = dialog.querySelector('[data-eels="yes"]');
     const no = dialog.querySelector('[data-eels="no"]');
-    const finish = (v) => { dialog.close(); resolve(v); };
+    let settled = false;
+    const finish = (v) => { settled = true; dialog.close(); resolve(v); };
     yes.addEventListener('click', () => finish('yes'), { once: true });
     no.addEventListener('click', () => finish('no'), { once: true });
     dialog.addEventListener('cancel', (e) => e.preventDefault());
+    // Chromium makes cancel non-cancelable without prior user activation, so Escape can still close it.
+    dialog.addEventListener('close', () => { if (!settled) { dialog.showModal(); yes.focus(); } });
     dialog.showModal();
     yes.focus();
   });
@@ -53,12 +56,13 @@ export function bindSoundButton(btn, panel, audio, rowMute) {
   const busSliders = [...panel.querySelectorAll('[data-bus]')];
   const sound = btn.closest('.sound');
   const drawer = document.getElementById('controls-drawer');
+  // jelly-icon-button forwards only label (as the inner aria-label), so the pin state rides in the name.
+  const syncPinLabel = () => btn.setAttribute('label', sound.classList.contains('pinned') ? 'Unpin sound mixer' : 'Pin sound mixer');
   const render = () => {
     const silent = !audio.unlocked || audio.muted;
     const state = !audio.unlocked ? 'locked' : audio.muted ? 'muted' : 'on';
-    // jelly-icon-button syncs its label attribute onto the inner button's aria-label.
     btn.dataset.state = state;
-    btn.setAttribute('label', 'Sound mixer');
+    syncPinLabel();
     rowMute.dataset.state = state;
     rowMute.setAttribute('label', !audio.unlocked ? 'Turn sound on' : audio.muted ? 'Unmute' : 'Mute');
     // Muted greys the whole mixer out; the row speaker is the only way back.
@@ -79,8 +83,9 @@ export function bindSoundButton(btn, panel, audio, rowMute) {
   // Controls drawer are mutually exclusive so the two panels never stack.
   btn.addEventListener('click', () => {
     if (sound.classList.toggle('pinned')) drawer.open = false;
+    syncPinLabel();
   });
-  drawer.addEventListener('toggle', () => { if (drawer.open) sound.classList.remove('pinned'); });
+  drawer.addEventListener('toggle', () => { if (drawer.open) { sound.classList.remove('pinned'); syncPinLabel(); } });
   rowMute.addEventListener('click', () => toggleSilent(audio.unlocked && !audio.muted));
   master.addEventListener('input', () => {
     const v = Number(master.value);
@@ -130,6 +135,8 @@ export function bindJunk({ seg, moon, drawer, cluster, volumeRows, volumeWrap, v
   const refreshMixer = () => requestAnimationFrame(() => {
     for (const c of volumeRows.querySelectorAll('jelly-slider, jelly-icon-button')) { c.applyShape?.(); c.requestFrame?.(); }
   });
+  const syncMoon = () => moon.setAttribute('label', root.classList.contains('moon-open') ? 'Close pond controls' : 'Open pond controls');
+  const closeMoon = () => { root.classList.remove('moon-open'); drawer.open = false; syncMoon(); };
   const apply = (v) => {
     root.dataset.junk = v;
     if (v === 'none') { volumeDock.append(volumeRows); drawer.open = false; }
@@ -137,36 +144,41 @@ export function bindJunk({ seg, moon, drawer, cluster, volumeRows, volumeWrap, v
     // The moon docks over the chevron in none mode, and the header stops being a collapse control there.
     if (chevron) chevron.style.display = v === 'none' ? 'none' : '';
     seg.value = v;
+    syncMoon();
   };
   // Capture on the shadow root outruns the component's own header listener: in moon mode, clicking
   // "Controls" dismisses the whole panel instead of collapsing the drawer downward inside it.
   drawer.shadowRoot?.addEventListener('click', (e) => {
     if (root.dataset.junk !== 'none' || !head || !e.composedPath().includes(head)) return;
     e.stopPropagation();
-    root.classList.remove('moon-open');
-    drawer.open = false;
+    closeMoon();
     moon.focus?.();
   }, true);
   seg.addEventListener('change', (e) => {
     const v = e.detail?.value || seg.value || 'some';
     write(v);
     apply(v);
+    // The change collapses or hides the drawer the segment lives in; keep keyboard focus on a survivor.
+    (v === 'none' ? moon : head)?.focus?.();
   });
   // The drawer's open state tracks panel visibility exactly, or aria-expanded lies while hidden.
   moon.addEventListener('click', () => {
     if (root.classList.toggle('moon-open')) { drawer.open = true; refreshMixer(); }
     else drawer.open = false;
+    syncMoon();
     // Discovered: from here on the moon may idle-fade with the rest of the chrome.
     root.classList.remove('moon-unseen');
     try { localStorage.setItem('xy.moonseen', '1'); } catch {}
   });
   try { if (!localStorage.getItem('xy.moonseen')) root.classList.add('moon-unseen'); } catch { root.classList.add('moon-unseen'); }
   document.addEventListener('pointerdown', (e) => {
-    if (root.classList.contains('moon-open') && !e.composedPath().includes(cluster)) {
-      root.classList.remove('moon-open');
-      drawer.open = false;
-    }
+    if (root.classList.contains('moon-open') && !e.composedPath().includes(cluster)) closeMoon();
   }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || e.defaultPrevented || !root.classList.contains('moon-open')) return;
+    closeMoon();
+    moon.focus?.();
+  });
   // The moon rides the water: a pinch rotating around the rim plus a slow slosh, so the deformation
   // travels coherently like a reflection instead of jittering. Driven through the public physics body.
   const knobs = { ripple: 0.045, mod: 0.5, spin: 0.32, slosh: 0.35, sloshRate: 0.23, tick: 90, hoverBoost: 1.25 };

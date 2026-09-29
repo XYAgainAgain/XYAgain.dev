@@ -82,10 +82,12 @@ function finish(then) {
 }
 
 const marks = [];
+let ceilingHid = false;   // only a ceiling-set no-renderer may be undone by a late boot
 function stage(name) {
   if (!STAGES.includes(name)) return;
   performance.mark(`pond:${name}`);
   marks.push([name, performance.now()]);
+  if (ceilingHid && name === 'renderer-ready') { ceilingHid = false; document.documentElement.classList.remove('no-renderer'); }
 }
 
 function done(info = {}) {
@@ -103,7 +105,7 @@ function fail(kind, error) {
 
 const ceiling = setTimeout(() => {
   // No stage mark ever landed: main.js likely never ran at all, and it owns the only other trigger for this class.
-  if (!marks.length) document.documentElement.classList.add('no-renderer');
+  if (!marks.length) { ceilingHid = true; document.documentElement.classList.add('no-renderer'); }
   done({ ceiling: true });
 }, READY_CEILING_MS);
 ready.then(() => clearTimeout(ceiling));
