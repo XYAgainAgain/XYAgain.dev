@@ -8,6 +8,7 @@ import { drawCast, pickAbsent, applyIdentity, rollIdentityColors, rollIdentityPa
 import { GLITTER_SCROLL_WRAP } from './eel-stars-core.js';
 import { pushFingerSample, seedFingerHistory, tumbleFor } from './treats-core.js';
 import { drainPoint } from './sam-eel-core.js';
+import { LEAP_KNOBS } from './eel-air-core.js';
 
 // How long a spook stays in sys.spooks. eel-fear.js ages its per-eel "already counted" ids on the same
 // clock, because an id that nothing can re-observe anymore has no duplicate left to suppress.
@@ -162,6 +163,8 @@ export class EelSystem {
         puffTrickle: 0.8, buriedEvict: 2.5, buriedGrace: 1.8, relief: 1, spinLeap: 60, leapExcite: 0.2,
         punchSlope: 55, punchIn: 0.6, punchMax: 5, snoutPuff: 1,
         digDepth: 1.6, digSoft: 2, digMax: 12, digCatchup: 1.5, buriedMin: 2,
+        // The arc's center, its per-eel and per-leap spreads, gravity, and the share of flight speed kept after re-entry.
+        ...LEAP_KNOBS,
       },
       // F2a's finger clock in seconds, and F4's two contest caps (decisions 10 and 5).
       familiarity: { full: 12, grace: 2, forget: 25 },

@@ -7,6 +7,7 @@ import { RELIEF_HEAL_TAU } from './relief-core.js';
 import {
   moonBrightAt, leapForm, leapArc, leapDistance, landingClear, crestHeight, knob, clamp01,
   burrowFront, burrowClearY, liftFloor, buryDepth, digStamps, airAllows, segDistSq, BURY_SOFT, BURY_FLOOR, BURY_DEPTH,
+  LEAP_KNOBS, ARC_SALT, nameUnit, drawApexMul, followClear, hopClearY,
 } from './eel-air-core.js';
 import { logTaken } from './sam-eel-core.js';
 
@@ -29,6 +30,8 @@ const RECOVER_WATCH = 1.5;
 const RECOVER_DEADLINE = 6;
 const RECOVER_EXTRA = 3;      // the defined fallback: one body length deeper at cruise, then snap
 const RECOVER_LIFT = 1.5;     // a burrow's last resort: the floor walks a mound-trapped tail out, then releases
+const HOP_MARGIN = 0.01;      // world units a hopping head holds above an obstacle's envelope
+const RECOVER_DECEL = 2.5;    // drive()'s braking, BL/s²; the follow-through's clear run assumes this same rate
 const FLOP_SPEED = 1.2;       // times prowl
 const FLOP_SCARE = 1.6;
 const FLOP_GIVEUP = 12;
@@ -102,6 +105,7 @@ export class AirStates {
     this.anchor = { x: 0, z: 0, ok: false };
     this.troughs = [];      // { trail, t0, puffAt } per exit, so the silt can follow the sand closing
     this.recoveries = [];   // { name, took, hitDeadline }, kept only under ?debug=1
+    this.follows = [];      // the follow-through's plan per leap landing, with its sweep inputs; ?debug=1 only
     // The relief stamp's scratch, reused across eels and ticks so a dig allocates nothing per frame.
     this.stampBuf = [];
     this.stampOpts = { step: 3, soft: BURY_SOFT, ridge: 0, sandAt: floorHeightAt };
@@ -137,9 +141,11 @@ export class AirStates {
     e.burrowFront = -1;
     e.burrowSoft = BURY_SOFT;
     e.sandBound = false;
+    e.hopTops = false;
     const rng = createRng(deriveSeed(this.seed, AIR_SALT + (e.index ?? 0)));
     this.map.set(e, {
       rng,
+      arcRng: createRng(deriveSeed(this.seed, ARC_SALT + (e.index ?? 0))),
       moonOff: rng.range(-0.08, 0.08),
       state: null, phase: '', t0: 0, until: 0,
       airFor: 0, coolUntil: -1e9, biteAt: -1e9,
@@ -542,7 +548,6 @@ export class AirStates {
     const sys = this.sys;
     const form = leapForm(e.wits ?? e.braincellUsage ?? 0.5);
     const y0 = this.defaultCeil(e);
-    const arc = leapArc(e.leap ?? 0, form.formHeight, y0);
     const dist = leapDistance(e.length, form.formDistance);
     let ang = Math.atan2(e.heading.z, e.heading.x);
     let reaim = false;
@@ -554,6 +559,11 @@ export class AirStates {
       if (clear === null) return false;
       reaim = clear !== ang; ang = clear;
     }
+    // The apex roll, drawn only once the leap is committed and always two draws (the arc stream's hygiene).
+    const ka = this.sys.knobs?.air;
+    const mul = drawApexMul(st.arcRng, nameUnit(e.name, ARC_SALT), knob(ka?.leapApex, LEAP_KNOBS.leapApex),
+      knob(ka?.leapApexPersonal, LEAP_KNOBS.leapApexPersonal), knob(ka?.leapApexSpread, LEAP_KNOBS.leapApexSpread));
+    const arc = leapArc(e.leap ?? 0, form.formHeight, y0, knob(ka?.leapG, LEAP_KNOBS.leapG) || LEAP_KNOBS.leapG, mul);
     st.state = 'leap'; st.phase = 'launch'; st.t0 = sys.time;
     st.leap = { form, arc, dist, ang, y0, from: e.head.y, bt: 0, target: !!target, aim: !!(target || forced || reaim) };
     st.ringUp = 0.4;
@@ -614,9 +624,16 @@ export class AirStates {
       return;
     }
     L.bt += dt;
+    e.hopTops = true;
     if (L.bt < L.arc.T) {
-      const y = L.y0 + L.arc.v * L.bt - 0.5 * L.arc.g * L.bt * L.bt;
-      this.drive(sys, e, dt, { heading: L.ang, speedFixed: L.dist / L.arc.T, ySet: y, ampMul: LEAP_AMP, excite: 0.9 });
+      let y = L.y0 + L.arc.v * L.bt - 0.5 * L.arc.g * L.bt * L.bt;
+      // The arc may pass through a raised log or rock the landing test never looked at; hop it, read at
+      // where this tick's advance will put the head, and lift the ceiling with it.
+      const sp = L.dist / L.arc.T;
+      const lift = hopClearY(head.x + Math.cos(L.ang) * sp * dt, head.z + Math.sin(L.ang) * sp * dt, e.radius,
+        sys.colliders.spheres, sys.colliders.logs) + HOP_MARGIN;
+      if (lift > y) { y = lift; e.ceilingY = Math.max(e.ceilingY, y + e.radius + 0.2); }
+      this.drive(sys, e, dt, { heading: L.ang, speedFixed: sp, ySet: y, ampMul: LEAP_AMP, excite: 0.9 });
       return;
     }
     // The last fractional slice of flight, so the eel lands on the point that was cleared, not a tick short.
@@ -634,11 +651,40 @@ export class AirStates {
     e.speedBL = e.cruiseBL * 1.2;
     e.uExcite.value = 1;
     st.embarrassedUntil = belly ? now + 2 : 0;
+    // Read off the flight before startRecover nulls it; carried on the record, never a new parameter.
+    const follow = this.followPlan(sys, e, L);
     this.startRecover(sys, e, st, 'air');
+    if (st.recover) st.recover.follow = follow;
     if (belly) { e.pose.ampMul = BELLY_AMP; commitPose(e); }
   }
 
+  /* The shloop: at re-entry, the run that pours the airborne trail in at flight speed. It sweeps the
+     trail plus the braking back to recovery pace, and a run too short to matter hands straight over. */
+  followPlan(sys, e, L) {
+    const ft = knob(sys.knobs?.air?.followThrough, LEAP_KNOBS.followThrough);
+    if (!(ft > 0) || !(L?.arc?.T > 0)) return null;
+    let last = -1;
+    for (let i = e.pts.length - 1; i > 0; i--) if (e.pts[i].y > 0) { last = i; break; }
+    if (last < 0) return null;
+    const v = ft * L.dist / L.arc.T;
+    const vr = e.prowlBL * RECOVER_SPEED * e.length;
+    const run = last * e.spacing + Math.max(0, v * v - vr * vr) / (2 * RECOVER_DECEL * e.length);
+    // No point of the run goes under the recovery's dive depth, where recoverTick aims the head.
+    const minY = this.defaultCeil(e) - e.radius * 1.5 - 0.01;
+    const cap = followClear(e.head.x, e.head.z, e.heading.x, e.heading.z, run, e.radius,
+      sys.colliders.spheres, sys.colliders.logs, sys.view.w * LEAP_INSET, sys.view.h * LEAP_INSET, minY);
+    const early = cap < run - 1e-6;
+    if (sys.debug) {
+      this.follows.push({ name: e.name, x: e.head.x, z: e.head.z, hx: e.heading.x, hz: e.heading.z, r: e.radius, minY, run, cap, early, skipped: cap < e.spacing });
+      if (this.follows.length > 500) this.follows.shift();
+    }
+    if (cap < e.spacing) return null;
+    // The sweep's cap is contact; the snout's sideways wiggle rides past it, so the run stops a quarter radius short.
+    return { x: e.head.x, z: e.head.z, ang: Math.atan2(e.heading.z, e.heading.x), v, cap: early ? cap - e.radius * 0.25 : cap, early };
+  }
+
   abort(sys, e, st, why = '') {
+    e.hopTops = false;
     e.ceilingY = this.defaultCeil(e);
     e.floorY = this.defaultFloor(e);
     e.sandBound = false;
@@ -1091,6 +1137,7 @@ export class AirStates {
   }
 
   release(e, st) {
+    e.hopTops = false;
     e.floorY = this.defaultFloor(e);
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
@@ -1138,13 +1185,27 @@ export class AirStates {
         return;
       }
     }
-    const ang = Math.atan2(e.heading.z, e.heading.x) + R.nudge;
-    const reach = e.length * (R.extra ? 1 : 0.8);
     // A burrow aims above the mound under the head: the flat floor sits inside a shoal it woke under.
     const ce = this.defaultCeil(e);
     const ty = burrow
       ? Math.min(burrowClearY(this.defaultFloor(e), ce, e.radius, shoalHeightAt(e.head.x, e.head.z)) + e.radius * 1.5, ce)
       : ce - e.radius * (R.extra ? 3 : 1.5);
+    const F = R.follow;
+    if (F && !R.extra && val > 0) {
+      const went = (e.head.x - F.x) * Math.cos(F.ang) + (e.head.z - F.z) * Math.sin(F.ang);
+      const reduced = !!sys.motion?.reduced;
+      // Recovery pace as drive() will ask for it, so the ramp hands over at the speed it brakes to.
+      const vr = e.prowlBL * RECOVER_SPEED * e.length * (reduced ? 0.35 : 1);
+      const v = Math.min(F.v * (reduced ? 0.5 : 1), Math.sqrt(vr * vr + 2 * RECOVER_DECEL * e.length * Math.max(0, F.cap - went)));
+      if (went < F.cap - 1e-3) {
+        // The swept test cleared this heading only, so the watchdog's nudge waits for ordinary recovery.
+        this.drive(sys, e, dt, { heading: F.ang, speedFixed: v, targetY: ty, excite: now < (st.embarrassedUntil ?? 0) ? 0.6 : 0 });
+        return;
+      }
+    }
+    R.follow = null;
+    const ang = Math.atan2(e.heading.z, e.heading.x) + R.nudge;
+    const reach = e.length * (R.extra ? 1 : 0.8);
     this.drive(sys, e, dt, {
       tx: e.head.x + Math.cos(ang) * reach,
       tz: e.head.z + Math.sin(ang) * reach,
@@ -1222,6 +1283,7 @@ export class AirStates {
 
   restore(e) {
     const st = this.map.get(e);
+    e.hopTops = false;
     e.floorY = this.defaultFloor(e);
     e.ceilingY = this.defaultCeil(e);
     e.buried = false;
@@ -1261,7 +1323,7 @@ export class AirStates {
     if (o.speedFixed !== undefined) speed = o.speedFixed / Math.max(1e-4, e.length);
     else {
       const want = (o.speedBL ?? e.prowlBL) * reduce;
-      const rate = want > e.speedBL ? 1.3 : 2.5;
+      const rate = want > e.speedBL ? 1.3 : RECOVER_DECEL;
       speed = e.speedBL + Math.max(-rate * dt, Math.min(rate * dt, want - e.speedBL));
     }
     e.speedMul += (1 - e.speedMul) * Math.min(1, dt * 4);

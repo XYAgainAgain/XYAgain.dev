@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { EEL_POINTS, DEPTH } from './config.js';
 import { floorHeightAt, shoalHeightAt } from './floor.js';
-import { BURY_FLOOR, BURY_CAP } from './eel-air-core.js';
+import { BURY_FLOOR, BURY_CAP, rockClearY } from './eel-air-core.js';
 
 export const TICK = 1 / 90;
 export const TRAIL_LEN = 400;   // ≥0.03-unit spacing × 400 covers a 12-unit body; Eleanor needs the headroom
@@ -175,6 +175,7 @@ export function collide(eels, colliders) {
     const front = ea.burrowFront ?? -1;
     const collar = ea.burrowSoft ?? 1;
     const sandClear = ea.voidClear ?? 0;   // zero for every ordinary body, so the mound ride is untouched
+    const hop = !!ea.hopTops;   // a leap, flight to release: above the film a surface-band rock gets its real top back
     // Decide the pair cull once per eel, outside the 24×24 point loop it gates. Scenery gets the same
     // treatment: a collider that the body's whole bounding sphere clears cannot push any of its 24 points.
     const pad = ea.boundR + 0.6;   // margin: pair pushes earlier in this pass can move a point up to a radius or so
@@ -227,6 +228,8 @@ export function collide(eels, colliders) {
         // A rock reaching the surface band pushes sideways only; pushing up there just fights the ceiling clamp.
         // The envelope is an ellipsoid: dy is scaled into the horizontal radius's units and pushed back out.
         const sr = s.rHit ?? s.r, ky = sr / (s.ryHit ?? sr);
+        // The sideways-only column reached the sky, so a leap over a waterline rock stalled against it mid-air.
+        if (hop && p.y > 0 && s.y + sr > -r * 2 && p.y >= rockClearY(s, Math.hypot(p.x - s.x, p.z - s.z), r) - 1e-3) continue;
         const dx = p.x - s.x, dy = s.y + sr > -r * 2 ? 0 : (p.y - s.y) * ky, dz = p.z - s.z;
         const d = Math.hypot(dx, dy, dz), min = sr + r - sink;
         if (d < min && d > 1e-5) { const k = (min - d) / d * soft * glance; p.x += dx * k; p.y += dy * k / ky; p.z += dz * k; }
