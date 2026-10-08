@@ -65,7 +65,7 @@ export class QualityGovernor {
     else if (this._cool >= RECOVER_S && this._rung > 0) this._move(this._rung - 1, true);
   }
 
-  /* Dev override: force-walks the ladder without persisting, so a test tier never follows Sam to the next boot. */
+  /* Dev override: force-walks the ladder without persisting, so a test tier never carries over to the next boot. */
   setRung(n) {
     const r = clampRung(n);
     if (r !== this._rung) this._move(r, false);

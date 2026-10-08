@@ -250,7 +250,7 @@ function makeSurfaceMaterial(shading, set, placeholder, tilingWorld, triplanar =
       const b = U.wakeTex.sample(wc.add(vec2(o, o))).z.add(U.wakeTex.sample(wc.sub(vec2(o, o))).z)
         .add(U.wakeTex.sample(wc.add(vec2(o, o.negate()))).z).add(U.wakeTex.sample(wc.add(vec2(o.negate(), o))).z).mul(0.25);
       // Value noise lives on a square lattice: axis-aligned, and multiplied into a steep curve, its cells
-      // were the mosaic Sam saw. Rotated 0.6 rad and added at low gain it reads as grain instead.
+      // read as a mosaic. Rotated 0.6 rad and added at low gain it reads as grain instead.
       const rq = vec2(p.x.mul(uAlgaeRot.x).sub(p.z.mul(uAlgaeRot.y)), p.x.mul(uAlgaeRot.y).add(p.z.mul(uAlgaeRot.x)));
       const detail = float(0).toVar(), streak = float(0).toVar();
       If(U.algaeDetail.notEqual(0), () => {

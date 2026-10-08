@@ -113,8 +113,8 @@ const DEFAULT_LIFETIME = {
 const DEG = Math.PI / 180;
 const lerp = (a, b, t) => a + (b - a) * t;
 
-/* The live dials. Sam is still deciding the lee strength, the turning, the counts, and whether the
-   shelter sticks read paler, so every one of these is a knob and none of them is a constant. */
+/* The live dials. The lee strength, the turning, the counts, and whether the shelter sticks read paler
+   are still being tuned, so every one of these is a knob and none of them is a constant. */
 export function detritusKnobs() {
   return {
     leeDriftGain: 0.3, leeAngularDamping: 2.2,

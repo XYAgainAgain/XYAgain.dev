@@ -438,7 +438,7 @@ export const NEB_OCTAVES = [
 export const NEB_RES = 512;
 export const NEB_SEED_SPAN = 1 << 20;
 
-/* A fresh nebula every page load, or ?nebseed=N to keep one Sam likes. Render side only: Math.random,
+/* A fresh nebula every page load, or ?nebseed=N to keep a favorite. Render side only: Math.random,
    never a sim generator. */
 export function nebulaSeed(search = '', rand = Math.random) {
   const raw = new URLSearchParams(search ?? '').get('nebseed');

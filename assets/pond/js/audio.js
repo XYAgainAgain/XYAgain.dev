@@ -509,7 +509,7 @@ export class PondAudio {
   /* A pad or leaf settling back after a body shoved it: a low plip. */
   padSettle({ pan = null } = {}) { this.pick('plips', 'padSettle', { jitter: 0.2, rate: 0.7, pan }); }
 
-  /* Verticality placeholders, all standing in for SFX-Wishlist rows Sam has yet to record. */
+  /* Verticality placeholders, all standing in for SFX-Wishlist rows not recorded yet. */
 
   // A snout breaking the film: the plip, five semitones down.
   peek({ pan = null } = {}) { this.pick('plips', 'plip', { db: -4, jitter: 0.25, rate: st(-5), pan }); }

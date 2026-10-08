@@ -313,7 +313,7 @@ async function boot() {
   // A scatter is the startle heard from farther off: same voice, quieter, so a whole pond bolting
   // does not stack into noise.
   eels.on('scatter', (ev) => audio.startle({ pan: ev.pan, length: ev.length, db: -8 }));
-  // Deliberate silence until Sam records them: SFX-Wishlist rows "gape hiss", "lunge swish", "the sigh".
+  // Deliberate silence until these SFX-Wishlist rows are recorded: "gape hiss", "lunge swish", "the sigh".
   const silent = () => {};
   eels.on('gape', silent);
   eels.on('lunge', silent);
@@ -323,7 +323,7 @@ async function boot() {
   eels.on('bonk', silent);
   eels.on('spin', (ev) => audio.spin({ pan: ev.pan, revs: ev.detail?.revs ?? 3 }));
   eels.on('graze', (ev) => audio.graze({ pan: ev.pan, muffled: ev.food?.kind === 'algae' }));   // a tuft is eaten under water
-  // Verticality, all placeholders until Sam records the wishlist rows (wet snout-pop, leap splash,
+  // Verticality, all placeholders until the wishlist rows are recorded (wet snout-pop, leap splash,
   // sand scrunch, wet snap on nothing). splash branches once: a belly flop is never both variants.
   eels.on('peek', (ev) => audio.peek({ pan: ev.pan }));
   eels.on('splash', (ev) => audio.splash({ pan: ev.pan, length: ev.length, bellyflop: !!ev.detail?.bellyflop }));
