@@ -27,9 +27,9 @@ export async function runScenario(name, ctx, opts = {}) {
   running = name;
   const k = ctx.loco.knobs, wander = k.wander;
   k.wander = false;
-  ctx.loco.stop('scenario');
+  ctx.loco.reset('scenario');
   try { return await s.run(ctx, opts); }
-  finally { ctx.loco.stop('scenario over'); k.wander = wander; running = null; }
+  finally { ctx.loco.reset('scenario over'); k.wander = wander; running = null; }
 }
 
 /* Resolves true once pred() holds on a fixed tick, false after `seconds` of sim time. */

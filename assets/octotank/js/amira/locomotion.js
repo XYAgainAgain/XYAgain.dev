@@ -128,6 +128,9 @@ export class Locomotion {
 
   stop(why = 'stopped') { if (this.desire) this._finish(false, why); }
 
+  /* A clean slate between scenarios: the desire stops, and every listener with a reset (a carry) drops what it holds. */
+  reset(why = 'reset') { this.stop(why); for (const f of this.listeners) f.reset?.(why); }
+
   _resolve(target) {
     if (typeof target === 'number') target = this.toys[target];
     if (target == null) return null;

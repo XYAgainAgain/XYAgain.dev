@@ -1,6 +1,8 @@
 import { LAYERS } from '../config.js';
+import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from './loco-carry-core.js';
+import { moveInputs } from './loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32 } from './arm-core.js';
-import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, whoMoves, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
+import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 
 /* Eight arm programs (arm-core.js) driving a kinematic Jolt capsule per segment. Each tick: root frames, programs and
    contact, arm-on-arm rounds, the suckers (touch, taste, flicker, grips), then the capsules follow the solved chains. */
@@ -26,11 +28,10 @@ export const ARM_KNOBS = {
   fetchBeat: 0.25,       // s between food sealing on and the fetch starting
   fetchClear: 1,         // a fetch with food stops this many of the food's sizes short of her mouth
   rejectPush: 0.15,      // m/s a rejected thing leaves the tip with
-  bodyMass: 1,           // kg, her whole weight, for whoMoves's tiebreak
 };
 
 const WINDOW = 1800;
-export const CLAIM_TIERS = { idle: 0, attend: 1, stroke: 2, mode: 3, held: 4 };
+export { CLAIM_TIERS };
 
 export class Arms {
   constructor(phys, mantle, knobs = {}, { seed = 1 } = {}) {
@@ -40,7 +41,7 @@ export class Arms {
     const count = mantle.roots.length;
     this.arms = Array.from({ length: count }, (_, i) => new Arm(i, this.knobs, seed));
     this.track = new Array(count).fill(null);
-    // Who holds each arm, strongest tier wins (a stub until shared arms are real).
+    // Who holds each arm, strongest tier wins; with no program and no grip it falls back to idle each tick unless a mode holds it.
     this.owner = new Array(count).fill('idle');
     this.slot = new Float64Array(count);   // m across a shared toy, so arms going for one thing lie side by side
     this.slotDir = new Float64Array(count * 2);
@@ -91,6 +92,7 @@ export class Arms {
     this.ignore = this.arms.map(() => new Map());
     this.proxies = this.arms.map(() => this.phys.addProxy([0, -0.5, 0]));
     this.fetchStand = new Float64Array(count);
+    this.fetchOut = new Float64Array(count);
     this.gripPos = new Float64Array(count * 3);
     this.reaction = new Float64Array(count * 3);   // N her arm feels from what it grips, last step
     this.anchorForce = new Float64Array(count);    // N its suckers sealed on the furniture bear before tearing
@@ -256,11 +258,16 @@ export class Arms {
     for (let a = 0; a < arms.length; a++) {
       const arm = arms[a];
       arm.setLead(this.lead);
+      this.owner[a] = settleOwner(this.owner[a], arm.busy || !!this.episodes?.[a]?.h);
       const g = arm.goal;
       if (!g || g.kind === 'lead') this.track[a] = null;
       else if (g.kind === 'fetch') {
         const o = this._o, st = this.fetchStand[a];
         g.target[0] = this._mouth[0] + o[0] * st; g.target[1] = this._mouth[1] + o[1] * st; g.target[2] = this._mouth[2] + o[2] * st;
+        // A stowed thing sits out from the mouth toward this arm's base, in the web, since flat on the floor her crown
+        // has no room under it.
+        const out = this.fetchOut[a], N = this.rootsN, nl = Math.hypot(N[a * 3], N[a * 3 + 2]);
+        if (out > 0 && nl > 1e-6) { g.target[0] += (N[a * 3] / nl) * out; g.target[2] += (N[a * 3 + 2] / nl) * out; }
       }
       // Followed while the bend travels, then held: an arm that kept chasing a toy it was shoving would carry it off. Its
       // suckers keep turning toward the toy either way.
@@ -407,7 +414,7 @@ export class Arms {
     const arm = this.arms[i];
     if (!arm || !arm.fetch(this._mouth, opts)) return false;
     this.track[i] = null;
-    this.fetchStand[i] = 0;
+    this.fetchStand[i] = 0; this.fetchOut[i] = 0;
     return true;
   }
 
@@ -434,9 +441,7 @@ export class Arms {
 
   /* Take arm i at a tier (idle < attend < stroke < mode < held); false while a stronger one holds it. */
   claim(i, tier) {
-    const T = CLAIM_TIERS;
-    if (!(tier in T) || !(i >= 0 && i < this.owner.length)) return false;
-    if (T[tier] < T[this.owner[i]]) return false;
+    if (!(i >= 0 && i < this.owner.length) || !claimWins(this.owner[i], tier)) return false;
     this.owner[i] = tier;
     return true;
   }
@@ -750,6 +755,7 @@ export class Arms {
     ep.h = this.phys.addPointConstraint(proxy, ep.toy, [cx, cy, cz]);
     this.phys.wake(ep.toy);
     ep.gripT = this.time; ep.ticks = 0; ep.fEma = 0; ep.weak = 0; ep.capEma = Math.max(ep.capEma, ep.cap);
+    this.owner[a] = 'held';
     this.counts.grips++;
   }
 
@@ -781,7 +787,8 @@ export class Arms {
     R.fill(0);
     for (let a = 0; a < this.arms.length; a++) {
       const ep = this.episodes[a];
-      if (!ep?.h) continue;
+      // A frozen grip's constraint is off; whatever lambda Jolt still reports is not a pull.
+      if (!ep?.h || ep.frozen) continue;
       const F = this.phys.constraintForce(ep.h, f);
       ep.fEma += ((Number.isFinite(F) ? F : 0) - ep.fEma) * k.breakSmooth;
       // Jolt's lambda is the impulse on the toy, so her arm feels the opposite.
@@ -799,7 +806,7 @@ export class Arms {
     const p = this._p3, G = this.gripPos, f = 1 - Math.exp(-dt / Math.max(1e-3, this.knobs.gripTau));
     for (let a = 0; a < this.arms.length; a++) {
       const ep = this.episodes[a];
-      if (!ep?.h || !this._gripPoint(a, ep, p)) continue;
+      if (!ep?.h || ep.frozen || !this._gripPoint(a, ep, p)) continue;
       for (let i = 0; i < 3; i++) G[a * 3 + i] += (p[i] - G[a * 3 + i]) * f;
       this._keepOut(a, ep.toy, G);
       this.phys.moveKinematic(this.proxies[a], G[a * 3], G[a * 3 + 1], G[a * 3 + 2], 0, 0, 0, 1, dt);
@@ -836,12 +843,16 @@ export class Arms {
     const ep = this.episodes[a];
     if (!ep) return;
     if (ep.h) { this.phys.removeConstraint(ep.h); ep.h = null; this.phys.stopKinematic(this.proxies[a]); }
+    ep.frozen = false;
     this.episodes[a] = null;
+    if (this.owner[a] === 'held') this.owner[a] = 'idle';
     const sk = this.suckerKnobs, S = this.S;
     if (ignore) this.ignore[a].set(ep.toy, this.time + sk.ignoreTime);
     for (let j = 0; j < S; j++) if (this.touchEntry[a * S + j] === ep.toy) this.refr[a * S + j] = this.time + sk.refractory;
     if (ep.fetched) this.fetchStand[a] = 0;
+    this.fetchOut[a] = 0;
     if ((why === 'moveOn' || why === 'reject') && this.arms[a].goal?.kind !== 'lead') this.arms[a].moveOn();
+    else if (ep.stowed && this.arms[a].goal?.kind === 'fetch') this.arms[a].idle();
     if (why in this.counts) this.counts[why]++;
   }
 
@@ -902,13 +913,49 @@ export class Arms {
     return 'released';
   }
 
-  /* Her other arms' sealed hold on the furniture against what she grips: whether a pull reels the thing in or hauls her. */
+  /* Whether a pull on arm i's grip reels the thing in ('object') or hauls her to it ('body'), why, and the inputs: her
+     anchors or a wedge when either holds, in-water weight for a lift, the friction toll for a drag (loco-carry-core.js). */
   whoMoves(i) {
-    const ep = this.episodes[i];
-    if (!ep?.h) return null;
-    let anchor = 0;
-    for (let b = 0; b < this.arms.length; b++) if (b !== i) anchor += this.anchorForce[b];
-    return whoMoves({ anchor, objectHold: 0, objectMass: 1 / Math.max(1e-9, this.phys.inverseMass(ep.toy)), bodyMass: this.knobs.bodyMass });
+    const inputs = moveInputs(this, i);
+    return inputs ? { ...whoMovesInWater(inputs), ...inputs } : null;
+  }
+
+  /* A small thing gripped by arm i rides in her web beside the crown ring until let go: a fetch that never times out,
+     `stand` m below her mouth and `out` m toward the arm's base, hard by command so neither boredom nor flicker ends it. */
+  stow(i, { stand = 0, out = 0, duration } = {}) {
+    const ep = this.episodes[i], arm = this.arms[i];
+    if (!ep?.h || ep.frozen || !this.claim(i, 'held')) return false;
+    // The fetch's hold falls back to its knob for anything not finite, so the endless hold is set after.
+    if (!this.fetch(i, { grasp: ep.arc / arm.length, hold: 1e9, duration })) return false;
+    arm.goal.hold = Infinity;
+    this.fetchStand[i] = Math.max(0, stand);
+    this.fetchOut[i] = Math.max(0, out);
+    ep.commanded = ep.hard = ep.fetched = ep.stowed = true;
+    return true;
+  }
+
+  /* Stop arm i's grip driving its toy (on), or drive it again from world point p (off): the constraint goes off and the
+     proxy rests, so a haul moves the toy only through the impulse it is given. */
+  freeze(i, on, p = null) {
+    const ep = this.episodes[i], proxy = this.proxies[i];
+    if (!ep?.h) return false;
+    if (on) {
+      if (ep.frozen) return true;
+      ep.h.c.SetEnabled(false);
+      this.phys.stopKinematic(proxy);
+      ep.frozen = true; ep.fEma = 0;
+      this.reaction[i * 3] = this.reaction[i * 3 + 1] = this.reaction[i * 3 + 2] = 0;
+      return true;
+    }
+    if (!ep.frozen) return true;
+    if (p && Number.isFinite(p[0] + p[1] + p[2])) {
+      this.phys.teleport(proxy, p[0], p[1], p[2], 0, 0, 0, 1);
+      this.gripPos[i * 3] = p[0]; this.gripPos[i * 3 + 1] = p[1]; this.gripPos[i * 3 + 2] = p[2];
+    }
+    ep.h.c.SetEnabled(true);
+    ep.frozen = false; ep.fEma = 0; ep.ticks = 0;
+    this.phys.wake(ep.toy);
+    return true;
   }
 
   /* Arm i's sealed contacts on the furniture: segment, surface point, outward normal, the newtons they bear before

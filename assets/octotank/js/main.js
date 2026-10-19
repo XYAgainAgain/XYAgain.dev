@@ -12,6 +12,7 @@ import { Pose } from './amira/pose.js';
 import { Attention } from './amira/attention.js';
 import { Locomotion } from './amira/locomotion.js';
 import { Wander } from './amira/loco-wander.js';
+import { Carry } from './amira/loco-carry.js';
 import { isRunning } from './scenarios.js';
 import { BodyParts } from './amira/body-parts.js';
 import { attachDebug } from './debug.js';
@@ -91,6 +92,7 @@ async function boot() {
   const attention = new Attention(pose, arms, toys, { seed, knobs: params.get('curious') === '0' ? { curious: false } : {} });
   const loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
   loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
+  const carry = new Carry({ mantle, arms, loco });
 
   // Scene: a long lens at the glass, dim gallery light, the tank as a wire box.
   const scene = new THREE.Scene();
@@ -160,11 +162,12 @@ async function boot() {
 
   water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
   water.setTint(water.knobs.tint);
-  const ctx = { phys, mantle, arms, pose, attention, loco, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
+  const ctx = { phys, mantle, arms, pose, attention, loco, carry, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
   tank.knobs.parts = bodyParts.knobs;
   tank.attention = attention; tank.knobs.attention = attention.knobs;
+  tank.carry = carry;
   tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
   const armView = tank.armView = new ArmView(arms, mantle, scene, Number(params.get('girth')) > 0 ? { girth: +params.get('girth') } : {});

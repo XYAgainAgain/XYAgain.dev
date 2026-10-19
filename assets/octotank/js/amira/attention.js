@@ -45,15 +45,17 @@ export function chooseEye(yaw, eyes, point, ahead, favor) {
 }
 
 /* The arm lying along the flat line from the eye to the point (Byrne et al. 2006b): the one whose outward bearing
-   from the crown's center turns least from that line. A back pair arm pays `backBias` radians, a strong preference. */
-export function armOnLine(roots, eye, point, { backBias = ATTEND_KNOBS.backBias } = {}) {
+   from the crown's center turns least from that line. A back pair arm pays `backBias` radians, a strong preference.
+   Arms in `skip` are passed over; -1 when every arm is. */
+export function armOnLine(roots, eye, point, { backBias = ATTEND_KNOBS.backBias } = {}, skip = null) {
   const n = roots.length / 3, bx = point[0] - eye[0], bz = point[2] - eye[2];
-  if (!(Math.hypot(bx, bz) > 1e-6) || !(n > 0)) return FRONT_ARMS[0];
+  if (!(Math.hypot(bx, bz) > 1e-6) || !(n > 0)) return [...FRONT_ARMS, ...Array.from({ length: n }, (_, i) => i)].find((i) => !skip?.has(i)) ?? -1;
   let cx = 0, cz = 0;
   for (let i = 0; i < n; i++) { cx += roots[i * 3] / n; cz += roots[i * 3 + 2] / n; }
   const line = Math.atan2(bz, bx);
-  let best = FRONT_ARMS[0], score = Infinity;
+  let best = -1, score = Infinity;
   for (let i = 0; i < n; i++) {
+    if (skip?.has(i)) continue;
     const s = Math.abs(wrap(Math.atan2(roots[i * 3 + 2] - cz, roots[i * 3] - cx) - line)) + (FRONT_ARMS.includes(i) ? 0 : backBias);
     if (s < score) { score = s; best = i; }
   }
@@ -173,8 +175,17 @@ export class Attention {
       m.rootWorld(r, this._r);
       R[r * 3] = this._r[0]; R[r * 3 + 1] = this._r[1]; R[r * 3 + 2] = this._r[2];
     }
-    const arm = armOnLine(R, eye, this.points[i], this.knobs);
-    this.reached = this.arms.reachToy(arm, this.toys[i]) ? arm : -1;
+    // The arm on the eye line if it can be had; past one a stronger claim holds, the next best on the line.
+    const skip = new Set(), A = this.arms;
+    this.reached = -1;
+    for (let tries = 0; tries < R.length / 3 && this.reached < 0; tries++) {
+      const arm = armOnLine(R, eye, this.points[i], this.knobs, skip);
+      if (arm < 0) break;
+      skip.add(arm);
+      if (A.claim && !A.claim(arm, 'attend')) continue;
+      if (A.reachToy(arm, this.toys[i])) this.reached = arm;
+      else A.unclaim?.(arm, 'attend');
+    }
     // A held look ends a while after the reach, like an idle one.
     this.until = this.time + this.rng.range(this.knobs.holdMin, Math.max(this.knobs.holdMin, this.knobs.holdMax));
   }
