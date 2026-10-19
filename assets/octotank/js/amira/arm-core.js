@@ -1,6 +1,8 @@
 /* Amira's arms without THREE or Jolt: a 24-point chain per arm posed from per-joint bends, stretch, and twist; the
    reach, grip, fetch, and idle programs; and the contact passes that make an arm drape instead of clip. */
 
+import { plantTargets, makePlant } from './arm-plant-core.js';
+
 export const ARM_KNOBS = {
   points: 24,
   length: 0.65,          // m at rest, root to tip, for every arm but the front pair
@@ -975,7 +977,7 @@ export class Arm {
   /* Send the bend out to a target. The middle of the arm arrives on it unless `tip` asks for a tip grip (rims,
      handles, small things); `speed` is the bend's peak in m/s, and the duration follows from the distance. `face` is
      a world point (a toy's center) the suckers turn toward where the arm meets it. */
-  reach(target, { duration, amplitude, hold, speed, tip = false, face = null } = {}) {
+  reach(target, { duration, amplitude, hold, speed, tip = false, face = null, contactArc = null } = {}) {
     if (!finite3(target)) return false;
     const k = this.knobs, F = this.frame;
     // A NaN option would poison the bend springs for good, so each falls back to its knob.
@@ -987,7 +989,18 @@ export class Arm {
       kind: 'reach', target: [target[0], target[1], target[2]], t: 0, ht: 0, duration: T, rise, tip: !!tip,
       amplitude: orKnob(amplitude, k.reachAmplitude), hold: orKnob(hold, k.holdTime), cArc: 0, e: 0,
       face: finite3(face) ? [face[0], face[1], face[2]] : null,
+      // A contact pinned at this fraction of the arm (a foot near the body) instead of the middle third.
+      cFix: Number.isFinite(contactArc) ? Math.max(0.05, Math.min(1, contactArc)) * this._length : null,
     };
+    this.reachB = 0;
+    return true;
+  }
+
+  /* Hold segment seg still at surface point p (outward normal n) while the root moves: arm-plant-core.js. */
+  plant(p, n, seg) {
+    const g = makePlant(this, p, n, seg);
+    if (!g) return false;
+    this.goal = g;
     this.reachB = 0;
     return true;
   }
@@ -1117,6 +1130,7 @@ export class Arm {
       return 0;
     }
     if (g.kind === 'fetch') return this._fetchTargets(T, K);
+    if (g.kind === 'plant') return plantTargets(this, T, K, dt);
     return this._reachTargets(T, K, dt);
   }
 
@@ -1139,6 +1153,7 @@ export class Arm {
       const e = Bw > 1e-9 ? Math.max(eMin, Math.min(eMax, (D - A) / Bw)) : 0;
       return { e, f: A + e * Bw - D };
     };
+    if (g.cFix && !g.tip) { g.cArc = g.cFix; g.e = eAt(g.cFix).e; return; }
     let c = g.tip ? Lr : Math.max(k.contactMin, Math.min(k.contactMax, D / (Lr * Math.max(0.5, k.reachStretch)))) * Lr;
     let r = eAt(c);
     if (Math.abs(r.f) > 1e-4 && !g.tip) {
@@ -1468,7 +1483,10 @@ export class Arm {
     const k = this.knobs, S = this.n - 1, L = this.lam, G = this.lamGoal, w = this.w;
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.stretchTau));
     const shorten = k.shortenSpeed / Math.max(1e-3, this._length);
+    const plant = this.goal?.kind === 'plant' ? this.goal.lamTo : -1;
     for (let j = 0; j < S; j++) {
+      // A plant's length is the geometry's, set outright, or its anchored suckers would slide.
+      if (j <= plant) { L[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], G[j])); continue; }
       const want = Math.max(k.stretchMin, Math.min(this.lamMax[j], 1 + (G[j] - 1) * w));
       let d = (want - L[j]) * f;
       if (d < 0) d = Math.max(d, -(L[j] > 1 ? k.recoverRate : shorten) * dt);
@@ -1558,7 +1576,7 @@ export class Arm {
     O.set(B);
     // The grip: FABRIK on the chain up to the contact point, warm-started from the last solved chain, read back as
     // bends and blended in bend space. Once the grip's goal is gone, it fades on its last answer.
-    const gripping = this.goal && (this.goal.kind === 'reach' || this.goal.kind === 'hold');
+    const gripping = this.goal && (this.goal.kind === 'reach' || this.goal.kind === 'hold' || this.goal.kind === 'plant');
     if (this.gw > 1e-4 && this.started && (gripping || this._lastGrip)) {
       if (gripping) {
         const G = this.G, tg = this.goal.target, gi = this.gripAt;

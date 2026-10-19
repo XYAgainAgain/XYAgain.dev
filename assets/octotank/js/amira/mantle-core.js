@@ -674,6 +674,33 @@ export function spinFor(P, m, n, cx, cy, cz, lx, ly, lz, out) {
   return out;
 }
 
+/* Make per-point accelerations A internal in place: 'force' takes out their net force, 'both' their net torque about
+   the center of mass as well, so a muscle field can deform her but never walk or spin her. */
+export function neutralizeAccel(A, P, m, n, mode, spin = [0, 0, 0]) {
+  if (mode !== 'force' && mode !== 'both') return A;
+  let fx = 0, fy = 0, fz = 0, M = 0, cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < n; i++) {
+    const w = m[i];
+    fx += w * A[i * 3]; fy += w * A[i * 3 + 1]; fz += w * A[i * 3 + 2]; M += w;
+    cx += w * P[i * 3]; cy += w * P[i * 3 + 1]; cz += w * P[i * 3 + 2];
+  }
+  if (!(M > 0)) return A;
+  fx /= M; fy /= M; fz /= M; cx /= M; cy /= M; cz /= M;
+  let tx = 0, ty = 0, tz = 0;
+  for (let i = 0; i < n; i++) {
+    const ax = (A[i * 3] -= fx), ay = (A[i * 3 + 1] -= fy), az = (A[i * 3 + 2] -= fz);
+    const rx = P[i * 3] - cx, ry = P[i * 3 + 1] - cy, rz = P[i * 3 + 2] - cz, w = m[i];
+    tx += w * (ry * az - rz * ay); ty += w * (rz * ax - rx * az); tz += w * (rx * ay - ry * ax);
+  }
+  if (mode !== 'both') return A;
+  const s = spinFor(P, m, n, cx, cy, cz, tx, ty, tz, spin);
+  for (let i = 0; i < n; i++) {
+    const rx = P[i * 3] - cx, ry = P[i * 3 + 1] - cy, rz = P[i * 3 + 2] - cz;
+    A[i * 3] -= s[1] * rz - s[2] * ry; A[i * 3 + 1] -= s[2] * rx - s[0] * rz; A[i * 3 + 2] -= s[0] * ry - s[1] * rx;
+  }
+  return A;
+}
+
 /* Her eyes. Pupils are W-shaped, a cuttlefish trait kept as an Osminoki one: a W in bright light, round in the dark. */
 export const EYE_KNOBS = {
   light: 0.6,             // 0 dark to 1 bright, until the tank has a lighting cycle

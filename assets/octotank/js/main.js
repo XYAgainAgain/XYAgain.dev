@@ -10,6 +10,9 @@ import { SuckerView } from './amira/sucker-view.js';
 import { ArmView } from './amira/arm-view.js';
 import { Pose } from './amira/pose.js';
 import { Attention } from './amira/attention.js';
+import { Locomotion } from './amira/locomotion.js';
+import { Wander } from './amira/loco-wander.js';
+import { isRunning } from './scenarios.js';
 import { BodyParts } from './amira/body-parts.js';
 import { attachDebug } from './debug.js';
 import { Water } from './water.js';
@@ -17,7 +20,7 @@ import { createPanel } from './panel.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
-   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
+   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -82,9 +85,12 @@ async function boot() {
   }
   const mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
   const arms = new Arms(phys, mantle, params.has('collider') ? { collider: params.get('collider') } : {}, { seed });
-  const pose = new Pose(mantle, start, {}, { seed });
+  const locoOn = params.get('loco') !== '0';
+  const pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
   pose.tick(0);
   const attention = new Attention(pose, arms, toys, { seed, knobs: params.get('curious') === '0' ? { curious: false } : {} });
+  const loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
+  loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
 
   // Scene: a long lens at the glass, dim gallery light, the tank as a wire box.
   const scene = new THREE.Scene();
@@ -154,7 +160,7 @@ async function boot() {
 
   water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
   water.setTint(water.knobs.tint);
-  const ctx = { phys, mantle, arms, pose, attention, panel, walls, rocks, toys, layoutKnobs, water, watch: null };
+  const ctx = { phys, mantle, arms, pose, attention, loco, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
   tank.knobs.parts = bodyParts.knobs;
@@ -187,10 +193,12 @@ async function boot() {
   const preTick = (dt) => {
     attention.tick(dt);
     pose.tick(dt, arms);
+    loco.tick(dt);
     mantle.tick(dt);
     mantle.sync();
     arms.tick(dt, phys.time);
     ctx.watch?.();
+    ctx.probe?.(dt);
   };
   function frame() {
     const now = performance.now();
@@ -217,6 +225,28 @@ async function boot() {
     if (afterFrame) { const f = afterFrame; afterFrame = null; f(); }
     if (!headless) diag.frame(now);
   }
+  // Click to send her: the floor, a rock, the panel, or the back or side glass; Alt-click the front glass, which plain
+  // clicks pass through (the camera sits beyond it). Shift is hurried.
+  const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+  const clickable = rigidMeshes.filter(({ e }) => (e.tag === 'wall' && e.taste !== 'lid') || e.tag === 'panel' || e.tag === 'rock').map((r) => r.mesh);
+  const inside = (p) => Math.abs(p.x) <= TANK.w / 2 + 0.005 && p.y >= -0.005 && p.y <= TANK.h + 0.005 && Math.abs(p.z) <= TANK.d / 2 + 0.005;
+  renderer.domElement.addEventListener('click', (ev) => {
+    if (isRunning() || !loco.knobs.enabled) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    ndc.set(((ev.clientX - rect.left) / rect.width) * 2 - 1, -((ev.clientY - rect.top) / rect.height) * 2 + 1);
+    ray.setFromCamera(ndc, camera);
+    let hit = null;
+    if (ev.altKey) {
+      const o = ray.ray.origin, d = ray.ray.direction, t = Math.abs(d.z) > 1e-6 ? (TANK.d / 2 - o.z) / d.z : -1;
+      if (t > 0) hit = new THREE.Vector3(o.x + d.x * t, o.y + d.y * t, TANK.d / 2);
+      if (hit && !inside(hit)) hit = null;
+    } else hit = ray.intersectObjects(clickable, false).map((h) => h.point).find(inside) ?? null;
+    if (!hit) { say('no place to go there'); return; }
+    const p = [Math.max(-TANK.w / 2, Math.min(TANK.w / 2, hit.x)), Math.max(0, hit.y), Math.max(-TANK.d / 2, Math.min(TANK.d / 2, hit.z))];
+    loco.want(p, { urgency: ev.shiftKey ? 0.9 : 0.3, source: 'click' });
+    say(`going to ${p.map((v) => v.toFixed(2)).join(', ')}${ev.shiftKey ? ', hurried' : ''}`);
+  });
+
   say('');
   renderer.setAnimationLoop(frame);
 

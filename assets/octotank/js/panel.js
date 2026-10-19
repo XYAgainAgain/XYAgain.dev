@@ -1,3 +1,5 @@
+import { list as scenarioList, isRunning } from './scenarios.js';
+
 /* The diagnostics panel: frame rate, physics and script costs, her state, and every control as both a button and a
    key, built from one list so the two never drift apart. */
 
@@ -43,12 +45,28 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     { key: 'd', hint: 'D', label: () => (el.classList.contains('collapsed') ? 'Show panel' : 'Hide panel'), run: () => el.classList.toggle('collapsed'), keep: true },
     { key: 'r', hint: 'R', label: () => 'Reload', run: () => location.reload() },
   ];
+  const loco = ctx.loco;
+  if (loco) actions.splice(actions.length - 3, 0, { key: 'v', hint: 'V', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } });
+  // One button per keyed scenario, from the registry; one not built yet stays disabled.
+  for (const sc of scenarioList()) {
+    if (!sc.key || !loco) continue;
+    actions.splice(actions.length - 3, 0, {
+      key: sc.key, hint: sc.key, disabled: !sc.run, label: () => (isRunning() === sc.name ? `${sc.label}…` : sc.label),
+      run: async () => {
+        if (!sc.run || isRunning()) return;
+        say(`${sc.label}: running`);
+        try { const r = await tank.scenario(sc.name); console.log(sc.name, r); say(`${sc.label}: ${r.passed ? 'PASS' : r.passed === false ? 'FAIL' : 'done'}`); }
+        catch (err) { say(`${sc.label}: ${err.message}`); }
+      },
+    });
+  }
   for (const a of actions) {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'btn' + (a.keep ? ' keep' : '');
     b.setAttribute('aria-keyshortcuts', a.key === ' ' ? 'Space' : a.hint);
     a.button = b;
+    if (a.disabled) { b.disabled = true; b.title = 'not built yet'; }
     b.addEventListener('click', () => { a.run(); relabel(); });
     controls.append(b);
   }
@@ -64,7 +82,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   addEventListener('keydown', (ev) => {
     if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
     const a = actions.find((x) => x.key === ev.key.toLowerCase());
-    if (!a) return;
+    if (!a || a.disabled) return;
     // A focused button already turns Space into a click.
     if (ev.key === ' ' && document.activeElement?.tagName === 'BUTTON') return;
     ev.preventDefault();
@@ -97,6 +115,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Body     volume ${h.volume.toFixed(2)}   strain ${h.strainMax.toFixed(2)}   tilt ${deg(h.tilt)}${h.nan ? `   NaN ${h.nan}` : ''}`,
         `Heading  ${deg(pose.yaw)}${pose.turning ? ', turning' : ''}   breath ${breath}`,
         `Attend   ${ctx.attention?.describe() ?? '–'}`,
+        `Gait     ${loco ? `${loco.describe()}   ${loco.stats().mean.toFixed(3)} ms` : '–'}`,
         `Arms     ${busyText}`,
         `Water    ${ctx.water?.enabled ? `on, surface ${ctx.water.knobs.surfaceY} m, ${(s.water?.mean ?? 0).toFixed(3)} ms` : 'off (?water=0)'}${ctx.water?.knobs.tint ? '   tint: pale = floats or near neutral, darker = denser' : ''}`,
         `Suckers  ${arms.suckerReport().map((r, i) => `${i} ${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,

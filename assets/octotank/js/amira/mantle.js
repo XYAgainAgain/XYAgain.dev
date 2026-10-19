@@ -1,5 +1,5 @@
 import { LAYERS } from '../config.js';
-import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVolume6, vertexNeighbors, domeWeights, BodyFieldFit, SHAPE_KNOBS, BREATH_KNOBS, breathPace, exhaleAt, breathWeights, vertexAreas, spinFor, inhaleShare } from './mantle-core.js';
+import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVolume6, vertexNeighbors, domeWeights, BodyFieldFit, SHAPE_KNOBS, BREATH_KNOBS, breathPace, exhaleAt, breathWeights, vertexAreas, spinFor, inhaleShare, neutralizeAccel } from './mantle-core.js';
 
 /* Her pressurized soft body: mantle, head, and arm crown in one shell. Vertex positions live in Jolt's heap and are
    read in place each frame; with mUpdatePosition off and the body at `origin`, a vertex's local position is world
@@ -27,6 +27,7 @@ export const MANTLE_KNOBS = {
   forceDamp: 90,          // mass: the newtons scale with the patch's mass by themselves
   forceN: 40,             // newtons one arm base can exert, as measured in vivo; the cap is spread over its patch
   patchRadius: 0.02,      // meters around a root that one arm base grips
+  lateralDamp: 0,         // 1/s across a spring arm's own line when set (0 keeps forceDamp on every axis)
   breathPa: null,         // muscle pressure per unit of breath depth on the mantle's front; null takes LEVEL_BREATH
   ...BREATH_KNOBS,
   rootDroop: 0.6,         // radians below the crown ring's plane that an arm leaves the body
@@ -77,6 +78,23 @@ export class Mantle {
     this.exhale = 0.5;        // 0 drawn in, 1 breathed out
     this.outflow = 1;         // 0–1, how fast the breath is leaving through the siphon, which flares with it
     this.armForce = new Float32Array(this.shell.roots.length);   // newtons each arm base pulled with last tick
+    // Per arm: 0 free (its patch is left alone), 1 spring (the patch follows armTarget, its root's target), 2 rigid
+    // (the posture's per-vertex targets). armAxis, when nonzero, is the line lateralDamp splits the damper about.
+    const arms = this.roots.length;
+    this.armMode = new Uint8Array(arms).fill(2);
+    this.armCap = new Float32Array(arms).fill(Infinity);
+    this.armTarget = new Float64Array(arms * 3);
+    this.armAxis = new Float64Array(arms * 3);
+    // A spring arm's target velocity: its damper works against motion relative to a moving target, not to the world.
+    this.armVel = new Float64Array(arms * 3);
+    this.breathHold = null;   // { exhale, depth, outflow? }: the breathing muscles held at a phase instead of cycling
+    this._extra = new Float32Array(this.shell.count * 3);
+    this._extraOn = false;
+    this._scratch = new Float32Array(this.shell.count * 3);
+    this._delta = new Float64Array(arms * 3);
+    // Mass-weighted shares of the mantle and the head, for the axis between them.
+    this._wMantle = Float32Array.from(this.vertexMass, (m, i) => m * this.shell.regions[i * 3]);
+    this._wHead = Float32Array.from(this.vertexMass, (m, i) => m * this.shell.regions[i * 3 + 1]);
     this._build();
   }
 
@@ -149,7 +167,7 @@ export class Mantle {
   }
 
   /* pin: the eight roots carry inverse mass 0 and are moved by velocity. force: every vertex keeps its mass and
-     each arm's patch is pulled toward its posture target with a newton cap. free: nothing pulls; she drifts and
+     each arm's patch is pulled toward its target (the posture's, or its spring's) with a newton cap. free: nothing pulls; she drifts and
      rights herself. `driven` lists whichever vertices are live. */
   setDrive(mode) {
     this.drive = DRIVES.includes(mode) ? mode : 'pin';
@@ -175,7 +193,10 @@ export class Mantle {
     for (let d = 0; d < this.driven.length; d++) {
       for (let k = 0; k < 3; k++) fresh[d * 3 + k] = this.positions[this.driven[d] * 3 + k] + this.origin[k];
     }
-    this.targets = fresh;   // world-space, one per driven vertex; the posture rewrites them every tick
+    this.targets = fresh;   // world-space, one per driven vertex; the rigid posture rewrites them every tick
+    // A spring arm with no target yet holds where its root is, never the world origin.
+    const p = [0, 0, 0];
+    for (let r = 0; r < this.roots.length; r++) { this.rootWorld(r, p); this.armTarget.set(p, r * 3); }
   }
 
   setPressurePa(pa) { this.knobs.pressurePa = pa; this.mp.SetPressure(pa * this.restVolume); }
@@ -204,24 +225,58 @@ export class Mantle {
       const lift = k.righting * dt, dome = this.dome;
       for (let i = 0, n = this.shell.count; i < n; i++) H[this.velAt + i * s + 1] += lift * dome[i];
     }
+    if (this._extraOn) {
+      const X = this._extra;
+      for (let i = 0, n = this.shell.count; i < n; i++) {
+        const vo = this.velAt + i * s;
+        H[vo] += X[i * 3] * dt; H[vo + 1] += X[i * 3 + 1] * dt; H[vo + 2] += X[i * 3 + 2] * dt;
+      }
+      X.fill(0);
+      this._extraOn = false;
+    }
     if (k.rollDamp) this._dampRoll(Math.min(1, k.rollDamp * dt));
     const pin = this.drive === 'pin', F = this._armF ??= new Float64Array(this.roots.length * 3);
     F.fill(0);
+    // A spring arm's whole patch moves by its root's error, so the patch translates and keeps its shape.
+    const mode = this.armMode, delta = this._delta, P = this.positions;
+    for (let r = 0; r < this.roots.length; r++) {
+      const ri = this.roots[r] * 3;
+      for (let a = 0; a < 3; a++) delta[r * 3 + a] = this.armTarget[r * 3 + a] - this.origin[a] - P[ri + a];
+    }
     // Implicit in the spring and the damper, so any gain is stable at the fixed step: v' = (v + dt·K·dx) / (1 + dt·D + dt²·K).
-    const K = k.forceK, D = k.forceDamp, den = 1 + dt * D + dt * dt * K;
+    const K = k.forceK, D = k.forceDamp, den = 1 + dt * D + dt * dt * K, lat = k.lateralDamp > 0 ? 1 + dt * k.lateralDamp + dt * dt * K : 0;
     for (let d = 0; d < this.driven.length; d++) {
-      const i = this.driven[d], po = this.posAt + i * s, vo = this.velAt + i * s;
-      const dx = this.targets[d * 3] - this.origin[0] - H[po];
-      const dy = this.targets[d * 3 + 1] - this.origin[1] - H[po + 1];
-      const dz = this.targets[d * 3 + 2] - this.origin[2] - H[po + 2];
+      const i = this.driven[d], po = this.posAt + i * s, vo = this.velAt + i * s, arm = this.drivenArm[d], am = pin ? 2 : mode[arm];
+      if (am === 0) continue;
+      let dx, dy, dz, wx = 0, wy = 0, wz = 0;
+      if (am === 1) {
+        dx = delta[arm * 3]; dy = delta[arm * 3 + 1]; dz = delta[arm * 3 + 2];
+        wx = dt * D * this.armVel[arm * 3]; wy = dt * D * this.armVel[arm * 3 + 1]; wz = dt * D * this.armVel[arm * 3 + 2];
+      }
+      else {
+        dx = this.targets[d * 3] - this.origin[0] - H[po];
+        dy = this.targets[d * 3 + 1] - this.origin[1] - H[po + 1];
+        dz = this.targets[d * 3 + 2] - this.origin[2] - H[po + 2];
+      }
       if (pin) {
         let vx = dx / dt, vy = dy / dt, vz = dz / dt;
         const sp = Math.hypot(vx, vy, vz);
         if (sp > k.pinSpeed) { const f = k.pinSpeed / sp; vx *= f; vy *= f; vz *= f; }
         H[vo] = vx; H[vo + 1] = vy; H[vo + 2] = vz;
       } else {
-        const arm = this.drivenArm[d], capV = (k.forceN / this.patchMass[arm]) * dt;
-        let ux = (H[vo] + dt * K * dx) / den - H[vo], uy = (H[vo + 1] + dt * K * dy) / den - H[vo + 1], uz = (H[vo + 2] + dt * K * dz) / den - H[vo + 2];
+        const capV = (Math.min(k.forceN, this.armCap[arm]) / this.patchMass[arm]) * dt;
+        // With a moving target: v' = (v + dt·K·dx + dt·D·vt) / den.
+        let ux = (H[vo] + dt * K * dx + wx) / den - H[vo], uy = (H[vo + 1] + dt * K * dy + wy) / den - H[vo + 1], uz = (H[vo + 2] + dt * K * dz + wz) / den - H[vo + 2];
+        if (lat && am === 1) {
+          // Across the arm's line the damper runs at lateralDamp: the same update with that denominator, minus its axial part.
+          const ax = this.armAxis[arm * 3], ay = this.armAxis[arm * 3 + 1], az = this.armAxis[arm * 3 + 2];
+          if (ax * ax + ay * ay + az * az > 0.5) {
+            let lx = (H[vo] + dt * K * dx) / lat - H[vo], ly = (H[vo + 1] + dt * K * dy) / lat - H[vo + 1], lz = (H[vo + 2] + dt * K * dz) / lat - H[vo + 2];
+            const ua = ux * ax + uy * ay + uz * az, la = lx * ax + ly * ay + lz * az;
+            lx -= la * ax; ly -= la * ay; lz -= la * az;
+            ux = ua * ax + lx; uy = ua * ay + ly; uz = ua * az + lz;
+          }
+        }
         const u = Math.hypot(ux, uy, uz);
         if (u > capV) { const f = capV / u; ux *= f; uy *= f; uz *= f; }
         H[vo] += ux; H[vo + 1] += uy; H[vo + 2] += uz;
@@ -242,14 +297,23 @@ export class Mantle {
      exhale, as a pressure on that skin alone. Muscles are internal, so the net force and torque come out and breathing
      never walks or rocks her. Her gas pressure stays at its rest value. */
   _breathe(dt) {
-    const k = this.knobs, pace = breathPace(k, this.pace);
-    if (!(pace.depth > 0 && pace.rate > 0)) { this.exhale = 0; this.outflow = 0; return; }
-    this.breathT = (this.breathT + (dt * pace.rate) / 60) % 1;
-    this.exhale = exhaleAt(this.breathT, k.breathInhale);
-    // Water leaves through the funnel only on the exhale, fastest halfway through it.
-    this.outflow = this.breathT >= inhaleShare(k.breathInhale) ? 4 * this.exhale * (1 - this.exhale) : 0;
+    const k = this.knobs, pace = breathPace(k, this.pace), hold = this.breathHold;
+    let depth = pace.depth;
+    if (hold) {
+      // Held: the muscles stay at one phase and depth (a full exhale, a jet's pulse) while the cycle waits.
+      depth = Number.isFinite(hold.depth) ? Math.max(0, hold.depth) : 0;
+      this.exhale = Number.isFinite(hold.exhale) ? Math.max(0, Math.min(1, hold.exhale)) : 0.5;
+      this.outflow = Number.isFinite(hold.outflow) ? Math.max(0, Math.min(1, hold.outflow)) : 0;
+      if (!(depth > 0)) return;
+    } else {
+      if (!(pace.depth > 0 && pace.rate > 0)) { this.exhale = 0; this.outflow = 0; return; }
+      this.breathT = (this.breathT + (dt * pace.rate) / 60) % 1;
+      this.exhale = exhaleAt(this.breathT, k.breathInhale);
+      // Water leaves through the funnel only on the exhale, fastest halfway through it.
+      this.outflow = this.breathT >= inhaleShare(k.breathInhale) ? 4 * this.exhale * (1 - this.exhale) : 0;
+    }
     if (k.breathFull !== this.breathW.full || k.breathStart !== this.breathW.start) this._weighBreath();
-    const push = k.breathPa * pace.depth * (0.5 - this.exhale);
+    const push = k.breathPa * depth * (0.5 - this.exhale);
     const H = this.J.HEAPF32, s = this.stride, n = this.shell.count, W = this.breathW, m = this.vertexMass, A = this._acc;
     vertexAreas(this.positions, this.shell.faces, this._areas);
     const P = this.positions;
@@ -274,6 +338,46 @@ export class Mantle {
       H[vo + 1] += (A[i * 3 + 1] - fy - (w[2] * rx - w[0] * rz)) * dt;
       H[vo + 2] += (A[i * 3 + 2] - fz - (w[0] * ry - w[1] * rx)) * dt;
     }
+  }
+
+  /* Per-vertex accelerations (m/s², count × 3), consumed by the next mantle.tick() whatever order callers tick in.
+     neutral 'both' takes out their net force and torque, 'force' the force alone, false applies them raw. */
+  addAccel(acc, { neutral = 'both' } = {}) {
+    const n = this.shell.count, A = this._scratch;
+    if (!acc || acc.length < n * 3) return false;
+    for (let i = 0; i < n * 3; i++) { const v = acc[i]; A[i] = Number.isFinite(v) ? v : 0; }
+    neutralizeAccel(A, this.positions, this.vertexMass, n, neutral, this._nspin ??= [0, 0, 0]);
+    const X = this._extra;
+    for (let i = 0; i < n * 3; i++) X[i] += A[i];
+    this._extraOn = true;
+    return true;
+  }
+
+  /* The unit axis from her head toward the far end of her mantle, from the two regions' mass-weighted centroids. */
+  mantleAxis(out = [0, 0, 0]) {
+    const P = this.positions, wm = this._wMantle, wh = this._wHead;
+    let mx = 0, my = 0, mz = 0, Mm = 0, hx = 0, hy = 0, hz = 0, Mh = 0;
+    for (let i = 0, n = this.shell.count; i < n; i++) {
+      const a = wm[i], b = wh[i], x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+      mx += a * x; my += a * y; mz += a * z; Mm += a;
+      hx += b * x; hy += b * y; hz += b * z; Mh += b;
+    }
+    if (!(Mm > 0 && Mh > 0)) { out[0] = 0; out[1] = 1; out[2] = 0; return out; }
+    const dx = mx / Mm - hx / Mh, dy = my / Mm - hy / Mh, dz = mz / Mm - hz / Mh, l = Math.hypot(dx, dy, dz);
+    if (l > 1e-9) { out[0] = dx / l; out[1] = dy / l; out[2] = dz / l; } else { out[0] = 0; out[1] = 1; out[2] = 0; }
+    return out;
+  }
+
+  /* The crown ring's span: the mean, least, and greatest distance between opposite roots, live or (rest) at rest. */
+  ringSpan(rest = false, out = { mean: 0, min: 0, max: 0 }) {
+    const R = this.roots, P = rest ? this.shell.positions : this.positions, half = R.length >> 1;
+    let sum = 0, lo = Infinity, hi = 0;
+    for (let r = 0; r < half; r++) {
+      const a = R[r] * 3, b = R[r + half] * 3, d = Math.hypot(P[a] - P[b], P[a + 1] - P[b + 1], P[a + 2] - P[b + 2]);
+      sum += d; lo = Math.min(lo, d); hi = Math.max(hi, d);
+    }
+    out.mean = sum / Math.max(1, half); out.min = lo; out.max = hi;
+    return out;
   }
 
   /* Take away a share of her rigid spin about level axes, leaving her yaw rate, drift, and every deformation alone.

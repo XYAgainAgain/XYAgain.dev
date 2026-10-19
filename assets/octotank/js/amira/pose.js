@@ -2,9 +2,9 @@ import { EYE, EYE_KNOBS } from './mantle-core.js';
 import { createRng, deriveSeed } from '../../../pond/js/rng.js';
 import { wrap, eyeTurn, chooseEye } from './attention.js';
 
-/* The posture controller: a virtual body center that the arm roots keep their rest offsets around. The spike's
-   squeeze test is a scripted path for this center through the hole; idle is a slow drift. Her heading is her own,
-   apart from where she travels: she turns to bring one eye onto what she attends to, and otherwise drifts slowly. */
+/* Her heading, plus the rigid posture (a virtual center the arm roots keep their rest offsets around) while a path
+   runs, ?loco=0 is set, or the drive isn't force. Live, center and yaw are read off her body and the heading
+   controller's yawCmd is what her planted arms turn her toward. She brings an eye onto what she attends to, else drifts. */
 
 export const POSE_KNOBS = {
   turnRate: 0.8,          // rad/s at most: plausible, but no study measured a peak
@@ -15,19 +15,23 @@ export const POSE_KNOBS = {
   driftMin: 20,           // s between idle changes of heading, at random in this range
   driftMax: 45,
   driftStep: 0.9,         // rad at most per change, either way; small ones add up until one passes the dead band
+  turnHold: 2,            // s a finished turn's command is held for her arms to bring her body onto it
 };
 
-// Heading sources, strongest first: the squeeze's lead, then attention, then the idle drift.
-export const HEADING = { drift: 0, attend: 1, lead: 2 };
-const { lead: LEAD, attend: ATTEND, drift: DRIFT } = HEADING;
+// Heading sources, strongest first: the squeeze's lead, a commanded heading, attention, then the idle drift.
+export const HEADING = { drift: 0, attend: 1, command: 2, lead: 3 };
+const { lead: LEAD, command: COMMAND, attend: ATTEND, drift: DRIFT } = HEADING;
 
 export class Pose {
-  constructor(mantle, start, knobs = {}, { seed = 1, eyeKnobs = EYE_KNOBS } = {}) {
+  constructor(mantle, start, knobs = {}, { seed = 1, eyeKnobs = EYE_KNOBS, rigid = false } = {}) {
     this.mantle = mantle;
     this.knobs = { ...POSE_KNOBS, ...knobs };
     this.eyeKnobs = eyeKnobs;   // main.js points this at the eyes' own live knobs
     this.center = [...start];
     this.yaw = 0;               // her heading is (cos yaw, sin yaw) on the floor plane (x, z)
+    this.yawCmd = 0;            // the heading the controller asks for; the same as yaw while rigid
+    this.command = null;        // a yaw a caller wants her to face, above attention and under the lead
+    this.alwaysRigid = !!rigid; // ?loco=0
     this.yawRate = 0;
     this.turning = false;
     this.squash = 1;           // vertical scale on the root offsets: a flattened posture fits a low hole
@@ -36,6 +40,7 @@ export class Pose {
     this.focus = null;         // { point, eye, turn }: what she attends to, which eye, and the body turn it asks for
     this.source = DRIFT;       // the source steering her now
     this.turnTo = 0;           // the heading a started turn is committed to
+    this.turnEnd = -Infinity;  // when the last turn's command arrived
     this.rng = createRng(deriveSeed(seed, 2203));
     this.driftYaw = 0;
     this.driftAt = this.rng.range(this.knobs.driftMin, Math.max(this.knobs.driftMin, this.knobs.driftMax));
@@ -44,6 +49,23 @@ export class Pose {
     const P = mantle.shell.positions, E = mantle.shell.eyes;
     this.eyeRest = [EYE.right, EYE.left].map((e) => (E ? [P[E[e] * 3], P[E[e] * 3 + 1], P[E[e] * 3 + 2]] : [0, 0, e === EYE.left ? -0.03 : 0.03]));
     this._eyes = [[0, 0, 0], [0, 0, 0]];
+    this._frame = { f: [1, 0, 0], u: [0, 1, 0], s: [0, 0, 1] };
+    this._wasRigid = true;
+  }
+
+  /* Rigid while a path runs, with ?loco=0, on a drive that isn't force, or on a body that can't report itself. */
+  get rigid() {
+    const m = this.mantle;
+    return !!this.path || this.alwaysRigid || (m.drive !== undefined && m.drive !== 'force') || typeof m.centroid !== 'function' || typeof m.bodyFrame !== 'function';
+  }
+
+  /* Live: where she really is. Her yaw only means something while her up is near vertical; past that it holds. */
+  _readBody() {
+    const m = this.mantle;
+    m.sync?.();
+    m.centroid(this.center);
+    const f = m.bodyFrame(this._frame);
+    if (f.u[1] > 0.7 && Math.hypot(f.f[0], f.f[2]) > 1e-6) this.yaw = Math.atan2(f.f[2], f.f[0]);
   }
 
   /* Follow a list of [seconds, x, y, z, squash?] keys in order; resolves with the keys' end time when done. */
@@ -86,6 +108,10 @@ export class Pose {
       out.src = LEAD; out.yaw = Math.atan2(lead[2] - c[2], lead[0] - c[0]); out.start = k.deadband;
       return out;
     }
+    if (Number.isFinite(this.command)) {
+      out.src = COMMAND; out.yaw = wrap(this.command); out.start = k.deadband;
+      return out;
+    }
     if (f && Number.isFinite(f.turn)) {
       out.src = ATTEND; out.yaw = wrap(this.yaw + f.turn); out.start = Math.max(k.deadband, k.eyeSlack);
       return out;
@@ -96,22 +122,30 @@ export class Pose {
 
   /* Ease her heading toward the goal. The dead band keeps her from fidgeting; once she starts a turn she finishes it,
      a weaker source can't take a turn over, and a turn under way keeps its side when the target crosses behind her. */
-  _steer(dt, lead) {
+  _steer(dt, lead, rigid) {
+    // Rigid, the command is her heading, so a heading set from outside steers from there. Live, it follows her body
+    // except during a turn and for turnHold after one, so a stale command never spins her.
+    if (rigid) this.yawCmd = this.yaw;
+    else if (!this.turning && this.time - this.turnEnd > this.knobs.turnHold) {
+      this.yawCmd = this.yaw;
+      if (this.source === DRIFT) this.driftYaw = this.yaw;
+    }
     const k = this.knobs, g = this._goal(lead, this._g ??= { src: DRIFT, yaw: 0, start: 0 });
     // A turn a stronger source started runs to its committed heading before a weaker one gets a say.
     if (!this.turning || g.src >= this.source) { this.source = g.src; this.turnTo = g.yaw; }
     let want = 0;
-    let e = wrap(this.turnTo - this.yaw);
+    let e = wrap(this.turnTo - this.yawCmd);
     if (this.yawRate !== 0 && Math.abs(e) > 2.8 && Math.sign(e) !== Math.sign(this.yawRate)) e += 2 * Math.PI * Math.sign(this.yawRate);
     if (!this.turning && Math.abs(e) > g.start) this.turning = true;
-    else if (this.turning && Math.abs(e) < k.deadband * 0.3) this.turning = false;
+    else if (this.turning && Math.abs(e) < k.deadband * 0.3) { this.turning = false; this.turnEnd = this.time; }
     if (this.turning) want = Math.max(-k.turnRate, Math.min(k.turnRate, e / Math.max(1e-3, k.turnLag)));
     this.yawRate += (want - this.yawRate) * Math.min(1, dt / Math.max(1e-3, k.turnEase));
     if (Math.abs(this.yawRate) < 1e-4 && !this.turning) this.yawRate = 0;
-    this.yaw = wrap(this.yaw + this.yawRate * dt);
+    this.yawCmd = wrap(this.yawCmd + this.yawRate * dt);
+    if (rigid) this.yaw = this.yawCmd;
     // The drift walks only while nothing stronger steers; it restarts from wherever she was left facing.
     if (this.source !== DRIFT || g.src !== DRIFT) {
-      this.driftYaw = this.yaw;
+      this.driftYaw = this.yawCmd;
       this.driftAt = Math.max(this.driftAt, this.time + k.driftMin);
     } else if (this.time >= this.driftAt) {
       this.driftYaw = wrap(this.driftYaw + this.rng.range(-k.driftStep, k.driftStep));
@@ -121,7 +155,16 @@ export class Pose {
 
   tick(dt, arms = null) {
     this.time += dt;
-    if (dt > 0) this._steer(dt, arms?.lead ?? null);
+    const rigid = this.rigid;
+    if (!rigid) {
+      this._readBody();
+      this.squash = 1;
+      // Coming off a path, the command starts from where she actually faces.
+      if (this._wasRigid) { this.yawCmd = this.driftYaw = this.turnTo = this.yaw; this.yawRate = 0; this.turning = false; }
+    }
+    this._wasRigid = rigid;
+    if (dt > 0) this._steer(dt, arms?.lead ?? null, rigid);
+    if (!rigid) return;
     if (this.path) {
       const p = this.path;
       p.t += dt;

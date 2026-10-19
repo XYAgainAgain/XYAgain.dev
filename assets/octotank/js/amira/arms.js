@@ -30,6 +30,7 @@ export const ARM_KNOBS = {
 };
 
 const WINDOW = 1800;
+export const CLAIM_TIERS = { idle: 0, attend: 1, stroke: 2, mode: 3, held: 4 };
 
 export class Arms {
   constructor(phys, mantle, knobs = {}, { seed = 1 } = {}) {
@@ -39,6 +40,8 @@ export class Arms {
     const count = mantle.roots.length;
     this.arms = Array.from({ length: count }, (_, i) => new Arm(i, this.knobs, seed));
     this.track = new Array(count).fill(null);
+    // Who holds each arm, strongest tier wins (a stub until shared arms are real).
+    this.owner = new Array(count).fill('idle');
     this.slot = new Float64Array(count);   // m across a shared toy, so arms going for one thing lie side by side
     this.slotDir = new Float64Array(count * 2);
     // The squeeze test sets this to a world point; every arm aims at it until it is cleared.
@@ -417,6 +420,29 @@ export class Arms {
 
   idle() { for (let i = 0; i < this.arms.length; i++) { this.track[i] = null; this.arms[i].idle(); } }
 
+  /* Plant arm i on one of its anchors ({ seg, p, n, taste }): that segment holds still on the surface. */
+  plant(i, anchor) {
+    const arm = this.arms[i];
+    if (!arm || !anchor || !arm.plant(anchor.p, anchor.n, anchor.seg)) return false;
+    arm.goal.entry = this.touchEntry[i * this.S + anchor.seg] ?? null;
+    arm.goal.taste = anchor.taste ?? null;
+    this.track[i] = null;
+    return true;
+  }
+
+  unplant(i) { const arm = this.arms[i]; if (arm?.goal?.kind === 'plant') arm.idle(); }
+
+  /* Take arm i at a tier (idle < attend < stroke < mode < held); false while a stronger one holds it. */
+  claim(i, tier) {
+    const T = CLAIM_TIERS;
+    if (!(tier in T) || !(i >= 0 && i < this.owner.length)) return false;
+    if (T[tier] < T[this.owner[i]]) return false;
+    this.owner[i] = tier;
+    return true;
+  }
+
+  unclaim(i, tier) { if (this.owner[i] === tier) this.owner[i] = 'idle'; }
+
   /* NaN, contact, length, and bend, measured on the solved chains against the layout's own distance field. */
   health() {
     // The root rides a shell vertex and inherits the mantle's own contact, so it is measured on its own.
@@ -588,6 +614,13 @@ export class Arms {
       // The patch a grip hangs from stays on its toy whatever the probe sees: those suckers are attached, not sliding.
       const held = ep?.h ? this._segAt(arm, ep.arc) : -1;
       if (held >= 0) { this.touchKind[a * S + held] = 2; this.touchEntry[a * S + held] = ep.toy; this.touchTaste[a * S + held] = ep.taste; }
+      // So does a planted foot on the furniture, and its neighbors where they touch: they hold still while the body moves.
+      const pg = arm.goal?.kind === 'plant' ? arm.goal : null, ps = pg ? pg.seg : -9;
+      if (pg && !this.touchKind[a * S + ps]) {
+        const q = a * S + ps;
+        this.touchKind[q] = 1; this.touchEntry[q] = pg.entry ?? null; this.touchTaste[q] = pg.taste ?? 'floor';
+        for (let i = 0; i < 3; i++) { this.touchP[q * 3 + i] = pg.point[i]; this.touchN[q * 3 + i] = pg.normal[i]; }
+      }
       for (let j = 0; j < S; j++) {
         const g = a * S + j, kind = this.touchKind[g];
         mode[j] = SEAL_NONE; scale[j] = 1;
@@ -595,7 +628,7 @@ export class Arms {
         if (kind === 3) { c.selfTouch++; if (this.gripSelf) mode[j] = SEAL_WORK; continue; }
         const entry = this.touchEntry[g], mine = kind === 2 && ep?.toy === entry;
         if (kind === 2 && !mine && this._ignored(a, entry)) continue;
-        if (j !== held && this._sliding(arm, j, g, kind === 2 ? entry : null, dt)) continue;
+        if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && this._sliding(arm, j, g, kind === 2 ? entry : null, dt)) continue;
         const rule = mine ? ep.rule : tasteRule(this.touchTaste[g], sk, this);
         if (!(rule.grip > 0)) continue;
         mode[j] = mine && ep.hard ? SEAL_HARD : SEAL_WORK;

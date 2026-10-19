@@ -1,5 +1,6 @@
 import { penetration } from './layout.js';
 import { TANK } from './config.js';
+import { runScenario } from './scenarios.js';
 
 /* window.tank: live knobs, step stats, and the squeeze test. The test drives the posture through the hole and
    watches the shell every tick; the result is the spike's acceptance record. */
@@ -20,7 +21,13 @@ export function attachDebug(ctx) {
     squeeze: (opts) => squeeze(ctx, opts),
     // What a sucker tastes on toy i, so food, spoiled, and slick can be tried without new art.
     taste: (i, taste = 'toy') => { const t = ctx.toys[i]; if (!t) return null; t.taste = String(taste); return t.taste; },
+    loco: ctx.loco ?? null,
+    scenario: (name, opts) => runScenario(name, ctx, opts),
+    get scenarioPhase() { return ctx.phase ?? null; },
+    // One per-tick callback after the rest of the pre-step tick, for harness watches; null clears it.
+    setProbe: (fn) => { ctx.probe = typeof fn === 'function' ? fn : null; },
   };
+  if (ctx.loco) tank.knobs.loco = ctx.loco.knobs;
   return tank;
 }
 
