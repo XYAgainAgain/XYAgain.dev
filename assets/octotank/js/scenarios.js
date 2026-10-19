@@ -4,12 +4,16 @@ import { crawlAngle, wrap } from './amira/locomotion-core.js';
    `passed`. The panel builds its buttons from this list and the headless harness runs the same entries through
    tank.scenario(name), so the two never drift. Later slices register theirs from their own modules. */
 
-const registry = new Map();
+const registry = new Map(), watchers = new Set();
 let running = null;
 
 export function register(name, { label = name, key = null, run = null } = {}) {
   registry.set(name, { name, label, key, run });
+  for (const fn of watchers) fn();
 }
+
+/* Calls fn after every registration, so a panel built first still picks up late scenarios; returns the unsubscribe. */
+export function onRegister(fn) { watchers.add(fn); return () => watchers.delete(fn); }
 
 export function list() { return [...registry.values()]; }
 

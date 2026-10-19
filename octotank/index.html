@@ -23,9 +23,14 @@
 </head>
 <body>
     <canvas id="tank-canvas" aria-label="Amira's tank, physics spike"></canvas>
-    <aside id="panel" aria-label="Diagnostics and controls">
-        <pre id="hud" aria-live="off"></pre>
-        <div id="controls" role="group" aria-label="Controls"></div>
+    <aside id="panel" aria-label="Developer panel">
+        <div class="panel-head"><p class="panel-title">Tank dev</p></div>
+        <div id="panel-keys" hidden></div>
+        <div id="controls"></div>
+        <details class="readouts" data-section="readouts" open>
+            <summary>Readouts</summary>
+            <pre id="hud" aria-live="off"></pre>
+        </details>
     </aside>
     <p id="status" role="status" aria-live="polite">loading</p>
     <script type="module" src="../assets/octotank/js/main.js"></script>

@@ -1,16 +1,43 @@
-import { list as scenarioList, isRunning } from './scenarios.js';
+import { list as scenarioList, isRunning, onRegister } from './scenarios.js';
 
-/* The diagnostics panel: frame rate, physics and script costs, her state, and every control as both a button and a
-   key, built from one list so the two never drift apart. */
+/* The dev panel: collapsible sections of controls, each a button and a key, a key legend on ?, and the readout.
+   Each action is { key, name, label(), run(), disabled? }; the first action to claim a key keeps it. */
 
 const FRAMES = 120;
+const STORE = 'octotank.panel';
+const SECTIONS = [['sim', 'Sim'], ['view', 'View'], ['body', 'Body'], ['arms', 'Arms'], ['loco', 'Locomotion']];
+
+const queued = [];
+let attach = null;
+
+/* Lets any module add a control to a section, before or after the panel exists:
+   section('view').add({ key: 'n', name: 'Normals', label: () => 'Normals', run }). An unknown name makes a new section. */
+export function section(name) {
+  const api = { add(action) { if (attach) attach(name, action); else queued.push([name, action]); return api; } };
+  return api;
+}
+
+const hintOf = (key) => (key === ' ' ? 'Space' : key.length === 1 ? key.toUpperCase() : key);
+const plain = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+const load = () => { try { return plain(JSON.parse(localStorage.getItem(STORE))); } catch { return {}; } };
+const save = (s) => { try { localStorage.setItem(STORE, JSON.stringify(s)); } catch { /* storage blocked */ } };
+const tag = (name, props = {}, ...kids) => { const e = Object.assign(document.createElement(name), props); e.append(...kids); return e; };
 
 export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say }) {
   const { phys, mantle, arms, pose } = ctx;
+  const loco = ctx.loco;
   const gaps = new Float32Array(FRAMES);
   let gapCount = 0, lastFrame = 0, textAt = 0, breathDepth = mantle.knobs.breathDepth || 0.035, lastExhale = 0, inhaling = false;
   const state = { paused: false };
   const DRIVES = ['force', 'pin', 'free'];
+  const stored = load();
+  stored.open = plain(stored.open);
+  const remember = () => save(stored);
+
+  let head = el.querySelector('.panel-head'), legend = el.querySelector('#panel-keys');
+  if (!head) el.prepend(head = tag('div', { className: 'panel-head' }));
+  if (!legend) head.after(legend = tag('div', { id: 'panel-keys', hidden: true }));
+  const readoutBox = readout.closest('details');
 
   const squeeze = async () => {
     if (ctx.watch) return;
@@ -21,78 +48,197 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       say(r.passed ? 'squeeze: PASS' : 'squeeze: FAIL');
     } catch (err) { say(`squeeze: ${err.message}`); }
   };
-  const actions = [
-    { key: 'h', hint: 'H', label: () => (ctx.watch ? 'Squeezing…' : 'Squeeze'), run: squeeze },
-    { key: 'a', hint: 'A', label: () => 'Reach toys', run: () => arms.reachNearestToys(toys) },
-    { key: 'l', hint: 'L', label: () => 'Look at a toy', run: () => ctx.attention?.lookAndReach() },
-    { key: 'i', hint: 'I', label: () => 'Arms idle', run: () => arms.idle() },
-    { key: 'f', hint: 'F', label: () => 'Fetch held', run: () => arms.fetchHolding() },
-    { key: 'g', hint: 'G', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
-    { key: 's', hint: 'S', label: () => (tank.suckerView?.visible ? 'Suckers: shown' : 'Suckers: hidden'), run: () => { if (tank.suckerView) tank.suckerView.visible = !tank.suckerView.visible; } },
-    { key: 'c', hint: 'C', label: () => (tank.armView?.capsules ? 'Capsules: shown' : 'Capsules: hidden'), run: () => { if (tank.armView) tank.armView.capsules = !tank.armView.capsules; } },
-    { key: 'w', hint: 'W', label: () => (ctx.water?.knobs.tint ? 'Density tint: on' : 'Density tint: off'), run: () => ctx.water?.setTint(!ctx.water.knobs.tint) },
-    { key: 'z', hint: 'Z', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
-    { key: 'p', hint: 'P', label: () => `Drive: ${mantle.drive}`, run: () => mantle.setDrive(DRIVES[(DRIVES.indexOf(mantle.drive) + 1) % DRIVES.length]) },
-    { key: 't', hint: 'T', label: () => 'Tip her', run: () => mantle.tip(1.2) },
-    {
-      key: 'b', hint: 'B', label: () => (mantle.knobs.breathDepth > 0 ? 'Breathing: on' : 'Breathing: off'),
-      run: () => {
-        if (mantle.knobs.breathDepth > 0) { breathDepth = mantle.knobs.breathDepth; mantle.knobs.breathDepth = 0; }
-        else mantle.knobs.breathDepth = breathDepth;
-      },
-    },
-    { key: ' ', hint: 'Space', label: () => (state.paused ? 'Resume' : 'Pause'), run: () => { state.paused = !state.paused; } },
-    { key: 'd', hint: 'D', label: () => (el.classList.contains('collapsed') ? 'Show panel' : 'Hide panel'), run: () => el.classList.toggle('collapsed'), keep: true },
-    { key: 'r', hint: 'R', label: () => 'Reload', run: () => location.reload() },
+  const setHidden = (on) => { el.classList.toggle('collapsed', on); stored.hidden = on; remember(); };
+  const setLegend = (on) => { legend.hidden = !on; legendAction.button?.setAttribute('aria-expanded', String(on)); };
+
+  const legendAction = { key: '?', name: 'Key legend', label: () => (legend.hidden ? 'Keys' : 'Hide keys'), run: () => setLegend(legend.hidden) };
+  const headActions = [
+    { key: 'h', name: 'Hide panel', label: () => (el.classList.contains('collapsed') ? 'Show panel' : 'Hide panel'), run: () => setHidden(!el.classList.contains('collapsed')) },
+    legendAction,
   ];
-  const loco = ctx.loco;
-  if (loco) actions.splice(actions.length - 3, 0, { key: 'v', hint: 'V', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } });
-  // One button per keyed scenario, from the registry; one not built yet stays disabled.
-  for (const sc of scenarioList()) {
-    if (!sc.key || !loco) continue;
-    actions.splice(actions.length - 3, 0, {
-      key: sc.key, hint: sc.key, disabled: !sc.run, label: () => (isRunning() === sc.name ? `${sc.label}…` : sc.label),
-      run: async () => {
-        if (!sc.run || isRunning()) return;
-        say(`${sc.label}: running`);
-        try { const r = await tank.scenario(sc.name); console.log(sc.name, r); say(`${sc.label}: ${r.passed ? 'PASS' : r.passed === false ? 'FAIL' : 'done'}`); }
-        catch (err) { say(`${sc.label}: ${err.message}`); }
+  const bySection = {
+    sim: [
+      { key: ' ', name: 'Pause', label: () => (state.paused ? 'Resume' : 'Pause'), run: () => { state.paused = !state.paused; } },
+      { key: 'r', name: 'Reload', label: () => 'Reload', run: () => location.reload() },
+    ],
+    view: [
+      { key: 's', name: 'Suckers', label: () => (tank.suckerView?.visible ? 'Suckers: shown' : 'Suckers: hidden'), run: () => { if (tank.suckerView) tank.suckerView.visible = !tank.suckerView.visible; } },
+      { key: 'c', name: 'Capsules', label: () => (tank.armView?.capsules ? 'Capsules: shown' : 'Capsules: hidden'), run: () => { if (tank.armView) tank.armView.capsules = !tank.armView.capsules; } },
+      { key: 'd', name: 'Density tint', label: () => (ctx.water?.knobs.tint ? 'Density tint: on' : 'Density tint: off'), run: () => ctx.water?.setTint(!ctx.water.knobs.tint) },
+    ],
+    body: [
+      { key: 'm', name: 'Drive mode', label: () => `Drive: ${mantle.drive}`, run: () => mantle.setDrive(DRIVES[(DRIVES.indexOf(mantle.drive) + 1) % DRIVES.length]) },
+      {
+        key: 'b', name: 'Breathing', label: () => (mantle.knobs.breathDepth > 0 ? 'Breathing: on' : 'Breathing: off'),
+        run: () => {
+          if (mantle.knobs.breathDepth > 0) { breathDepth = mantle.knobs.breathDepth; mantle.knobs.breathDepth = 0; }
+          else mantle.knobs.breathDepth = breathDepth;
+        },
       },
-    });
-  }
-  for (const a of actions) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'btn' + (a.keep ? ' keep' : '');
-    b.setAttribute('aria-keyshortcuts', a.key === ' ' ? 'Space' : a.hint);
-    a.button = b;
-    if (a.disabled) { b.disabled = true; b.title = 'not built yet'; }
-    b.addEventListener('click', () => { a.run(); relabel(); });
-    controls.append(b);
-  }
+      { key: 't', name: 'Tip her', label: () => 'Tip her', run: () => mantle.tip(1.2) },
+      { key: 'q', name: 'Squeeze test', label: () => (ctx.watch ? 'Squeezing…' : 'Squeeze test'), run: squeeze },
+    ],
+    arms: [
+      { key: 'a', name: 'Reach toys', label: () => 'Reach toys', run: () => arms.reachNearestToys(toys) },
+      { key: 'l', name: 'Look at a toy', label: () => 'Look at a toy', run: () => ctx.attention?.lookAndReach() },
+      { key: 'i', name: 'Arms idle', label: () => 'Arms idle', run: () => arms.idle() },
+      { key: 'f', name: 'Fetch held', label: () => 'Fetch held', run: () => arms.fetchHolding() },
+      { key: 'g', name: 'Grip/let go', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
+      { key: 'z', name: 'Resting/awake', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
+    ],
+    loco: loco ? [{ key: 'w', name: 'Wander', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } }] : [],
+  };
+
+  const keys = new Map(), warned = new Set();
+  const all = () => [...headActions, ...sections.flatMap((s) => [...s.actions, ...s.scenarios])];
   const relabel = () => {
-    for (const a of actions) {
-      const text = `${a.label()} `;
+    for (const a of all()) {
+      const text = a.label();
       if (a.button.dataset.text === text) continue;
       a.button.dataset.text = text;
-      a.button.replaceChildren(text, Object.assign(document.createElement('kbd'), { textContent: a.hint }));
+      a.button.firstChild.textContent = text;
     }
   };
-  relabel();
-  addEventListener('keydown', (ev) => {
-    if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
-    const a = actions.find((x) => x.key === ev.key.toLowerCase());
-    if (!a || a.disabled) return;
-    // A focused button already turns Space into a click.
-    if (ev.key === ' ' && document.activeElement?.tagName === 'BUTTON') return;
-    ev.preventDefault();
-    a.run();
+  const fire = (a) => { a.run(); relabel(); };
+  const button = (a) => {
+    const b = tag('button', { type: 'button', className: 'btn' });
+    b.append(tag('span'), tag('kbd', { hidden: true }));
+    b.lastChild.setAttribute('aria-hidden', 'true');
+    if (a.disabled) { b.disabled = true; b.title = 'not built yet'; }
+    b.addEventListener('click', () => fire(a));
+    a.button = b;
+    return b;
+  };
+
+  /* Gives every action its key in tab order; a collision keeps the first claimant and warns once. */
+  const rebind = () => {
+    keys.clear();
+    for (const a of all()) {
+      const k = a.key ? String(a.key).toLowerCase() : null, kbd = a.button.lastChild;
+      const other = k && keys.get(k);
+      if (other) {
+        const msg = `panel: key "${hintOf(k)}" is taken by "${other.name}", so "${a.name}" gets none`;
+        if (!warned.has(msg)) { warned.add(msg); console.warn(msg); }
+      }
+      if (!k || other) { kbd.hidden = true; a.button.removeAttribute('aria-keyshortcuts'); a.bound = null; continue; }
+      keys.set(k, a);
+      a.bound = k;
+      kbd.hidden = false;
+      kbd.textContent = hintOf(k);
+      a.button.setAttribute('aria-keyshortcuts', k === '?' ? 'Shift+?' : hintOf(k));
+    }
+    const groups = [['Panel', headActions], ...sections.map((s) => [s.title, [...s.actions, ...s.scenarios]])];
+    legend.replaceChildren(tag('p', { className: 'keys-title', textContent: 'Keys' }), ...groups.filter(([, as]) => as.some((a) => a.bound)).map(([title, as]) => tag('dl', {},
+      tag('dt', { textContent: title }),
+      tag('dd', {}, ...as.filter((a) => a.bound).map((a) => tag('span', {}, tag('kbd', { textContent: hintOf(a.bound) }), ` ${a.name}`))))));
+  };
+
+  const sections = [];
+  const sectionFor = (name) => {
+    const id = String(name).toLowerCase();
+    let s = sections.find((x) => x.id === id || x.title.toLowerCase() === id);
+    if (s) return s;
+    const title = SECTIONS.find(([i]) => i === id)?.[1] ?? String(name);
+    const details = tag('details', { className: 'sec', open: stored.open[id] ?? true });
+    details.dataset.section = id;
+    const row = tag('div', { className: 'row' });
+    row.setAttribute('role', 'group');
+    row.setAttribute('aria-label', title);
+    const scRow = tag('div', { className: 'row' }), checks = tag('div', { className: 'row checks' });
+    details.append(tag('summary', { textContent: title }), row, scRow, checks);
+    details.addEventListener('toggle', () => { stored.open[id] = details.open; remember(); });
+    controls.append(details);
+    s = { id, title, details, row, scRow, checks, actions: [], scenarios: [] };
+    sections.push(s);
+    return s;
+  };
+  const add = (name, a, quiet) => {
+    const s = sectionFor(name);
+    a.name ??= a.label();
+    s.actions.push(a);
+    s.row.append(button(a));
+    if (!quiet) { rebind(); relabel(); }
+  };
+
+  head.append(...headActions.map(button));
+  legendAction.button.setAttribute('aria-controls', legend.id || (legend.id = 'panel-keys'));
+  legendAction.button.setAttribute('aria-expanded', 'false');
+  for (const [id] of SECTIONS) {
+    if (id === 'loco' && !loco) continue;
+    for (const a of bySection[id]) add(id, a, true);
+  }
+  for (const [name, a] of queued.splice(0)) add(name, a, true);
+  attach = add;
+
+  /* Scenario buttons straight from the registry, rebuilt whenever a module registers one; keyed ones first, by key. */
+  const built = new Map();
+  const syncScenarios = () => {
+    if (!loco) return;
+    const s = sectionFor('loco'), focused = document.activeElement;
+    const focusedName = s.scenarios.find((a) => a.button === focused)?.sc.name;
+    const scs = scenarioList().sort((x, y) => (x.key ? 0 : 1) - (y.key ? 0 : 1) || String(x.key ?? '').localeCompare(String(y.key ?? '')));
+    s.scenarios = scs.map((sc) => {
+      const prev = built.get(sc.name);
+      if (prev?.sc === sc) return prev;
+      const a = {
+        sc, key: sc.key, name: sc.label, disabled: !sc.run, label: () => (isRunning() === sc.name ? `${sc.label}…` : sc.label),
+        run: async () => {
+          if (!sc.run || isRunning()) return;
+          say(`${sc.label}: running`);
+          try { const r = await tank.scenario(sc.name); console.log(sc.name, r); say(`${sc.label}: ${r.passed ? 'PASS' : r.passed === false ? 'FAIL' : 'done'}`); }
+          catch (err) { say(`${sc.label}: ${err.message}`); }
+        },
+      };
+      button(a);
+      built.set(sc.name, a);
+      return a;
+    });
+    s.scRow.replaceChildren(...s.scenarios.filter((a) => a.key).map((a) => a.button));
+    const unkeyed = s.scenarios.filter((a) => !a.key);
+    s.checks.replaceChildren(...(unkeyed.length ? [tag('span', { className: 'row-label', textContent: 'Checks' }), ...unkeyed.map((a) => a.button)] : []));
+    s.scRow.setAttribute('role', 'group');
+    s.scRow.setAttribute('aria-label', 'Scenarios');
+    s.checks.setAttribute('role', 'group');
+    s.checks.setAttribute('aria-label', 'Checks');
+    rebind();
     relabel();
+    // Moving or replacing a focused button drops its focus, so hand it to the same scenario's button.
+    const target = focusedName ? built.get(focusedName)?.button : focused;
+    if (target?.isConnected && target !== document.activeElement) target.focus();
+  };
+  let syncQueued = false;
+  onRegister(() => { if (!syncQueued) { syncQueued = true; queueMicrotask(() => { syncQueued = false; syncScenarios(); }); } });
+  syncScenarios();
+  if (!loco) { rebind(); relabel(); }
+
+  for (const d of el.querySelectorAll('details[data-section]:not(.sec)')) {
+    const id = d.dataset.section;
+    if (id in stored.open) d.open = stored.open[id];
+    d.addEventListener('toggle', () => { stored.open[id] = d.open; remember(); });
+  }
+  if (stored.hidden) el.classList.add('collapsed');
+  relabel();
+
+  addEventListener('keydown', (ev) => {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat || ev.isComposing) return;
+    // Shift and Alt clicks steer her, so only ? (itself shifted on most layouts) may come with Shift.
+    if (ev.shiftKey && ev.key !== '?') return;
+    const t = ev.target instanceof Element ? ev.target : null;
+    if (t && (t.isContentEditable || t.closest('input, textarea, select'))) return;
+    const a = keys.get(ev.key.toLowerCase());
+    if (!a || a.disabled) return;
+    // A focused button or summary already turns Space into its own click.
+    if (ev.key === ' ' && t?.closest('button, summary')) return;
+    ev.preventDefault();
+    fire(a);
   });
 
   const deg = (r) => `${Math.round((r * 180) / Math.PI)}°`;
   return {
     state,
+    /* Same as section(name).add(action), for a caller holding the panel. */
+    add: (name, action) => add(name, action),
+    keys: () => new Map([...keys].map(([k, a]) => [k, a.name])),
     /* Call once per drawn frame. */
     frame(now) {
       if (lastFrame) gaps[gapCount++ % FRAMES] = now - lastFrame;
@@ -100,6 +246,8 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       if (mantle.exhale !== lastExhale) { inhaling = mantle.exhale < lastExhale; lastExhale = mantle.exhale; }
       if (now < textAt || el.classList.contains('collapsed')) return;
       textAt = now + 250;
+      relabel();
+      if (readoutBox && !readoutBox.open) return;
       const n = Math.min(gapCount, FRAMES), sorted = Array.from(gaps.subarray(0, n)).sort((x, y) => x - y);
       const mean = n ? sorted.reduce((x, y) => x + y, 0) / n : 0, p95 = n ? sorted[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
       const s = phys.stats(), h = mantle.health(), am = arms.stats();
@@ -121,7 +269,6 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Suckers  ${arms.suckerReport().map((r, i) => `${i} ${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
         `Tasted   ${arms.lastTaste ? `arm ${arms.lastTaste.arm} seg ${arms.lastTaste.seg} ${arms.lastTaste.taste} (${arms.lastTaste.tag})  salience ${arms.lastTaste.salience.toFixed(2)}${arms.lastTaste.idle ? '  idle' : ''}   ${arms.tastes.length} touching` : '–'}`,
       ].join('\n');
-      relabel();
     },
   };
 }
