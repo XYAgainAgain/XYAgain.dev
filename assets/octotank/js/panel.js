@@ -27,6 +27,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     { key: 'f', hint: 'F', label: () => 'Fetch held', run: () => arms.fetchHolding() },
     { key: 'g', hint: 'G', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
     { key: 's', hint: 'S', label: () => (tank.suckerView?.visible ? 'Suckers: shown' : 'Suckers: hidden'), run: () => { if (tank.suckerView) tank.suckerView.visible = !tank.suckerView.visible; } },
+    { key: 'w', hint: 'W', label: () => (ctx.water?.knobs.tint ? 'Density tint: on' : 'Density tint: off'), run: () => ctx.water?.setTint(!ctx.water.knobs.tint) },
     { key: 'z', hint: 'Z', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
     { key: 'p', hint: 'P', label: () => `Drive: ${mantle.drive}`, run: () => mantle.setDrive(DRIVES[(DRIVES.indexOf(mantle.drive) + 1) % DRIVES.length]) },
     { key: 't', hint: 'T', label: () => 'Tip her', run: () => mantle.tip(1.2) },
@@ -96,6 +97,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Heading  ${deg(pose.yaw)}${pose.turning ? ', turning' : ''}   breath ${breath}`,
         `Attend   ${ctx.attention?.describe() ?? '–'}`,
         `Arms     ${busyText}`,
+        `Water    ${ctx.water?.enabled ? `on, surface ${ctx.water.knobs.surfaceY} m, ${(s.water?.mean ?? 0).toFixed(3)} ms` : 'off (?water=0)'}${ctx.water?.knobs.tint ? '   tint: pale = floats or near neutral, darker = denser' : ''}`,
         `Suckers  ${arms.suckerReport().map((r, i) => `${i} ${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
       ].join('\n');
       relabel();

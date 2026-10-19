@@ -74,10 +74,11 @@ export class Physics {
     this.acc = 0;
     this.collisionSteps = 1;
     this.stepMs = new Float32Array(STEP_WINDOW);
-    this.tickMs = new Float32Array(STEP_WINDOW);   // the JS side of a tick: posture, pins, 184 kinematic moves
+    this.tickMs = new Float32Array(STEP_WINDOW);   // the JS side of a tick: posture, pins, 184 kinematic moves, water
     this.stepCount = 0;
     this.stepTotal = 0;
     this.dropped = 0;         // seconds of frame time the step cap discarded
+    this.water = null;        // ticked after the JS work, just before Jolt steps
   }
 
   /* Fixed 60 Hz with a two-step cap; leftover time past that is dropped, never caught up. */
@@ -87,6 +88,7 @@ export class Physics {
     while (this.acc >= FIXED_DT && n < MAX_SUBSTEPS) {
       const t0 = performance.now();
       preTick?.(FIXED_DT, this.stepTotal);
+      this.water?.tick(FIXED_DT);
       const t1 = performance.now();
       this.jolt.Step(FIXED_DT, this.collisionSteps);
       this.stepMs[this.stepCount % STEP_WINDOW] = performance.now() - t1;
@@ -102,16 +104,18 @@ export class Physics {
 
   get time() { return this.stepTotal * FIXED_DT; }
 
-  /* Jolt's Step alone; `js` is the same summary for the JS work that feeds each step. */
+  /* Jolt's Step alone; `js` is the same summary for the JS work that feeds each step, water included, and `water` that
+     part alone. */
   stats() {
     const n = Math.min(this.stepCount, STEP_WINDOW);
-    return { n, ...summarize(this.stepMs, n), js: summarize(this.tickMs, n), dropped: this.dropped };
+    return { n, ...summarize(this.stepMs, n), js: summarize(this.tickMs, n), water: this.water?.stats() ?? null, dropped: this.dropped };
   }
 
-  resetStats() { this.stepCount = 0; this.dropped = 0; }
+  resetStats() { this.stepCount = 0; this.dropped = 0; this.water?.resetStats(); }
 
-  /* kind: box (size = half extents), sphere (size = [r]), capsule/cylinder (size = [halfHeight, r]). */
-  addRigid(kind, size, pos, { rot = null, motion = 'dynamic', layer = LAYERS.TOYS, friction = 0.5, restitution = 0, damping = 0, gravityFactor = 1 } = {}) {
+  /* kind: box (size = half extents), sphere (size = [r]), capsule/cylinder (size = [halfHeight, r]). Jolt derives mass
+     and inertia from `density` (kg/m³) and the shape's volume; `ccd` sweeps a fast body so it can't skip through a wall. */
+  addRigid(kind, size, pos, { rot = null, motion = 'dynamic', layer = LAYERS.TOYS, friction = 0.5, restitution = 0, density = 1000, ccd = false } = {}) {
     const J = this.Jolt;
     let shape;
     if (kind === 'box') {
@@ -121,20 +125,23 @@ export class Physics {
     else if (kind === 'capsule') shape = new J.CapsuleShape(size[0], size[1], null);
     else if (kind === 'cylinder') shape = new J.CylinderShape(size[0], size[1], Math.min(0.005, 0.3 * size[1]), null);
     else throw new Error(`addRigid: unknown kind ${kind}`);
+    shape.SetDensity(density);
+    const volume = shape.GetVolume();
     const motionType = motion === 'static' ? J.EMotionType_Static : motion === 'kinematic' ? J.EMotionType_Kinematic : J.EMotionType_Dynamic;
     this.tmp.r.Set(pos[0], pos[1], pos[2]);
     if (rot) this.tmp.q.Set(rot[0], rot[1], rot[2], rot[3]); else this.tmp.q.Set(0, 0, 0, 1);
     const cs = new J.BodyCreationSettings(shape, this.tmp.r, this.tmp.q, motionType, layer);
     cs.mFriction = friction;
     cs.mRestitution = restitution;
-    cs.mLinearDamping = damping;
-    cs.mAngularDamping = damping;
-    cs.mGravityFactor = gravityFactor;
+    // Jolt's default damping would be a second, unphysical drag on top of the water's.
+    cs.mLinearDamping = 0;
+    cs.mAngularDamping = 0;
+    if (ccd) cs.mMotionQuality = J.EMotionQuality_LinearCast;
     const body = this.bodies.CreateBody(cs);
     J.destroy(cs);
     const id = body.GetID();
     this.bodies.AddBody(id, J.EActivation_Activate);
-    const entry = { id, body, kind, size, motion, layer, pos: [...pos] };
+    const entry = { id, body, kind, size, motion, layer, pos: [...pos], volume, mass: motion === 'dynamic' ? 1 / body.GetMotionProperties().GetInverseMass() : Infinity };
     this.rigid.push(entry);
     return entry;
   }

@@ -11,11 +11,12 @@ import { Pose } from './amira/pose.js';
 import { Attention } from './amira/attention.js';
 import { BodyParts } from './amira/body-parts.js';
 import { attachDebug } from './debug.js';
+import { Water } from './water.js';
 import { createPanel } from './panel.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
-   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
+   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -65,7 +66,9 @@ async function boot() {
   const rocks = buildRocks(phys);
   const start = [layoutKnobs.panelX - 0.42, layoutKnobs.gapY + 0.08, 0];
   const keepOut = [[-0.55, 0.05, -0.12, 0.09], [0.5, 0.05, 0.1, 0.1], [start[0], start[1], start[2], 0.1]];
-  const toys = buildToys(phys, seed, Math.max(0, Math.min(80, +(params.get('toys') ?? 12) || 0)), { keepOut, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT });
+  const toys = buildToys(phys, seed, Math.max(0, Math.min(80, +(params.get('toys') ?? 12) || 0)), { keepOut, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, floaters: +params.get('floaters') || 0 });
+  // ?water=0 keeps the toys' real masses but leaves them in air: no buoyancy, no drag.
+  const water = phys.water = new Water(phys, toys, { enabled: params.get('water') !== '0' });
   // Any mantle knob can ride the query string by its own name (?forceK=2000&bend=none); iters and pa are short forms.
   const mantleKnobs = {};
   const alias = { iters: 'iterations', pa: 'pressurePa' };
@@ -130,7 +133,8 @@ async function boot() {
     else geo = new THREE.CylinderGeometry(e.size[1], e.size[1], e.size[0] * 2, 16);
     const mesh = new THREE.Mesh(geo, mats[e.tag] ?? mats.toy);
     scene.add(mesh);
-    rigidMeshes.push({ e, mesh });
+    const tint = e.water ? new THREE.MeshStandardMaterial({ color: e.water.tint, roughness: 0.4, metalness: 0.1 }) : null;
+    rigidMeshes.push({ e, mesh, tint });
   }
   const mantleGeo = new THREE.BufferGeometry();
   mantleGeo.setAttribute('position', new THREE.BufferAttribute(mantle.positions, 3));
@@ -147,11 +151,14 @@ async function boot() {
   scene.add(rootMarkers);
   const m4 = new THREE.Matrix4(), tmp3 = [0, 0, 0];
 
-  const ctx = { phys, mantle, arms, pose, attention, panel, walls, rocks, toys, layoutKnobs, watch: null };
+  water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
+  water.setTint(water.knobs.tint);
+  const ctx = { phys, mantle, arms, pose, attention, panel, walls, rocks, toys, layoutKnobs, water, watch: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
   tank.knobs.parts = bodyParts.knobs;
   tank.attention = attention; tank.knobs.attention = attention.knobs;
+  tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
   window.tank = tank;
   const diag = createPanel({ el: document.getElementById('panel'), readout: hud, controls: document.getElementById('controls'), ctx, tank, toys, seed, say });

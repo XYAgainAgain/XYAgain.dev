@@ -1,5 +1,6 @@
 import { TANK, WALL, LAYERS } from './config.js';
 import { createRng, deriveSeed } from '../../pond/js/rng.js';
+import { MATERIALS, assignMaterials, buoyancyFactor, weightInWater, densityT, rampHex } from './water-core.js';
 
 /* The fixed furniture of the spike: six tank panels, a rock wall with a hole, two boulders, and a dozen toys, all plain
    Jolt shapes. `tag` is what a piece is to the code; `taste` is what a sucker reports touching it, and can change. */
@@ -59,10 +60,11 @@ export function buildRocks(phys) {
   return rocks;
 }
 
-/* Twelve toys of four shapes, seeded placements on both sides of the panel, drifting down through "water".
-   `keepOut` is a list of [x, y, z, radius] spheres a toy must not start inside (the rocks, the mantle). */
-export function buildToys(phys, seed, count = 12, { keepOut = [], panelX = LAYOUT_KNOBS.panelX, panelT = LAYOUT_KNOBS.panelT } = {}) {
+/* Twelve toys of four shapes and seeded materials, placed on both sides of the panel. `keepOut` is a list of
+   [x, y, z, radius] spheres a toy must not start inside (the rocks, the mantle). */
+export function buildToys(phys, seed, count = 12, { keepOut = [], panelX = LAYOUT_KNOBS.panelX, panelT = LAYOUT_KNOBS.panelT, floaters = 0 } = {}) {
   const rng = createRng(deriveSeed(seed, 77));
+  const materials = assignMaterials(createRng(deriveSeed(seed, 78)), count, { floaters });
   const toys = [];
   const kinds = ['sphere', 'box', 'capsule', 'cylinder'];
   for (let i = 0; i < count; i++) {
@@ -73,12 +75,19 @@ export function buildToys(phys, seed, count = 12, { keepOut = [], panelX = LAYOU
     do {
       x = rng.range(-TANK.w / 2 + 0.1, TANK.w / 2 - 0.1); z = rng.range(-TANK.d / 2 + 0.08, TANK.d / 2 - 0.08); y = rng.range(0.25, TANK.h * 0.75);
     } while (++tries < 40 && (Math.abs(x - panelX) < panelT / 2 + 0.05 || keepOut.some(([kx, ky, kz, kr]) => Math.hypot(x - kx, y - ky, z - kz) < kr + 0.05)));
+    // A spent draw where the old gravity stand-in sat, so every seed keeps its toys' places and turns.
+    rng.next();
+    const material = materials[i], rho = MATERIALS[material].rho;
     const toy = phys.addRigid(kind, size, [x, y, z], {
-      motion: 'dynamic', layer: LAYERS.TOYS, friction: 0.5, restitution: 0.05,
-      damping: 1.5, gravityFactor: rng.range(0.1, 0.3), rot: axisAngle(rng.next(), rng.next(), rng.next(), rng.range(0, 6.28)),
+      motion: 'dynamic', layer: LAYERS.TOYS, friction: 0.5, restitution: 0.05, density: rho, ccd: true,
+      rot: axisAngle(rng.next(), rng.next(), rng.next(), rng.range(0, 6.28)),
     });
     toy.tag = 'toy';
     toy.taste = 'toy';
+    toy.water = {
+      material, rho, volume: toy.volume, mass: toy.mass,
+      buoyancy: buoyancyFactor(rho), weightInWater: weightInWater(rho, toy.volume), tint: rampHex(densityT(rho)),
+    };
     toys.push(toy);
   }
   return toys;
