@@ -93,6 +93,14 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   const all = () => [...headActions, ...sections.flatMap((s) => [...s.actions, ...s.scenarios])];
   const relabel = () => {
     for (const a of all()) {
+      if (a.type === 'range') {
+        const value = a.get(), text = a.label();
+        const index = a.values.reduce((best, v, i) => Math.abs(v - value) < Math.abs(a.values[best] - value) ? i : best, 0);
+        a.button.value = index;
+        a.button.setAttribute('aria-valuetext', text);
+        a.caption.textContent = text;
+        continue;
+      }
       const text = a.label();
       if (a.button.dataset.text === text) continue;
       a.button.dataset.text = text;
@@ -101,6 +109,14 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   };
   const fire = (a) => { a.run(); relabel(); };
   const button = (a) => {
+    if (a.type === 'range') {
+      const input = tag('input', { type: 'range', min: 0, max: a.values.length - 1, step: 1, disabled: !!a.disabled });
+      input.setAttribute('aria-label', a.name);
+      input.addEventListener('input', () => { a.set(a.values[Number(input.value)]); relabel(); });
+      a.button = input;
+      a.caption = tag('span');
+      return tag('label', { className: 'btn' }, a.caption, input);
+    }
     const b = tag('button', { type: 'button', className: 'btn' });
     b.append(tag('span'), tag('kbd', { hidden: true }));
     b.lastChild.setAttribute('aria-hidden', 'true');
@@ -114,6 +130,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   const rebind = () => {
     keys.clear();
     for (const a of all()) {
+      if (a.type === 'range') { a.bound = null; continue; }
       const k = a.key ? String(a.key).toLowerCase() : null, kbd = a.button.lastChild;
       const other = k && keys.get(k);
       if (other) {

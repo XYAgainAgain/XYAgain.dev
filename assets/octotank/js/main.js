@@ -21,6 +21,7 @@ import { isRunning } from './scenarios.js';
 import { BodyParts } from './amira/body-parts.js';
 import { attachDebug } from './debug.js';
 import { Water } from './water.js';
+import { WaterVisuals } from './water/visuals.js';
 import { createPanel } from './panel.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
@@ -184,6 +185,9 @@ async function boot() {
   armView.capsuleMeshes = rigidMeshes.filter((r) => r.e.tag === 'arm').map((r) => r.mesh);
   armView.capsules = params.get('capsules') === '1';
   window.tank = tank;
+  const waterVisuals = new WaterVisuals({ renderer, scene, camera, ctx, jet, seed, enabled: params.get('waterview') !== '0' });
+  tank.waterVisuals = waterVisuals;
+  tank.knobs.waterVisuals = waterVisuals.knobs;
   const diag = createPanel({ el: document.getElementById('panel'), readout: hud, controls: document.getElementById('controls'), ctx, tank, toys, seed, say });
 
   const syncRigid = (all = false) => {
@@ -233,6 +237,8 @@ async function boot() {
     }
     rootMarkers.instanceMatrix.needsUpdate = true;
     syncRigid();
+    waterVisuals.update(phys.time);
+    waterVisuals.beforeRender(phys.time);
     renderer.render(scene, camera);
     if (afterFrame) { const f = afterFrame; afterFrame = null; f(); }
     if (!headless) diag.frame(now);
