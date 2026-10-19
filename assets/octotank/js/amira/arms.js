@@ -1,6 +1,6 @@
 import { LAYERS } from '../config.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32 } from './arm-core.js';
-import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, whoMoves, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
+import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, whoMoves, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 
 /* Eight arm programs (arm-core.js) driving a kinematic Jolt capsule per segment. Each tick: root frames, programs and
    contact, arm-on-arm rounds, the suckers (touch, taste, flicker, grips), then the capsules follow the solved chains. */
@@ -19,6 +19,7 @@ export const ARM_KNOBS = {
   breakSmooth: 0.5,      // weight of the newest reading in the grip's force average
   breakGrace: 2,         // ticks after a grip forms before it can tear; any longer and a dragged toy is crushed into the floor
   capTau: 0.2,           // s the sealed force a tear is judged against is averaged over, as seals flicker
+  gripSkip: 2,           // segments either side of a grip's that may lie into the toy it holds
   gripTau: 0.1,          // s the proxy smooths the grip point over, so the toy follows the arm and not its contact jitter
   minGrip: 0.05,         // N of sealed force under which a grip has nothing left holding it
   lostGrace: 0.3,        // s an arm's interest survives without touching the thing, or a grip without a seal
@@ -98,6 +99,13 @@ export class Arms {
     this.pushPen = new Float64Array(count * this.loose.length);
     this.pushNP = new Float64Array(count * this.loose.length * 6);
     this._rec = -1;
+    // What every arm tastes: this tick's touches (one per arm per thing), and the touches that just began, for the brain.
+    this.tastes = [];
+    this.tasteLog = [];
+    this.tasteSeq = 0;
+    this.lastTaste = null;
+    this.familiar = new Familiarity(sk);
+    this._tasting = this.arms.map(() => new Map());
     this._f3 = [0, 0, 0]; this._v3 = [0, 0, 0]; this._p3 = [0, 0, 0];
     this._fr = { m: [0, 0, 0], e1: [0, 0, 0], e2: [0, 0, 0], e3: [0, 0, 0] };
   }
@@ -136,14 +144,17 @@ export class Arms {
     this._looseAt = prims.length;
     const phys = this.phys, knobs = this.knobs, sdf = this.sdf;
     this.world = {
-      collide: (x, y, z, r, out) => {
+      collide: (x, y, z, r, out, pt) => {
         if (knobs.collider !== 'jolt') {
-          const w = knobs.looseContact ? all : sdf, pen = w.collide(x, y, z, r, out);
+          const w = knobs.looseContact ? all : sdf, pen = w.collide(x, y, z, r, out, pt);
+          // The arm yields to a loose thing over a few ticks rather than being thrown out of it in one.
+          this.world.loose = pen > 0 && w === all && all.hit >= this._looseAt;
           // How far the arm meant to go into a loose thing is how hard it pushes it, once the solve is done.
           if (pen > 0 && this._rec >= 0 && w === all && all.hit >= this._looseAt) this._recordPush(all.hit - this._looseAt, pen, out, x, y, z, r);
           return pen;
         }
         const a = phys.collideStaticSphere(x, y, z, r, out);
+        this.world.loose = false;
         return a > 0 ? a : 0;
       },
       distance: sdf.distance,
@@ -248,8 +259,13 @@ export class Arms {
         const o = this._o, st = this.fetchStand[a];
         g.target[0] = this._mouth[0] + o[0] * st; g.target[1] = this._mouth[1] + o[1] * st; g.target[2] = this._mouth[2] + o[2] * st;
       }
-      // Followed while the bend travels, then held: an arm that kept chasing a toy it was shoving would carry it off.
-      else if (this.track[a] && g.kind === 'reach') this._toyTarget(a, this.track[a], g.target);
+      // Followed while the bend travels, then held: an arm that kept chasing a toy it was shoving would carry it off. Its
+      // suckers keep turning toward the toy either way.
+      else if (this.track[a]) {
+        if (g.kind === 'reach') this._toyTarget(a, this.track[a], g.target);
+        const p = this.track[a].body.GetPosition();
+        if (g.face) { g.face[0] = p.GetX(); g.face[1] = p.GetY(); g.face[2] = p.GetZ(); }
+      }
       this._rec = a; this._skipHeld(a);
       arm.step(dt, this.world, this.body);
     }
@@ -264,7 +280,7 @@ export class Arms {
     }
     this._rec = -1;
     this.allSdf.skip = -1;
-    if (dt > 0) { this._touches(); this._suckers(dt); }
+    if (dt > 0) { this._touches(); this._taste(dt); this._suckers(dt); }
     this._place(dt, teleport);
     if (dt > 0) { this._moveProxies(dt); this._pushToys(dt); }
     this.ms = performance.now() - t0;
@@ -359,7 +375,8 @@ export class Arms {
     const arm = this.arms[i];
     if (!arm || !toy) return false;
     // The goal decides tip or middle, and the target depends on which, so place it once the goal exists.
-    if (!arm.reach(this._toyTarget(i, toy, [0, 0, 0]), opts)) return false;
+    const p = toy.body.GetPosition(), face = [p.GetX(), p.GetY(), p.GetZ()];
+    if (!arm.reach(this._toyTarget(i, toy, [0, 0, 0]), { face, ...opts })) return false;
     this._toyTarget(i, toy, arm.goal.target);
     this.track[i] = toy;
     return true;
@@ -450,10 +467,12 @@ export class Arms {
     this.shapes.clear();
   }
 
-  /* An arm lies over toys but not over the one it grips: pushed out of what follows it, it would chase its own toy. */
+  /* An arm lies over toys but not over the patch that grips one: pushed out of what follows it, it would chase its own
+     toy. The rest of the arm still lies over it, or it sinks in and pops out when the grip ends. */
   _skipHeld(a) {
-    const ep = this.episodes?.[a];
-    this.allSdf.skip = ep?.h ? this._looseAt + this.loose.indexOf(ep.toy) : -1;
+    const ep = this.episodes?.[a], w = this.allSdf;
+    w.skip = ep?.h ? this._looseAt + this.loose.indexOf(ep.toy) : -1;
+    if (ep?.h) { const j = this._segAt(this.arms[a], ep.arc); w.skipLo = j - this.knobs.gripSkip; w.skipHi = j + 1 + this.knobs.gripSkip; }
   }
 
   _recordPush(t, pen, n, x, y, z, r) {
@@ -504,6 +523,53 @@ export class Arms {
         TP[g * 3] = mx - TN[g * 3] * d; TP[g * 3 + 1] = my - TN[g * 3 + 1] * d; TP[g * 3 + 2] = mz - TN[g * 3 + 2] * d;
       }
     }
+  }
+
+  /* Every touch on the sucker side is tasted and reported, idle arms included: `tastes` holds one entry per arm per thing
+     it touches this tick (the segment nearest the base, the touched point, tag, taste, salience, idle), and a touch that
+     just began also goes into `tasteLog` (the last tasteLogSize, numbered by `tasteSeq`) and `lastTaste`. */
+  _taste(dt) {
+    const arms = this.arms, S = this.S, TK = this.touchKind, TP = this.touchP, list = this.tastes, sk = this.suckerKnobs, now = this.time, fam = this.familiar;
+    const seen = this._tasteSeen ??= new Set();
+    seen.clear();
+    let n = 0;
+    for (let a = 0; a < arms.length; a++) {
+      const arm = arms[a], g = arm.goal, was = this._tasting[a], now2 = this._tastingNow ??= new Map();
+      now2.clear();
+      for (let j = 0; j < S; j++) {
+        const q = a * S + j, kind = TK[q];
+        if (!kind) continue;
+        const entry = kind === 3 ? 'self' : this.touchEntry[q] ?? this.touchTaste[q];
+        if (now2.has(entry)) { list[now2.get(entry)].segs++; continue; }
+        const o = list[n] ??= { arm: 0, seg: 0, segs: 0, point: [0, 0, 0], tag: null, taste: null, salience: 0, idle: false, fresh: false, seq: 0 };
+        // Reaching for it, or holding it, is meaning to touch it; any other program is busy; none at all is idle.
+        const meant = !!g && g.kind !== 'lead' && (this.track[a] === entry || this.episodes[a]?.toy === entry);
+        const state = meant ? 'reach' : g ? 'busy' : 'idle';
+        o.arm = a; o.seg = j; o.segs = 1; o.point[0] = TP[q * 3]; o.point[1] = TP[q * 3 + 1]; o.point[2] = TP[q * 3 + 2];
+        o.tag = kind === 3 ? 'self' : entry?.tag ?? 'wall'; o.taste = this.touchTaste[q]; o.idle = state === 'idle';
+        o.salience = tasteSalience(o.taste, state, fam.novelty(entry, now), sk);
+        // A touch that flickers off for less than tasteGap is the same touch, not a new taste.
+        const prior = was.get(entry);
+        o.fresh = !prior || now - prior.at > sk.tasteGap;
+        o.seq = o.fresh ? ++this.tasteSeq : prior.seq;
+        now2.set(entry, n);
+        if (o.fresh) {
+          const e = { ...o, point: o.point.slice(), t: now };
+          this.tasteLog.push(e);
+          if (this.tasteLog.length > sk.tasteLogSize) this.tasteLog.shift();
+          this.lastTaste = e;
+        }
+        n++;
+      }
+      for (const [entry, i] of now2) {
+        const m = was.get(entry);
+        if (m) { m.seq = list[i].seq; m.at = now; } else was.set(entry, { seq: list[i].seq, at: now });
+        seen.add(entry);
+      }
+      for (const [entry, m] of was) if (now - m.at > sk.tasteGap) was.delete(entry);
+    }
+    list.length = n;
+    for (const entry of seen) fam.touch(entry, dt, now);
   }
 
   /* Taste sets which patches may seal and how hard; the banks flicker; interest in a loose thing runs its course. */

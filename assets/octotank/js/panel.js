@@ -99,6 +99,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Arms     ${busyText}`,
         `Water    ${ctx.water?.enabled ? `on, surface ${ctx.water.knobs.surfaceY} m, ${(s.water?.mean ?? 0).toFixed(3)} ms` : 'off (?water=0)'}${ctx.water?.knobs.tint ? '   tint: pale = floats or near neutral, darker = denser' : ''}`,
         `Suckers  ${arms.suckerReport().map((r, i) => `${i} ${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
+        `Tasted   ${arms.lastTaste ? `arm ${arms.lastTaste.arm} seg ${arms.lastTaste.seg} ${arms.lastTaste.taste} (${arms.lastTaste.tag})  salience ${arms.lastTaste.salience.toFixed(2)}${arms.lastTaste.idle ? '  idle' : ''}   ${arms.tastes.length} touching` : '–'}`,
       ].join('\n');
       relabel();
     },

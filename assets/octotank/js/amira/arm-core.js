@@ -21,6 +21,9 @@ export const ARM_KNOBS = {
   shortenSpeed: 0.0171,  // m/s over the whole arm, shortening below rest
   twistMax: 0.2,         // rad per segment, either way
   twistAmp: 0.05,
+  aimTwistMax: 0.35,     // rad per segment a reach may twist to turn its suckers onto what it reaches for
+  aimTau: 0.25,          // s for that twist to take up what it is missing
+  aimFrom: 0.05,         // fraction along the arm where that twist starts to ramp in
   stiffTwist: 30,
   stiffIdle: 40,         // 1/s² springs pulling each joint's bend toward its program's target
   stiffAhead: 90,
@@ -66,6 +69,7 @@ export const ARM_KNOBS = {
   gripFrom: 0.7,         // reach progress where FABRIK starts placing the contact point
   holdTime: 1.6,
   dragTau: 0.18,         // s the trailing part of the arm lags behind its pose
+  dragFree: 0.05,        // drag under this no longer counts, so contact's catch-up limit is back as a reach's drag fades
   weightRise: 0.2,       // s for a program's weight to come up
   release: 0.9,          // s for it to fade back to idle
   fabrikIters: 3,
@@ -86,7 +90,18 @@ export const ARM_KNOBS = {
   focusPad: 0.15,        // m around an arm's last chain where its contact looks for solids; more than a point moves in a tick
   foldSlack: 0.03,       // a segment squeezed shorter by this fraction may fold past the bend limit to keep its length
   foldJam: 0.85,         // and one squeezed under this share of its length folds the way the surfaces push
-  contactFeedback: 0.15, // share of the contact-solved shape an awake arm's bends take where contact moved them
+  contactFeedback: 1,    // share of the contact-solved shape the bends take where contact moved the arm
+  feedbackRest: 1,       // how much of that a resting arm gives up, so its curl keeps pressing into what it wraps
+  contactRelax: 1,       // s for what contact left in the bends to fade, so an arm leans back into its program's shape
+  sweepStep: 0.5,        // a point's move is checked for contact every this many of its radii
+  sweepMax: 16,          // checks per leg of a move at most; a longer one finishes next tick
+  sweepLegs: 3,          // a stop and a slide along the surface it met make one leg
+  sweepUnfold: 0.75,     // in the swept solve, only a segment squeezed under this share of its length is unfolded
+  jumpReset: 0.05,       // m a root may move in one tick before the arm is seated afresh, as on its first tick
+  stillTol: 2e-5,        // m a point may move in a finishing pass and still skip its contact check
+  headOn: 0.9,           // a contact normal this square against a segment meets it head-on
+  unfoldRate: 1.5,       // rad/s a fold contact forced past a joint's limit straightens at once contact lets go
+  catchUp: 0.3,          // rad/s a segment may turn toward its pose beyond the pose's own turn, once contact lets it go
 };
 
 export function minJerk(u) {
@@ -361,7 +376,8 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
   const api = {
     prims: P,
     hit: -1,
-    skip: -1,              // one primitive collide() ignores, such as the toy the probing arm holds
+    skip: -1,              // one primitive collide() ignores, such as the toy the probing arm holds.
+    skipLo: 0, skipHi: Infinity, // for probes of these arm points only (a probe naming no point always skips it)
     /* Move primitive i, one past the fixed ones, to its pose this tick. */
     move(i, c, q) { place(P[i], c, q); },
     /* Narrow every collide() to the primitives whose bounds meet the box lo..hi, until the next focus or unfocus. */
@@ -373,11 +389,13 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
       }
     },
     unfocus() { nAct = P.length; for (let i = 0; i < P.length; i++) act[i] = i; },
-    /* Deepest penetration of a sphere and its outward normal; `hit` is left on the primitive it came from, or -1. */
-    collide(x, y, z, r, out) {
+    /* Deepest penetration of a sphere and its outward normal; `hit` is left on the primitive it came from, or -1. `pt`
+       is the arm point probing, if any, for skip's range. */
+    collide(x, y, z, r, out, pt) {
       let best = 0, bi = -1;
+      const skip = pt === undefined || (pt >= api.skipLo && pt <= api.skipHi) ? api.skip : -1;
       for (let k = 0; k < nAct; k++) {
-        if (act[k] === api.skip) continue;
+        if (act[k] === skip) continue;
         const p = P[act[k]], lo = p.lo, hi = p.hi;
         if (x < lo[0] - r || x > hi[0] + r || y < lo[1] - r || y > hi[1] + r || z < lo[2] - r || z > hi[2] + r) continue;
         const pen = r - sdf(p, x, y, z);
@@ -814,6 +832,7 @@ export class Arm {
     this.twist = new Float64Array(S);       // rad, the frame's roll after each segment
     this.twistV = new Float64Array(S);
     this.twistIdle = new Float64Array(S);
+    this.twistAim = new Float64Array(S);    // what a reach adds to turn its suckers onto what it reaches for
     this.limBase = new Float64Array(n);     // bend limit of the joint at each point from the knobs; [0] is the root turn
     this.limRaise = new Float64Array(n);    // a fetch's pseudo-joints fold past it
     this.lim = new Float64Array(n);         // the limit in force this tick
@@ -824,13 +843,17 @@ export class Arm {
     this.idleT = new Float64Array(S * 2);
     this.goalT = new Float64Array(S * 2);
     this.tgt = new Float64Array(S * 2);
+    this.rest = new Float64Array(S * 2);    // where contact left the bends, added to every program's targets and relaxing
     this.stiffGoal = new Float64Array(S);
     this.dragGoal = new Float64Array(S);    // per segment: how much of it trails behind its pose
     this.drag = new Float64Array(S);
     this.gripB = new Float64Array(S * 2);
     this.out = new Float64Array(S * 2);
     this.D = new Float64Array(S * 3);       // posed segment directions
-    this.SK = new Float64Array(S * 3);      // posed sucker side per segment
+    this.Dp = new Float64Array(S * 3);      // last tick's posed segment directions
+    this.Q = new Float64Array(n * 3);       // the chain as it last lay clear of every solid, where a finishing pass slides from
+    this.SKp = new Float64Array(S * 3);     // posed sucker side per segment
+    this.SK = new Float64Array(S * 3);      // the sucker side of the solved chain: SKp carried onto each solved segment
     this.X = new Float64Array(n * 3);       // the solved chain the capsules follow
     this.P = new Float64Array(n * 3);       // last tick's solved chain
     this.G = new Float64Array(n * 3);       // scratch chain for FABRIK and fetch
@@ -950,8 +973,9 @@ export class Arm {
   }
 
   /* Send the bend out to a target. The middle of the arm arrives on it unless `tip` asks for a tip grip (rims,
-     handles, small things); `speed` is the bend's peak in m/s, and the duration follows from the distance. */
-  reach(target, { duration, amplitude, hold, speed, tip = false } = {}) {
+     handles, small things); `speed` is the bend's peak in m/s, and the duration follows from the distance. `face` is
+     a world point (a toy's center) the suckers turn toward where the arm meets it. */
+  reach(target, { duration, amplitude, hold, speed, tip = false, face = null } = {}) {
     if (!finite3(target)) return false;
     const k = this.knobs, F = this.frame;
     // A NaN option would poison the bend springs for good, so each falls back to its knob.
@@ -962,6 +986,7 @@ export class Arm {
     this.goal = {
       kind: 'reach', target: [target[0], target[1], target[2]], t: 0, ht: 0, duration: T, rise, tip: !!tip,
       amplitude: orKnob(amplitude, k.reachAmplitude), hold: orKnob(hold, k.holdTime), cArc: 0, e: 0,
+      face: finite3(face) ? [face[0], face[1], face[2]] : null,
     };
     this.reachB = 0;
     return true;
@@ -1178,9 +1203,58 @@ export class Arm {
     let ci = this.n - 1;
     if (!g.tip) { ci = 2; for (let i = 2; i < this.n; i++) if (Math.abs(this.arc0[i] - cArc) < Math.abs(this.arc0[ci] - cArc)) ci = i; }
     this.gripAt = ci;
+    if (g.face) this._aimSuckers(g.face, ci, dt);
     if (!hold && u >= 1) { g.kind = 'hold'; g.ht = 0; }
     if (hold && g.ht >= g.hold) this._letGo(true);
     return smoothstep(k.gripFrom, 1, u);
+  }
+
+  /* Turn the sucker side where the arm meets a thing toward its center f: the signed roll still missing at contact point
+     ci, spread over the twist of the segments before it. */
+  _aimSuckers(f, ci, dt) {
+    const k = this.knobs, S = this.n - 1, X = this.X, D = this.D, SK = this.SK, Ta = this.twistAim;
+    const sc = Math.max(1, Math.min(S - 1, ci - 1)), o = sc * 3;
+    // The arm as it lies: the solved segment and the sucker side carried onto it.
+    let dx = X[o + 3] - X[o], dy = X[o + 4] - X[o + 1], dz = X[o + 5] - X[o + 2];
+    const dl = len3(dx, dy, dz);
+    if (!(dl > 1e-9)) return;
+    dx /= dl; dy /= dl; dz /= dl;
+    let fx = f[0] - X[ci * 3], fy = f[1] - X[ci * 3 + 1], fz = f[2] - X[ci * 3 + 2];
+    const fd = fx * dx + fy * dy + fz * dz;
+    fx -= fd * dx; fy -= fd * dy; fz -= fd * dz;
+    let sx = SK[o], sy = SK[o + 1], sz = SK[o + 2];
+    const sd = sx * dx + sy * dy + sz * dz;
+    sx -= sd * dx; sy -= sd * dy; sz -= sd * dz;
+    if (!(len3(fx, fy, fz) > 1e-6 && len3(sx, sy, sz) > 1e-6) || !Number.isFinite(fx + sx)) return;
+    // A positive twist turns every later segment's sucker side right-handed about the arm.
+    const cx = sy * fz - sz * fy, cy = sz * fx - sx * fz, cz = sx * fy - sy * fx;
+    const phi = Math.atan2(cx * dx + cy * dy + cz * dz, sx * fx + sy * fy + sz * fz);
+    // Aiming may reach nearer the base than idle torsion does (Kennedy saw some proximal torsion, Bennice none), so
+    // the roll is spread on a ramp from aimFrom, each segment's share capped and the rest passed to those with room.
+    const Wt = this._aw ??= new Float64Array(S), A = this._ab ??= new Float64Array(S), tw = this.twist, cap = k.aimTwistMax;
+    let left = phi;
+    A.fill(0, 0, sc);
+    for (let pass = 0; pass < 3 && Math.abs(left) > 1e-4; pass++) {
+      let wsum = 0;
+      for (let j = 0; j < sc; j++) {
+        const room = left > 0 ? cap - tw[j] - A[j] : cap + tw[j] + A[j];
+        Wt[j] = room > 1e-6 ? smoothstep(k.aimFrom, 0.35, j / (S - 1)) : 0;
+        wsum += Wt[j];
+      }
+      if (!(wsum > 1e-6)) break;
+      const share = left / wsum;
+      left = 0;
+      for (let j = 0; j < sc; j++) {
+        if (!Wt[j]) continue;
+        const want = A[j] + share * Wt[j], room = Math.max(-cap, Math.min(cap, tw[j] + want)) - tw[j];
+        left += want - room; A[j] = room;
+      }
+    }
+    // Aimed at the twist the arm has now plus what is missing, never at its own last aim, so the spring's lag can't wind it up.
+    const f2 = Math.min(1, dt / Math.max(1e-3, k.aimTau));
+    for (let j = 0; j < sc; j++) Ta[j] += (tw[j] + A[j] - Ta[j]) * f2;
+    // Past the contact the twist has no say over it; a part aimed for an earlier contact lets its aim go.
+    for (let j = sc; j < S; j++) Ta[j] -= Ta[j] * f2;
   }
 
   /* Point indices of the fetch's pseudo-joints and its grasp: the live arc from the base to the grasp in thirds. */
@@ -1325,7 +1399,7 @@ export class Arm {
   /* Integrate bends B outward from the root frame into points P and segment directions D, with each segment's
      twist rolling the frame the next joint bends in. */
   poseFromBends(B, P, D) {
-    const S = this.n - 1, F = this.frame, f = this._f, tw = this.twist, SK = this.SK;
+    const S = this.n - 1, F = this.frame, f = this._f, tw = this.twist, SK = this.SKp;
     const d = f.d, u = this._a, v = this._b;
     d[0] = F.d[0]; d[1] = F.d[1]; d[2] = F.d[2];
     u[0] = F.u[0]; u[1] = F.u[1]; u[2] = F.u[2];
@@ -1344,7 +1418,33 @@ export class Arm {
     }
   }
 
-  /* The posed sucker side of segment j, a world unit vector. */
+  /* Carry each segment's posed sucker side onto its solved direction by the smallest rotation between them, so
+     everything that asks where the suckers face (touch, seals, taste, the view) reads the chain as it lies, keeping
+     the program's twist. Past about 170° off its pose the turn has no clear axis; the segment keeps its last side. */
+  _solveSK() {
+    const S = this.n - 1, X = this.X, D = this.D, Sp = this.SKp, SK = this.SK;
+    for (let j = 0; j < S; j++) {
+      const o = j * 3;
+      let xx = X[o + 3] - X[o], xy = X[o + 4] - X[o + 1], xz = X[o + 5] - X[o + 2];
+      const xl = len3(xx, xy, xz);
+      if (!(xl > 1e-9)) continue;
+      xx /= xl; xy /= xl; xz /= xl;
+      const dx = D[o], dy = D[o + 1], dz = D[o + 2], c = dx * xx + dy * xy + dz * xz;
+      let sx, sy, sz;
+      if (c > -0.985) {
+        // Rodrigues with the unnormalized axis a = d × x: v' = v c + a × v + a (a · v) / (1 + c).
+        const ax = dy * xz - dz * xy, ay = dz * xx - dx * xz, az = dx * xy - dy * xx;
+        const vx = Sp[o], vy = Sp[o + 1], vz = Sp[o + 2], av = (ax * vx + ay * vy + az * vz) / (1 + c);
+        sx = vx * c + (ay * vz - az * vy) + ax * av; sy = vy * c + (az * vx - ax * vz) + ay * av; sz = vz * c + (ax * vy - ay * vx) + az * av;
+      } else { sx = SK[o]; sy = SK[o + 1]; sz = SK[o + 2]; }
+      const k = sx * xx + sy * xy + sz * xz;
+      sx -= k * xx; sy -= k * xy; sz -= k * xz;
+      const sl = len3(sx, sy, sz);
+      if (sl > 1e-9) { SK[o] = sx / sl; SK[o + 1] = sy / sl; SK[o + 2] = sz / sl; }
+    }
+  }
+
+  /* The sucker side of segment j on the solved chain, a world unit vector. */
   suckerSide(j, out = [0, 0, 0]) {
     out[0] = this.SK[j * 3]; out[1] = this.SK[j * 3 + 1]; out[2] = this.SK[j * 3 + 2];
     return out;
@@ -1379,11 +1479,14 @@ export class Arm {
   _stepTwist(dt) {
     const k = this.knobs, S = this.n - 1, tw = this.twist, V = this.twistV, w = this.w;
     const kk = k.stiffTwist, c = 2 * k.damping * Math.sqrt(kk);
+    const Ta = this.twistAim, lim = Math.max(k.twistMax, k.aimTwistMax * w);
     for (let j = 0; j < S; j++) {
-      const want = this.twistIdle[j] * (1 - w);
+      // The aim fades with the program; without one it relaxes away on its own.
+      if (!this.goal?.face) Ta[j] *= Math.exp(-dt / Math.max(1e-3, k.release));
+      const want = this.twistIdle[j] * (1 - w) + Ta[j] * w;
       if (!this.started) { tw[j] = want; V[j] = 0; continue; }
       V[j] = (V[j] + dt * kk * (want - tw[j])) / (1 + dt * c + dt * dt * kk);
-      tw[j] = Math.max(-k.twistMax, Math.min(k.twistMax, tw[j] + V[j] * dt));
+      tw[j] = Math.max(-lim, Math.min(lim, tw[j] + V[j] * dt));
     }
   }
 
@@ -1410,6 +1513,9 @@ export class Arm {
     this._syncRest();
     this._syncLimits();
     if (Number.isFinite(this.X[this.n * 3 - 1])) this.P.set(this.X);
+    // A root that jumped farther than any move (a reset, a teleport) has no side to keep: seated from the pose afresh.
+    const Fp = this.frame.p;
+    this._jumped = this.started && !(len3(Fp[0] - this.P[0], Fp[1] - this.P[1], Fp[2] - this.P[2]) <= k.jumpReset);
     const restRate = dt / Math.max(1e-3, k.restTau);
     this.restW = !this.started ? (this.resting ? 1 : 0) : Math.max(0, Math.min(1, this.restW + (this.resting ? restRate : -restRate)));
     this._idleTargets(dt, world);
@@ -1427,9 +1533,12 @@ export class Arm {
     this._stepTwist(dt);
     this._syncLive();
     const w = this.w, T = this.tgt, B = this.bend, V = this.vel;
+    // A fetch places the grasp at her mouth exactly; what contact left in the bends would hold it short.
+    const Rb = this.rest, relax = Math.exp(-dt / Math.max(1e-3, k.contactRelax)), rw = this.goal?.kind === 'fetch' ? 1 - w : 1;
     for (let j = 0; j < S; j++) {
-      T[j * 2] = this.idleT[j * 2] + (this.goalT[j * 2] - this.idleT[j * 2]) * w;
-      T[j * 2 + 1] = this.idleT[j * 2 + 1] + (this.goalT[j * 2 + 1] - this.idleT[j * 2 + 1]) * w;
+      Rb[j * 2] *= relax; Rb[j * 2 + 1] *= relax;
+      T[j * 2] = this.idleT[j * 2] + (this.goalT[j * 2] - this.idleT[j * 2]) * w + Rb[j * 2] * rw;
+      T[j * 2 + 1] = this.idleT[j * 2 + 1] + (this.goalT[j * 2 + 1] - this.idleT[j * 2 + 1]) * w + Rb[j * 2 + 1] * rw;
     }
     if (!this.started) {
       B.set(T); V.fill(0);
@@ -1470,8 +1579,14 @@ export class Arm {
     // The new pose lies within one tick's travel of the last solved chain (or anywhere, before the first).
     if (this.started) this._focus(world, k.focusPad); else world?.unfocus?.();
     this._hit = this.n;
-    (this._touched ??= new Uint8Array(this.n)).fill(0);
+    (this._was ??= new Uint8Array(this.n)).set(this._touched ??= new Uint8Array(this.n));
+    this._folded ??= new Uint8Array(this.n);
+    this._touched.fill(0);
     this._sweep(world, body);
+    // Next tick measures the pose's own turn from this one.
+    this.Dp.set(this.D);
+    this.Q.set(this.X);
+    this._solveSK();
     this.started = true;
   }
 
@@ -1483,7 +1598,7 @@ export class Arm {
     for (let round = 0; round < 3; round++) {
       let moved = false;
       if (world) {
-        const pen = world.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], r, nrm);
+        const pen = this._yield(i, world.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], r, nrm, i), world);
         if (pen > 0) {
           X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen;
           acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true;
@@ -1504,6 +1619,117 @@ export class Arm {
 
 
 
+  /* A loose thing (a toy) that moved into the point pushes it out no more than one check's step at a time: the arm
+     yields over a few ticks, pushing the toy away meanwhile, instead of being thrown off it at once. */
+  _yield(i, pen, world) { return pen > 0 && world.loose ? Math.min(pen, this.rad[i] * this.knobs.sweepStep) : pen; }
+
+  /* Deepest penetration of point i's sphere at (x, y, z) into the world or her body, its outward normal into out. */
+  _pen(i, x, y, z, world, body, out) {
+    let best = 0;
+    if (world) { const p = this._yield(i, world.collide(x, y, z, this.rad[i], out, i), world); if (p > 0) best = p; }
+    if (body && i > 0) {
+      const nb = this._nb ??= [0, 0, 0], p = body.collide(x, y, z, bodyRadius(this.rad[i], i, this.knobs.bodySkip), nb);
+      if (p > best) { best = p; out[0] = nb[0]; out[1] = nb[1]; out[2] = nb[2]; }
+    }
+    return best;
+  }
+
+  /* Point i's sphere at (x, y, z) pushed out of every solid it is in, a few rounds for a corner, into q; whether it moved. */
+  _out(i, x, y, z, world, body, q) {
+    const n = this._n;
+    let moved = false;
+    for (let round = 0; round < 3; round++) {
+      const pen = this._pen(i, x, y, z, world, body, n);
+      if (!(pen > 0)) break;
+      x += n[0] * pen; y += n[1] * pen; z += n[2] * pen; moved = true;
+    }
+    q[0] = x; q[1] = y; q[2] = z;
+    return moved;
+  }
+
+  /* Carry point i from (x, y, z) toward the place now in X, never into a solid: sampled at sweepStep of its radius,
+     stopped at the first penetration, then slid along that surface with what is left of the move. */
+  _travel(i, world, body, x, y, z) {
+    const k = this.knobs, X = this.X, o = i * 3, n = this._n, r = this.rad[i], q = this._q3 ??= [0, 0, 0];
+    const tx = X[o], ty = X[o + 1], tz = X[o + 2];
+    // A start something moved into (her body, a toy) is met by the first check along the way, as shallow as its move.
+    let mx = tx - x, my = ty - y, mz = tz - z, hit = false, pen = 0;
+    const step = Math.max(1e-3, r * k.sweepStep);
+    for (let leg = 0; leg < k.sweepLegs; leg++) {
+      const m = len3(mx, my, mz);
+      let cnt = Math.max(1, Math.ceil(m / step));
+      // A move longer than sweepMax checks goes only as far as it was checked; the rest is next tick's.
+      if (cnt > k.sweepMax) { const f = k.sweepMax * step / m; mx *= f; my *= f; mz *= f; cnt = k.sweepMax; this._short = true; }
+      let stopped = false;
+      for (let s = 1; s <= cnt; s++) {
+        const f = s / cnt, sx = x + mx * f, sy = y + my * f, sz = z + mz * f;
+        pen = this._pen(i, sx, sy, sz, world, body, n);
+        if (!(pen > 0)) continue;
+        // Out on the side it came in, then the rest of the move loses its part into the surface.
+        x = sx + n[0] * pen; y = sy + n[1] * pen; z = sz + n[2] * pen;
+        if (this._out(i, x, y, z, world, body, q)) { x = q[0]; y = q[1]; z = q[2]; }
+        const rx = mx * (1 - f), ry = my * (1 - f), rz = mz * (1 - f), into = rx * n[0] + ry * n[1] + rz * n[2];
+        mx = rx; my = ry; mz = rz;
+        if (into < 0) { mx -= into * n[0]; my -= into * n[1]; mz -= into * n[2]; }
+        stopped = true; hit = true;
+        break;
+      }
+      if (!stopped) { x += mx; y += my; z += mz; mx = my = mz = 0; break; }
+    }
+    X[o] = x; X[o + 1] = y; X[o + 2] = z;
+    if (hit) { if (i < this._hit) this._hit = i; if (this._touched) this._touched[i] = 1; }
+    return hit;
+  }
+
+  /* Turn segment i - 1 about its solved start from where point i is now toward (tx, ty, tz), in steps of sweepStep of
+     its radius: each step that meets a surface is pushed out and put back at length, so a segment driven into a
+     surface folds along it, keeping its length and its side. Returns 0 if it met nothing, 1 if it ended clear, 2 if not. */
+  _swing(i, world, body, tx, ty, tz) {
+    const k = this.knobs, X = this.X, o = i * 3, n = this._n, L = this.len[i - 1], c = this._f.d, g = this._f.u;
+    const px = X[o - 3], py = X[o - 2], pz = X[o - 1];
+    c[0] = X[o] - px; c[1] = X[o + 1] - py; c[2] = X[o + 2] - pz;
+    g[0] = tx - px; g[1] = ty - py; g[2] = tz - pz;
+    normalize3(g, 0, 1, 0);
+    normalize3(c, g[0], g[1], g[2]);
+    let total = Math.acos(Math.max(-1, Math.min(1, c[0] * g[0] + c[1] * g[1] + c[2] * g[2])));
+    const dth = Math.max(1e-3, this.rad[i] * k.sweepStep / L);
+    let cnt = Math.max(1, Math.ceil(total / dth));
+    // A turn longer than sweepMax checks goes only as far as it was checked; the rest is next tick's.
+    if (cnt > k.sweepMax) { slerp3(c, g, k.sweepMax * dth / total, g); total = k.sweepMax * dth; cnt = k.sweepMax; }
+    let hit = false, inside = false;
+    for (let s = 1; s <= cnt; s++) {
+      if (cnt === 1) { c[0] = g[0]; c[1] = g[1]; c[2] = g[2]; } else {
+        const left = Math.acos(Math.max(-1, Math.min(1, c[0] * g[0] + c[1] * g[1] + c[2] * g[2])));
+        if (left > 1e-9) slerp3(c, g, Math.min(1, total / cnt / left), c);
+      }
+      let x = px + c[0] * L, y = py + c[1] * L, z = pz + c[2] * L;
+      inside = true;
+      for (let it = 0; it < 2; it++) {
+        const pen = this._pen(i, x, y, z, world, body, n);
+        if (!(pen > 0)) { inside = false; break; }
+        hit = true;
+        // Met head-on, the push runs back along the segment and gives no way around: it tips over a step toward its
+        // posed suckers, as a tip curls onto what it meets (the solved side turns with the fold and would chase itself).
+        const cn = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+        if (cn < -k.headOn) {
+          const sk = this.SKp, j = i - 1;
+          let ux = sk[j * 3], uy = sk[j * 3 + 1], uz = sk[j * 3 + 2];
+          const un = ux * n[0] + uy * n[1] + uz * n[2];
+          ux -= un * n[0]; uy -= un * n[1]; uz -= un * n[2];
+          const ul = len3(ux, uy, uz);
+          if (ul > 1e-6) { x += ux / ul * dth * L; y += uy / ul * dth * L; z += uz / ul * dth * L; }
+        }
+        x += n[0] * pen; y += n[1] * pen; z += n[2] * pen;
+        c[0] = x - px; c[1] = y - py; c[2] = z - pz;
+        normalize3(c, g[0], g[1], g[2]);
+        x = px + c[0] * L; y = py + c[1] * L; z = pz + c[2] * L;
+      }
+    }
+    X[o] = px + c[0] * L; X[o + 1] = py + c[1] * L; X[o + 2] = pz + c[2] * L;
+    if (hit) { if (i < this._hit) this._hit = i; if (this._touched) this._touched[i] = 1; }
+    return hit ? (inside ? 2 : 1) : 0;
+  }
+
   /* Re-seat point i at its segment length from i - 1, along dir (x, y, z), inside the bend cone. */
   _seat(i, x, y, z, widen = 1) {
     const X = this.X, a = (i - 1) * 3, F = this.frame;
@@ -1523,11 +1749,14 @@ export class Arm {
     X[i * 3] = X[a] + t[0] * L; X[i * 3 + 1] = X[a + 1] + t[1] * L; X[i * 3 + 2] = X[a + 2] + t[2] * L;
   }
 
-  /* Root to tip: each point goes where the pose aims it from the solved point before, then out of the solids. A
-     trailing segment leans toward where it pointed last tick, so the part past a reach's bend is dragged along. */
+  /* Root to tip. Each segment turns from where it pointed last tick toward where the pose aims it, by as much as the
+     pose itself turned it plus a slow catch-up, and its end point slides there around whatever it meets: it stays on
+     the side of a solid it came from, and a part contact held back never snaps the rest of the way at once. A trailing
+     segment leans toward where it pointed last tick, so the part past a reach's bend is dragged along. */
   _sweep(world, body) {
     const k = this.knobs, X = this.X, D = this.D, F = this.frame, P = this.P, dr = this.drag;
     const lag = this.started ? Math.exp(-this._dt / Math.max(1e-3, k.dragTau)) : 0, dir = this._c;
+    const swept = this.started && !this._jumped && k.sweepStep > 0 && Number.isFinite(P[this.n * 3 - 1]);
     X[0] = F.p[0]; X[1] = F.p[1]; X[2] = F.p[2];
     for (let i = 1; i < this.n; i++) {
       const j = i - 1, gd = dr[j] * lag;
@@ -1536,22 +1765,89 @@ export class Arm {
         const px = P[i * 3] - P[j * 3], py = P[i * 3 + 1] - P[j * 3 + 1], pz = P[i * 3 + 2] - P[j * 3 + 2], pl = len3(px, py, pz);
         if (pl > 1e-9) { dir[0] += (px / pl - dir[0]) * gd; dir[1] += (py / pl - dir[1]) * gd; dir[2] += (pz / pl - dir[2]) * gd; }
       }
-      this._seat(i, dir[0], dir[1], dir[2]);
-      // Contact has the last word per point, or the next segment's cone would be measured off a sunken one.
-      for (let it = 0; it < k.collideIters; it++) {
+      if (!swept) {
+        this._seat(i, dir[0], dir[1], dir[2]);
+        for (let it = 0; it < k.collideIters; it++) {
+          this._project(i, world, body);
+          const a = (i - 1) * 3;
+          this._seat(i, X[i * 3] - X[a], X[i * 3 + 1] - X[a + 1], X[i * 3 + 2] - X[a + 2]);
+        }
         this._project(i, world, body);
-        const a = (i - 1) * 3;
-        this._seat(i, X[i * 3] - X[a], X[i * 3 + 1] - X[a + 1], X[i * 3 + 2] - X[a + 2]);
+        this._unfold(i, world, body);
+        continue;
       }
-      this._project(i, world, body);
-      this._unfold(i, world, body);
+      // A dragged segment's lag is its program's, already smooth; every other gap closes no faster than catchUp.
+      this._held = gd < k.dragFree;
+      // Two legs, as the arm moves: carried along with the point before, then turned about it.
+      const o = i * 3, sd = this._turn(i, dir, world, body), L = this.len[j], tx = X[o], ty = X[o + 1], tz = X[o + 2];
+      X[o] = X[o - 3] + sd[0] * L; X[o + 1] = X[o - 2] + sd[1] * L; X[o + 2] = X[o - 1] + sd[2] * L;
+      // A carry shorter than the point's radius can't cross anything (her breathing moves every point a little each
+      // tick); the swing's first check meets whatever it ends in.
+      this._short = false;
+      if (len3(X[o] - P[o], X[o + 1] - P[o + 1], X[o + 2] - P[o + 2]) > this.rad[i]) this._travel(i, world, body, P[o], P[o + 1], P[o + 2]);
+      // A carry cut short leaves the point behind its segment's start; turning it from there would re-seat it unchecked.
+      if (this._short) continue;
+      const met = this._swing(i, world, body, tx, ty, tz);
+      if (met < 2) continue;
+      // Back to length from the solved point before; what that leaves inside a surface is a sliver, so it leaves as it came.
+      for (let it = 0; it < k.collideIters; it++) {
+        const a = (i - 1) * 3;
+        this._seat(i, X[i * 3] - X[a], X[i * 3 + 1] - X[a + 1], X[i * 3 + 2] - X[a + 2], Infinity);
+        if (!this._project(i, world, body)) break;
+      }
+      // Wedged where no direction at full length is clear and squeezed well short, it folds the way the cone and the
+      // surfaces allow; a sliver short is left alone, since the fold jumps.
+      const a = j * 3;
+      if (len3(X[o] - X[a], X[o + 1] - X[a + 1], X[o + 2] - X[a + 2]) < this.len[j] * k.sweepUnfold) this._unfold(i, world, body);
     }
   }
 
-
-
-
-
+  /* Point i's new place for the swept solve: segment i - 1 turns from last tick's solved direction toward dir (clamped
+     into the bend cone off the solved segment before), by the pose's own turn of it this tick plus catchUp. Returns
+     last tick's direction. */
+  _turn(i, dir, world, body) {
+    const k = this.knobs, X = this.X, P = this.P, D = this.D, Dp = this.Dp, F = this.frame, j = i - 1, o = i * 3, L = this.len[j];
+    normalize3(dir, D[j * 3], D[j * 3 + 1], D[j * 3 + 2]);
+    let rx, ry, rz;
+    if (i === 1) { rx = F.d[0]; ry = F.d[1]; rz = F.d[2]; }
+    else {
+      rx = X[o - 3] - X[o - 6]; ry = X[o - 2] - X[o - 5]; rz = X[o - 1] - X[o - 4];
+      const l = len3(rx, ry, rz);
+      if (l < 1e-12) { rx = F.d[0]; ry = F.d[1]; rz = F.d[2]; } else { rx /= l; ry /= l; rz /= l; }
+    }
+    // Only a pose driving the segment into something may fold it past the joint's limit: contact then stops it there.
+    const inCone = dir[0] * rx + dir[1] * ry + dir[2] * rz >= this.limCos[j];
+    const pressed = !inCone && this._pen(i, X[o - 3] + dir[0] * L, X[o - 2] + dir[1] * L, X[o - 1] + dir[2] * L, world, body, this._n) > 0;
+    if (!pressed) coneClamp(dir, 0, rx, ry, rz, this.limCos[j], this.limSin[j]);
+    const s = this._a;
+    s[0] = P[o] - P[o - 3]; s[1] = P[o + 1] - P[o - 2]; s[2] = P[o + 2] - P[o - 1];
+    normalize3(s, dir[0], dir[1], dir[2]);
+    // How far the joint was bent last tick, and whether contact put it past its limit: such a fold is kept, unfolding at
+    // unfoldRate, until it is back within the limit. Compared as cosines; the angles are only taken when needed.
+    let qx = F.d[0], qy = F.d[1], qz = F.d[2];
+    if (i > 1) { qx = P[o - 3] - P[o - 6]; qy = P[o - 2] - P[o - 5]; qz = P[o - 1] - P[o - 4]; const ql = len3(qx, qy, qz) || 1; qx /= ql; qy /= ql; qz /= ql; }
+    const foldCos = s[0] * qx + s[1] * qy + s[2] * qz, W = this._was, Fd = this._folded;
+    if (foldCos >= this.limCos[j]) Fd[i] = 0; else if (W[i] || W[j]) Fd[i] = 1;
+    const gapCos = Math.max(-1, Math.min(1, s[0] * dir[0] + s[1] * dir[1] + s[2] * dir[2]));
+    let allow = Infinity;
+    if (this._held) {
+      const posedCos = D[j * 3] * Dp[j * 3] + D[j * 3 + 1] * Dp[j * 3 + 1] + D[j * 3 + 2] * Dp[j * 3 + 2];
+      allow = (posedCos > 1 - 1e-12 ? 0 : Math.acos(Math.max(-1, posedCos))) + k.catchUp * this._dt;
+    }
+    const gap = allow < Math.PI && gapCos < Math.cos(allow) ? Math.acos(gapCos) : 0;
+    if (gap > allow) {
+      const fold = Math.acos(Math.max(-1, Math.min(1, foldCos)));
+      slerp3(s, dir, allow / gap, dir);
+      // A held-back segment bends no farther than its joint allows off the one before, or than contact already folded it:
+      // a fold unfolds at the turn's pace, never at once.
+      const keep = Fd[i] ? Math.min(Math.PI, fold - k.unfoldRate * this._dt) : 0;
+      if (pressed) { /* contact, not the cone, stops it */ }
+      else if (keep > this.lim[j]) coneClamp(dir, 0, rx, ry, rz, Math.cos(keep), Math.sin(keep));
+      else coneClamp(dir, 0, rx, ry, rz, this.limCos[j], this.limSin[j]);
+    }
+    X[o] = X[o - 3] + dir[0] * L; X[o + 1] = X[o - 2] + dir[1] * L; X[o + 2] = X[o - 1] + dir[2] * L;
+    return s;
+  }
 
   /* Met head-on, the cone and the contact disagree and the segment collapses; a wider cone folds it instead. Driven
      into a corner, every widening still aims into it, so the last try folds the way the surfaces push. */
@@ -1577,8 +1873,13 @@ export class Arm {
     if (this.valid === false) return;
     this._focus(world, this.knobs.focusPad);
     const X = this.X, n = this.n, F = this.frame, len = this.len, lim = this.limCos;
+    const Q = this.started && !this._jumped && this.knobs.sweepStep > 0 ? this.Q : null;
     X[0] = F.p[0]; X[1] = F.p[1]; X[2] = F.p[2];
+    const Tc = Q ? this._touched : null, Fd = this._folded;
     for (let j = 0; j < n - 1; j++) {
+      // Where contact holds the arm, or folded a joint that is still unfolding, it may bend past the limit: lifted back
+      // here, it would be pushed in again next tick, and a touch flickering on and off would make them take turns.
+      if (Tc && (Tc[j + 1] || Tc[j] || (j > 0 && Tc[j - 1]) || Fd[j + 1])) continue;
       // Joint 0 bends against a pinned virtual point one segment back along the root's outward direction.
       let ax, ay, az, la;
       if (j === 0) { la = len[0]; ax = F.p[0] - F.d[0] * la; ay = F.p[1] - F.d[1] * la; az = F.p[2] - F.d[2] * la; }
@@ -1599,41 +1900,66 @@ export class Arm {
       const l = len3(dx, dy, dz);
       if (l < 1e-12) { dx = F.d[0]; dy = F.d[1]; dz = F.d[2]; } else { dx /= l; dy /= l; dz /= l; }
       X[i * 3] = X[a] + dx * len[i - 1]; X[i * 3 + 1] = X[a + 1] + dy * len[i - 1]; X[i * 3 + 2] = X[a + 2] + dz * len[i - 1];
-      // On the last round a pushed point is re-seated at its length and pushed again, so a corner costs less length.
-      let moved = this._project(i, world, body);
+      // Re-seated off a point the passes before moved, it slides there from where it last lay clear, keeping its side; a
+      // move shorter than one check can't cross anything, so a plain push-out does.
+      const m = Q ? len3(X[i * 3] - Q[i * 3], X[i * 3 + 1] - Q[i * 3 + 1], X[i * 3 + 2] - Q[i * 3 + 2]) : Infinity;
+      // Not moved since it last lay clear, it is still clear (by a hair: stillTol) and needs no check, unless the last round
+      // finds it touching; the last round still checks its segment's middle.
+      const still = m < this.knobs.stillTol && !(last && this._touched[i]);
+      if (still && !last) continue;
+      let moved = still ? false : Q && m > this.rad[i] * this.knobs.sweepStep ? this._travel(i, world, body, Q[i * 3], Q[i * 3 + 1], Q[i * 3 + 2]) : this._project(i, world, body);
       if (!last) continue;
       // A long segment can cut the corner of a lip or a small toy between its two points: swing its end to lift its middle.
       if (world) {
-        const nrm = this._n, pen = world.collide((X[a] + X[i * 3]) / 2, (X[a + 1] + X[i * 3 + 1]) / 2, (X[a + 2] + X[i * 3 + 2]) / 2, (this.rad[i - 1] + this.rad[i]) / 2, nrm);
-        if (pen > 0) { X[i * 3] += 2 * pen * nrm[0]; X[i * 3 + 1] += 2 * pen * nrm[1]; X[i * 3 + 2] += 2 * pen * nrm[2]; moved = true; }
+        const nrm = this._n, pen = world.collide((X[a] + X[i * 3]) / 2, (X[a + 1] + X[i * 3 + 1]) / 2, (X[a + 2] + X[i * 3 + 2]) / 2, (this.rad[i - 1] + this.rad[i]) / 2, nrm, i);
+        if (pen > 0) {
+          const fx = X[i * 3], fy = X[i * 3 + 1], fz = X[i * 3 + 2];
+          X[i * 3] += 2 * pen * nrm[0]; X[i * 3 + 1] += 2 * pen * nrm[1]; X[i * 3 + 2] += 2 * pen * nrm[2];
+          if (Q) { this._seat(i, X[i * 3] - X[a], X[i * 3 + 1] - X[a + 1], X[i * 3 + 2] - X[a + 2], Infinity); this._travel(i, world, body, fx, fy, fz); continue; }
+          moved = true;
+        }
       }
-      if (!moved) continue;
+      if (!moved || Q) continue;
       for (let c = 0; c < this.knobs.collideIters; c++) {
         this._seat(i, X[i * 3] - X[a], X[i * 3 + 1] - X[a + 1], X[i * 3 + 2] - X[a + 2], 3);
         if (!this._project(i, world, body)) break;
       }
     }
+    if (Q) Q.set(X);
+    this._solveSK();
     if (last) this._feedback();
   }
 
-  /* The pose ignores contact, so it drives through what the arm lies on and the push-out picks a side afresh each tick.
-     Joints contact moved take part of the solved shape; a free tail keeps its program, or its drag sets it whirling. */
+  /* The pose ignores contact and would drive on through what the arm lies on. Where contact holds the arm, the springs'
+     targets take the shape it left, touched segments as solved and free ones keeping their posed world direction, so
+     the bends follow through the springs (nothing in the pose jumps) and come to rest against it; then it relaxes. */
   _feedback() {
     // A resting curl keeps pressing into what it wraps, so feedback fades out with rest.
-    const k = this.knobs, w = k.contactFeedback * (1 - this.restW), S = this.n - 1, h = this._hit ?? this.n, Tc = this._touched;
-    if (!(w > 0) || !this.started || h >= this.n || !Tc || !Number.isFinite(this.X[this.n * 3 - 1])) return;
-    const Fb = this._fb ??= new Float64Array(S * 2), B = this.bend;
-    this.bendsFromPoints(this.X, Fb);
-    const V = this.vel;
-    for (let a = Math.max(0, h - 1) * 2; a < S * 2; a++) {
-      const j = a >> 1;
-      if (!Tc[j + 1] && !Tc[j] || !Number.isFinite(Fb[a])) continue;
-      const d = (Fb[a] - B[a]) * w;
-      B[a] += d;
-      // Speed that drove the bend into the contact is spent there, never returned as a bounce.
-      if (d * V[a] < 0) V[a] = 0;
+    const k = this.knobs, w = k.contactFeedback * (1 - this.restW * k.feedbackRest), S = this.n - 1, h = this._hit, Tc = this._touched;
+    if (!(w > 0) || !this.started || h >= this.n || !Number.isFinite(this.X[this.n * 3 - 1])) return;
+    const X = this.X, D = this.D, H = this._fh ??= new Float64Array(this.n * 3), Fb = this._fb ??= new Float64Array(S * 2), d = this._t;
+    H[0] = X[0]; H[1] = X[1]; H[2] = X[2];
+    for (let s = 0; s < S; s++) {
+      d[0] = D[s * 3]; d[1] = D[s * 3 + 1]; d[2] = D[s * 3 + 2];
+      if (s + 1 >= h && Tc[s + 1]) { d[0] = X[s * 3 + 3] - X[s * 3]; d[1] = X[s * 3 + 4] - X[s * 3 + 1]; d[2] = X[s * 3 + 5] - X[s * 3 + 2]; normalize3(d, D[s * 3], D[s * 3 + 1], D[s * 3 + 2]); }
+      H[s * 3 + 3] = H[s * 3] + d[0]; H[s * 3 + 4] = H[s * 3 + 1] + d[1]; H[s * 3 + 5] = H[s * 3 + 2] + d[2];
     }
-    this._clampBends(B, this.vel);
+    this.bendsFromPoints(H, Fb);
+    // A shape the joints can't hold is never asked for, or the offset would grow by the unreachable part every tick.
+    this._clampBends(Fb, null);
+    const V = this.vel, T = this.tgt, Rb = this.rest;
+    for (let j = Math.max(0, h - 1); j < S; j++) {
+      // Only joints contact bent, and the one after each such run that keeps the free part's direction: elsewhere the pose
+      // is the program's own (a grip, a spring still on its way), not contact's to bake in.
+      if (!Tc[j + 1] && !Tc[j]) continue;
+      const du = (Fb[j * 2] - T[j * 2]) * w, dv = (Fb[j * 2 + 1] - T[j * 2 + 1]) * w;
+      if (!Number.isFinite(du + dv)) continue;
+      Rb[j * 2] += du; Rb[j * 2 + 1] += dv;
+      if (!Tc[j + 1]) continue;
+      // Speed that drove the bend into the contact is spent there, never returned as a bounce.
+      const c = V[j * 2] * du + V[j * 2 + 1] * dv;
+      if (c < 0) { const l2 = du * du + dv * dv; V[j * 2] -= c / l2 * du; V[j * 2 + 1] -= c / l2 * dv; }
+    }
   }
 
   finish(world, body) { for (let it = 0; it < this.knobs.finishIters; it++) this.finishPass(world, body, it === this.knobs.finishIters - 1); }

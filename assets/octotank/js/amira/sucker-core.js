@@ -36,6 +36,15 @@ export const SUCKER_KNOBS = {
   rejectSpeed: 0.2,      // m/s a rejected thing travels out along the arm
   refractory: 1,         // s a patch stays unsealed after the arm moves on
   ignoreTime: 4,         // s an arm leaves a thing it moved on from alone
+  // What a touch is worth to the brain, before the arm's state and the thing's novelty scale it.
+  tasteWeight: { food: 1, spoiled: 0.9, toy: 0.5, slick: 0.5, rock: 0.25, floor: 0.15, glass: 0.15, lid: 0.15, wall: 0.15, self: 0.05 },
+  busySalience: 0.6,     // a touch by an arm busy with something else
+  idleSalience: 0.35,    // and by an idle one, against an arm reaching for that very thing
+  familiarTime: 40,      // s of touching that halve a thing's novelty
+  forgetTime: 1800,      // s over which that touching is forgotten
+  novelFloor: 0.25,      // what a wholly familiar thing still weighs
+  tasteLogSize: 64,      // touches the log keeps for the brain to read
+  tasteGap: 0.25,        // s a touch may lapse and still be the same one
 };
 
 /* Where the suckers sit on one arm and what each can hold. Pitch follows sucker size, so they crowd toward the tip. */
@@ -118,6 +127,32 @@ export function whoMoves({ anchor = 0, objectHold = 0, objectMass = 0, bodyMass 
   if (anchor > objectHold) return 'object';
   if (objectHold > anchor) return 'body';
   return objectMass <= bodyMass ? 'object' : 'body';
+}
+
+/* How much one touch matters: its taste's weight, scaled by the arm's state ('reach' for the thing it meant to touch,
+   'busy' with something else, 'idle') and by novelty, 0 for a wholly familiar thing to 1 for a new one. */
+export function tasteSalience(taste, state, novelty, k = SUCKER_KNOBS) {
+  const base = k.tasteWeight[taste] ?? k.tasteWeight.toy;
+  const s = state === 'reach' ? 1 : state === 'busy' ? k.busySalience : k.idleSalience;
+  const n = Math.max(0, Math.min(1, novelty));
+  return base * s * (k.novelFloor + (1 - k.novelFloor) * n);
+}
+
+/* How familiar each thing is: touching time builds up, halving its novelty every familiarTime, and fades over
+   forgetTime. Keys are whatever identifies a thing (a collider entry, or 'self'). */
+export class Familiarity {
+  constructor(k = SUCKER_KNOBS) { this.k = k; this.m = new Map(); }
+
+  _get(key, now) {
+    let e = this.m.get(key);
+    if (!e) { e = { s: 0, at: now }; this.m.set(key, e); }
+    if (now > e.at) { e.s *= Math.exp(-(now - e.at) / Math.max(1e-3, this.k.forgetTime)); e.at = now; }
+    return e;
+  }
+
+  touch(key, dt, now) { this._get(key, now).s += dt; }
+
+  novelty(key, now) { return Math.pow(0.5, this._get(key, now).s / Math.max(1e-3, this.k.familiarTime)); }
 }
 
 export const SEAL_NONE = 0, SEAL_WORK = 1, SEAL_HARD = 2;
