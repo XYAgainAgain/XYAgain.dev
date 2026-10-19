@@ -27,6 +27,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     { key: 'f', hint: 'F', label: () => 'Fetch held', run: () => arms.fetchHolding() },
     { key: 'g', hint: 'G', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
     { key: 's', hint: 'S', label: () => (tank.suckerView?.visible ? 'Suckers: shown' : 'Suckers: hidden'), run: () => { if (tank.suckerView) tank.suckerView.visible = !tank.suckerView.visible; } },
+    { key: 'c', hint: 'C', label: () => (tank.armView?.capsules ? 'Capsules: shown' : 'Capsules: hidden'), run: () => { if (tank.armView) tank.armView.capsules = !tank.armView.capsules; } },
     { key: 'w', hint: 'W', label: () => (ctx.water?.knobs.tint ? 'Density tint: on' : 'Density tint: off'), run: () => ctx.water?.setTint(!ctx.water.knobs.tint) },
     { key: 'z', hint: 'Z', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
     { key: 'p', hint: 'P', label: () => `Drive: ${mantle.drive}`, run: () => mantle.setDrive(DRIVES[(DRIVES.indexOf(mantle.drive) + 1) % DRIVES.length]) },

@@ -7,9 +7,9 @@ export const ARM_KNOBS = {
   frontArms: [0, 7],
   frontScale: 0.92,      // her first pair runs a little shorter than the rest
   tipLenRatio: 0.45,     // last segment's rest length over the first's
-  rootRadius: 0.0115,    // the one measured arm scaled isometrically to her 1 kg
+  rootRadius: 0.014,     // fuller than the measured arm scaled to her 1 kg (11.5 mm), still 4 mm clear of the next root
   tipRadius: 0.003,
-  taperPow: 3,           // radius falls as (1 - s)^taperPow along the arc, so eight arms weigh about half of her
+  taperPow: 2,           // radius falls as (1 - s)^taperPow along the arc; arm mass isn't simulated, so this is a look
   bendBase: 0.32,        // rad per joint at the base, loosening toward the tip on a bendPow ramp
   bendTip: 1.1,
   bendPow: 1.5,

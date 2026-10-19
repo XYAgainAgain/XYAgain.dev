@@ -7,6 +7,7 @@ import { SHELL_LEVELS } from './amira/mantle-core.js';
 import { buildTank, buildPanel, buildRocks, buildToys, LAYOUT_KNOBS } from './layout.js';
 import { Arms } from './amira/arms.js';
 import { SuckerView } from './amira/sucker-view.js';
+import { ArmView } from './amira/arm-view.js';
 import { Pose } from './amira/pose.js';
 import { Attention } from './amira/attention.js';
 import { BodyParts } from './amira/body-parts.js';
@@ -16,7 +17,7 @@ import { createPanel } from './panel.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
-   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
+   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -160,6 +161,10 @@ async function boot() {
   tank.attention = attention; tank.knobs.attention = attention.knobs;
   tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
+  const armView = tank.armView = new ArmView(arms, mantle, scene, Number(params.get('girth')) > 0 ? { girth: +params.get('girth') } : {});
+  tank.knobs.armView = armView.knobs;
+  armView.capsuleMeshes = rigidMeshes.filter((r) => r.e.tag === 'arm').map((r) => r.mesh);
+  armView.capsules = params.get('capsules') === '1';
   window.tank = tank;
   const diag = createPanel({ el: document.getElementById('panel'), readout: hud, controls: document.getElementById('controls'), ctx, tank, toys, seed, say });
 
@@ -200,6 +205,7 @@ async function boot() {
     attention.aimEyes(bodyParts);
     bodyParts.update();
     tank.suckerView.update();
+    armView.update();
     for (let r = 0; r < mantle.roots.length; r++) {
       mantle.rootWorld(r, tmp3);
       m4.makeTranslation(tmp3[0], tmp3[1], tmp3[2]);
