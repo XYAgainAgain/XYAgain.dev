@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Amira's Tank (spike) · XYAgain.dev</title>
+    <meta name="description" content="The octopus tank, under construction.">
+    <meta name="theme-color" content="#06080d">
+    <meta name="robots" content="noindex">
+    <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+    <link href="../assets/shared/css/base.css" rel="stylesheet" type="text/css">
+    <link href="../assets/octotank/css/tank.css" rel="stylesheet" type="text/css">
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "../assets/shared/vendor/three/three.webgpu.min.js",
+        "three/webgpu": "../assets/shared/vendor/three/three.webgpu.min.js",
+        "three/tsl": "../assets/shared/vendor/three/three.tsl.min.js",
+        "jolt": "../assets/shared/vendor/jolt/jolt-physics.wasm-compat.js"
+      }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="tank-canvas" aria-label="Amira's tank, physics spike"></canvas>
+    <aside id="panel" aria-label="Diagnostics and controls">
+        <pre id="hud" aria-live="off"></pre>
+        <div id="controls" role="group" aria-label="Controls"></div>
+    </aside>
+    <p id="status" role="status" aria-live="polite">loading</p>
+    <script type="module" src="../assets/octotank/js/main.js"></script>
+</body>
+</html>

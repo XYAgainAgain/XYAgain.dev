@@ -1,0 +1,19 @@
+/* The spike page: one canvas, a stats readout, a status line. */
+html, body { margin: 0; height: 100%; background: #06080d; color: var(--ink); overflow: hidden; }
+#tank-canvas { display: block; width: 100vw; height: 100vh; }
+#panel {
+  position: fixed; left: 12px; top: 10px; max-width: calc(100vw - 24px);
+  display: grid; gap: 8px; padding: 8px 10px;
+  background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 8px;
+  backdrop-filter: blur(6px);
+}
+#hud { margin: 0; font: 13px/1.5 ui-monospace, Consolas, monospace; color: var(--ink-strong); white-space: pre; overflow-x: auto; }
+#hud:empty { display: none; }
+#controls { display: flex; flex-wrap: wrap; gap: 6px; }
+#controls .btn { padding: 3px 8px; font-size: 0.8rem; }
+#controls kbd { margin-inline-start: 4px; padding: 0 4px; font: 0.75rem ui-monospace, Consolas, monospace; color: var(--ink); border: 1px solid var(--glass-edge); border-radius: 4px; }
+#panel.collapsed { padding: 4px; }
+#panel.collapsed #hud, #panel.collapsed #controls .btn:not(.keep) { display: none; }
+#status { position: fixed; left: 12px; bottom: 10px; margin: 0; font-size: 0.9rem; }
+#status:empty { display: none; }
+.no-renderer #tank-canvas { display: none; }
