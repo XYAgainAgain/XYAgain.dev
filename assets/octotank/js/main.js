@@ -4,7 +4,7 @@ import { seedFromUrl } from '../../pond/js/rng.js';
 import { loadJolt, Physics } from './physics.js';
 import { Mantle, MANTLE_KNOBS } from './amira/mantle.js';
 import { SHELL_LEVELS } from './amira/mantle-core.js';
-import { buildTank, buildPanel, buildRocks, buildToys, LAYOUT_KNOBS } from './layout.js';
+import { buildTank, buildPanel, buildRocks, buildToys, apertures, LAYOUT_KNOBS } from './layout.js';
 import { Arms } from './amira/arms.js';
 import { SuckerView } from './amira/sucker-view.js';
 import { ArmView } from './amira/arm-view.js';
@@ -13,6 +13,10 @@ import { Attention } from './amira/attention.js';
 import { Locomotion } from './amira/locomotion.js';
 import { Wander } from './amira/loco-wander.js';
 import { Carry } from './amira/loco-carry.js';
+import { installClimb } from './amira/loco-climb.js';
+import { installSqueeze } from './amira/loco-squeeze.js';
+import { installJet } from './amira/loco-jet.js';
+import { installFew } from './amira/loco-few.js';
 import { isRunning } from './scenarios.js';
 import { BodyParts } from './amira/body-parts.js';
 import { attachDebug } from './debug.js';
@@ -93,6 +97,10 @@ async function boot() {
   const loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
   loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
   const carry = new Carry({ mantle, arms, loco });
+  installClimb(loco);
+  installSqueeze(loco, { apertures: apertures(layoutKnobs) });
+  const jet = installJet(loco);
+  installFew(loco, { carry });
 
   // Scene: a long lens at the glass, dim gallery light, the tank as a wire box.
   const scene = new THREE.Scene();
@@ -156,6 +164,7 @@ async function boot() {
   scene.add(mantleMesh);
   const bodyParts = new BodyParts(mantle, scene, {}, { seed });
   pose.eyeKnobs = bodyParts.knobs;
+  jet.parts = bodyParts;
   const rootMarkers = new THREE.InstancedMesh(new THREE.SphereGeometry(0.006, 8, 6), new THREE.MeshBasicMaterial({ color: 0xffe08a }), mantle.roots.length);
   scene.add(rootMarkers);
   const m4 = new THREE.Matrix4(), tmp3 = [0, 0, 0];

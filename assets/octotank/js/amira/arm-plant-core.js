@@ -84,3 +84,87 @@ export function plantTargets(arm, T, K, dt) {
   arm.gw = 1;
   return 1;
 }
+
+/* The jet's arm goals: trailing behind a jet, spread like a parachute as she sinks after one, and tucked under her (the
+   swim, a bound arm). None of them grips; the base aims, the rest lags. */
+
+function unit3(x, y, z, out, fx = 0, fy = -1, fz = 0) {
+  const l = Math.hypot(x, y, z);
+  if (l > 1e-9 && Number.isFinite(l)) { out[0] = x / l; out[1] = y / l; out[2] = z / l; }
+  else { out[0] = fx; out[1] = fy; out[2] = fz; }
+  return out;
+}
+
+/* Where a trailing arm's base points: straight back along −v, turned `spread` radians toward the root's own outward
+   direction d, so the crown opens a little instead of bunching into one rope. */
+export function trailDir(d, v, spread, out) {
+  const b = unit3(-v[0], -v[1], -v[2], out);
+  const bx = b[0], by = b[1], bz = b[2], c = d[0] * bx + d[1] * by + d[2] * bz;
+  let ox = d[0] - c * bx, oy = d[1] - c * by, oz = d[2] - c * bz, ol = Math.hypot(ox, oy, oz);
+  if (!(ol > 1e-6)) {
+    // A root pointing straight back has no outward side of its own; any perpendicular will do.
+    ox = Math.abs(by) < 0.9 ? -bz : 0; oy = Math.abs(by) < 0.9 ? 0 : bz; oz = Math.abs(by) < 0.9 ? bx : -by;
+    ol = Math.hypot(ox, oy, oz) || 1;
+  }
+  const cs = Math.cos(spread), sn = Math.sin(spread);
+  return unit3(bx * cs + (ox / ol) * sn, by * cs + (oy / ol) * sn, bz * cs + (oz / ol) * sn, out);
+}
+
+/* The parachute: out along the root's flat bearing and `down` radians below level, in world terms, since she sinks. */
+export function spreadDir(d, down, out) {
+  const l = Math.hypot(d[0], d[2]);
+  if (!(l > 1e-6)) { out[0] = 0; out[1] = -1; out[2] = 0; return out; }
+  const c = Math.cos(down), s = Math.sin(down);
+  out[0] = (d[0] / l) * c; out[1] = -s; out[2] = (d[2] / l) * c;
+  return out;
+}
+
+/* stiff and tip are shares of stiffBehind for the base and the distal half; a null tip leaves the distal half soft. */
+export function makeTrail(v, spread = 0.35, stiff = 0.3, tip = null) {
+  return { kind: 'trail', t: 0, v: [v[0], v[1], v[2]], spread, stiff, tip };
+}
+
+export function makeSpread(down = 0.5) {
+  return { kind: 'spread', t: 0, down };
+}
+
+export function makeTuck(curl = 2) {
+  return { kind: 'tuck', t: 0, curl };
+}
+
+const _dir = [0, 0, 0];
+
+/* Stiff at the base, soft and lagging past `from` of the arm's length, so the tips stream behind. */
+function trailingStiffness(arm, K, base, from, tip = arm.knobs.stiffDrag) {
+  const S = arm.n - 1, L = arm.length, D = arm.dragGoal;
+  for (let j = 0; j < S; j++) {
+    const s = (arm.arc0[j] + arm.len0[j] / 2) / L, distal = s >= from;
+    K[j] = distal ? tip : base;
+    D[j] = distal ? 1 : 0;
+  }
+}
+
+/* The jet's trailing arms: the base aimed back along the travel, turned out by the goal's spread. */
+export function trailTargets(arm, T, K) {
+  const g = arm.goal, k = arm.knobs;
+  trailDir(arm.frame.d, g.v, g.spread, _dir);
+  arm._aim(_dir[0], _dir[1], _dir[2], 1, T);
+  trailingStiffness(arm, K, k.stiffBehind * g.stiff, 0.5, Number.isFinite(g.tip) ? k.stiffBehind * g.tip : k.stiffDrag);
+  return 0;
+}
+
+/* After a jet, arms out wide and down while she sinks onto them. */
+export function spreadTargets(arm, T, K) {
+  const g = arm.goal, k = arm.knobs;
+  spreadDir(arm.frame.d, g.down, _dir);
+  arm._aim(_dir[0], _dir[1], _dir[2], 1, T);
+  trailingStiffness(arm, K, k.stiffBehind * 0.2, 0.6);
+  return 0;
+}
+
+/* Curled in toward the suckers, under her: the resting curl, held harder. */
+export function tuckTargets(arm, T, K) {
+  const g = arm.goal, k = arm.knobs, S = arm.n - 1;
+  for (let j = 0; j < S; j++) { arm._curl(j, T, g.curl); K[j] = k.stiffIdle * 2; }
+  return 0;
+}

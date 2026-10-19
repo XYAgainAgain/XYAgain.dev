@@ -233,6 +233,8 @@ export class Locomotion {
     // Up a wall with no climb registered, she goes to the floor below it and stops a standoff short.
     const T = this.travel;
     T[0] = d.point[0]; T[1] = wall && !climb ? 0 : d.point[1]; T[2] = d.point[2];
+    // A mode may set a waypoint instead (the squeeze climbs to a slot before the target behind its panel).
+    for (const m of this._modeList) m.route?.(this, d, T);
     const flat = flatDir(this.c, T, this.dFlat);
     if (this._arrived(d, T, flat, wall && climb)) return this._finish(true, null);
     const dx = T[0] - this.c[0], dy = T[1] - this.c[1], dz = T[2] - this.c[2], l = Math.hypot(dx, dy, dz);

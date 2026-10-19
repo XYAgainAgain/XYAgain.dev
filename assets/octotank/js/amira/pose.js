@@ -163,6 +163,8 @@ export class Pose {
       if (this._wasRigid) { this.yawCmd = this.driftYaw = this.turnTo = this.yaw; this.yawRate = 0; this.turning = false; }
     }
     this._wasRigid = rigid;
+    // Off the level her yaw means nothing: the command rests on her body and she doesn't turn until she is back down.
+    if (!rigid && !(this._frame.u[1] > 0.7)) { this.yawCmd = this.turnTo = this.driftYaw = this.yaw; this.yawRate = 0; this.turning = false; return; }
     if (dt > 0) this._steer(dt, arms?.lead ?? null, rigid);
     if (!rigid) return;
     if (this.path) {

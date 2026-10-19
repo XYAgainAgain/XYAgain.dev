@@ -2,6 +2,7 @@ import { LAYERS } from '../config.js';
 import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from './loco-carry-core.js';
 import { moveInputs } from './loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32 } from './arm-core.js';
+import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 
 /* Eight arm programs (arm-core.js) driving a kinematic Jolt capsule per segment. Each tick: root frames, programs and
@@ -438,6 +439,25 @@ export class Arms {
   }
 
   unplant(i) { const arm = this.arms[i]; if (arm?.goal?.kind === 'plant') arm.idle(); }
+
+  /* Arm i trails behind a jet moving along unit v, opened by spread radians, its base and tip stiffness as shares of
+     stiffBehind (arm-plant-core.js). */
+  trail(i, v, spread, stiff, tip) { return this._goal(i, makeTrail(v, spread, stiff, tip)); }
+
+  /* Arm i spreads out and down, `down` radians below level, as she sinks after a jet. */
+  spread(i, down) { return this._goal(i, makeSpread(down)); }
+
+  /* Arm i curls in under her and stays there. */
+  tuck(i, curl) { return this._goal(i, makeTuck(curl)); }
+
+  _goal(i, g) {
+    const arm = this.arms[i];
+    if (!arm || (g.kind === 'trail' && !g.v.every(Number.isFinite))) return false;
+    arm.goal = g;
+    arm.reachB = 0;
+    this.track[i] = null;
+    return true;
+  }
 
   /* Take arm i at a tier (idle < attend < stroke < mode < held); false while a stronger one holds it. */
   claim(i, tier) {

@@ -50,6 +50,12 @@ export function buildPanel(phys, k = LAYOUT_KNOBS) {
   return parts;
 }
 
+/* The holes she can pass through, for the squeeze's route: the slot's middle, its normal, half its height and width,
+   and the panel's thickness. A function of the knobs, so ?gap= reaches it. */
+export function apertures(k = LAYOUT_KNOBS) {
+  return [{ center: [k.panelX, k.gapY, 0], normal: [1, 0, 0], halfH: k.gapH / 2, halfW: TANK.d / 2, thick: k.panelT }];
+}
+
 export function buildRocks(phys) {
   const opts = { motion: 'static', layer: LAYERS.NON_MOVING, friction: 0.7 };
   const rocks = [

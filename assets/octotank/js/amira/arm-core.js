@@ -1,7 +1,7 @@
 /* Amira's arms without THREE or Jolt: a 24-point chain per arm posed from per-joint bends, stretch, and twist; the
    reach, grip, fetch, and idle programs; and the contact passes that make an arm drape instead of clip. */
 
-import { plantTargets, makePlant } from './arm-plant-core.js';
+import { plantTargets, makePlant, trailTargets, spreadTargets, tuckTargets } from './arm-plant-core.js';
 
 export const ARM_KNOBS = {
   points: 24,
@@ -1131,6 +1131,7 @@ export class Arm {
     }
     if (g.kind === 'fetch') return this._fetchTargets(T, K);
     if (g.kind === 'plant') return plantTargets(this, T, K, dt);
+    if (g.kind === 'trail' || g.kind === 'spread' || g.kind === 'tuck') return (g.kind === 'trail' ? trailTargets : g.kind === 'spread' ? spreadTargets : tuckTargets)(this, T, K);
     return this._reachTargets(T, K, dt);
   }
 

@@ -24,7 +24,7 @@ const COLUMNS = 24, ROWS = 6;
 const UP = [0, 1, 0];
 const _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _n = new THREE.Vector3(), _c = new THREE.Vector3(), _g = new THREE.Vector3();
 const _m = new THREE.Matrix4(), _q = new THREE.Matrix4(), _f = new THREE.Matrix4(), _p = new THREE.Matrix4();
-const _quat = new THREE.Quaternion(), _y = new THREE.Vector3(0, 1, 0), _one = new THREE.Vector3(1, 1, 1);
+const _quat = new THREE.Quaternion(), _y = new THREE.Vector3(0, 1, 0), _one = new THREE.Vector3(1, 1, 1), _s = new THREE.Matrix4();
 
 export class BodyParts {
   constructor(mantle, scene, knobs = {}, { seed = 1 } = {}) {
@@ -149,8 +149,16 @@ export class BodyParts {
     const now = this.mantle.phys?.time ?? 0, dt = this.time === null ? 0 : Math.max(0, Math.min(2, now - this.time));
     this.time = now;
     if (this.siphon?.restInv) {
-      const swing = k.siphonSwing * Math.sin((2 * Math.PI * now) / Math.max(0.1, k.siphonPeriod));
-      this.siphon.offset.copy(this.siphon.restInv).multiply(this._siphonPose(swing, _p));
+      const A = this._aim;
+      if (A) {
+        // The world aim carried back into the rest shell: the mount's live frame undone, then its rest frame applied.
+        frame(P, o, this.siphon, _s);
+        _g.set(A[0], A[1], A[2]).transformDirection(_s.invert()).transformDirection(this.siphon.rest);
+        this.siphon.offset.copy(this.siphon.restInv).multiply(_p.compose(this.siphonBase, _quat.setFromUnitVectors(_y, _g), _one));
+      } else {
+        const swing = k.siphonSwing * Math.sin((2 * Math.PI * now) / Math.max(0.1, k.siphonPeriod));
+        this.siphon.offset.copy(this.siphon.restInv).multiply(this._siphonPose(swing, _p));
+      }
     }
     for (const part of this.parts) {
       frame(P, o, part, _m);
@@ -232,6 +240,11 @@ export class BodyParts {
     }
     pos.needsUpdate = true;
     this._shown = this.open;
+  }
+
+  /* Point the funnel's mouth along a world direction (the jet's outflow) until called with null, when it swings again. */
+  aimSiphon(dir) {
+    this._aim = dir && Number.isFinite(dir[0] + dir[1] + dir[2]) && Math.hypot(dir[0], dir[1], dir[2]) > 1e-6 ? [dir[0], dir[1], dir[2]] : null;
   }
 
   /* The siphon's mouth direction in world space, for the jet. */
