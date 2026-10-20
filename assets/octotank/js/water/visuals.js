@@ -80,7 +80,8 @@ export class WaterVisuals {
     mantle.centroid(this.centroid);
     put(...this.centroid, 0.075);
     for (const arm of arms.bodies) {
-      for (let i = 0; i < arm.n; i += 3) put(arm.X[i * 3], arm.X[i * 3 + 1], arm.X[i * 3 + 2], Math.max(0.025, arm.rad[i] * 2));
+      const R = arm.drawRad ?? arm.rad;
+      for (let i = 0; i < arm.n; i += 3) put(arm.X[i * 3], arm.X[i * 3 + 1], arm.X[i * 3 + 2], Math.max(0.025, R[i] * 2));
       const p = (arm.n - 1) * 3;
       put(arm.X[p], arm.X[p + 1], arm.X[p + 2], 0.025);
     }

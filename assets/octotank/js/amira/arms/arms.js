@@ -38,9 +38,10 @@ export { CLAIM_TIERS };
 
 export class Arms {
   /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
-     numbers that get rod bodies, rodKnobs their knobs over ROD_ARM_KNOBS; bodyMass: her body's kg, which her arms
-     together match (else her rest volume's). */
-  constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, bodyMass = null } = {}) {
+     numbers that get rod bodies, rodKnobs their knobs over ROD_ARM_KNOBS; rodMode: 'drive' (the rod is the arm) or
+     'shadow' (it runs beside the authored arm, touching nothing); bodyMass: her body's kg, which her arms together
+     match (else her rest volume's). */
+  constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, rodMode = 'drive', bodyMass = null } = {}) {
     this.phys = phys;
     this.mantle = mantle;
     this.knobs = { ...ARM_KNOBS, ...knobs };
@@ -51,8 +52,10 @@ export class Arms {
     this.rodKnobs = { ...ROD_ARM_KNOBS, ...rodKnobs };
     const armsMass = bodyMass ?? (mantle.restVolume > 0 ? mantle.restVolume * this.rodKnobs.density : null);
     if (rods.length && !(armsMass > 0)) console.warn('arms: no body mass to share among the rod arms; each weighs its own drawn volume');
-    this.rods = this.arms.map((arm) => (rods.includes(arm.index) ? new RodArm(arm, this.rodKnobs, armsMass > 0 ? armsMass * armMassShare(arm.index, this.knobs, this.rodKnobs) : null) : null));
-    this.bodies = this.arms.map((arm, s) => this.rods[s] ?? arm);
+    const caps = this._rootCaps(rods);
+    this.rods = this.arms.map((arm, s) => (rods.includes(arm.index) ? new RodArm(arm, this.rodKnobs, armsMass > 0 ? armsMass * armMassShare(arm.index, this.knobs, this.rodKnobs) : null, { cap: caps[s] }) : null));
+    this.shadow = rodMode === 'shadow';
+    this.bodies = this.arms.map((arm, s) => (this.shadow ? arm : this.rods[s] ?? arm));
     this.holdDelta = this.rods.map((rod, s) => (rod ? new Float64Array(this.arms[s].rest.length) : null));
     this._anyRod = this.rods.some(Boolean);
     // The water's velocity at a point, for the rods' drag: set once the tank's currents exist.
@@ -87,6 +90,22 @@ export class Arms {
     this._build();
     this._initSuckers(seed);
     this.tick(0, 0, true);
+  }
+
+  /* The most each rod arm's collision radius may be: clear of both neighbors' roots on her crown at rest by rootGap, two
+     rods side by side splitting the spacing. Her canon root is thicker than the authored arms beside it. */
+  _rootCaps(rods) {
+    const count = this.arms.length, caps = new Array(count).fill(Infinity), P = this.mantle.shell?.positions, R = this.mantle.roots, gap = this.rodKnobs.rootGap;
+    if (count < 2 || !P) return caps;
+    const isRod = (s) => rods.includes(this.arms[s].index);
+    for (let s = 0; s < count; s++) {
+      if (!isRod(s)) continue;
+      for (const nb of [(s + count - 1) % count, (s + 1) % count]) {
+        const a = R[s] * 3, b = R[nb] * 3, d = Math.hypot(P[a] - P[b], P[a + 1] - P[b + 1], P[a + 2] - P[b + 2]);
+        caps[s] = Math.min(caps[s], isRod(nb) ? (d - gap) / 2 : d - this.arms[nb].rad0[0] - gap);
+      }
+    }
+    return caps;
   }
 
   _initSuckers(seed) {
@@ -206,7 +225,7 @@ export class Arms {
     for (const arm of this.bodies) {
       const segs = [];
       for (let s = 0; s < arm.n - 1; s++) {
-        const r = (arm.rad0[s] + arm.rad0[s + 1]) / 2;
+        const r = capsuleRadius(arm, s, 1);
         const e = this.phys.addRigid('capsule', [arm.len0[s] / 2, r], [0, -1, 0], { motion: 'kinematic', layer: LAYERS.ARMS, friction: 0.8 });
         e.tag = 'arm';
         // The render mesh is built once from `size`; `scale` is how far the live capsule has grown from it.
@@ -228,7 +247,7 @@ export class Arms {
     let sh = this.shapes.get(key);
     if (!sh) {
       const lam = this.knobs.stretchMin + b * this.knobs.capsuleStep;
-      const r = (arm.rad0[s] + arm.rad0[s + 1]) / 2 / Math.sqrt(lam);
+      const r = capsuleRadius(arm, s, lam);
       sh = new this.phys.Jolt.CapsuleShape(Math.max(1e-4, arm.len0[s] * lam / 2), r, null);
       sh.AddRef();
       this.shapes.set(key, sh);
@@ -301,9 +320,9 @@ export class Arms {
         const p = this.track[a].body.GetPosition();
         if (g.face) { g.face[0] = p.GetX(); g.face[1] = p.GetY(); g.face[2] = p.GetZ(); }
       }
-      // A rod arm's intent chain is a ghost: what it pokes into, its rod pushes.
+      // A driving rod's intent chain is a ghost: what it pokes into, its rod pushes.
       const rod = this.rods[a];
-      this._rec = rod ? -1 : a; this._skipHeld(a);
+      this._rec = rod && !this.shadow ? -1 : a; this._skipHeld(a);
       arm.step(dt, this.world, this.body);
       if (rod) {
         const t1 = performance.now();
@@ -312,22 +331,21 @@ export class Arms {
         rodMs += performance.now() - t1;
       }
     }
-    // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which gets the last word: an
-    // authored arm's lengths, limits, and contact; a rod arm's intent chain on its own, then its rod's contact. The
-    // last round records which side of each other the arms lie on.
-    const C = this.contact, rounds = Math.max(1, k.finishIters), hold = this.rodKnobs.hold;
+    // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which has the last word; a driving
+    // rod's intent chain contacts on its own, and a shadow rod meets only the world and her body, shoving nothing.
+    const C = this.contact, rounds = Math.max(1, k.finishIters), hold = this.rodKnobs.hold, shadow = this.shadow;
     C.tick++;
     C.touchGap = this.suckerKnobs.touchGap; C.faceCos = this.suckerKnobs.faceCos;
     for (let it = 0; it < rounds; it++) {
       const last = it === rounds - 1;
       separateArms(this.bodies, k, C, last ? 1 : 0);
       for (let a = 0; a < arms.length; a++) {
-        const rod = this.rods[a];
-        if (!rod) { this._rec = a; this._skipHeld(a); arms[a].finishPass(this.world, this.body, last); continue; }
-        this._rec = -1; this._skipHeld(a);
-        arms[a].finishPass(this.world, this.body, last, hold === 'ghost');
+        const rod = this.rods[a], drives = rod && !shadow;
+        this._rec = drives ? -1 : a; this._skipHeld(a);
+        arms[a].finishPass(this.world, this.body, last, !drives || hold === 'ghost');
+        if (!rod) continue;
         const t1 = performance.now();
-        this._rec = a;
+        this._rec = drives ? a : -1;
         rod.contact(this.world, this.body, last);
         rodMs += performance.now() - t1;
       }
@@ -339,7 +357,7 @@ export class Arms {
       const t1 = performance.now();
       rod.settle(dt);
       // The contact hold comes from the rod: what it lies on bends the program's later rest shapes, never its sag.
-      if (hold === 'rod') arms[a]._feedback(rod.contactHold);
+      if (hold === 'rod' && !shadow) arms[a]._feedback(rod.contactHold);
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
       const H = this.holdDelta[a], R = arms[a].rest;
       for (let i = 0; i < H.length; i++) H[i] = R[i] - H[i];
@@ -401,7 +419,7 @@ export class Arms {
           const rl = this.knobs.stretchMin + b * step;
           bodies.SetShape(seg.id, this._shape(a, s, b, arm), false, J.EActivation_Activate);
           seg.bin = b; seg.gen = arm.restGen;
-          const r0 = seg.size[1], h0 = seg.size[0], r = (arm.rad0[s] + arm.rad0[s + 1]) / 2 / Math.sqrt(rl);
+          const r0 = seg.size[1], h0 = seg.size[0], r = capsuleRadius(arm, s, rl);
           seg.scale[0] = r / r0; seg.scale[1] = (arm.len0[s] * rl / 2 + r) / (h0 + r0);
         }
         quatFromY(dx, dy, dz, q, 0);
@@ -1077,7 +1095,8 @@ export class Arms {
     const arm = this.bodies[a], L = this.layouts[a], j = L.seg[i];
     const f = Math.max(0, Math.min(1, (L.arc[i] - arm.arc0[j]) / arm.len0[j])), F = segFrame(arm, j, f, this._fr);
     if (!F) return null;
-    const r = arm.rad[j] + (arm.rad[j + 1] - arm.rad[j]) * f, side = L.row[i] ? 0.4 : -0.4;
+    // On the skin as drawn: a rod's collision radius is capped near the root.
+    const R = arm.drawRad ?? arm.rad, r = R[j] + (R[j + 1] - R[j]) * f, side = L.row[i] ? 0.4 : -0.4;
     for (let c = 0; c < 3; c++) out[c] = F.m[c] + F.e2[c] * r * 0.9 + F.e3[c] * r * side;
     return out;
   }
@@ -1105,6 +1124,13 @@ function segFrame(arm, j, f, out) {
   e2[0] = sx / sl; e2[1] = sy / sl; e2[2] = sz / sl;
   e3[0] = dy * e2[2] - dz * e2[1]; e3[1] = dz * e2[0] - dx * e2[2]; e3[2] = dx * e2[1] - dy * e2[0];
   return out;
+}
+
+/* Segment s's capsule radius at stretch lam, thinning as it lengthens; a rod's drawn radii thin first and then meet its
+   cap, as its live collision radius does. */
+function capsuleRadius(arm, s, lam) {
+  const q = Math.sqrt(lam), D = arm.drawRad0;
+  return D ? (Math.min(D[s] / q, arm.cap) + Math.min(D[s + 1] / q, arm.cap)) / 2 : (arm.rad0[s] + arm.rad0[s + 1]) / 2 / q;
 }
 
 /* Quaternion rotating +Y onto the unit vector d, written into out[o..o+3]. */

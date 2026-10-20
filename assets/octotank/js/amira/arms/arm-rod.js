@@ -1,7 +1,7 @@
 import { Rod, ROD_KNOBS, frameQuat } from './arm-rod-core.js';
-import { restArm, armVolume, projectPoint, travelPoint, focusChain } from './arm-core.js';
+import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends } from './arm-core.js';
 
-/* A rod arm's body chain: the intent Arm keeps its programs and its chain, its bends set the rod's rest shape, and the
+/* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
    rod, with mass, water, and contact of its own, is where the arm is; it reaches the intent only through _feedback. */
 
 // Fitted on the bench: a reach arrives about 0.1 s behind its program and a still arm's tip hangs about 2 cm low.
@@ -9,10 +9,12 @@ export const ROD_ARM_KNOBS = {
   ...ROD_KNOBS,
   E0: 1e6,
   tipStiff: 2,
-  rest: 'bends',         // the rest shape: the intent's posed bends, or 'targets', its programs' own with the rod as their spring
+  rest: 'chain',         // the rest shape: the intent's chain as its contact laid it, its posed bends ('bends', which can
+                         // run through her body), or 'targets' (its programs' own, with the rod as their spring)
   hold: 'rod',           // whose contact bends later rest shapes: 'rod', 'ghost' (the intent chain's own), or 'off'
   stiffRef: 90,          // 1/s² of authored joint stiffness that leaves the rod's bending as is, in targets mode
   rootShare: 0.033,      // the drawn arm's root radius over the full arm's length, the front pair's too
+  rootGap: 0.002,        // m a rod's collision radius keeps clear of its neighbors' roots on her crown
   current: true,         // the tank's currents push the rod
 };
 
@@ -39,17 +41,21 @@ export function armMassShare(index, armKnobs, k, count = 8) {
 }
 
 export class RodArm {
-  /* arm: the intent Arm; k: the rod knobs every rod arm shares; mass: this rod's kg. */
-  constructor(arm, k, mass) {
+  /* arm: the intent Arm; k: the rod knobs every rod arm shares; mass: this rod's kg; cap: the most its collision radius
+     may be, so a root beside thinner neighbors on her crown never overlaps theirs (the drawn arm keeps the canon girth). */
+  constructor(arm, k, mass, { cap = Infinity } = {}) {
     this.intent = arm;
     this.k = k;
     this.mass = mass;
+    this.cap = Math.max(arm.knobs.tipRadius, cap);
     const n = this.n = arm.n;
     this.X = new Float64Array(n * 3);     // the body chain as it lies; contact works on it, then hands the change to the rod
     this.P = new Float64Array(n * 3);     // last tick's
     this.Q = new Float64Array(n * 3);     // where it last lay clear, which the swept check starts from
-    this.rad = new Float64Array(n);
+    this.rad = new Float64Array(n);       // collision, live; the drawn radius with the cap
     this.rad0 = new Float64Array(n);
+    this.drawRad = new Float64Array(n);   // as drawn, live
+    this.drawRad0 = new Float64Array(n);
     this.SK = new Float64Array((n - 1) * 3);
     this.lam = new Float64Array(n - 1).fill(1);
     this.D = null;                         // the view measures the roll from SK
@@ -66,6 +72,8 @@ export class RodArm {
     this._n = [0, 0, 0];
     this._q = [0, 0, 0, 1];
     this._f9 = new Float64Array(9);
+    this._B = new Float64Array((n - 1) * 2);
+    this._s3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     this._sync();
   }
 
@@ -83,16 +91,17 @@ export class RodArm {
   _sync() {
     const arm = this.intent;
     if (this.restGen === arm.restGen) return;
-    drawnRadii(arm, this.k, this.rad0);
-    this.rad.set(this.rad0);
-    this.rod = new Rod({ len: arm.len0, rad: this.rad0, mass: this.mass }, this.k);
+    drawnRadii(arm, this.k, this.drawRad0);
+    this.drawRad.set(this.drawRad0);
+    for (let i = 0; i < this.n; i++) this.rad[i] = this.rad0[i] = Math.min(this.drawRad0[i], this.cap);
+    this.rod = new Rod({ len: arm.len0, rad: this.drawRad0, mass: this.mass }, this.k);
     this.restGen = arm.restGen;
     this.started = false;
     this._resets = 0;
   }
 
-  /* The rest shape from the intent chain: its posed bends, or in targets mode its programs' targets with each joint's
-     authored stiffness scaling the rod's bending there. */
+  /* The rest shape from the intent chain: its posed bends, the bends of its chain as its own contact laid it, or in
+     targets mode its programs' targets with each joint's authored stiffness scaling the rod's bending there. */
   _rest() {
     const arm = this.intent, rod = this.rod, k = this.k;
     if (k.rest === 'targets') {
@@ -103,7 +112,8 @@ export class RodArm {
         rod.bendScale[j] = this.stiff * Math.max(0.05, Math.min(20, kk / ref));
       }
     } else {
-      rod.setRestFromBends(arm.out, arm.twist, arm.lam);
+      const s = this._s3, B = k.rest === 'chain' && arm.X.every(Number.isFinite) ? chainBends(arm.frame, arm.twist, arm.X, this._B, this.n - 1, s[0], s[1], s[2]) : arm.out;
+      rod.setRestFromBends(B, arm.twist, arm.lam);
       rod.bendScale.fill(this.stiff);
     }
   }
@@ -115,6 +125,8 @@ export class RodArm {
     if (arm.valid === false) return;
     this._sync();
     const rod = this.rod, F = arm.frame, q = frameQuat(F.u, F.v, F.d, this._q);
+    // A root that jumped (a reset, a teleport) laid the intent chain afresh; dragged there, the rod would whip.
+    if (arm._jumped) this.started = false;
     this._rest();
     if (!this.started) {
       // On the intent chain as it lies, which its own contact has already laid clear at full length.
@@ -133,7 +145,7 @@ export class RodArm {
     this.X.set(rod.x);
     if (!this.started) this.P.set(this.X);
     this.Q.set(this.P);
-    rod.radii(this.rad);
+    this._radii();
     // Arm-on-arm contact reads the sucker side before settle does, so it gets this tick's.
     this._frames();
     this._touched.fill(0);
@@ -188,8 +200,13 @@ export class RodArm {
     rod.alignFrames();
     X.set(x);
     this.Q.set(X);
-    rod.radii(this.rad);
+    this._radii();
     this._frames();
+  }
+
+  _radii() {
+    this.rod.radii(this.drawRad);
+    for (let i = 0; i < this.n; i++) this.rad[i] = Math.min(this.drawRad[i], this.cap);
   }
 
   /* Each segment's live stretch, and its sucker side from the rod's own frame, as poseFromBends lays it on the posed one. */

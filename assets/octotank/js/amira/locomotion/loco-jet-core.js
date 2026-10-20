@@ -11,7 +11,7 @@ export const JET_KNOBS = {
   jetMeters: 3,           // m of jetting that spends the whole oxygen debt ("more than a few meters is impossible")
   jetRecover: 30,         // s the debt takes to clear from full; recovery after a jet is unmeasured
   jetReady: 0.5,          // debt above which no new jet starts
-  jetRest: 6,             // s after a jet before the next may start, however short it was: the heart restarts
+  jetRest: 3,             // s after a jet before the next may start, however short it was: the heart restarts
   jetMaxT: 6,             // s one jet may thrust
   jetHz: 1.5,             // mantle pulses per second and their depth; both unmeasured in Octopus
   jetDepth: 0.06,
@@ -20,6 +20,7 @@ export const JET_KNOBS = {
   trailTip: 0.1,          // lasts well under a second, so the arms must swing back fast
   jetStop: 0.15,          // m from a surface ahead, plus jetCoast of her drag coast, where thrust ends
   jetCoast: 0.5,
+  jetTouch: 0.01,         // m from a surface where a jet meant to reach it ('touch') stops thrusting: she arrives at speed
   jetAlign0: 0.3,         // cos of the thrust's angle off the course where thrust starts, and where it is full
   jetAlign1: 0.8,
   alignK: 30,             // 1/s² and 1/s: the steering spring on that angle, and its damper on the axis's swing

@@ -26,7 +26,8 @@ export class Breaches {
     for (const [a, b] of m.edges) stamp(this.oldSkin, this.skin, a, b, 0.003, 0.05);
     for (let j = 0; j < this.arms.bodies.length; j++) {
       const arm = this.arms.bodies[j];
-      for (let i = 0; i < arm.n - 1; i++) stamp(this.oldArms[j], arm.X, i, i + 1, Math.max(0.004, arm.rad[i]), 0.5);
+      const R = arm.drawRad ?? arm.rad;
+      for (let i = 0; i < arm.n - 1; i++) stamp(this.oldArms[j], arm.X, i, i + 1, Math.max(0.004, R[i]), 0.5);
       this.oldArms[j].set(arm.X);
     }
     this.oldSkin.set(this.skin);

@@ -2,7 +2,7 @@
    frames rolled onto the sucker side), the sucker cups' frames on it, and the web between neighboring arms. */
 
 export const VIEW_KNOBS = {
-  girth: 1,              // drawn radius over the collision radius
+  girth: 1,              // scale on the drawn radii
   previewRoot: 0,        // m: draw the arms on a candidate taper with this root radius (0 off)
   previewPow: 0,         // and this exponent (0 keeps the arm's own)
   sub: 4,                // rings per chain segment

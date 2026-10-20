@@ -177,6 +177,35 @@ function bendFrame(d, u, v, ku, kv) {
   v[0] += ve * (nex - ex); v[1] += ve * (ney - ey); v[2] += ve * (nez - ez);
 }
 
+/* The bends that reproduce chain P from root frame F (P[0] at its root) under twists tw, into out for the first `count`
+   joints: poseFromBends run backward. d, u, and v are 3-array scratch. */
+export function chainBends(F, tw, P, out, count, d, u, v) {
+  d[0] = F.d[0]; d[1] = F.d[1]; d[2] = F.d[2];
+  u[0] = F.u[0]; u[1] = F.u[1]; u[2] = F.u[2];
+  v[0] = F.v[0]; v[1] = F.v[1]; v[2] = F.v[2];
+  for (let j = 0; j < count; j++) {
+    let qx = P[j * 3 + 3] - P[j * 3], qy = P[j * 3 + 4] - P[j * 3 + 1], qz = P[j * 3 + 5] - P[j * 3 + 2];
+    const ql = len3(qx, qy, qz);
+    out[j * 2] = 0; out[j * 2 + 1] = 0;
+    if (ql >= 1e-12) {
+      qx /= ql; qy /= ql; qz /= ql;
+      const c = qx * d[0] + qy * d[1] + qz * d[2];
+      let ex = qx - c * d[0], ey = qy - c * d[1], ez = qz - c * d[2];
+      const el = len3(ex, ey, ez);
+      let phi = 0;
+      if (el < 1e-12) { if (c <= 0) { ex = u[0]; ey = u[1]; ez = u[2]; phi = Math.PI; } }
+      else { ex /= el; ey /= el; ez /= el; phi = Math.atan2(el, c); }
+      if (phi > 0) {
+        const ku = phi * (ex * u[0] + ey * u[1] + ez * u[2]), kv = phi * (ex * v[0] + ey * v[1] + ez * v[2]);
+        out[j * 2] = ku; out[j * 2 + 1] = kv;
+        bendFrame(d, u, v, ku, kv);
+      }
+    }
+    roll(u, v, tw[j]);
+  }
+  return out;
+}
+
 function normalize3(a, fx = 0, fy = 1, fz = 0) {
   const l = len3(a[0], a[1], a[2]);
   if (l < 1e-12 || !Number.isFinite(l)) { a[0] = fx; a[1] = fy; a[2] = fz; return a; }
@@ -1489,34 +1518,7 @@ export class Arm {
 
   /* The bends that reproduce chain P from this arm's root frame (P[0] is assumed at the root), under the arm's
      current twist; joints from `count` on are left as they are. */
-  bendsFromPoints(P, out, count = this.n - 1) {
-    const F = this.frame, f = this._f, tw = this.twist;
-    const d = f.d, u = this._a, v = this._b;
-    d[0] = F.d[0]; d[1] = F.d[1]; d[2] = F.d[2];
-    u[0] = F.u[0]; u[1] = F.u[1]; u[2] = F.u[2];
-    v[0] = F.v[0]; v[1] = F.v[1]; v[2] = F.v[2];
-    for (let j = 0; j < count; j++) {
-      let qx = P[j * 3 + 3] - P[j * 3], qy = P[j * 3 + 4] - P[j * 3 + 1], qz = P[j * 3 + 5] - P[j * 3 + 2];
-      const ql = len3(qx, qy, qz);
-      out[j * 2] = 0; out[j * 2 + 1] = 0;
-      if (ql >= 1e-12) {
-        qx /= ql; qy /= ql; qz /= ql;
-        const c = qx * d[0] + qy * d[1] + qz * d[2];
-        let ex = qx - c * d[0], ey = qy - c * d[1], ez = qz - c * d[2];
-        const el = len3(ex, ey, ez);
-        let phi = 0;
-        if (el < 1e-12) { if (c <= 0) { ex = u[0]; ey = u[1]; ez = u[2]; phi = Math.PI; } }
-        else { ex /= el; ey /= el; ez /= el; phi = Math.atan2(el, c); }
-        if (phi > 0) {
-          const ku = phi * (ex * u[0] + ey * u[1] + ez * u[2]), kv = phi * (ex * v[0] + ey * v[1] + ez * v[2]);
-          out[j * 2] = ku; out[j * 2 + 1] = kv;
-          bendFrame(d, u, v, ku, kv);
-        }
-      }
-      roll(u, v, tw[j]);
-    }
-    return out;
-  }
+  bendsFromPoints(P, out, count = this.n - 1) { return chainBends(this.frame, this.twist, P, out, count, this._f.d, this._a, this._b); }
 
   /* Integrate bends B outward from the root frame into points P and segment directions D, with each segment's
      twist rolling the frame the next joint bends in. */

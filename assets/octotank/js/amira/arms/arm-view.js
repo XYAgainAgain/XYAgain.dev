@@ -1,9 +1,9 @@
 import * as THREE from 'three/webgpu';
 import { VIEW_KNOBS, ArmTube, WebSector, newFrame, ringAtArc, tubeIndex, gridIndex, sectorName, webArmDepth } from './arm-view-core.js';
 
-/* Her arms as she looks: one smooth tube per solved chain (a rod arm's body), the sucker cups along its oral face, the
-   web between neighboring arm bases, and for a rod arm its intent chain as a thin ghost when asked for. Render-only;
-   the capsules stay the collision and are hidden unless asked for. */
+/* Her arms as she looks: one smooth tube per body chain at its drawn girth, the sucker cups along its oral face, the
+   web between neighboring arm bases, and for a rod arm its other chain (the intent, or a shadow rod) as a thin ghost.
+   Render-only; the capsules stay the collision and are hidden unless asked for. */
 
 const SKIN = 0x8c5fb0;
 const CUP = 0xa987c4;   // the skin a quarter of the way to white
@@ -71,7 +71,7 @@ export class ArmView {
     this.msCount = 0;
   }
 
-  /* A rod arm's intent chain drawn beside it, so its lag and sag read at a glance. */
+  /* A rod arm's other chain drawn beside it, so the rod's lag and sag read at a glance. */
   get ghost() { return !!this.ghostMesh?.visible; }
   set ghost(v) { if (this.ghostMesh) this.ghostMesh.visible = !!v; }
 
@@ -108,13 +108,13 @@ export class ArmView {
   _cupLayout(a) {
     const c = this.cupCache[a], L = this.arms.layouts[a], arm = this.arms.bodies[a];
     if (c.layout === L && c.gen === arm.restGen) return c;
-    const sub = this.tubes[a].sub;
+    const sub = this.tubes[a].sub, rad0 = arm.drawRad0 ?? arm.rad0;
     if (!c.u || c.u.length < L.n) { c.u = new Float64Array(L.n); c.big = new Uint8Array(L.n); }
     const frac = this.arms.suckerKnobs.suckerFrac;
     for (let i = 0; i < L.n; i++) {
       c.u[i] = ringAtArc(L.arc[i], arm.len0, arm.arc0, sub);
       const j = L.seg[i], f = Math.max(0, Math.min(1, (L.arc[i] - arm.arc0[j]) / arm.len0[j]));
-      c.big[i] = L.radius[i] > 1.01 * frac * (arm.rad0[j] + (arm.rad0[j + 1] - arm.rad0[j]) * f) ? 1 : 0;
+      c.big[i] = L.radius[i] > 1.01 * frac * (rad0[j] + (rad0[j + 1] - rad0[j]) * f) ? 1 : 0;
     }
     c.layout = L; c.gen = arm.restGen;
     if (!this._warned && this.arms.layouts.reduce((s, x) => s + x.n, 0) > this.capacity) {
@@ -163,23 +163,23 @@ export class ArmView {
     const pos = this.ghostGeo.attributes.position.array, nor = this.ghostGeo.attributes.normal.array, N = this.arms.rootsN, inw = this._in;
     const g = girth * (this.knobs.ghostGirth > 0 ? this.knobs.ghostGirth : 0.45);
     for (let s = 0; s < this.ghostSlots.length; s++) {
-      const a = this.ghostSlots[s], arm = this.arms.arms[a], tube = this.ghostTubes[s];
+      const a = this.ghostSlots[s], A = this.arms, arm = A.bodies[a] === A.arms[a] ? A.rods[a] : A.arms[a], tube = this.ghostTubes[s];
       inw[0] = -N[a * 3]; inw[1] = -N[a * 3 + 1]; inw[2] = -N[a * 3 + 2];
-      if (tube.update(arm.X, arm.rad, arm.SK, g, this.mantle.rootWorld(a, this._root), arm.D, arm.twist)) tube.write(pos, nor, s * this.tubeVerts, this.knobs.rootSink, Number.isFinite(inw[0] + inw[1] + inw[2]) ? inw : null);
+      if (tube.update(arm.X, arm.drawRad ?? arm.rad, arm.SK, g, this.mantle.rootWorld(a, this._root), arm.D, arm.twist)) tube.write(pos, nor, s * this.tubeVerts, this.knobs.rootSink, Number.isFinite(inw[0] + inw[1] + inw[2]) ? inw : null);
     }
     this.ghostGeo.attributes.position.needsUpdate = true;
     this.ghostGeo.attributes.normal.needsUpdate = true;
   }
 
-  /* The live radii, or with previewRoot set, the live radii carried onto a candidate taper (root radius previewRoot,
-     exponent previewPow, the arm's own tip), to judge thicker collision numbers before they exist. */
+  /* The live drawn radii (a rod's collision radius is capped at the root), or with previewRoot set, carried onto a
+     candidate taper (root radius previewRoot, exponent previewPow, the arm's own tip), to judge it before it exists. */
   _radii(a, arm) {
-    const k = this.knobs;
-    if (!(k.previewRoot > 0)) return arm.rad;
-    const out = this._rad[a], tip = arm.knobs.tipRadius, pow = k.previewPow > 0 ? k.previewPow : arm.knobs.taperPow, L = arm.length;
+    const k = this.knobs, rad = arm.drawRad ?? arm.rad;
+    if (!(k.previewRoot > 0)) return rad;
+    const out = this._rad[a], rad0 = arm.drawRad0 ?? arm.rad0, tip = arm.knobs.tipRadius, pow = k.previewPow > 0 ? k.previewPow : arm.knobs.taperPow, L = arm.length;
     for (let i = 0; i < arm.n; i++) {
       const want = tip + (k.previewRoot - tip) * Math.pow(Math.max(0, 1 - arm.arc0[i] / L), pow);
-      out[i] = arm.rad[i] * want / Math.max(1e-5, arm.rad0[i]);
+      out[i] = rad[i] * want / Math.max(1e-5, rad0[i]);
     }
     return out;
   }

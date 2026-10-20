@@ -4,6 +4,7 @@ import { Arm } from '../amira/arms/arm-core.js';
 import { TANK } from '../config.js';
 import { section } from './panel.js';
 import { register, until } from './scenarios.js';
+import { RodDiag } from './rod-diag.js';
 
 /* The bench (?bench=arm): Amira set aside and one arm on a mount in the real tank, so the rod arm can be looked at and
    measured on its own (Rod Arm Build Plan, Stage 2). The mount stands in for her body with the surface Arms reads. */
@@ -20,6 +21,7 @@ export const BENCH_KNOBS = {
 
 export const SCRIPTS = { hold: 'Hold', eight: 'Figure-8', jerk: 'Jerk', carry: 'Carry' };
 const MARGIN = 0.06;
+const NO_ROD = Object.freeze({ tipLag: 0, shapeRms: 0, shapeMax: 0, rootN: 0, rootNm: 0, kinetic: 0, speedMax: 0 });
 
 /* Her body's mass by the rule, drawn volume at tissue density, from the shell she would have; her arms together match it. */
 export function benchBodyMass(density) {
@@ -163,8 +165,6 @@ export class Bench {
     this.arm = arms.arms[this.slot];
     this.rod = arms.rods[this.slot];
     this.listeners = new Set();
-    this.limp = false;
-    this.stat = { tipLag: 0, shapeRms: 0, shapeMax: 0, rootN: 0, rootNm: 0, kinetic: 0, speedMax: 0 };
     this.twin = twin ? new Arm(this.arm.index, arms.knobs, seed) : null;
     this.twinLog = { ticks: 0, mismatches: 0, first: null };
     if (this.twin) this._twinStep(0);
@@ -173,33 +173,19 @@ export class Bench {
     this._controls();
   }
 
+  /* The rod's live numbers against its intent chain (rod-diag.js). */
+  get stat() { return this.diag.stats[0] ?? NO_ROD; }
+
+  get limp() { return this.diag.limp; }
+
   /* Before the arms: the mount moves. */
   tick(dt) { this.mount.tick(dt); }
 
   /* After the arms and before anything else that tick: the twin, the stats, then any scenario watching. */
   after(dt) {
     if (this.twin) this._twinStep(dt);
-    this._stats();
+    this.diag.tick();
     for (const fn of this.listeners) fn(dt);
-  }
-
-  _stats() {
-    const s = this.stat, rod = this.rod;
-    if (!rod) return;
-    const A = this.arm.X, B = rod.X, n = this.arm.n;
-    let sum = 0, max = 0;
-    for (let i = 0; i < n; i++) {
-      const d = Math.hypot(B[i * 3] - A[i * 3], B[i * 3 + 1] - A[i * 3 + 1], B[i * 3 + 2] - A[i * 3 + 2]);
-      sum += d * d; if (d > max) max = d;
-    }
-    const t = (n - 1) * 3, v = rod.rod.v;
-    s.tipLag = Math.hypot(B[t] - A[t], B[t + 1] - A[t + 1], B[t + 2] - A[t + 2]);
-    s.shapeRms = Math.sqrt(sum / n); s.shapeMax = max;
-    s.rootN = Math.hypot(...rod.rod.rootForce); s.rootNm = Math.hypot(...rod.rod.rootTorque);
-    s.kinetic = rod.kinetic();
-    let vm = 0;
-    for (let i = 0; i < v.length; i += 3) vm = Math.max(vm, Math.hypot(v[i], v[i + 1], v[i + 2]));
-    s.speedMax = vm;
   }
 
   /* The twin gets everything Arms gives the intent chain (frame, lead, a fetch's moving target, the contact passes)
@@ -252,10 +238,7 @@ export class Bench {
 
   setResting(v) { this._both((arm, real) => { if (real) this.arms.resting = v; else arm.resting = v; }); }
 
-  setLimp(v) {
-    this.limp = !!v;
-    if (this.rod) this.rod.stiff = this.limp ? this.mount.k.limp : 1;
-  }
+  setLimp(v) { this.diag.setLimp(v); }
 
   /* The rod laid back along the intent chain at rest. */
   resetRod() { this.rod?.reset(); }
@@ -306,38 +289,23 @@ export class Bench {
   takeClick() { const c = this._clicked; this._clicked = false; return c; }
 
   describe() {
-    const m = this.mount, s = this.stat, k = this.arms.rodKnobs, rs = this.arms.rodStats(), cm = (v) => (v * 100).toFixed(1);
+    const m = this.mount, L = this.twinLog;
     const lines = [`Mount    ${SCRIPTS[m.script]}   at ${m.center.map((v) => v.toFixed(2)).join(', ')}   pitch ${Math.round((m.k.pitch + m.angle) * 180 / Math.PI)}°`];
     if (!this.rod) return [...lines, 'Rod      off (?rod=0): the authored arm'];
-    lines.push(`Rod      E ${k.E0.toExponential(1)} Pa × ${k.tipStiff} at the tip   rest ${k.rest}   hold ${k.hold}${this.limp ? '   LIMP' : ''}   ${this.rod.mass ? `${Math.round(this.rod.mass * 1000)} g` : ''}`);
-    lines.push(`Lag      tip ${cm(s.tipLag)} cm   shape rms ${cm(s.shapeRms)} cm, max ${cm(s.shapeMax)} cm   fastest ${s.speedMax.toFixed(2)} m/s`);
-    lines.push(`Mount    pull ${(s.rootN * 1000).toFixed(0)} mN   twist ${(s.rootNm * 1000).toFixed(1)} mN·m   motion ${(s.kinetic * 1000).toFixed(2)} mJ`);
-    lines.push(`Cost     rod ${rs.p50.toFixed(3)} ms p50, ${rs.p95.toFixed(3)} p95${this.twin ? `   twin ${this.twinLog.mismatches ? `DIFFERS at tick ${this.twinLog.first.tick} (${this.twinLog.first.field})` : `matches over ${this.twinLog.ticks} ticks`}` : ''}`);
-    return lines;
+    return [...lines, ...this.diag.describe('Mount', this.twin ? `   twin ${L.mismatches ? `DIFFERS at tick ${L.first.tick} (${L.first.field})` : `matches over ${L.ticks} ticks`}` : '')];
   }
 
+  /* The mount's own controls around the rod's shared ones. */
   _controls() {
-    const k = this.arms.rodKnobs, rod = !!this.rod, add = (a) => section('bench').add(a);
+    const add = (a) => section('bench').add(a);
     for (const [name, label] of Object.entries(SCRIPTS)) {
       add({ key: String(Object.keys(SCRIPTS).indexOf(name) + 1), name: `Mount: ${label}`, label: () => (this.mount.script === name ? `${label} ✓` : label), run: () => this.mount.setScript(name) });
     }
-    add({ key: '5', name: 'Limp', label: () => (this.limp ? 'Limp: on' : 'Limp: off'), run: () => this.setLimp(!this.limp), disabled: !rod });
     add({ key: '6', name: 'Drape over the rock', label: () => 'Drape over the rock', run: () => this.drape() });
     add({ key: '7', name: 'Fetch to the mount', label: () => 'Fetch to the mount', run: () => this.fetch() });
-    add({ key: 'j', name: 'Ghost', label: () => (this.view?.ghost ? 'Ghost: shown' : 'Ghost: hidden'), run: () => { if (this.view) this.view.ghost = !this.view.ghost; }, disabled: !rod });
-    add({ key: 'k', name: 'Rest source', label: () => `Rest: ${k.rest}`, run: () => { k.rest = k.rest === 'bends' ? 'targets' : 'bends'; }, disabled: !rod });
-    add({ key: 'p', name: 'Contact hold', label: () => `Hold: ${k.hold}`, run: () => { k.hold = k.hold === 'rod' ? 'ghost' : k.hold === 'ghost' ? 'off' : 'rod'; }, disabled: !rod || !!this.twin });
-    add({ key: 'u', name: 'Current', label: () => (k.current ? 'Current: on' : 'Current: off'), run: () => { k.current = !k.current; }, disabled: !rod });
-    add({ key: 'x', name: 'Reset the rod', label: () => 'Reset the rod', run: () => this.resetRod(), disabled: !rod });
-    if (!rod) return;
-    const sci = (v) => v.toExponential(1).replace('e+', 'e');
-    const range = (name, values, get, set, fmt) => add({ type: 'range', name, values, get, set, label: () => `${name} ${fmt(get())}` });
-    range('Stiffness', [3e4, 1e5, 2e5, 3e5, 5e5, 1e6, 2e6, 5e6], () => k.E0, (v) => { k.E0 = v; }, (v) => `${sci(v)} Pa`);
-    range('Tip ×', [0.1, 0.25, 0.5, 1, 2, 4], () => k.tipStiff, (v) => { k.tipStiff = v; }, (v) => `${v}`);
-    range('Weight', [0, 0.02, 0.04, 0.08, 0.15, 0.3], () => k.weightFactor, (v) => { k.weightFactor = v; }, (v) => `${Math.round(v * 100)}% g`);
-    range('Added mass', [0, 0.5, 1], () => k.addedMass, (v) => { k.addedMass = v; }, (v) => `${v}`);
-    range('Substeps', [1, 2, 3, 4], () => k.substeps, (v) => { k.substeps = v; }, (v) => `${v}`);
-    range('Pitch', [-1.2, -0.8, -0.5, -0.26, 0, 0.3, 0.6], () => this.mount.k.pitch, (v) => { this.mount.k.pitch = v; }, (v) => `${Math.round(v * 180 / Math.PI)}°`);
+    this.diag = new RodDiag(this.arms, { name: 'bench', view: () => this.view, limp: this.mount.k.limp, holdLocked: !!this.twin });
+    if (!this.rod) return;
+    add({ type: 'range', name: 'Pitch', values: [-1.2, -0.8, -0.5, -0.26, 0, 0.3, 0.6], get: () => this.mount.k.pitch, set: (v) => { this.mount.k.pitch = v; }, label: () => `Pitch ${Math.round(this.mount.k.pitch * 180 / Math.PI)}°` });
   }
 }
 

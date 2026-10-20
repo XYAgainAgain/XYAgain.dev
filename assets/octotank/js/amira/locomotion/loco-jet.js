@@ -1,5 +1,6 @@
 import { JET_KNOBS, OxygenDebt, jetSpeed, swimSpeed, jetThrust, steerAlpha, steerAccel, domeCancel, adrift, stopDistance, rayHit, smoothstep, clamp } from './loco-jet-core.js';
 import { register, until } from '../../diag/scenarios.js';
+import { section } from '../../diag/panel.js';
 
 /* Her jets: mantle-first at 45 cm/s to 1 m/s with her arms trailing, and the slower head-first swim. Thrust is one uniform acceleration on every
    skin vertex (no torque, no tearing), steered by a force-free turn of her mantle onto the course; she holds the locomotion controller off while it
@@ -54,12 +55,15 @@ export class Jet {
 
   get busy() { return this.phase !== 'off'; }
 
-  /* A jet (or with kind 'swim', the head-first swim) along dir, or toward point `to`. speed overrides urgency's. Returns
-     true, or a string saying why not. */
+  /* A jet (or with kind 'swim', the head-first swim) along dir, or toward point `to`. speed overrides urgency's. Thrust
+     ends short of a surface ahead so she coasts up to it (stopAtWalls true), on reaching it ('touch'), or never (false).
+     Returns true, or a string saying why not. */
   start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true } = {}) {
     const L = this.loco, k = this.k, m = this.mantle;
-    if (this.phase !== 'off') return 'already moving';
-    if (L.hold) return 'held by a probe';
+    // Sinking after one counts as free (the hold on her gait is the glide's own): another jet takes her back up, once
+    // her heart allows.
+    if (this.phase === 'thrust') return 'already moving';
+    if (L.hold && this.phase !== 'glide') return 'held by a probe';
     if (this.arms.lead) return 'the scripted squeeze has the arms';
     if (!k.enabled || L.pose.rigid || m.drive !== 'force') return 'no soft drive';
     if (kind === 'jet' && !this.debt.ready) return this.debt.debt > k.jetReady ? 'oxygen debt' : 'resting';
@@ -77,7 +81,7 @@ export class Jet {
     this.vWant = Number.isFinite(speed) && speed > 0 ? Math.min(speed, k.vJetMax) : this.kind === 'jet' ? jetSpeed(u, k) : swimSpeed(u, k);
     if (this.kind === 'jet') this.debt.start();
     this.reason = reason;
-    this.stopAtWalls = stopAtWalls !== false;
+    this.stopAtWalls = stopAtWalls === 'touch' ? 'touch' : stopAtWalls !== false;
     // The crawl stands down: strokes and stations let go, the stance lets go, every patch is left free.
     L.standDown(0);
     L.hold = true;
@@ -236,7 +240,7 @@ export class Jet {
     if (this.stopAtWalls && this.arms.sdf) {
       this.arms.sdf.unfocus?.();
       // Along the course, not her velocity: the launch's first ticks can point her motion into the floor she leaves.
-      const stop = stopDistance(this.speed, drag, k);
+      const stop = this.stopAtWalls === 'touch' ? k.jetTouch : stopDistance(this.speed, drag, k);
       if (rayHit(this.arms.sdf.distance, this.apex, d, stop + 0.05) <= stop) return this._endThrust('wall');
     }
   }
@@ -386,17 +390,16 @@ export async function jetScenario(ctx, { dir = null, urgency = 1, variant = null
   }
 }
 
-/* J: jet away from the camera's glass toward the back, or toward the last clicked point if there is one. */
-export async function jetKey(ctx) {
-  const jet = ctx.loco.jetMode;
-  if (!jet) return { passed: null, failed: 'no jet installed' };
+/* J: up into the water column off the front glass, or at the last clicked point, all the way into whatever is there.
+   A key, not a scenario: a scenario's teardown would stand her down mid-flight and lock out the next press. */
+export function jetPress(jet) {
   const to = jet.lastClick;
-  const r = jet.start(to ? { to, urgency: 1, reason: 'key' } : { dir: [0, 0.3, -1], urgency: 1, reason: 'key' });
-  if (r !== true) return { passed: null, refused: r };
-  jet.lastClick = null;
-  await until(ctx.loco, () => jet.phase === 'off', 20);
-  return { passed: null, ...jet.last };
+  const r = jet.start({ ...(to ? { to } : { dir: [0, 1, -0.15] }), urgency: 1, reason: 'key', stopAtWalls: 'touch' });
+  if (r === true) jet.lastClick = null;
+  return r;
 }
+
+const jetLabel = (jet) => (jet.phase === 'thrust' ? 'Jet: thrusting' : jet.debt.ready ? 'Jet' : jet.debt.debt > jet.k.jetReady ? 'Jet: winded' : 'Jet: resting');
 
 /* Install on a Locomotion: loco.jet(opts), loco.startle(point, strength), loco.heartStopped, and the scenarios. */
 export function installJet(loco, opts = {}) {
@@ -407,7 +410,7 @@ export function installJet(loco, opts = {}) {
   loco.jet = (o) => jet.start(o);
   loco.startle = (p, s) => jet.startle(p, s);
   Object.defineProperty(loco, 'heartStopped', { get: () => jet.heartStopped, configurable: true });
-  register('jet', { label: 'Jet', key: 'j', run: jetKey });
+  section('loco').add({ key: 'j', name: 'Jet', label: () => jetLabel(jet), run: () => jetPress(jet) });
   register('jetCheck', { label: 'Jet check', run: jetScenario });
   return jet;
 }
