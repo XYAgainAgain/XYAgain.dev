@@ -1,8 +1,8 @@
 export const VISUAL_KNOBS = {
   sourceX: -0.92, sourceZ: -0.29, rippleStrength: 0.0015,
   caustics: 0.95, particles: 320, particleOpacity: 0.32,
-  reflectionResolution: 2048, reflectionHz: 30, reflectionStrength: 1.2, reflections: true,
-  refractionResolution: 384, refractionHz: 20, refractions: true,
+  opticsHz: 30, reflectionResolution: 2048, reflectionHz: 30, reflectionStrength: 1.2, reflections: true,
+  refractionResolution: 384, refractionHz: 30, refractions: true,
   contactStrength: 0.002, currentStrength: 0.14,
   ambientSpeed: 0.012, isolatedFlow: 0.22, swirlScale: 3.5, swirlRate: 0.12,
 };

@@ -1,0 +1,10 @@
+{
+  "tiers": { "1024": "tier-1k/", "512": "tier-512/", "256": "tier-256/" },
+  "sand": {
+    "albedo": "tank-sand-albedo.webp",
+    "normal": "tank-sand-normal.webp",
+    "height": "tank-sand-height.webp",
+    "roughness": "tank-sand-roughness.webp",
+    "ao": "tank-sand-ao.webp"
+  }
+}

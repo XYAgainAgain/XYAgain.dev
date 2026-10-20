@@ -1,0 +1,88 @@
+import { TANK, WALL, LAYERS } from '../config.js';
+
+/* The fixed furniture: six tank panels, a rock wall with a slot, and two rocks, all plain Jolt shapes (the toys are
+   in enrichment/toys.js). `tag` is what a piece is to the code; `taste` is what a sucker reports touching it, and can change. */
+
+export const LAYOUT_KNOBS = {
+  panelX: 0.1,        // where the rock wall stands
+  gapH: 0.07,         // the slot's height, under the mantle's 0.12 m resting diameter
+  gapY: 0.32,         // slot center height
+  panelT: 0.06,
+  bullnose: true,     // round the slot's lips; a hard box corner snags shell vertices on the way through
+};
+
+export function buildTank(phys) {
+  const hw = TANK.w / 2, hh = TANK.h / 2, hd = TANK.d / 2, t = WALL / 2;
+  const opts = { motion: 'static', layer: LAYERS.NON_MOVING, friction: 0.6 };
+  const walls = [
+    phys.addRigid('box', [hw + WALL, t, hd + WALL], [0, -t, 0], opts),                 // floor
+    phys.addRigid('box', [hw + WALL, t, hd + WALL], [0, TANK.h + t, 0], opts),         // lid
+    phys.addRigid('box', [t, hh + WALL, hd + WALL], [-hw - t, hh, 0], opts),           // left
+    phys.addRigid('box', [t, hh + WALL, hd + WALL], [hw + t, hh, 0], opts),            // right
+    phys.addRigid('box', [hw + WALL, hh + WALL, t], [0, hh, -hd - t], opts),           // back
+    phys.addRigid('box', [hw + WALL, hh + WALL, t], [0, hh, hd + t], opts),            // front glass
+  ];
+  for (const w of walls) { w.tag = 'wall'; w.taste = 'glass'; }
+  walls[0].taste = 'floor';
+  walls[1].taste = 'lid';
+  return walls;
+}
+
+/* A rock wall across the tank split by a horizontal slot the full depth of the tank, so the glass sees the squeeze.
+   With the bullnose on, each lip is a capsule lying along z whose surface sits exactly on the slot's edge. */
+export function buildPanel(phys, k = LAYOUT_KNOBS) {
+  const hd = TANK.d / 2, ht = k.panelT / 2;
+  const opts = { motion: 'static', layer: LAYERS.NON_MOVING, friction: 0.5 };
+  const yTop = k.gapY + k.gapH / 2, yBot = k.gapY - k.gapH / 2;
+  const r = k.bullnose ? ht : 0;
+  const parts = [
+    phys.addRigid('box', [ht, (TANK.h - yTop - r) / 2, hd], [k.panelX, (TANK.h + yTop + r) / 2, 0], opts),
+    phys.addRigid('box', [ht, (yBot - r) / 2, hd], [k.panelX, (yBot - r) / 2, 0], opts),
+  ];
+  if (r > 0) {
+    const alongZ = axisAngle(1, 0, 0, Math.PI / 2);
+    parts.push(phys.addRigid('capsule', [hd - r, r], [k.panelX, yTop + r, 0], { ...opts, rot: alongZ }));
+    parts.push(phys.addRigid('capsule', [hd - r, r], [k.panelX, yBot - r, 0], { ...opts, rot: alongZ }));
+  }
+  for (const p of parts) { p.tag = 'panel'; p.taste = 'rock'; }
+  return parts;
+}
+
+/* The holes she can pass through, for the squeeze's route: the slot's middle, its normal, half its height and width,
+   and the panel's thickness. A function of the knobs, so ?gap= reaches it. */
+export function apertures(k = LAYOUT_KNOBS) {
+  return [{ center: [k.panelX, k.gapY, 0], normal: [1, 0, 0], halfH: k.gapH / 2, halfW: TANK.d / 2, thick: k.panelT }];
+}
+
+export function buildRocks(phys) {
+  const opts = { motion: 'static', layer: LAYERS.NON_MOVING, friction: 0.7 };
+  const rocks = [
+    phys.addRigid('sphere', [0.09], [-0.55, 0.05, -0.12], opts),
+    phys.addRigid('box', [0.07, 0.05, 0.06], [0.5, 0.05, 0.1], { ...opts, rot: axisAngle(0, 1, 0, 0.5) }),
+  ];
+  for (const r of rocks) { r.tag = 'rock'; r.taste = 'rock'; }
+  return rocks;
+}
+
+export function axisAngle(x, y, z, angle) {
+  const l = Math.hypot(x, y, z) || 1, s = Math.sin(angle / 2);
+  return [x / l * s, y / l * s, z / l * s, Math.cos(angle / 2)];
+}
+
+/* Depth of a world point inside the panel's pieces: axis-aligned boxes, and capsules lying along z. */
+export function penetration(point, parts) {
+  let worst = 0;
+  for (const b of parts) {
+    if (b.kind === 'capsule') {
+      const dz = Math.max(0, Math.abs(point[2] - b.pos[2]) - b.size[0]);
+      const d = b.size[1] - Math.hypot(point[0] - b.pos[0], point[1] - b.pos[1], dz);
+      if (d > 0) worst = Math.max(worst, d);
+      continue;
+    }
+    const dx = b.size[0] - Math.abs(point[0] - b.pos[0]);
+    const dy = b.size[1] - Math.abs(point[1] - b.pos[1]);
+    const dz = b.size[2] - Math.abs(point[2] - b.pos[2]);
+    if (dx > 0 && dy > 0 && dz > 0) worst = Math.max(worst, Math.min(dx, dy, dz));
+  }
+  return worst;
+}

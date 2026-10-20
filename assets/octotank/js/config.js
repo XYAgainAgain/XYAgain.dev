@@ -1,5 +1,5 @@
-// Tank interior in meters; Jolt works in SI, so the tank is 2.0 × 1.0 × 0.7.
-export const TANK = { w: 2.0, h: 1.0, d: 0.7 };
+// Tank interior in meters; Jolt works in SI.
+export const TANK = { w: 2.0, h: 1.0, d: 1.0 };
 export const WALL = 0.05;
 export const FIXED_DT = 1 / 60;
 // A long frame never buys a third step; the ladder drops quality instead (Osminoktopus plan, Physics).

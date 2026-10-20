@@ -1,24 +1,29 @@
 import { TANK } from '../config.js';
-import { section } from '../panel.js';
-import { VISUAL_KNOBS, Waves, Flow, contactImpulse } from './water-core.js';
+import { section } from '../diag/panel.js';
+import { VISUAL_KNOBS, Waves, Flow } from './water-core.js';
 import { Surface } from './surface.js';
 import { Particles } from './particles.js';
 import { WaterObstacles } from './obstacles.js';
 import { Breaches } from './breaches.js';
 import { Circulation } from './currents.js';
+import { Displacements } from '../tank/toy-ripples.js';
 
 export class WaterVisuals {
   constructor({ renderer, scene, camera, ctx, jet, seed, enabled = true }) {
     Object.assign(this, { renderer, scene, camera, ctx, jet });
-    this.knobs = { ...VISUAL_KNOBS };
+    this.knobs = { ...VISUAL_KNOBS, sourceX: -TANK.w / 2 + 0.08, sourceZ: -TANK.d / 2 + 0.06 };
+    for (const key of ['reflectionHz', 'refractionHz']) Object.defineProperty(this.knobs, key, {
+      enumerable: true, get: () => this.knobs.opticsHz, set: (value) => { this.knobs.opticsHz = value; },
+    });
     this.enabled = enabled;
     this.reduced = matchMedia('(prefers-reduced-motion: reduce)');
-    this.waves = new Waves(TANK.w, TANK.d);
+    this.waves = new Waves(TANK.w, TANK.d, 128, Math.round(128 * TANK.d / TANK.w));
     this.obstacles = new WaterObstacles(ctx.phys, this.waves);
     this.obstacles.update(ctx.water.knobs.surfaceY);
     this.currents = new Circulation(this.waves, this.knobs, seed);
     this.currents.update(this.obstacles.bakes);
     this.breaches = new Breaches(ctx.mantle, ctx.arms, this.waves);
+    this.displacements = new Displacements(ctx.toys, this.waves);
     // The overflow is already running when the page opens.
     if (enabled && !this.reduced.matches) for (let i = 0; i < 960; i++) this.waves.advance(1 / 120, this.knobs);
     this.flow = new Flow(TANK.w, TANK.h, TANK.d);
@@ -37,10 +42,10 @@ export class WaterVisuals {
     section('view').add(this.maskAction);
     this.qualityActions = [
       ['Reflection resolution', 'reflectionResolution', [128, 256, 384, 512, 1024, 2048, 4096], 'px'],
-      ['Reflection rate', 'reflectionHz', [5, 10, 15, 20, 30, 60, 120], 'Hz'],
+      ['Water optics rate', 'opticsHz', [5, 10, 15, 20, 30, 60, 120], 'Hz'],
     ].map(([name, knob, values, unit]) => ({
       type: 'range', name, values, get: () => this.knobs[knob], label: () => `${name}: ${this.knobs[knob]} ${unit}`,
-      set: (value) => { if (!this.disposed) { this.knobs[knob] = value; this.surface.lastReflection = -Infinity; } },
+      set: (value) => { if (!this.disposed) { this.knobs[knob] = value; this.surface.lastReflection = -Infinity; this.surface.refraction.last = -Infinity; } },
     }));
     for (const action of this.qualityActions) section('view').add(action);
   }
@@ -79,7 +84,6 @@ export class WaterVisuals {
       const p = (arm.n - 1) * 3;
       put(arm.X[p], arm.X[p + 1], arm.X[p + 2], 0.025);
     }
-    this.creatureSamples = n;
     for (const toy of toys) {
       if (toy.motion !== 'dynamic') continue;
       const p = toy.body.GetPosition();
@@ -112,13 +116,12 @@ export class WaterVisuals {
         const distance = Math.hypot(dx, dy, dz);
         if (distance < 0.15 && !this.reduced.matches) {
           this.flow.stir(s[p], s[p + 1], s[p + 2], dx / dt, dy / dt, dz / dt, Math.max(0.11, s[p + 3] * 2), k.currentStrength * dt * 20);
-          const impulse = i >= this.creatureSamples ? contactImpulse(prev[old + 1], s[p + 1], level, s[p + 3], distance, k.contactStrength) : 0;
-          if (impulse) this.waves.impulse(s[p], s[p + 2], Math.max(0.05, s[p + 3]), impulse * Math.sign(dy || dx || dz));
         }
       }
       prev[old] = s[p]; prev[old + 1] = s[p + 1]; prev[old + 2] = s[p + 2];
     }
     this.breaches.update(level, k.contactStrength, valid && !this.reduced.matches);
+    this.displacements.update(level, k.contactStrength, valid && !this.reduced.matches);
     if (dt && !this.reduced.matches && this.jet.phase === 'thrust' && this.jet.siphonDir) {
       const d = this.jet.siphonDir, c = this.centroid, mouth = this.jet.parts?.siphon?.mesh.matrix.elements;
       const x = mouth ? mouth[12] : c[0], y = mouth ? mouth[13] : c[1], z = mouth ? mouth[14] : c[2];

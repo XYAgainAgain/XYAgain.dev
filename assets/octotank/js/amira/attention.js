@@ -1,4 +1,4 @@
-import { EYE } from './mantle-core.js';
+import { EYE } from './body/mantle-core.js';
 import { createRng, deriveSeed } from '../../../pond/js/rng.js';
 
 /* Where her attention goes and which arm answers it, THREE-free. She looks with one eye, the left by preference,

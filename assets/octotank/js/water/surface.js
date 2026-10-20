@@ -89,9 +89,9 @@ export class Surface {
       P[p] = THREE.DataUtils.toHalfFloat(h[j * nx + i]);
       P[p + 1] = THREE.DataUtils.toHalfFloat(this.slope[0]);
       P[p + 2] = THREE.DataUtils.toHalfFloat(this.slope[1]);
-      // Refracted near-vertical rays compress and spread the grid's light on the floor.
-      const x = i - this.slope[0] * this.level.value * 0.25 / dx;
-      const z = j - this.slope[1] * this.level.value * 0.25 / dz;
+      // A vertical ray bends uphill by (1 − 1/1.333) × slope, so crests focus light beneath them and troughs spread it.
+      const x = i + this.slope[0] * this.level.value * 0.25 / dx;
+      const z = j + this.slope[1] * this.level.value * 0.25 / dz;
       const ix = Math.floor(x), iz = Math.floor(z), fx = x - ix, fz = z - iz;
       for (let b = 0; b < 2; b++) for (let a = 0; a < 2; a++) {
         if (ix + a < 0 || ix + a >= nx || iz + b < 0 || iz + b >= nz) continue;
