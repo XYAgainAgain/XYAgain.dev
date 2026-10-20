@@ -1,12 +1,14 @@
 import { LAYERS } from '../../config.js';
 import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from '../locomotion/loco-carry-core.js';
 import { moveInputs } from '../locomotion/loco-carry.js';
-import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32 } from './arm-core.js';
+import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
+import { RodArm, ROD_ARM_KNOBS, armMassShare } from './arm-rod.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 
 /* Eight arm programs (arm-core.js) driving a kinematic Jolt capsule per segment. Each tick: root frames, programs and
-   contact, arm-on-arm rounds, the suckers (touch, taste, flicker, grips), then the capsules follow the solved chains. */
+   contact, arm-on-arm rounds, the suckers (touch, taste, flicker, grips), then the capsules follow the solved chains.
+   Everything that touches, tastes, collides, or draws reads `bodies`: a rod arm's rod (arm-rod.js), else the arm. */
 
 export const ARM_KNOBS = {
   ...CORE_KNOBS,
@@ -35,12 +37,28 @@ const WINDOW = 1800;
 export { CLAIM_TIERS };
 
 export class Arms {
-  constructor(phys, mantle, knobs = {}, { seed = 1 } = {}) {
+  /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
+     numbers that get rod bodies, rodKnobs their knobs over ROD_ARM_KNOBS; bodyMass: her body's kg, which her arms
+     together match (else her rest volume's). */
+  constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, bodyMass = null } = {}) {
     this.phys = phys;
     this.mantle = mantle;
     this.knobs = { ...ARM_KNOBS, ...knobs };
     const count = mantle.roots.length;
-    this.arms = Array.from({ length: count }, (_, i) => new Arm(i, this.knobs, seed));
+    if (indices && indices.length !== count) throw new Error(`arms: ${count} roots need ${count} arm numbers, got ${indices.length}`);
+    this.arms = Array.from({ length: count }, (_, s) => new Arm(indices ? indices[s] : s, this.knobs, seed));
+    this._slotOf = indices ? new Map(indices.map((i, s) => [i, s])) : null;
+    this.rodKnobs = { ...ROD_ARM_KNOBS, ...rodKnobs };
+    const armsMass = bodyMass ?? (mantle.restVolume > 0 ? mantle.restVolume * this.rodKnobs.density : null);
+    if (rods.length && !(armsMass > 0)) console.warn('arms: no body mass to share among the rod arms; each weighs its own drawn volume');
+    this.rods = this.arms.map((arm) => (rods.includes(arm.index) ? new RodArm(arm, this.rodKnobs, armsMass > 0 ? armsMass * armMassShare(arm.index, this.knobs, this.rodKnobs) : null) : null));
+    this.bodies = this.arms.map((arm, s) => this.rods[s] ?? arm);
+    this.holdDelta = this.rods.map((rod, s) => (rod ? new Float64Array(this.arms[s].rest.length) : null));
+    this._anyRod = this.rods.some(Boolean);
+    // The water's velocity at a point, for the rods' drag: set once the tank's currents exist.
+    this.ambient = null;
+    this.rodMs = new Float32Array(WINDOW);
+    this.rodCount = 0;
     this.track = new Array(count).fill(null);
     // Who holds each arm, strongest tier wins; with no program and no grip it falls back to idle each tick unless a mode holds it.
     this.owner = new Array(count).fill('idle');
@@ -74,10 +92,10 @@ export class Arms {
   _initSuckers(seed) {
     const count = this.arms.length, S = this.S = this.arms[0].n - 1, NS = count * S;
     const sk = this.suckerKnobs = { ...SUCKER_KNOBS };
-    this.layouts = this.arms.map((arm, a) => layoutSuckers(arm.len0, arm.rad0, arm.arc0, a, sk));
+    this.layouts = this.arms.map((arm) => layoutSuckers(arm.len0, arm.rad0, arm.arc0, arm.index, sk));
     this._layoutGen = this.arms.map((arm) => arm.restGen);
-    this.banks = this.layouts.map((L, a) => new SuckerBank(L, a, sk, seed));
-    this.epRng = this.arms.map((_, a) => mulberry32(((seed * 3266489917) ^ ((a + 1) * 0x27D4EB2F) ^ 0x7A57E) >>> 0));
+    this.banks = this.layouts.map((L, a) => new SuckerBank(L, this.arms[a].index, sk, seed));
+    this.epRng = this.arms.map((arm) => mulberry32(((seed * 3266489917) ^ ((arm.index + 1) * 0x27D4EB2F) ^ 0x7A57E) >>> 0));
     this.touchKind = new Uint8Array(NS);   // per segment: 0 nothing, 1 the furniture, 2 a loose thing, 3 herself
     this.touchTaste = new Array(NS).fill(null);
     this.touchEntry = new Array(NS).fill(null);
@@ -185,7 +203,7 @@ export class Arms {
 
   _build() {
     this.chains = [];
-    for (const arm of this.arms) {
+    for (const arm of this.bodies) {
       const segs = [];
       for (let s = 0; s < arm.n - 1; s++) {
         const r = (arm.rad0[s] + arm.rad0[s + 1]) / 2;
@@ -203,9 +221,10 @@ export class Arms {
 
   _bin(lam) { return Math.round((lam - this.knobs.stretchMin) / this.knobs.capsuleStep); }
 
-  /* A capsule sized for segment s of arm a at stretch bin b, made once and kept (Jolt capsules can't scale unevenly). */
+  /* A capsule sized for segment s of slot a's body at stretch bin b, made once and kept (Jolt capsules can't scale
+     unevenly); a rod's thicker drawn radius keys apart from an authored arm's. */
   _shape(a, s, b, arm) {
-    const key = ((a * 64 + s) * 64 + b) * 1024 + (arm.restGen & 1023);
+    const key = (((a * 64 + s) * 64 + b) * 1024 + (arm.restGen & 1023)) * 2 + (arm instanceof RodArm ? 1 : 0);
     let sh = this.shapes.get(key);
     if (!sh) {
       const lam = this.knobs.stretchMin + b * this.knobs.capsuleStep;
@@ -254,6 +273,7 @@ export class Arms {
   tick(dt, time, teleport = false) {
     const t0 = performance.now();
     const k = this.knobs, m = this.mantle, arms = this.arms;
+    let rodMs = 0;
     if (dt > 0) { this.time += dt; this._readGrips(); }
     this.pushPen.fill(0);
     this._frames();
@@ -281,19 +301,51 @@ export class Arms {
         const p = this.track[a].body.GetPosition();
         if (g.face) { g.face[0] = p.GetX(); g.face[1] = p.GetY(); g.face[2] = p.GetZ(); }
       }
-      this._rec = a; this._skipHeld(a);
+      // A rod arm's intent chain is a ghost: what it pokes into, its rod pushes.
+      const rod = this.rods[a];
+      this._rec = rod ? -1 : a; this._skipHeld(a);
       arm.step(dt, this.world, this.body);
+      if (rod) {
+        const t1 = performance.now();
+        this.holdDelta[a].set(arm.rest);
+        rod.step(dt, this.rodKnobs.current ? this.ambient : null);
+        rodMs += performance.now() - t1;
+      }
     }
-    // Rounds of arm-on-arm contact, then each arm's lengths, limits, and world contact, which get the last word. The
+    // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which gets the last word: an
+    // authored arm's lengths, limits, and contact; a rod arm's intent chain on its own, then its rod's contact. The
     // last round records which side of each other the arms lie on.
-    const C = this.contact, rounds = Math.max(1, k.finishIters);
+    const C = this.contact, rounds = Math.max(1, k.finishIters), hold = this.rodKnobs.hold;
     C.tick++;
     C.touchGap = this.suckerKnobs.touchGap; C.faceCos = this.suckerKnobs.faceCos;
     for (let it = 0; it < rounds; it++) {
-      separateArms(arms, k, C, it === rounds - 1 ? 1 : 0);
-      for (let a = 0; a < arms.length; a++) { this._rec = a; this._skipHeld(a); arms[a].finishPass(this.world, this.body, it === rounds - 1); }
+      const last = it === rounds - 1;
+      separateArms(this.bodies, k, C, last ? 1 : 0);
+      for (let a = 0; a < arms.length; a++) {
+        const rod = this.rods[a];
+        if (!rod) { this._rec = a; this._skipHeld(a); arms[a].finishPass(this.world, this.body, last); continue; }
+        this._rec = -1; this._skipHeld(a);
+        arms[a].finishPass(this.world, this.body, last, hold === 'ghost');
+        const t1 = performance.now();
+        this._rec = a;
+        rod.contact(this.world, this.body, last);
+        rodMs += performance.now() - t1;
+      }
     }
     this._rec = -1;
+    for (let a = 0; a < arms.length; a++) {
+      const rod = this.rods[a];
+      if (!rod) continue;
+      const t1 = performance.now();
+      rod.settle(dt);
+      // The contact hold comes from the rod: what it lies on bends the program's later rest shapes, never its sag.
+      if (hold === 'rod') arms[a]._feedback(rod.contactHold);
+      // What the hold, from whichever chain gave it, added to the rest shape this tick.
+      const H = this.holdDelta[a], R = arms[a].rest;
+      for (let i = 0; i < H.length; i++) H[i] = R[i] - H[i];
+      rodMs += performance.now() - t1;
+    }
+    if (this._anyRod && !teleport) this.rodMs[this.rodCount++ % WINDOW] = rodMs;
     this.allSdf.skip = -1;
     if (dt > 0) { this._touches(); this._taste(dt); this._suckers(dt); }
     this._place(dt, teleport);
@@ -323,9 +375,10 @@ export class Arms {
       ax /= al; az /= al;
       group.sort((m, n) => ((arms[m].frame.p[0] - x) * ax + (arms[m].frame.p[2] - z) * az) - ((arms[n].frame.p[0] - x) * ax + (arms[n].frame.p[2] - z) * az));
       let width = 0;
-      for (const b of group) width += 2 * arms[b].rad[arms[b].gripAt] + k.slotGap;
+      const B = this.bodies;
+      for (const b of group) width += 2 * B[b].rad[arms[b].gripAt] + k.slotGap;
       let at = -width / 2;
-      for (const b of group) { const w = 2 * arms[b].rad[arms[b].gripAt] + k.slotGap; this.slot[b] = at + w / 2; at += w; }
+      for (const b of group) { const w = 2 * B[b].rad[arms[b].gripAt] + k.slotGap; this.slot[b] = at + w / 2; at += w; }
       for (const b of group) { this.slotDir[b * 2] = ax; this.slotDir[b * 2 + 1] = az; }
     }
   }
@@ -333,7 +386,7 @@ export class Arms {
   _place(dt, teleport) {
     const q = this._q, J = this.phys.Jolt, bodies = this.phys.bodies, step = this.knobs.capsuleStep;
     for (let a = 0; a < this.arms.length; a++) {
-      const arm = this.arms[a], X = arm.X, segs = this.chains[a];
+      const arm = this.bodies[a], X = arm.X, segs = this.chains[a];
       for (let s = 0; s < segs.length; s++) {
         const seg = segs[s];
         let dx = X[s * 3 + 3] - X[s * 3], dy = X[s * 3 + 4] - X[s * 3 + 1], dz = X[s * 3 + 5] - X[s * 3 + 2];
@@ -342,7 +395,8 @@ export class Arms {
         const cx = (X[s * 3] + X[s * 3 + 3]) / 2, cy = (X[s * 3 + 1] + X[s * 3 + 4]) / 2, cz = (X[s * 3 + 2] + X[s * 3 + 5]) / 2;
         if (!Number.isFinite(cx + cy + cz)) continue;
         // A new size only once the stretch has moved well past the current bin, so a segment never flickers between two.
-        const lam = arm.lam[s], b = this._bin(lam);
+        // A rod's segment can be squeezed or pulled past what a program asks for; its capsule stops at a sane size.
+        const lam = Math.max(0.5, Math.min(2.5, arm.lam[s])), b = this._bin(lam);
         if (seg.gen !== arm.restGen || (b !== seg.bin && Math.abs(lam - (this.knobs.stretchMin + seg.bin * step)) > 0.6 * step)) {
           const rl = this.knobs.stretchMin + b * step;
           bodies.SetShape(seg.id, this._shape(a, s, b, arm), false, J.EActivation_Activate);
@@ -360,33 +414,40 @@ export class Arms {
   /* Where a reach for a toy aims: its near top, so the middle of the arm lies over it; a tip grip aims at its near
      side, so the tip arrives touching it rather than inside it. */
   _toyTarget(a, toy, out) {
-    const arm = this.arms[a], p = toy.body.GetPosition(), root = arm.frame.p;
+    const arm = this.arms[a], body = this.bodies[a], p = toy.body.GetPosition(), root = arm.frame.p;
     const x = p.GetX(), y = p.GetY(), z = p.GetZ();
     const sz = toy.size, size = toy.kind === 'sphere' ? sz[0] : toy.kind === 'box' ? Math.min(sz[0], sz[1], sz[2]) : sz[1];
     let dx = root[0] - x, dy = root[1] - y, dz = root[2] - z;
     if (arm.goal?.tip) {
       const l = Math.hypot(dx, dy, dz);
-      const off = l > 1e-6 ? (size * this.knobs.toyStandoff + arm.rad[arm.n - 1]) / l : 0;
+      const off = l > 1e-6 ? (size * this.knobs.toyStandoff + body.rad[arm.n - 1]) / l : 0;
       out[0] = x + dx * off; out[1] = y + dy * off; out[2] = z + dz * off;
       return out;
     }
     const fl = Math.hypot(dx, dz), ci = arm.gripAt;
     const ux = fl > 1e-6 ? 0.5 * dx / fl : 0, uz = fl > 1e-6 ? 0.5 * dz / fl : 0, ul = Math.hypot(ux, 1, uz);
-    const off = (size + arm.rad[ci] + this.knobs.toyClear) / ul, sl = this.slot[a];
+    const off = (size + body.rad[ci] + this.knobs.toyClear) / ul, sl = this.slot[a];
     out[0] = x + ux * off + this.slotDir[a * 2] * sl; out[1] = y + off; out[2] = z + uz * off + this.slotDir[a * 2 + 1] * sl;
     return out;
   }
 
-  reach(i, target, opts) {
+  /* The slot holding arm number `index`, or -1. Methods that take an arm take its number and resolve it here. */
+  slotOf(index) { return this._slotOf ? (this._slotOf.get(index) ?? -1) : index; }
+
+  reach(i, target, opts) { return this._reach(this.slotOf(i), target, opts); }
+
+  _reach(i, target, opts) {
     const arm = this.arms[i];
     if (!arm || !arm.reach(target, opts)) return false;
     this.track[i] = null;
     return true;
   }
 
-  reachAll(target, opts) { for (let i = 0; i < this.arms.length; i++) this.reach(i, target, opts); }
+  reachAll(target, opts) { for (let i = 0; i < this.arms.length; i++) this._reach(i, target, opts); }
 
-  reachToy(i, toy, opts) {
+  reachToy(i, toy, opts) { return this._reachToy(this.slotOf(i), toy, opts); }
+
+  _reachToy(i, toy, opts) {
     const arm = this.arms[i];
     if (!arm || !toy) return false;
     // The goal decides tip or middle, and the target depends on which, so place it once the goal exists.
@@ -409,13 +470,15 @@ export class Arms {
         const d = Math.hypot(p.GetX() - arm.frame.p[0], p.GetY() - arm.frame.p[1], p.GetZ() - arm.frame.p[2]);
         if (d < bd) { bd = d; best = t; }
       }
-      if (best && this.reachToy(i, best, opts)) sent++;
+      if (best && this._reachToy(i, best, opts)) sent++;
     }
     return sent;
   }
 
   /* Bring arm i's grasp to her mouth; opts.grasp is where along the arm it holds (default: where it last touched). */
-  fetch(i, opts) {
+  fetch(i, opts) { return this._fetch(this.slotOf(i), opts); }
+
+  _fetch(i, opts) {
     const arm = this.arms[i];
     if (!arm || !arm.fetch(this._mouth, opts)) return false;
     this.track[i] = null;
@@ -426,15 +489,15 @@ export class Arms {
   /* Every arm holding something after a reach fetches it. */
   fetchHolding(opts) {
     let sent = 0;
-    for (let i = 0; i < this.arms.length; i++) if (this.arms[i].goal?.kind === 'hold' && this.fetch(i, opts)) sent++;
+    for (let i = 0; i < this.arms.length; i++) if (this.arms[i].goal?.kind === 'hold' && this._fetch(i, opts)) sent++;
     return sent;
   }
 
   idle() { for (let i = 0; i < this.arms.length; i++) { this.track[i] = null; this.arms[i].idle(); } }
 
   /* Plant arm i on one of its anchors ({ seg, p, n, taste }): that segment holds still on the surface. */
-  plant(i, anchor) {
-    const arm = this.arms[i];
+  plant(n, anchor) {
+    const i = this.slotOf(n), arm = this.arms[i];
     if (!arm || !anchor || !arm.plant(anchor.p, anchor.n, anchor.seg)) return false;
     arm.goal.entry = this.touchEntry[i * this.S + anchor.seg] ?? null;
     arm.goal.taste = anchor.taste ?? null;
@@ -442,17 +505,17 @@ export class Arms {
     return true;
   }
 
-  unplant(i) { const arm = this.arms[i]; if (arm?.goal?.kind === 'plant') arm.idle(); }
+  unplant(i) { const arm = this.arms[this.slotOf(i)]; if (arm?.goal?.kind === 'plant') arm.idle(); }
 
   /* Arm i trails behind a jet moving along unit v, opened by spread radians, its base and tip stiffness as shares of
      stiffBehind (arm-plant-core.js). */
-  trail(i, v, spread, stiff, tip) { return this._goal(i, makeTrail(v, spread, stiff, tip)); }
+  trail(i, v, spread, stiff, tip) { return this._goal(this.slotOf(i), makeTrail(v, spread, stiff, tip)); }
 
   /* Arm i spreads out and down, `down` radians below level, as she sinks after a jet. */
-  spread(i, down) { return this._goal(i, makeSpread(down)); }
+  spread(i, down) { return this._goal(this.slotOf(i), makeSpread(down)); }
 
   /* Arm i curls in under her and stays there. */
-  tuck(i, curl) { return this._goal(i, makeTuck(curl)); }
+  tuck(i, curl) { return this._goal(this.slotOf(i), makeTuck(curl)); }
 
   _goal(i, g) {
     const arm = this.arms[i];
@@ -464,24 +527,26 @@ export class Arms {
   }
 
   /* Take arm i at a tier (idle < attend < stroke < mode < held); false while a stronger one holds it. */
-  claim(i, tier) {
+  claim(i, tier) { return this._claim(this.slotOf(i), tier); }
+
+  _claim(i, tier) {
     if (!(i >= 0 && i < this.owner.length) || !claimWins(this.owner[i], tier)) return false;
     this.owner[i] = tier;
     return true;
   }
 
-  unclaim(i, tier) { if (this.owner[i] === tier) this.owner[i] = 'idle'; }
+  unclaim(n, tier) { const i = this.slotOf(n); if (i >= 0 && this.owner[i] === tier) this.owner[i] = 'idle'; }
 
   /* NaN, contact, length, and bend, measured on the solved chains against the layout's own distance field. */
   health() {
     // The root rides a shell vertex and inherits the mantle's own contact, so it is measured on its own.
     const out = {
       nan: 0, penetration: 0, rootPenetration: 0, centerPenetration: 0, bodyPenetration: 0, bodyMidPenetration: 0, lenErr: 0, bend: 0, bendOver: -Infinity,
-      stretchMax: 0, stretchMin: Infinity, twistMax: 0, armPenetration: separateArms(this.arms, this.knobs, this.contact, 2), crossings: this.contact.crossings, ms: this.stats(),
+      stretchMax: 0, stretchMin: Infinity, twistMax: 0, armPenetration: separateArms(this.bodies, this.knobs, this.contact, 2), crossings: this.contact.crossings, ms: this.stats(),
     };
     const nrm = [0, 0, 0], sdf = this.sdf, k = this.knobs;
     sdf.unfocus();
-    for (const arm of this.arms) {
+    for (const arm of this.bodies) {
       const h = arm.health(), X = arm.X;
       out.nan += h.nan; out.lenErr = Math.max(out.lenErr, h.lenErr); out.bend = Math.max(out.bend, h.bend); out.bendOver = Math.max(out.bendOver, h.bendOver);
       out.stretchMax = Math.max(out.stretchMax, h.stretchMax); out.stretchMin = Math.min(out.stretchMin, h.stretchMin); out.twistMax = Math.max(out.twistMax, h.twistMax);
@@ -512,7 +577,15 @@ export class Arms {
     return { n, mean: s.reduce((a, b) => a + b, 0) / n, p95: s[Math.min(n - 1, Math.floor(n * 0.95))], max: s[n - 1] };
   }
 
-  resetStats() { this.msCount = 0; }
+  /* The rod arms' own share of each tick (step, contact, settle), over the last WINDOW ticks. */
+  rodStats() {
+    const n = Math.min(this.rodCount, WINDOW);
+    if (!n) return { n: 0, mean: 0, p50: 0, p95: 0, max: 0 };
+    const s = Array.from(this.rodMs.subarray(0, n)).sort((a, b) => a - b);
+    return { n, mean: s.reduce((a, b) => a + b, 0) / n, p50: s[n >> 1], p95: s[Math.min(n - 1, Math.floor(n * 0.95))], max: s[n - 1] };
+  }
+
+  resetStats() { this.msCount = 0; this.rodCount = 0; }
 
   /* Drops the grips and the capsule shapes this cache holds; the bodies keep their own references until they go, and
      the proxies belong to the physics world. */
@@ -546,9 +619,9 @@ export class Arms {
     const w = this.knobs.looseContact ? this.allSdf : this.sdf, nrm = this._f3, nb = this._v3, bs = this.knobs.bodySkip;
     const TK = this.touchKind, TP = this.touchP, TN = this.touchN;
     for (let a = 0; a < arms.length; a++) {
-      const arm = arms[a], X = arm.X;
+      const arm = this.bodies[a], X = arm.X;
       if (arm.valid === false) { TK.fill(0, a * S, a * S + S); continue; }
-      arm._focus(w, this.knobs.focusPad);
+      focusChain(arm, w, this.knobs.focusPad);
       for (let j = 0; j < S; j++) {
         const g = a * S + j, p = j * 3;
         const dx = X[p + 3] - X[p], dy = X[p + 4] - X[p + 1], dz = X[p + 5] - X[p + 2];
@@ -634,7 +707,7 @@ export class Arms {
     for (let a = 0; a < arms.length; a++) {
       const arm = arms[a], bank = this.banks[a];
       if (arm.restGen !== this._layoutGen[a]) {
-        this.layouts[a] = layoutSuckers(arm.len0, arm.rad0, arm.arc0, a, sk);
+        this.layouts[a] = layoutSuckers(arm.len0, arm.rad0, arm.arc0, arm.index, sk);
         bank.relayout(this.layouts[a]);
         this._layoutGen[a] = arm.restGen;
       }
@@ -657,7 +730,7 @@ export class Arms {
         if (kind === 3) { c.selfTouch++; if (this.gripSelf) mode[j] = SEAL_WORK; continue; }
         const entry = this.touchEntry[g], mine = kind === 2 && ep?.toy === entry;
         if (kind === 2 && !mine && this._ignored(a, entry)) continue;
-        if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && this._sliding(arm, j, g, kind === 2 ? entry : null, dt)) continue;
+        if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && this._sliding(this.bodies[a], j, g, kind === 2 ? entry : null, dt)) continue;
         const rule = mine ? ep.rule : tasteRule(this.touchTaste[g], sk, this);
         if (!(rule.grip > 0)) continue;
         mode[j] = mine && ep.hard ? SEAL_HARD : SEAL_WORK;
@@ -752,7 +825,7 @@ export class Arms {
       ep.arc += this.suckerKnobs.rejectSpeed * dt;
       if (ep.arc >= arm.arc0[S] - arm.len0[S - 1] / 2) return this._reject(a, ep);
     } else if (ep.h && ep.rule.fetch && !ep.fetched && t - ep.gripT > k.fetchBeat) {
-      if (this.fetch(a, { grasp: ep.arc / arm.length, hold: ep.hold })) {
+      if (this._fetch(a, { grasp: ep.arc / arm.length, hold: ep.hold })) {
         const sz = ep.toy.size;
         this.fetchStand[a] = k.fetchClear * (ep.toy.kind === 'box' ? Math.max(sz[0], sz[1], sz[2]) : ep.toy.kind === 'sphere' ? sz[0] : sz[0] + sz[1]);
         ep.fetched = true;
@@ -765,7 +838,7 @@ export class Arms {
 
   /* A grip: the toy pinned at the touched point to this arm's proxy, which follows that spot on the arm from now on. */
   _grip(a, ep, j) {
-    const arm = this.arms[a], g = a * this.S + j, P = this.touchP, F = segFrame(arm, j, 0.5, this._fr);
+    const arm = this.bodies[a], g = a * this.S + j, P = this.touchP, F = segFrame(arm, j, 0.5, this._fr);
     const cx = P[g * 3], cy = P[g * 3 + 1], cz = P[g * 3 + 2];
     if (!F || !Number.isFinite(cx + cy + cz)) return;
     const vx = cx - F.m[0], vy = cy - F.m[1], vz = cz - F.m[2];
@@ -798,7 +871,7 @@ export class Arms {
 
   /* Where arm a's grip sits now: its stored offset, in the arm's frame at the grip's rest arc. */
   _gripPoint(a, ep, out) {
-    const arm = this.arms[a], j = this._segAt(arm, ep.arc);
+    const arm = this.bodies[a], j = this._segAt(arm, ep.arc);
     const F = segFrame(arm, j, Math.max(0, Math.min(1, (ep.arc - arm.arc0[j]) / arm.len0[j])), this._fr);
     if (!F) return null;
     for (let i = 0; i < 3; i++) out[i] = F.m[i] + ep.off[0] * F.e1[i] + ep.off[1] * F.e2[i] + ep.off[2] * F.e3[i];
@@ -852,7 +925,7 @@ export class Arms {
 
   /* Out along the arm and off the tip, with a little shove. */
   _reject(a, ep) {
-    const arm = this.arms[a], X = arm.X, n = arm.n, toy = ep.toy;
+    const arm = this.bodies[a], X = arm.X, n = arm.n, toy = ep.toy;
     const dx = X[n * 3 - 3] - X[n * 3 - 6], dy = X[n * 3 - 2] - X[n * 3 - 5], dz = X[n * 3 - 1] - X[n * 3 - 4];
     const l = Math.hypot(dx, dy, dz), inv = this.phys.inverseMass(toy);
     this._end(a, true, 'reject');
@@ -939,18 +1012,20 @@ export class Arms {
 
   /* Whether a pull on arm i's grip reels the thing in ('object') or hauls her to it ('body'), why, and the inputs: her
      anchors or a wedge when either holds, in-water weight for a lift, the friction toll for a drag (loco-carry-core.js). */
-  whoMoves(i) {
+  whoMoves(n) {
+    const i = this.slotOf(n);
+    if (i < 0) return null;
     const inputs = moveInputs(this, i);
     return inputs ? { ...whoMovesInWater(inputs), ...inputs } : null;
   }
 
   /* A small thing gripped by arm i rides in her web beside the crown ring until let go: a fetch that never times out,
      `stand` m below her mouth and `out` m toward the arm's base, hard by command so neither boredom nor flicker ends it. */
-  stow(i, { stand = 0, out = 0, duration } = {}) {
-    const ep = this.episodes[i], arm = this.arms[i];
-    if (!ep?.h || ep.frozen || !this.claim(i, 'held')) return false;
+  stow(n, { stand = 0, out = 0, duration } = {}) {
+    const i = this.slotOf(n), ep = this.episodes[i], arm = this.arms[i];
+    if (!ep?.h || ep.frozen || !this._claim(i, 'held')) return false;
     // The fetch's hold falls back to its knob for anything not finite, so the endless hold is set after.
-    if (!this.fetch(i, { grasp: ep.arc / arm.length, hold: 1e9, duration })) return false;
+    if (!this._fetch(i, { grasp: ep.arc / arm.length, hold: 1e9, duration })) return false;
     arm.goal.hold = Infinity;
     this.fetchStand[i] = Math.max(0, stand);
     this.fetchOut[i] = Math.max(0, out);
@@ -960,8 +1035,8 @@ export class Arms {
 
   /* Stop arm i's grip driving its toy (on), or drive it again from world point p (off): the constraint goes off and the
      proxy rests, so a haul moves the toy only through the impulse it is given. */
-  freeze(i, on, p = null) {
-    const ep = this.episodes[i], proxy = this.proxies[i];
+  freeze(n, on, p = null) {
+    const i = this.slotOf(n), ep = this.episodes[i], proxy = this.proxies[i];
     if (!ep?.h) return false;
     if (on) {
       if (ep.frozen) return true;
@@ -984,7 +1059,7 @@ export class Arms {
 
   /* Arm i's sealed contacts on the furniture: segment, surface point, outward normal, the newtons they bear before
      tearing (force) and hold with routinely (hold), and taste. */
-  anchors(i) { return this.anchorList[i].slice(0, this.anchorCount[i]); }
+  anchors(n) { const i = this.slotOf(n); return i >= 0 ? this.anchorList[i].slice(0, this.anchorCount[i]) : []; }
 
   /* Per arm: the share of touching suckers sealed, what it holds (by taste) or is tasting, and how hard. */
   suckerReport() {
@@ -999,7 +1074,7 @@ export class Arms {
 
   /* World position of sucker i on arm a, on the sucker side of the solved chain, its row a little to one side. */
   suckerPoint(a, i, out) {
-    const arm = this.arms[a], L = this.layouts[a], j = L.seg[i];
+    const arm = this.bodies[a], L = this.layouts[a], j = L.seg[i];
     const f = Math.max(0, Math.min(1, (L.arc[i] - arm.arc0[j]) / arm.len0[j])), F = segFrame(arm, j, f, this._fr);
     if (!F) return null;
     const r = arm.rad[j] + (arm.rad[j + 1] - arm.rad[j]) * f, side = L.row[i] ? 0.4 : -0.4;

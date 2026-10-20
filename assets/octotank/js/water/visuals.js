@@ -79,7 +79,7 @@ export class WaterVisuals {
     const { mantle, arms, toys } = this.ctx;
     mantle.centroid(this.centroid);
     put(...this.centroid, 0.075);
-    for (const arm of arms.arms) {
+    for (const arm of arms.bodies) {
       for (let i = 0; i < arm.n; i += 3) put(arm.X[i * 3], arm.X[i * 3 + 1], arm.X[i * 3 + 2], Math.max(0.025, arm.rad[i] * 2));
       const p = (arm.n - 1) * 3;
       put(arm.X[p], arm.X[p + 1], arm.X[p + 2], 0.025);
@@ -122,7 +122,7 @@ export class WaterVisuals {
     }
     this.breaches.update(level, k.contactStrength, valid && !this.reduced.matches);
     this.displacements.update(level, k.contactStrength, valid && !this.reduced.matches);
-    if (dt && !this.reduced.matches && this.jet.phase === 'thrust' && this.jet.siphonDir) {
+    if (dt && !this.reduced.matches && this.jet?.phase === 'thrust' && this.jet.siphonDir) {
       const d = this.jet.siphonDir, c = this.centroid, mouth = this.jet.parts?.siphon?.mesh.matrix.elements;
       const x = mouth ? mouth[12] : c[0], y = mouth ? mouth[13] : c[1], z = mouth ? mouth[14] : c[2];
       for (let i = 1; i <= 4; i++) this.flow.stir(x + d[0] * i * 0.07, y + d[1] * i * 0.07, z + d[2] * i * 0.07,

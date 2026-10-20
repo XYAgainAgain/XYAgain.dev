@@ -7,8 +7,9 @@ import { crawlAngle, wrap } from '../amira/locomotion/locomotion-core.js';
 const registry = new Map(), watchers = new Set();
 let running = null;
 
-export function register(name, { label = name, key = null, run = null } = {}) {
-  registry.set(name, { name, label, key, run });
+/* `bench` marks a scenario for the bench (?bench=arm), which runs without her body or locomotion. */
+export function register(name, { label = name, key = null, run = null, bench = false } = {}) {
+  registry.set(name, { name, label, key, run, bench });
   for (const fn of watchers) fn();
 }
 
@@ -23,6 +24,11 @@ export async function runScenario(name, ctx, opts = {}) {
   const s = registry.get(name);
   if (!s?.run) throw new Error(`scenario ${name}: not built yet`);
   if (running) throw new Error(`scenario ${running} is already running`);
+  if (s.bench !== !!ctx.bench) throw new Error(`scenario ${name}: ${s.bench ? 'needs the bench (?bench=arm)' : 'not on the bench'}`);
+  if (s.bench) {
+    running = name;
+    try { return await s.run(ctx, opts); } finally { running = null; }
+  }
   if (!ctx.loco) throw new Error('scenario: no locomotion');
   running = name;
   const k = ctx.loco.knobs, wander = k.wander;
@@ -32,7 +38,8 @@ export async function runScenario(name, ctx, opts = {}) {
   finally { ctx.loco.reset('scenario over'); k.wander = wander; running = null; }
 }
 
-/* Resolves true once pred() holds on a fixed tick, false after `seconds` of sim time. */
+/* Resolves true once pred() holds on a fixed tick, false after `seconds` of sim time; `loco` is anything whose
+   `listeners` are called every tick (locomotion, or the bench). */
 export function until(loco, pred, seconds = Infinity) {
   return new Promise((resolve) => {
     let t = 0;

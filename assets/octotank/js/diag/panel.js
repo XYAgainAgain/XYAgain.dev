@@ -5,7 +5,7 @@ import { list as scenarioList, isRunning, onRegister } from './scenarios.js';
 
 const FRAMES = 120;
 const STORE = 'octotank.panel';
-const SECTIONS = [['sim', 'Sim'], ['view', 'View'], ['body', 'Body'], ['arms', 'Arms'], ['loco', 'Locomotion']];
+const SECTIONS = [['sim', 'Sim'], ['view', 'View'], ['body', 'Body'], ['bench', 'Bench'], ['arms', 'Arms'], ['loco', 'Locomotion']];
 
 const queued = [];
 let attach = null;
@@ -25,7 +25,7 @@ const tag = (name, props = {}, ...kids) => { const e = Object.assign(document.cr
 
 export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say }) {
   const { phys, mantle, arms, pose } = ctx;
-  const loco = ctx.loco;
+  const loco = ctx.loco, bench = ctx.bench ?? null;
   const gaps = new Float32Array(FRAMES);
   let gapCount = 0, lastFrame = 0, textAt = 0, breathDepth = mantle.knobs.breathDepth || 0.035, lastExhale = 0, inhaling = false;
   const state = { paused: false };
@@ -80,7 +80,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     ],
     arms: [
       { key: 'a', name: 'Reach toys', label: () => 'Reach toys', run: () => arms.reachNearestToys(toys) },
-      { key: 'l', name: 'Look at a toy', label: () => 'Look at a toy', run: () => ctx.attention?.lookAndReach() },
+      { key: 'l', name: 'Look at a toy', label: () => 'Look at a toy', run: () => ctx.attention?.lookAndReach(), disabled: !ctx.attention },
       { key: 'i', name: 'Arms idle', label: () => 'Arms idle', run: () => arms.idle() },
       { key: 'f', name: 'Fetch held', label: () => 'Fetch held', run: () => arms.fetchHolding() },
       { key: 'g', name: 'Grip/let go', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
@@ -181,19 +181,20 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   legendAction.button.setAttribute('aria-controls', legend.id || (legend.id = 'panel-keys'));
   legendAction.button.setAttribute('aria-expanded', 'false');
   for (const [id] of SECTIONS) {
-    if (id === 'loco' && !loco) continue;
+    if ((id === 'loco' && !loco) || (id === 'body' && bench) || !bySection[id]) continue;
     for (const a of bySection[id]) add(id, a, true);
   }
   for (const [name, a] of queued.splice(0)) add(name, a, true);
   attach = add;
 
-  /* Scenario buttons straight from the registry, rebuilt whenever a module registers one; keyed ones first, by key. */
+  /* Scenario buttons straight from the registry, rebuilt whenever a module registers one; keyed ones first, by key.
+     The bench shows its own, her body the rest. */
   const built = new Map();
   const syncScenarios = () => {
-    if (!loco) return;
-    const s = sectionFor('loco'), focused = document.activeElement;
+    if (!loco && !bench) return;
+    const s = sectionFor(bench ? 'bench' : 'loco'), focused = document.activeElement;
     const focusedName = s.scenarios.find((a) => a.button === focused)?.sc.name;
-    const scs = scenarioList().sort((x, y) => (x.key ? 0 : 1) - (y.key ? 0 : 1) || String(x.key ?? '').localeCompare(String(y.key ?? '')));
+    const scs = scenarioList().filter((sc) => !!sc.bench === !!bench).sort((x, y) => (x.key ? 0 : 1) - (y.key ? 0 : 1) || String(x.key ?? '').localeCompare(String(y.key ?? '')));
     s.scenarios = scs.map((sc) => {
       const prev = built.get(sc.name);
       if (prev?.sc === sc) return prev;
@@ -226,7 +227,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   let syncQueued = false;
   onRegister(() => { if (!syncQueued) { syncQueued = true; queueMicrotask(() => { syncQueued = false; syncScenarios(); }); } });
   syncScenarios();
-  if (!loco) { rebind(); relabel(); }
+  if (!loco && !bench) { rebind(); relabel(); }
 
   for (const d of el.querySelectorAll('details[data-section]:not(.sec)')) {
     const id = d.dataset.section;
@@ -268,6 +269,17 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       const n = Math.min(gapCount, FRAMES), sorted = Array.from(gaps.subarray(0, n)).sort((x, y) => x - y);
       const mean = n ? sorted.reduce((x, y) => x + y, 0) / n : 0, p95 = n ? sorted[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
       const s = phys.stats(), h = mantle.health(), am = arms.stats();
+      if (bench) {
+        readout.textContent = [
+          `${document.documentElement.dataset.backend ?? '?'} · seed ${seed} · bench, arm ${bench.index}${state.paused ? ' · PAUSED' : ''}`,
+          `Render   ${mean ? Math.round(1000 / mean) : '–'} fps   frame ${mean.toFixed(1)} ms   p95 ${p95.toFixed(1)}`,
+          `Physics  step ${s.mean.toFixed(2)} ms   p95 ${s.p95.toFixed(2)}   tick ${s.js.mean.toFixed(2)} ms   arms ${am.mean.toFixed(2)}`,
+          ...bench.describe(),
+          `Arm      ${bench.arm.goal?.kind ?? 'exploring'}${arms.resting ? ', resting' : ''}`,
+          `Suckers  ${arms.suckerReport().map((r) => `${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
+        ].join('\n');
+        return;
+      }
       const busy = {};
       for (const arm of arms.arms) if (arm.goal) busy[arm.goal.kind] = (busy[arm.goal.kind] ?? 0) + 1;
       const busyText = Object.entries(busy).map(([k, v]) => `${v} ${k}`).join(', ') || 'all exploring';

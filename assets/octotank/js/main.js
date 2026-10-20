@@ -30,10 +30,12 @@ import { TankGlass } from './tank/glass.js';
 import { wallGeometry } from './tank/geometry.js';
 import { TankSand } from './tank/sand.js';
 import { WallOptics } from './tank/wall-optics.js';
+import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
-   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce) */
+   ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
+   ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -98,19 +100,31 @@ async function boot() {
     if (typeof MANTLE_KNOBS[name] === 'string') mantleKnobs[name] = raw;
     else if (Number.isFinite(+raw)) mantleKnobs[name] = +raw;
   }
-  const mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
-  const arms = new Arms(phys, mantle, params.has('collider') ? { collider: params.get('collider') } : {}, { seed });
-  const locoOn = params.get('loco') !== '0';
-  const pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
-  pose.tick(0);
-  const attention = new Attention(pose, arms, toys, { seed, knobs: params.get('curious') === '0' ? { curious: false } : {} });
-  const loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
-  loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
-  const carry = new Carry({ mantle, arms, loco });
-  installClimb(loco);
-  installSqueeze(loco, { apertures: apertures(layoutKnobs) });
-  const jet = installJet(loco);
-  installFew(loco, { carry });
+  const armKnobs = params.has('collider') ? { collider: params.get('collider') } : {};
+  // The bench sets her aside: a mount holds one arm (a rod unless ?rod=0), and nothing of her body, posture, attention,
+  // or locomotion is built.
+  const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
+  let mantle, arms, pose = null, attention = null, loco = null, carry = null, jet = null, bench = null;
+  if (benchOn) {
+    mantle = new Mount({ ...BENCH_KNOBS });
+    const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: twin ? { hold: 'off' } : {}, bodyMass: benchBodyMass(1040) });
+    bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
+  } else {
+    mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
+    arms = new Arms(phys, mantle, armKnobs, { seed });
+    const locoOn = params.get('loco') !== '0';
+    pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
+    pose.tick(0);
+    attention = new Attention(pose, arms, toys, { seed, knobs: params.get('curious') === '0' ? { curious: false } : {} });
+    loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
+    loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
+    carry = new Carry({ mantle, arms, loco });
+    installClimb(loco);
+    installSqueeze(loco, { apertures: apertures(layoutKnobs) });
+    jet = installJet(loco);
+    installFew(loco, { carry });
+  }
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();
@@ -154,25 +168,25 @@ async function boot() {
   mantleGeo.setAttribute('position', new THREE.BufferAttribute(mantle.positions, 3));
   mantleGeo.setIndex(new THREE.BufferAttribute(mantle.shell.faces, 1));
   mantleGeo.computeVertexNormals();
-  const mantleMesh = new THREE.Mesh(mantleGeo, new THREE.MeshStandardMaterial({ color: 0x8c5fb0, roughness: 0.35, metalness: 0.05, side: THREE.DoubleSide }));
+  const mantleMesh = new THREE.Mesh(mantleGeo, new THREE.MeshStandardMaterial({ color: bench ? 0x9aa7ad : 0x8c5fb0, roughness: bench ? 0.6 : 0.35, metalness: 0.05, side: THREE.DoubleSide }));
   mantleMesh.position.set(...mantle.origin);
   // Its bounding sphere is from the spawn pose and never follows her, so culling would hide her from a close camera.
   mantleMesh.frustumCulled = false;
   scene.add(mantleMesh);
-  const bodyParts = new BodyParts(mantle, scene, {}, { seed });
-  pose.eyeKnobs = bodyParts.knobs;
-  jet.parts = bodyParts;
+  const bodyParts = bench ? null : new BodyParts(mantle, scene, {}, { seed });
+  if (bodyParts) { pose.eyeKnobs = bodyParts.knobs; jet.parts = bodyParts; }
   const rootMarkers = new THREE.InstancedMesh(new THREE.SphereGeometry(0.006, 8, 6), new THREE.MeshBasicMaterial({ color: 0xffe08a }), mantle.roots.length);
   scene.add(rootMarkers);
   const m4 = new THREE.Matrix4(), tmp3 = [0, 0, 0];
 
   water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
   water.setTint(water.knobs.tint);
-  const ctx = { phys, mantle, arms, pose, attention, loco, carry, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
+  const ctx = { phys, mantle, arms, pose, attention, loco, carry, bench, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
-  tank.knobs.parts = bodyParts.knobs;
-  tank.attention = attention; tank.knobs.attention = attention.knobs;
+  if (bodyParts) tank.knobs.parts = bodyParts.knobs;
+  if (bench) { tank.bench = bench; tank.knobs.bench = bench.mount.k; }
+  tank.attention = attention; if (attention) tank.knobs.attention = attention.knobs;
   tank.carry = carry;
   tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
@@ -180,8 +194,9 @@ async function boot() {
   tank.knobs.armView = armView.knobs;
   armView.capsuleMeshes = rigidMeshes.filter((r) => r.e.tag === 'arm').map((r) => r.mesh);
   armView.capsules = params.get('capsules') === '1';
+  if (bench) bench.view = armView;
   const cameraRig = new TankCamera(camera, renderer.domElement, {
-    animals: [mantleMesh, armView.tubeMesh, armView.webMesh, ...bodyParts.parts.map((p) => p.mesh)],
+    animals: [mantleMesh, armView.tubeMesh, armView.webMesh, ...(bodyParts?.parts.map((p) => p.mesh) ?? [])].filter(Boolean),
     scenery: [...rigidMeshes.filter(({ e }) => e.tag !== 'arm').map((r) => r.mesh), ...(sand ? [sand.mesh] : [])], say,
   });
   tank.cameraRig = cameraRig; tank.knobs.camera = cameraRig.knobs;
@@ -192,8 +207,8 @@ async function boot() {
       for (let i = 0; i < p.length; i += 3) emit(p[i] + o[0], p[i + 1] + o[1], p[i + 2] + o[2], radius, 0.05);
     });
     sand.contacts.register(arms, (emit) => {
-      for (let a = 0; a < arms.arms.length; a++) {
-        const arm = arms.arms[a];
+      for (let a = 0; a < arms.bodies.length; a++) {
+        const arm = arms.bodies[a];
         if (arm.valid === false) continue;
         for (let i = 0; i < arm.n; i++) emit(arm.X[i * 3], arm.X[i * 3 + 1], arm.X[i * 3 + 2], arm.rad[i], Math.max(0.02, mantle.armForce[a] / arm.n));
       }
@@ -207,6 +222,9 @@ async function boot() {
   window.tank = tank;
   const waterVisuals = new WaterVisuals({ renderer, scene, camera, ctx, jet, seed, enabled: params.get('waterview') !== '0' });
   tank.waterVisuals = waterVisuals;
+  // The rods feel the tank's currents, which are the visuals' for now.
+  const flow = [0, 0, 0];
+  arms.ambient = (x, y, z, out) => { waterVisuals.currents.sample(x, y, z, phys.time, water.knobs.surfaceY, flow); out[0] = flow[0]; out[1] = flow[1]; out[2] = flow[2]; };
   tank.knobs.waterVisuals = waterVisuals.knobs;
   const glass = tank.glass = new TankGlass(scene);
   tank.knobs.glass = glass.knobs;
@@ -231,12 +249,16 @@ async function boot() {
   tank.renderOnce = () => new Promise((resolve) => { wantFrame = true; afterFrame = resolve; });
   let last = performance.now();
   const preTick = (dt) => {
-    attention.tick(dt);
-    pose.tick(dt, arms);
-    loco.tick(dt);
-    mantle.tick(dt);
-    mantle.sync();
+    if (bench) bench.tick(dt);
+    else {
+      attention.tick(dt);
+      pose.tick(dt, arms);
+      loco.tick(dt);
+      mantle.tick(dt);
+      mantle.sync();
+    }
     arms.tick(dt, phys.time);
+    bench?.after(dt);
     sand?.tick(dt);
     ctx.watch?.();
     ctx.probe?.(dt);
@@ -251,8 +273,7 @@ async function boot() {
     mantle.sync();
     mantleGeo.attributes.position.needsUpdate = true;
     mantleGeo.computeVertexNormals();
-    attention.aimEyes(bodyParts);
-    bodyParts.update();
+    if (bodyParts) { attention.aimEyes(bodyParts); bodyParts.update(); }
     tank.suckerView.update();
     armView.update();
     for (let r = 0; r < mantle.roots.length; r++) {
@@ -277,8 +298,9 @@ async function boot() {
   const clickable = rigidMeshes.filter(({ e }) => (e.tag === 'wall' && e.taste !== 'lid') || e.tag === 'panel' || e.tag === 'rock').map((r) => r.mesh);
   if (sand) clickable.push(sand.mesh);
   const inside = (p) => Math.abs(p.x) <= TANK.w / 2 + 0.005 && p.y >= -0.005 && p.y <= TANK.h + 0.005 && Math.abs(p.z) <= TANK.d / 2 + 0.005;
+  if (bench) bench.bindPointer(renderer.domElement, camera, mantleMesh);
   renderer.domElement.addEventListener('click', (ev) => {
-    if (isRunning() || !loco.knobs.enabled) return;
+    if (bench?.takeClick() || isRunning() || (!bench && !loco.knobs.enabled)) return;
     const rect = renderer.domElement.getBoundingClientRect();
     ndc.set(((ev.clientX - rect.left) / rect.width) * 2 - 1, -((ev.clientY - rect.top) / rect.height) * 2 + 1);
     ray.setFromCamera(ndc, camera);
@@ -293,6 +315,7 @@ async function boot() {
     }
     if (!hit) { say('no place to go there'); return; }
     const p = [Math.max(-TANK.w / 2, Math.min(TANK.w / 2, hit.x)), Math.max(0, hit.y), Math.max(-TANK.d / 2, Math.min(TANK.d / 2, hit.z))];
+    if (bench) { bench.reachTo(p); say(`reaching to ${p.map((v) => v.toFixed(2)).join(', ')}`); return; }
     loco.want(p, { urgency: ev.shiftKey ? 0.9 : 0.3, source: 'click' });
     say(`going to ${p.map((v) => v.toFixed(2)).join(', ')}${ev.shiftKey ? ', hurried' : ''}`);
   });

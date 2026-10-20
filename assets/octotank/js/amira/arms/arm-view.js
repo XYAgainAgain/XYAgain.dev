@@ -1,11 +1,13 @@
 import * as THREE from 'three/webgpu';
 import { VIEW_KNOBS, ArmTube, WebSector, newFrame, ringAtArc, tubeIndex, gridIndex, sectorName, webArmDepth } from './arm-view-core.js';
 
-/* Her arms as she looks: one smooth tube per solved chain, the sucker cups along its oral face, and the web between
-   neighboring arm bases. Render-only; the capsules stay the collision and are hidden unless asked for. */
+/* Her arms as she looks: one smooth tube per solved chain (a rod arm's body), the sucker cups along its oral face, the
+   web between neighboring arm bases, and for a rod arm its intent chain as a thin ghost when asked for. Render-only;
+   the capsules stay the collision and are hidden unless asked for. */
 
 const SKIN = 0x8c5fb0;
 const CUP = 0xa987c4;   // the skin a quarter of the way to white
+const GHOST = 0x9fe3f0;
 const WINDOW = 240;
 
 /* A shallow cup of unit radius around +Y: a rim, a dimple, and a base sunk `sink` under the skin. */
@@ -19,9 +21,9 @@ export class ArmView {
     this.arms = arms;
     this.mantle = mantle;
     this.scene = scene;
-    const k = this.knobs = { ...VIEW_KNOBS, ...knobs };
+    const k = this.knobs = { ...VIEW_KNOBS, ghostGirth: 0.45, ...knobs };
     const count = arms.arms.length;
-    this.tubes = arms.arms.map((arm) => new ArmTube(arm.n, k));
+    this.tubes = arms.bodies.map((arm) => new ArmTube(arm.n, k));
     const vc = this.tubeVerts = this.tubes[0].vertexCount;
     this.skin = new THREE.MeshStandardMaterial({ color: SKIN, roughness: 0.35, metalness: 0.05 });
     this.tubeGeo = dynamicGeometry(count * vc, tubeIndex(count, this.tubes[0].ringCount, this.tubes[0].sides));
@@ -41,15 +43,23 @@ export class ArmView {
     this.cupCache = arms.arms.map(() => ({ layout: null, gen: -1, u: null, big: null }));
     this.cupOff = new Int32Array(count + 1);
 
-    const U = k.webU, V = k.webV, wv = this.webVerts = (U + 1) * (V + 1);
-    this.webs = Array.from({ length: count }, (_, r) => Object.assign(new WebSector(U, V), { a: r, b: (r + 1) % count, name: sectorName(r, count), gens: [-1, -1] }));
+    // A lone arm (the bench) has no neighbor to web to.
+    const U = k.webU, V = k.webV, wv = this.webVerts = (U + 1) * (V + 1), sectors = count > 1 ? count : 0;
+    this.webs = Array.from({ length: sectors }, (_, r) => Object.assign(new WebSector(U, V), { a: r, b: (r + 1) % count, name: sectorName(r, count), gens: [-1, -1] }));
     this.webSkin = new THREE.MeshStandardMaterial({ color: SKIN, roughness: 0.35, metalness: 0.05, side: THREE.DoubleSide });
-    this.webGeo = dynamicGeometry(count * wv, gridIndex(count, U, V));
-    this.webMesh = new THREE.Mesh(this.webGeo, this.webSkin);
-    this.webMesh.frustumCulled = false;
-    scene.add(this.webMesh);
+    this.webGeo = sectors ? dynamicGeometry(sectors * wv, gridIndex(sectors, U, V)) : null;
+    this.webMesh = sectors ? new THREE.Mesh(this.webGeo, this.webSkin) : null;
+    if (this.webMesh) { this.webMesh.frustumCulled = false; scene.add(this.webMesh); }
     this._mouthGaps();
     this._webOpts = { inset: k.webInset, fullness: k.fullness, count, down: [0, -1, 0] };
+
+    const slots = arms.rods.map((rod, a) => (rod ? a : -1)).filter((a) => a >= 0);
+    this.ghostSlots = slots;
+    this.ghostTubes = slots.map((a) => new ArmTube(arms.arms[a].n, k));
+    this.ghostSkin = new THREE.MeshStandardMaterial({ color: GHOST, roughness: 0.6, metalness: 0, transparent: true, opacity: 0.28, depthWrite: false });
+    this.ghostGeo = slots.length ? dynamicGeometry(slots.length * vc, tubeIndex(slots.length, this.tubes[0].ringCount, this.tubes[0].sides)) : null;
+    this.ghostMesh = slots.length ? new THREE.Mesh(this.ghostGeo, this.ghostSkin) : null;
+    if (this.ghostMesh) { this.ghostMesh.frustumCulled = false; this.ghostMesh.renderOrder = 1; scene.add(this.ghostMesh); }
 
     this._f = newFrame();
     this._in = [0, 0, 0];
@@ -60,6 +70,10 @@ export class ArmView {
     this.ms = new Float32Array(WINDOW);
     this.msCount = 0;
   }
+
+  /* A rod arm's intent chain drawn beside it, so its lag and sag read at a glance. */
+  get ghost() { return !!this.ghostMesh?.visible; }
+  set ghost(v) { if (this.ghostMesh) this.ghostMesh.visible = !!v; }
 
   /* The arm capsules' meshes, shown only for debugging. */
   get capsules() { return this._capsules; }
@@ -81,7 +95,7 @@ export class ArmView {
   }
 
   _layoutWeb(w) {
-    const k = this.knobs, arms = this.arms.arms, A = arms[w.a], B = arms[w.b];
+    const k = this.knobs, arms = this.arms.bodies, A = arms[w.a], B = arms[w.b];
     const longest = arms.reduce((x, arm) => Math.max(x, arm.length), 0);
     const mid = k.webDeep * longest * (k.webOrder[w.name] ?? 1);
     w.midDepth = mid;
@@ -92,7 +106,7 @@ export class ArmView {
   /* Per-sucker ring params and which cups are the enlarged few, rebuilt whenever the arm's layout object (replaced
      on a re-layout) or its rest geometry changes. */
   _cupLayout(a) {
-    const c = this.cupCache[a], L = this.arms.layouts[a], arm = this.arms.arms[a];
+    const c = this.cupCache[a], L = this.arms.layouts[a], arm = this.arms.bodies[a];
     if (c.layout === L && c.gen === arm.restGen) return c;
     const sub = this.tubes[a].sub;
     if (!c.u || c.u.length < L.n) { c.u = new Float64Array(L.n); c.big = new Uint8Array(L.n); }
@@ -112,7 +126,7 @@ export class ArmView {
 
   update() {
     const t0 = performance.now();
-    const k = this.knobs, arms = this.arms.arms, tubes = this.tubes, count = arms.length;
+    const k = this.knobs, arms = this.arms.bodies, tubes = this.tubes, count = arms.length;
     const pos = this.tubeGeo.attributes.position.array, nor = this.tubeGeo.attributes.normal.array;
     const girth = Number.isFinite(k.girth) && k.girth > 0 ? k.girth : 1;
     const N = this.arms.rootsN, inw = this._in;
@@ -124,8 +138,10 @@ export class ArmView {
     }
     this.tubeGeo.attributes.position.needsUpdate = true;
     this.tubeGeo.attributes.normal.needsUpdate = true;
+    if (this.ghost) this._writeGhosts(girth);
 
     if (this.cups.visible) this._writeCups();
+    if (!this.webMesh) { this.ms[this.msCount++ % WINDOW] = performance.now() - t0; return; }
 
     const wpos = this.webGeo.attributes.position.array, wnor = this.webGeo.attributes.normal.array, wv = this.webVerts;
     const o = this._webOpts, down = this.mantle.ring().down;
@@ -141,6 +157,18 @@ export class ArmView {
     this.webGeo.attributes.normal.needsUpdate = true;
 
     this.ms[this.msCount++ % WINDOW] = performance.now() - t0;
+  }
+
+  _writeGhosts(girth) {
+    const pos = this.ghostGeo.attributes.position.array, nor = this.ghostGeo.attributes.normal.array, N = this.arms.rootsN, inw = this._in;
+    const g = girth * (this.knobs.ghostGirth > 0 ? this.knobs.ghostGirth : 0.45);
+    for (let s = 0; s < this.ghostSlots.length; s++) {
+      const a = this.ghostSlots[s], arm = this.arms.arms[a], tube = this.ghostTubes[s];
+      inw[0] = -N[a * 3]; inw[1] = -N[a * 3 + 1]; inw[2] = -N[a * 3 + 2];
+      if (tube.update(arm.X, arm.rad, arm.SK, g, this.mantle.rootWorld(a, this._root), arm.D, arm.twist)) tube.write(pos, nor, s * this.tubeVerts, this.knobs.rootSink, Number.isFinite(inw[0] + inw[1] + inw[2]) ? inw : null);
+    }
+    this.ghostGeo.attributes.position.needsUpdate = true;
+    this.ghostGeo.attributes.normal.needsUpdate = true;
   }
 
   /* The live radii, or with previewRoot set, the live radii carried onto a candidate taper (root radius previewRoot,
@@ -199,9 +227,9 @@ export class ArmView {
   resetStats() { this.msCount = 0; }
 
   dispose() {
-    for (const m of [this.tubeMesh, this.cups, this.webMesh]) { this.scene.remove(m); m.geometry.dispose(); }
+    for (const m of [this.tubeMesh, this.cups, this.webMesh, this.ghostMesh]) { if (!m) continue; this.scene.remove(m); m.geometry.dispose(); }
     this.cups.dispose();
-    this.skin.dispose(); this.cupMat.dispose(); this.webSkin.dispose();
+    this.skin.dispose(); this.cupMat.dispose(); this.webSkin.dispose(); this.ghostSkin.dispose();
     // The capsule meshes belong to the rigid-body view, so they go back visible.
     this.capsules = true;
   }

@@ -817,6 +817,111 @@ function unitBetween(X, i, j, out) {
   return normalize3(out);
 }
 
+/* The contact pieces an arm's chain and a rod arm's body chain share, over a chain state c: knobs, X, rad, frame, and the
+   scratch and flags below. None of them re-seats a length or clamps a bend, so a rod's own dynamics keep those. */
+
+/* Tell a world that can narrow its search (focus) which part of it chain c can touch: its points X, grown by pad. */
+export function focusChain(c, world, pad) {
+  if (!world?.focus) return;
+  const X = c.X, lo = c._lo ??= [0, 0, 0], hi = c._hi ??= [0, 0, 0], F = c.frame.p;
+  for (let a = 0; a < 3; a++) { lo[a] = F[a]; hi[a] = F[a]; }
+  for (let i = 0; i < X.length; i += 3) {
+    for (let a = 0; a < 3; a++) { const v = X[i + a]; if (v < lo[a]) lo[a] = v; else if (v > hi[a]) hi[a] = v; }
+  }
+  if (!Number.isFinite(lo[0] + lo[1] + lo[2] + hi[0] + hi[1] + hi[2])) { world.unfocus(); return; }
+  for (let a = 0; a < 3; a++) { lo[a] -= pad; hi[a] += pad; }
+  world.focus(lo, hi);
+}
+
+function markTouched(c, i) { if (i < c._hit) c._hit = i; if (c._touched) c._touched[i] = 1; }
+
+/* A loose thing (a toy) that moved into the point pushes it out no more than one check's step at a time: the arm
+   yields over a few ticks, pushing the toy away meanwhile, instead of being thrown off it at once. */
+function yieldPen(c, i, pen, world) { return pen > 0 && world.loose ? Math.min(pen, c.rad[i] * c.knobs.sweepStep) : pen; }
+
+/* Deepest penetration of point i's sphere at (x, y, z) into the world or her body, its outward normal into out. */
+function penAt(c, i, x, y, z, world, body, out) {
+  let best = 0;
+  if (world) { const p = yieldPen(c, i, world.collide(x, y, z, c.rad[i], out, i), world); if (p > 0) best = p; }
+  if (body && i > 0) {
+    const nb = c._nb ??= [0, 0, 0], p = body.collide(x, y, z, bodyRadius(c.rad[i], i, c.knobs.bodySkip), nb);
+    if (p > best) { best = p; out[0] = nb[0]; out[1] = nb[1]; out[2] = nb[2]; }
+  }
+  return best;
+}
+
+/* Point i's sphere at (x, y, z) pushed out of every solid it is in, a few rounds for a corner, into q; whether it moved. */
+function outOf(c, i, x, y, z, world, body, q) {
+  const n = c._n;
+  let moved = false;
+  for (let round = 0; round < 3; round++) {
+    const pen = penAt(c, i, x, y, z, world, body, n);
+    if (!(pen > 0)) break;
+    x += n[0] * pen; y += n[1] * pen; z += n[2] * pen; moved = true;
+  }
+  q[0] = x; q[1] = y; q[2] = z;
+  return moved;
+}
+
+/* Push point i of chain c out of the world and her body; returns whether it moved, with the summed push direction in _push3. */
+export function projectPoint(c, i, world, body) {
+  const X = c.X, r = c.rad[i], nrm = c._n, acc = c._push3 ??= [0, 0, 0];
+  acc[0] = 0; acc[1] = 0; acc[2] = 0;
+  let any = false;
+  for (let round = 0; round < 3; round++) {
+    let moved = false;
+    if (world) {
+      const pen = yieldPen(c, i, world.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], r, nrm, i), world);
+      if (pen > 0) {
+        X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen;
+        acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true;
+      }
+    }
+    if (body && i > 0) {
+      const pen = body.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], bodyRadius(r, i, c.knobs.bodySkip), nrm);
+      if (pen > 0) { X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen; acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true; }
+    }
+    if (!moved) break;
+    any = true;
+  }
+  if (any) markTouched(c, i);
+  return any;
+}
+
+/* Carry point i of chain c from (x, y, z) toward the place now in X, never into a solid: sampled at sweepStep of its
+   radius, stopped at the first penetration, then slid along that surface with what is left of the move. */
+export function travelPoint(c, i, world, body, x, y, z) {
+  const k = c.knobs, X = c.X, o = i * 3, n = c._n, r = c.rad[i], q = c._q3 ??= [0, 0, 0];
+  const tx = X[o], ty = X[o + 1], tz = X[o + 2];
+  // A start something moved into (her body, a toy) is met by the first check along the way, as shallow as its move.
+  let mx = tx - x, my = ty - y, mz = tz - z, hit = false, pen = 0;
+  const step = Math.max(1e-3, r * k.sweepStep);
+  for (let leg = 0; leg < k.sweepLegs; leg++) {
+    const m = len3(mx, my, mz);
+    let cnt = Math.max(1, Math.ceil(m / step));
+    // A move longer than sweepMax checks goes only as far as it was checked; the rest is next tick's.
+    if (cnt > k.sweepMax) { const f = k.sweepMax * step / m; mx *= f; my *= f; mz *= f; cnt = k.sweepMax; c._short = true; }
+    let stopped = false;
+    for (let s = 1; s <= cnt; s++) {
+      const f = s / cnt, sx = x + mx * f, sy = y + my * f, sz = z + mz * f;
+      pen = penAt(c, i, sx, sy, sz, world, body, n);
+      if (!(pen > 0)) continue;
+      // Out on the side it came in, then the rest of the move loses its part into the surface.
+      x = sx + n[0] * pen; y = sy + n[1] * pen; z = sz + n[2] * pen;
+      if (outOf(c, i, x, y, z, world, body, q)) { x = q[0]; y = q[1]; z = q[2]; }
+      const rx = mx * (1 - f), ry = my * (1 - f), rz = mz * (1 - f), into = rx * n[0] + ry * n[1] + rz * n[2];
+      mx = rx; my = ry; mz = rz;
+      if (into < 0) { mx -= into * n[0]; my -= into * n[1]; mz -= into * n[2]; }
+      stopped = true; hit = true;
+      break;
+    }
+    if (!stopped) { x += mx; y += my; z += mz; mx = my = mz = 0; break; }
+  }
+  X[o] = x; X[o + 1] = y; X[o + 2] = z;
+  if (hit) markTouched(c, i);
+  return hit;
+}
+
 /* One arm. Programs set a bend per joint (in the arm's own transported frame), a stretch and a twist per segment;
    springs relax them, the chain is integrated out from the root frame, then made to touch, not clip. */
 export class Arm {
@@ -1510,18 +1615,7 @@ export class Arm {
     }
   }
 
-  /* Tell a world that can narrow its search (focus) which part of it this arm can touch: its chain X, grown by pad. */
-  _focus(world, pad) {
-    if (!world?.focus) return;
-    const X = this.X, lo = this._lo ??= [0, 0, 0], hi = this._hi ??= [0, 0, 0], F = this.frame.p;
-    for (let a = 0; a < 3; a++) { lo[a] = F[a]; hi[a] = F[a]; }
-    for (let i = 0; i < X.length; i += 3) {
-      for (let a = 0; a < 3; a++) { const v = X[i + a]; if (v < lo[a]) lo[a] = v; else if (v > hi[a]) hi[a] = v; }
-    }
-    if (!Number.isFinite(lo[0] + lo[1] + lo[2] + hi[0] + hi[1] + hi[2])) { world.unfocus(); return; }
-    for (let a = 0; a < 3; a++) { lo[a] -= pad; hi[a] += pad; }
-    world.focus(lo, hi);
-  }
+  _focus(world, pad) { focusChain(this, world, pad); }
 
   /* Programs, relaxation, the grip, the pose, then the contact sweep. world and body are collide callbacks. */
   step(dt, world, body) {
@@ -1610,96 +1704,9 @@ export class Arm {
     this.started = true;
   }
 
-  /* Push point i out of the world and her body; returns whether it moved, with the summed push direction in _push3. */
-  _project(i, world, body) {
-    const X = this.X, r = this.rad[i], nrm = this._n, acc = this._push3 ??= [0, 0, 0];
-    acc[0] = 0; acc[1] = 0; acc[2] = 0;
-    let any = false;
-    for (let round = 0; round < 3; round++) {
-      let moved = false;
-      if (world) {
-        const pen = this._yield(i, world.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], r, nrm, i), world);
-        if (pen > 0) {
-          X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen;
-          acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true;
-        }
-      }
-      if (body && i > 0) {
-        const pen = body.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], bodyRadius(r, i, this.knobs.bodySkip), nrm);
-        if (pen > 0) { X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen; acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true; }
-      }
-      if (!moved) break;
-      any = true;
-    }
-    if (any) { if (i < this._hit) this._hit = i; if (this._touched) this._touched[i] = 1; }
-    return any;
-  }
-
-
-
-
-
-  /* A loose thing (a toy) that moved into the point pushes it out no more than one check's step at a time: the arm
-     yields over a few ticks, pushing the toy away meanwhile, instead of being thrown off it at once. */
-  _yield(i, pen, world) { return pen > 0 && world.loose ? Math.min(pen, this.rad[i] * this.knobs.sweepStep) : pen; }
-
-  /* Deepest penetration of point i's sphere at (x, y, z) into the world or her body, its outward normal into out. */
-  _pen(i, x, y, z, world, body, out) {
-    let best = 0;
-    if (world) { const p = this._yield(i, world.collide(x, y, z, this.rad[i], out, i), world); if (p > 0) best = p; }
-    if (body && i > 0) {
-      const nb = this._nb ??= [0, 0, 0], p = body.collide(x, y, z, bodyRadius(this.rad[i], i, this.knobs.bodySkip), nb);
-      if (p > best) { best = p; out[0] = nb[0]; out[1] = nb[1]; out[2] = nb[2]; }
-    }
-    return best;
-  }
-
-  /* Point i's sphere at (x, y, z) pushed out of every solid it is in, a few rounds for a corner, into q; whether it moved. */
-  _out(i, x, y, z, world, body, q) {
-    const n = this._n;
-    let moved = false;
-    for (let round = 0; round < 3; round++) {
-      const pen = this._pen(i, x, y, z, world, body, n);
-      if (!(pen > 0)) break;
-      x += n[0] * pen; y += n[1] * pen; z += n[2] * pen; moved = true;
-    }
-    q[0] = x; q[1] = y; q[2] = z;
-    return moved;
-  }
-
-  /* Carry point i from (x, y, z) toward the place now in X, never into a solid: sampled at sweepStep of its radius,
-     stopped at the first penetration, then slid along that surface with what is left of the move. */
-  _travel(i, world, body, x, y, z) {
-    const k = this.knobs, X = this.X, o = i * 3, n = this._n, r = this.rad[i], q = this._q3 ??= [0, 0, 0];
-    const tx = X[o], ty = X[o + 1], tz = X[o + 2];
-    // A start something moved into (her body, a toy) is met by the first check along the way, as shallow as its move.
-    let mx = tx - x, my = ty - y, mz = tz - z, hit = false, pen = 0;
-    const step = Math.max(1e-3, r * k.sweepStep);
-    for (let leg = 0; leg < k.sweepLegs; leg++) {
-      const m = len3(mx, my, mz);
-      let cnt = Math.max(1, Math.ceil(m / step));
-      // A move longer than sweepMax checks goes only as far as it was checked; the rest is next tick's.
-      if (cnt > k.sweepMax) { const f = k.sweepMax * step / m; mx *= f; my *= f; mz *= f; cnt = k.sweepMax; this._short = true; }
-      let stopped = false;
-      for (let s = 1; s <= cnt; s++) {
-        const f = s / cnt, sx = x + mx * f, sy = y + my * f, sz = z + mz * f;
-        pen = this._pen(i, sx, sy, sz, world, body, n);
-        if (!(pen > 0)) continue;
-        // Out on the side it came in, then the rest of the move loses its part into the surface.
-        x = sx + n[0] * pen; y = sy + n[1] * pen; z = sz + n[2] * pen;
-        if (this._out(i, x, y, z, world, body, q)) { x = q[0]; y = q[1]; z = q[2]; }
-        const rx = mx * (1 - f), ry = my * (1 - f), rz = mz * (1 - f), into = rx * n[0] + ry * n[1] + rz * n[2];
-        mx = rx; my = ry; mz = rz;
-        if (into < 0) { mx -= into * n[0]; my -= into * n[1]; mz -= into * n[2]; }
-        stopped = true; hit = true;
-        break;
-      }
-      if (!stopped) { x += mx; y += my; z += mz; mx = my = mz = 0; break; }
-    }
-    X[o] = x; X[o + 1] = y; X[o + 2] = z;
-    if (hit) { if (i < this._hit) this._hit = i; if (this._touched) this._touched[i] = 1; }
-    return hit;
-  }
+  _project(i, world, body) { return projectPoint(this, i, world, body); }
+  _pen(i, x, y, z, world, body, out) { return penAt(this, i, x, y, z, world, body, out); }
+  _travel(i, world, body, x, y, z) { return travelPoint(this, i, world, body, x, y, z); }
 
   /* Turn segment i - 1 about its solved start from where point i is now toward (tx, ty, tz), in steps of sweepStep of
      its radius: each step that meets a surface is pushed out and put back at length, so a segment driven into a
@@ -1888,8 +1895,9 @@ export class Arm {
   }
 
   /* One round after the arm-on-arm push: bend limits as minimum spans across each triple, so a kink pressed into a
-     surface rounds off by lifting the points before it; then lengths from the root, then contact has the last word. */
-  finishPass(world, body, last = false) {
+     surface rounds off by lifting the points before it; then lengths from the root, then contact has the last word.
+     `feed` off leaves the contact hold to whoever calls _feedback with another chain's contact (a rod arm's body). */
+  finishPass(world, body, last = false, feed = true) {
     if (this.valid === false) return;
     this._focus(world, this.knobs.focusPad);
     const X = this.X, n = this.n, F = this.frame, len = this.len, lim = this.limCos;
@@ -1947,17 +1955,19 @@ export class Arm {
     }
     if (Q) Q.set(X);
     this._solveSK();
-    if (last) this._feedback();
+    if (last && feed) this._feedback();
   }
 
   /* The pose ignores contact and would drive on through what the arm lies on. Where contact holds the arm, the springs'
      targets take the shape it left, touched segments as solved and free ones keeping their posed world direction, so
-     the bends follow through the springs (nothing in the pose jumps) and come to rest against it; then it relaxes. */
-  _feedback() {
+     the bends follow through the springs (nothing in the pose jumps) and come to rest against it; then it relaxes.
+     The contact is this chain's own unless src ({ X, touched, hit }) brings another's. */
+  _feedback(src = null) {
     // A resting curl keeps pressing into what it wraps, so feedback fades out with rest.
-    const k = this.knobs, w = k.contactFeedback * (1 - this.restW * k.feedbackRest), S = this.n - 1, h = this._hit, Tc = this._touched;
-    if (!(w > 0) || !this.started || h >= this.n || !Number.isFinite(this.X[this.n * 3 - 1])) return;
-    const X = this.X, D = this.D, H = this._fh ??= new Float64Array(this.n * 3), Fb = this._fb ??= new Float64Array(S * 2), d = this._t;
+    const k = this.knobs, w = k.contactFeedback * (1 - this.restW * k.feedbackRest), S = this.n - 1;
+    const X = src ? src.X : this.X, h = src ? src.hit : this._hit, Tc = src ? src.touched : this._touched;
+    if (!(w > 0) || !this.started || h >= this.n || !Number.isFinite(X[this.n * 3 - 1])) return;
+    const D = this.D, H = this._fh ??= new Float64Array(this.n * 3), Fb = this._fb ??= new Float64Array(S * 2), d = this._t;
     H[0] = X[0]; H[1] = X[1]; H[2] = X[2];
     for (let s = 0; s < S; s++) {
       d[0] = D[s * 3]; d[1] = D[s * 3 + 1]; d[2] = D[s * 3 + 2];

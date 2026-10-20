@@ -212,6 +212,17 @@ export class Rod {
     this._mOld = false;
   }
 
+  /* Lays the rod at rest on the points X (a chain that already lies clear of everything), its root where it is and
+     each frame turned onto its segment from the rest shape's; a non-finite X leaves it on its rest shape. */
+  poseFromPoints(X) {
+    this.poseFromRest();
+    const x = this.x, m = 3 * (this.n + 1);
+    for (let i = 3; i < m; i++) if (!Number.isFinite(X[i])) return;
+    for (let i = 3; i < m; i++) x[i] = X[i];
+    this.alignFrames();
+    this.p.set(x); this.qp.set(this.q);
+  }
+
   /* Element j's directors (d1, d2, d3) into out[0..8]; d3 runs along the arm, and d1, d2 carry the arm's u, v. */
   frame(j, out, o = 0) {
     const q = this.q, x = q[4 * j], y = q[4 * j + 1], z = q[4 * j + 2], w = q[4 * j + 3];

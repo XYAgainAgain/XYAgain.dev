@@ -351,8 +351,8 @@ export async function jetScenario(ctx, { dir = null, urgency = 1, variant = null
     const c = m.ring().c;
     let behind = 0;
     const backs = [];
-    if (sp > 0.05) for (const arm of A.arms) {
-      const X = arm.X, i = (arm.n - 1) * 3, back = -((X[i] - c[0]) * v[0] + (X[i + 1] - c[1]) * v[1] + (X[i + 2] - c[2]) * v[2]) / sp;
+    if (sp > 0.05) for (let s = 0; s < A.arms.length; s++) {
+      const arm = A.arms[s], X = A.bodies[s].X, i = (arm.n - 1) * 3, back = -((X[i] - c[0]) * v[0] + (X[i + 1] - c[1]) * v[1] + (X[i + 2] - c[2]) * v[2]) / sp;
       backs.push(`${arm.goal?.kind ?? '-'}:${r3(arm.w)}:${r3(back)}`);
       if (back >= 0.2) behind++;
     }

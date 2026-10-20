@@ -5,7 +5,7 @@ export class Breaches {
     Object.assign(this, { mantle, arms, waves });
     this.skin = new Float32Array(mantle.positions.length);
     this.oldSkin = new Float32Array(mantle.positions.length);
-    this.oldArms = arms.arms.map((a) => new Float32Array(a.X.length));
+    this.oldArms = arms.bodies.map((a) => new Float32Array(a.X.length));
     this.point = [0, 0];
     this.ready = false; this.contacts = 0; this.total = 0;
   }
@@ -24,8 +24,8 @@ export class Breaches {
       this.contacts++;
     };
     for (const [a, b] of m.edges) stamp(this.oldSkin, this.skin, a, b, 0.003, 0.05);
-    for (let j = 0; j < this.arms.arms.length; j++) {
-      const arm = this.arms.arms[j];
+    for (let j = 0; j < this.arms.bodies.length; j++) {
+      const arm = this.arms.bodies[j];
       for (let i = 0; i < arm.n - 1; i++) stamp(this.oldArms[j], arm.X, i, i + 1, Math.max(0.004, arm.rad[i]), 0.5);
       this.oldArms[j].set(arm.X);
     }

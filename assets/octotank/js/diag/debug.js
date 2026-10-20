@@ -9,7 +9,7 @@ export function attachDebug(ctx) {
   const { phys, mantle, arms, pose, panel, layoutKnobs } = ctx;
   const tank = {
     phys, mantle, arms, pose, toys: ctx.toys,
-    knobs: { mantle: mantle.knobs, arms: arms.knobs, pose: pose.knobs, layout: layoutKnobs, suckers: arms.suckerKnobs },
+    knobs: { mantle: mantle.knobs, arms: arms.knobs, pose: pose?.knobs, layout: layoutKnobs, suckers: arms.suckerKnobs, rod: arms.rodKnobs },
     get stats() { return { step: phys.stats(), sim: phys.time, verts: mantle.shell.count, drive: mantle.drive, iterations: mantle.knobs.iterations, backend: document.documentElement.dataset.backend }; },
     resetStats: () => phys.resetStats(),
     setPressure: (pa) => mantle.setPressurePa(pa),
