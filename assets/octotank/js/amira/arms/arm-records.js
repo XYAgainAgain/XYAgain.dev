@@ -1,7 +1,7 @@
-/* Each arm's state, its reason, and since when, plus a ring of recent events that collapses repeats. Pure observation:
-   it reads the arms, their reflexes, the blocked tell, and locomotion's roles, and writes nothing but its own state. */
+/* Each arm's state, its reason, and since when, plus a ring of recent events per arm that collapses repeats. Pure
+   observation: it reads the arms, their reflexes, the blocked tell, and locomotion's roles, and writes only its own state. */
 
-export const RECORD_SIZE = 64;
+export const RECORD_SIZE = 64;   // events per arm, so a busy arm can't write over a quiet one's beats
 const WINDOW = 1800;
 
 export class ArmRecords {
@@ -11,10 +11,9 @@ export class ArmRecords {
     this.state = Array.from({ length: n }, () => ({ label: 'exploring', reason: null, since: 0 }));
     // Locomotion, when the page has one: its role names tell a stroke from a station. Arms holds no reference to it.
     this.loco = null;
-    this.ring = Array.from({ length: RECORD_SIZE }, () => ({ t: 0, arm: -1, kind: '', text: '', count: 0, seq: 0 }));
-    this.seq = 0;
-    this._last = new Int32Array(n).fill(-1);   // ring slot of each arm's newest event, valid while its seq still matches
-    this._lastSeq = new Float64Array(n);
+    this.ring = Array.from({ length: n }, (_, a) => Array.from({ length: RECORD_SIZE }, () => ({ t: 0, arm: a, kind: '', text: '', count: 0, seq: 0 })));
+    this.written = new Float64Array(n);        // events each arm has logged; its newest sits at (written - 1) % RECORD_SIZE
+    this.seq = 0;                              // across every arm, so a merged read keeps their order
     this._note = new Array(n).fill(null);      // the newest note since the last tick, for a label change's reason
     this._kind = new Array(n).fill(null);
     this._goal = new Array(n).fill(null);
@@ -73,25 +72,42 @@ export class ArmRecords {
     return i >= 0 ? `${e.taste ?? e.tag} ${i}` : String(e.tag ?? e.taste ?? 'thing');
   }
 
-  /* A repeat of this arm's newest event, while it is still in the ring, only counts up; `t` stays the first time. */
+  /* A repeat of this arm's newest event only counts up; `t` stays the first time. */
   _log(a, kind, text) {
-    const R = this.ring, j = this._last[a];
-    if (j >= 0) {
-      const e = R[j];
-      if (e.seq === this._lastSeq[a] && e.kind === kind && e.text === text) { e.count++; return; }
+    const R = this.ring[a], w = this.written[a];
+    if (w > 0) {
+      const e = R[(w - 1) % RECORD_SIZE];
+      if (e.kind === kind && e.text === text) { e.count++; return; }
     }
-    const slot = this.seq % RECORD_SIZE, e = R[slot];
-    e.t = this.arms.time; e.arm = a; e.kind = kind; e.text = text; e.count = 1; e.seq = ++this.seq;
-    this._last[a] = slot; this._lastSeq[a] = e.seq;
+    const e = R[w % RECORD_SIZE];
+    e.t = this.arms.time; e.kind = kind; e.text = text; e.count = 1; e.seq = ++this.seq;
+    this.written[a] = w + 1;
   }
 
-  /* Up to `count` of the newest events, oldest first: slot a's alone, or every arm's with a < 0. These are the ring's
-     own entries, rewritten as it wraps, so copy any you keep. */
+  /* Up to `count` of the newest events, oldest first: slot a's alone, or every arm's merged with a < 0. These are the
+     rings' own entries, rewritten as they wrap, so copy any you keep. */
   recent(a = -1, count = RECORD_SIZE) {
-    const R = this.ring, out = [], have = Math.min(this.seq, RECORD_SIZE);
-    for (let i = 0; i < have && out.length < count; i++) {
-      const e = R[(this.seq - 1 - i) % RECORD_SIZE];
-      if (a < 0 || e.arm === a) out.push(e);
+    const out = [];
+    if (a >= 0) {
+      const R = this.ring[a], w = this.written[a];
+      if (!R) return out;
+      for (let i = 1; i <= Math.min(w, RECORD_SIZE, count); i++) out.push(R[(w - i) % RECORD_SIZE]);
+      return out.reverse();
+    }
+    // Newest first across the arms: each arm's ring is in order, so its next-newest is always the one to compare.
+    const n = this.ring.length, back = this._back ??= new Int32Array(n);
+    back.fill(0);
+    while (out.length < count) {
+      let best = -1, bs = 0;
+      for (let b = 0; b < n; b++) {
+        const w = this.written[b], i = back[b] + 1;
+        if (i > Math.min(w, RECORD_SIZE)) continue;
+        const s = this.ring[b][(w - i) % RECORD_SIZE].seq;
+        if (s > bs) { bs = s; best = b; }
+      }
+      if (best < 0) break;
+      back[best]++;
+      out.push(this.ring[best][(this.written[best] - back[best]) % RECORD_SIZE]);
     }
     return out.reverse();
   }

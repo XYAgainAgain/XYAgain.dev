@@ -113,9 +113,10 @@ export class ArmReflexes {
     return claimWins(owner, 'reflex') || (owner === 'held' && A.episodes[a]?.h) ? null : owner;
   }
 
-  /* A plain reach or hold to come back to; locomotion's feet, fetches, and the rest are let go instead. */
+  /* A plain reach or hold to come back to; locomotion's feet, fetches, and the rest are let go instead, and so is a
+     careful try stung again, which would otherwise come back every few seconds for as long as the thing lies there. */
   _stashOf(a, g) {
-    if ((g.kind !== 'reach' && g.kind !== 'hold') || g.loco || !g.target) return null;
+    if ((g.kind !== 'reach' && g.kind !== 'hold') || g.loco || !g.target || g.keepOut) return null;
     const A = this.arms, w = A.blocked?.watch[a], side = w?.phase === 1 && w.goal === g;
     // Mid side-step the blocked tell has moved the target and stretched the hold; the reach was going where it began.
     return { toy: A.track[a], target: (side ? w.orig : g.target).slice(0, 3), face: g.face ? g.face.slice(0, 3) : null, tip: !!g.tip, hold: side ? w.hold0 : g.hold, cFix: g.cFix ?? null, owner: A.owner[a], t: A.time };

@@ -12,6 +12,7 @@ export const BLOCKED_KNOBS = {
   facing: 0.3,       // a touch is in the way when the way through it to the target meets its normal this head-on
   touchGrace: 0.1,   // s a touch may flicker off without restarting the window
   probeT: 0.9,       // s of the side-step: out along the surface and back, then settleT with the target home
+  probeStretch: 0.5, // s a side-step may outlast its hold, so a stall late in a short hold still shows one
   settleT: 0.25,     // s the gap is averaged over at the end, so an arm swinging through doesn't count as past
   probeDist: 0.08,   // m it moves the hold's target at most
   clearFrac: 0.25,   // of the blocked gap the side-step must win back to count as getting past,
@@ -132,8 +133,8 @@ export class ArmBlocked {
     if (touching) { for (let i = 0; i < 3; i++) { st.c[i] = this._c[i]; st.n[i] = this._n[i]; } st.what = this._hit; }
     if (!stallStep(st, gap, touching, dt, k)) return;
     if (st.probed) return this._moveOn(a, arm, st, 'moveOn', gap, 'still blocked after its side-step');
-    // Too late in the hold for a side-step: one would only keep it pressed past its own end.
-    if (g.hold - g.ht < k.probeT) return this._moveOn(a, arm, st, 'moveOn', gap, 'blocked near the end of its hold');
+    // Too late in the hold for a side-step: one would keep it pressed well past its own end.
+    if (g.hold - g.ht < k.probeT - k.probeStretch) return this._moveOn(a, arm, st, 'moveOn', gap, 'blocked near the end of its hold');
     // Blocked: this tick says so, and the side-step starts moving the target on the next.
     if (!latchSide(st, st.c, st.n, T, k.sideMin)) return this._moveOn(a, arm, st, 'moveOn', gap, 'blocked, with no way along the surface');
     st.phase = 1; st.probed = true; st.cleared = false; st.t = 0; st.gap0 = gap; st.dir = 0; st.sum = 0; st.sumT = 0;
