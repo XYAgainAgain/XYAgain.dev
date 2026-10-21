@@ -16,6 +16,16 @@ export const ROD_ARM_KNOBS = {
   rootShare: 0.033,      // the drawn arm's root radius over the full arm's length, the front pair's too
   rootGap: 0.002,        // m a rod's collision radius keeps clear of its neighbors' roots on her crown
   current: true,         // the tank's currents push the rod
+  // The loads stay on the bench (main.js turns them on there) until Stage 6 brings the root wrench into her body.
+  toyPush: 'capped',     // 'rod': a toy takes the rod's own contact momentum, split by the two inverse masses; 'capped': pushN per toy
+  gripLoad: false,       // what a grip holds weighs on the rod's grip nodes, a tick late
+  gripMass: true,        // and the held toy's mass rides those nodes, so its inertia is the rod's own, not a late pull that rings
+  gripLoadTau: 0.08,     // s that load is smoothed over
+  seals: false,          // sealed suckers on the furniture, and a plant's foot, hold their node where it sealed
+  toySeals: false,       // and on a loose thing, which a grip mostly holds anyway
+  sealCompliance: 1e-4,  // m/N
+  sealGrace: 0.15,       // s a segment's seal outlasts its suckers all flickering off at once
+  sealLift: 0.04,        // m the intent chain may draw a sealed node's point off its anchor before the arm lets go there
 };
 
 const len3 = (x, y, z) => Math.sqrt(x * x + y * y + z * z);
@@ -38,6 +48,21 @@ export function armMassShare(index, armKnobs, k, count = 8) {
   let total = 0;
   for (let i = 0; i < count; i++) total += front.includes(i) ? vf : vb;
   return (front.includes(index) ? vf : vb) / total;
+}
+
+/* A node pushed out of a loose thing by d along unit n over h: the normal impulse j that stops their closing, split by
+   the node's 3×3 inverse mass W (at 9i) and the thing's wt, and the node's own share of the push-out into out. */
+export function splitPush(W, i, nx, ny, nz, d, h, wt, out) {
+  const o = 9 * i, ax = W[o] * nx + W[o + 1] * ny + W[o + 2] * nz, ay = W[o + 3] * nx + W[o + 4] * ny + W[o + 5] * nz, az = W[o + 6] * nx + W[o + 7] * ny + W[o + 8] * nz;
+  const den = nx * ax + ny * ay + nz * az + Math.max(0, wt), j = den > 0 && d > 0 && h > 0 ? d / h / den : 0;
+  out[0] = ax * j * h; out[1] = ay * j * h; out[2] = az * j * h;
+  return j;
+}
+
+/* A grip's load L (N on the arm) shared between the two nodes of segment j, fr of the way along it. */
+export function spreadLoad(ext, j, fr, L) {
+  const f = Math.max(0, Math.min(1, fr)), o = 3 * j;
+  for (let c = 0; c < 3; c++) { ext[o + c] += (1 - f) * L[c]; ext[o + 3 + c] += f * L[c]; }
 }
 
 export class RodArm {
@@ -110,11 +135,16 @@ export class RodArm {
       for (let j = 0; j < rod.n; j++) {
         const kk = ak.stiffIdle + (arm.stiffGoal[j] - ak.stiffIdle) * arm.w;
         rod.bendScale[j] = this.stiff * Math.max(0.05, Math.min(20, kk / ref));
+        // The bend's bracing is already in the authored stiffness here; only the muscles' axial stiffening is added.
+        rod.stretchScale[j] = arm.knobs.muscle && arm.mus ? arm.mus.axialStiff[j] : 1;
       }
     } else {
       const s = this._s3, B = k.rest === 'chain' && arm.X.every(Number.isFinite) ? chainBends(arm.frame, arm.twist, arm.X, this._B, this.n - 1, s[0], s[1], s[2]) : arm.out;
       rod.setRestFromBends(B, arm.twist, arm.lam);
-      rod.bendScale.fill(this.stiff);
+      // Muscle mode: a braced stretch of arm is as much stiffer as its co-contraction makes it, a relaxed one is not.
+      const M = arm.knobs.muscle ? arm.mus : null;
+      if (M) for (let j = 0; j < rod.n; j++) { rod.bendScale[j] = this.stiff * M.bendStiff[j]; rod.stretchScale[j] = M.axialStiff[j]; }
+      else { rod.bendScale.fill(this.stiff); rod.stretchScale.fill(1); }
     }
   }
 

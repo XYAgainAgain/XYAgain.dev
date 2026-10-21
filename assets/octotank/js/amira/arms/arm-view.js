@@ -108,13 +108,16 @@ export class ArmView {
   _cupLayout(a) {
     const c = this.cupCache[a], L = this.arms.layouts[a], arm = this.arms.bodies[a];
     if (c.layout === L && c.gen === arm.restGen) return c;
-    const sub = this.tubes[a].sub, rad0 = arm.drawRad0 ?? arm.rad0;
-    if (!c.u || c.u.length < L.n) { c.u = new Float64Array(L.n); c.big = new Uint8Array(L.n); }
+    // The layout sized its cups on the authored arm; a rod arm draws thicker, so its enlarged cups grow by as much.
+    const sub = this.tubes[a].sub, rad0 = this.arms.arms[a].rad0, drawn = arm.drawRad0 ?? rad0;
+    if (!c.u || c.u.length < L.n) { c.u = new Float64Array(L.n); c.big = new Uint8Array(L.n); c.grow = new Float64Array(L.n); }
     const frac = this.arms.suckerKnobs.suckerFrac;
     for (let i = 0; i < L.n; i++) {
       c.u[i] = ringAtArc(L.arc[i], arm.len0, arm.arc0, sub);
       const j = L.seg[i], f = Math.max(0, Math.min(1, (L.arc[i] - arm.arc0[j]) / arm.len0[j]));
-      c.big[i] = L.radius[i] > 1.01 * frac * (rad0[j] + (rad0[j + 1] - rad0[j]) * f) ? 1 : 0;
+      const r = rad0[j] + (rad0[j + 1] - rad0[j]) * f;
+      c.big[i] = L.radius[i] > 1.01 * frac * r ? 1 : 0;
+      c.grow[i] = (drawn[j] + (drawn[j + 1] - drawn[j]) * f) / r;
     }
     c.layout = L; c.gen = arm.restGen;
     if (!this._warned && this.arms.layouts.reduce((s, x) => s + x.n, 0) > this.capacity) {
@@ -202,8 +205,8 @@ export class ArmView {
         tube.frameAt(c.u[i], f);
         const side = L.row[i] ? sa : -sa, t = f.t, o = f.o, b = f.b;
         const dx = o[0] * ca + b[0] * side, dy = o[1] * ca + b[1] * side, dz = o[2] * ca + b[2] * side;
-        // Ordinary cups follow the drawn arm; the enlarged few keep their own size.
-        const s = c.big[i] ? Math.max(L.radius[i], sk.suckerFrac * f.r) : sk.suckerFrac * f.r;
+        // Ordinary cups follow the drawn arm; the enlarged few keep their own size, grown with a rod arm's girth.
+        const s = c.big[i] ? Math.max(L.radius[i] * c.grow[i], sk.suckerFrac * f.r) : sk.suckerFrac * f.r;
         const zx = t[1] * dz - t[2] * dy, zy = t[2] * dx - t[0] * dz, zz = t[0] * dy - t[1] * dx;
         const m = (off[a] + i) * 16;
         M[m] = t[0] * s; M[m + 1] = t[1] * s; M[m + 2] = t[2] * s; M[m + 3] = 0;

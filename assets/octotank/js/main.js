@@ -103,6 +103,8 @@ async function boot() {
     else if (Number.isFinite(+raw)) mantleKnobs[name] = +raw;
   }
   const armKnobs = params.has('collider') ? { collider: params.get('collider') } : {};
+  // Her arms run on their muscles; ?muscle=0 runs them on the authored targets alone, as before the muscle map.
+  armKnobs.muscle = params.get('muscle') === '0' ? 0 : 1;
   // The bench sets her aside: a mount holds one arm (a rod unless ?rod=0), and nothing of her body, posture, attention,
   // or locomotion is built.
   const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
@@ -110,7 +112,7 @@ async function boot() {
   if (benchOn) {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: twin ? { hold: 'off' } : {}, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off' } : {}), toyPush: 'rod', gripLoad: true, seals: true }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });

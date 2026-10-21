@@ -23,6 +23,7 @@ export const ROD_KNOBS = {
   rootStep: 0.01,        // m the root may travel in one substep before the step takes more of them
   rootTurn: 0.1,         // rad, the same for its turn
   maxSubsteps: 8,
+  sealBreak: false,      // a seal pulled past its maxForce lets go; off, a seal holds whatever it bears
 };
 
 // 3×3 row-major blocks at offsets; outputs never alias inputs.
@@ -130,6 +131,11 @@ export class Rod {
     this.rootTorque = [0, 0, 0];  // N·m about node 0
     this._k = new Float64Array(9); this._t1 = new Float64Array(9); this._t2 = new Float64Array(9); this._t3 = new Float64Array(9);
     this._u6 = new Float64Array(6); this._v6 = new Float64Array(6); this._amb = [0, 0, 0];
+    this.sealed = new Uint8Array(N); this.nSeals = 0;
+    this.sealBroke = new Uint8Array(N);              // set when a seal lets go on its own (a break or a reset); the caller clears it
+    this.sA = new Float64Array(3 * N); this.sA0 = new Float64Array(3 * N); this.sC = new Float64Array(N); this.sMax = new Float64Array(N);
+    this.sF = new Float64Array(3 * N); this._sAcc = new Float64Array(3 * N); this._sP = new Float64Array(3 * N); this._sLive = false;
+    this.addM = new Float64Array(N); this._aIn = new Float64Array(N); this._aLive = false;   // kg carried at a node: a held toy's inertia
     this.configure();
     this.poseFromRest();
   }
@@ -240,6 +246,52 @@ export class Rod {
     v[3 * i] += dx * inv; v[3 * i + 1] += dy * inv; v[3 * i + 2] += dz * inv;
   }
 
+  /* Holds node i at the world point (x, y, z), compliance in m/N; sealing it again moves the anchor (a sliding foot, a
+     toy that moves), which the next step follows across its substeps. A new seal draws its node in from where it is. */
+  seal(i, x, y, z, { compliance = 0, maxForce = Infinity } = {}) {
+    if (!Number.isInteger(i) || i < (this.fixedRoot ? 1 : 0) || i > this.n || !Number.isFinite(x + y + z)) return false;
+    if (!(compliance >= 0) || !Number.isFinite(compliance) || !(maxForce > 0)) return false;
+    const o = 3 * i;
+    if (!this.sealed[i]) {
+      this.sealed[i] = 1; this.nSeals++;
+      this.sA0[o] = this.x[o]; this.sA0[o + 1] = this.x[o + 1]; this.sA0[o + 2] = this.x[o + 2];
+    }
+    this.sA[o] = x; this.sA[o + 1] = y; this.sA[o + 2] = z;
+    this.sC[i] = compliance; this.sMax[i] = maxForce;
+    return true;
+  }
+
+  unseal(i) {
+    if (!this.sealed[i]) return false;
+    this.sealed[i] = 0; this.nSeals--;
+    this.sF.fill(0, 3 * i, 3 * i + 3);
+    return true;
+  }
+
+  unsealAll() {
+    for (let i = 0; i <= this.n; i++) this.unseal(i);
+  }
+
+  /* kg node i carries besides its own, inertia only (its weight is the caller's, through ext); set each tick, so a held
+     thing's mass follows its grip along the arm. Velocity is kept across a change, so letting go flings nothing. */
+  addMass(i, kg) {
+    if (!Number.isInteger(i) || i < 0 || i > this.n || !(kg >= 0) || !Number.isFinite(kg)) return false;
+    this.addM[i] = kg;
+    if (kg > 0) this._aLive = true;
+    return true;
+  }
+
+  clearMass() { if (this._aLive) this.addM.fill(0); }
+
+  /* N the seal put on the rod at node i, averaged over the last step's substeps; a seal that broke in that step
+     reports what it bore before letting go. Opposite in sense to rootForce, which is what the rod puts on its mount. */
+  sealForce(i, out = [0, 0, 0]) {
+    const f = this.sF, o = 3 * i;
+    if (!Number.isInteger(i) || i < 0 || i > this.n) { out[0] = out[1] = out[2] = 0; return out; }
+    out[0] = f[o]; out[1] = f[o + 1]; out[2] = f[o + 2];
+    return out;
+  }
+
   /* After corrections, turns each element by the smallest rotation that lays its d3 back along its segment. */
   alignFrames() {
     const n = this.n, x = this.x, q = this.q;
@@ -292,14 +344,18 @@ export class Rod {
     const its = Math.max(1, Math.round(k.iterations) || 1), ds = dt / S, ds2 = ds * ds;
     const F = this.rootForce, T = this.rootTorque, lS = this.lamS, lB = this.lamB, A = this.A, ll = this.ll;
     let fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0;
+    const sealing = this.nSeals > 0;
+    if (sealing || this._sLive) this._sAcc.fill(0);
     for (let s = 0; s < S; s++) {
       if (this.fixedRoot) this._placeRoot((s + 1) / S);
       this._masses();
       this._forces(ds, ambient);
       this._predict(ds);
+      if (this.nSeals) this._pin((s + 1) / S, ds2);
       lS.fill(0); lB.fill(0);
       // A step that had to be scaled down left the rod short of its constraints: a few more catch it up.
       for (let it = 0, extra = 0; it < its + extra; it++) if (this._newton(ds2) < 1 && extra < 3) extra++;
+      if (this.nSeals) this._held(ds2);
       this._finish(ds);
       if (!this.fixedRoot) continue;
       // The reaction on the mount is the constraints' generalized force on what holds still: node 0 and the root frame.
@@ -318,7 +374,16 @@ export class Rod {
       this.poseFromRest();
       this.resets = (this.resets ?? 0) + 1;
       fx = fy = fz = tx = ty = tz = 0;
+      // Anchors far from the rest pose would yank it straight back, so a reset rod starts with nothing held.
+      for (let i = 0; i <= this.n; i++) if (this.unseal(i)) this.sealBroke[i] = 1;
+      this._sAcc.fill(0);
     }
+    if (sealing || this._sLive) {
+      const a = this._sAcc, f = this.sF;
+      for (let i = 0; i < a.length; i++) f[i] = a[i] / S;
+      this.sA0.set(this.sA);
+    }
+    this._sLive = sealing;
     // Node 0 is held, so what acts on it goes straight to the mount.
     const held = this.fixedRoot ? 1 : 0, e = this.ext;
     F[0] = fx / S + held * e[0]; F[1] = fy / S + held * (e[1] + k.weightFactor * this.mN[0] * k.gravity); F[2] = fz / S + held * e[2];
@@ -331,6 +396,49 @@ export class Rod {
     let gx = a[0] + (b[0] - a[0]) * t, gy = a[1] + (b[1] - a[1]) * t, gz = a[2] + (b[2] - a[2]) * t, gw = a[3] + (b[3] - a[3]) * t;
     const il = 1 / (Math.hypot(gx, gy, gz, gw) || 1);
     g[0] = gx * il; g[1] = gy * il; g[2] = gz * il; g[3] = gw * il;
+  }
+
+  /* A seal is a point constraint, linear in its node, so it folds exactly into the direct solve: a spring k = ds²/compliance
+     joins the node's inertia (inverse mass (M + kI)⁻¹, target drawn to the anchor), and a rigid one pins it like the root.
+     A projection after the solve stalls at a light tip, where each Newton step hands the correction back to the sealed node. */
+  _pin(t, ds2) {
+    const n = this.n, p = this.p, Wp = this.Wp, M = this.Mp, A = this.sA, A0 = this.sA0, P = this._sP;
+    for (let i = 0; i <= n; i++) {
+      if (!this.sealed[i]) continue;
+      const o = 3 * i, w = 9 * i;
+      const ax = A0[o] + (A[o] - A0[o]) * t, ay = A0[o + 1] + (A[o + 1] - A0[o + 1]) * t, az = A0[o + 2] + (A[o + 2] - A0[o + 2]) * t;
+      const px = P[o] = p[o], py = P[o + 1] = p[o + 1], pz = P[o + 2] = p[o + 2];
+      if (!(this.sC[i] > 0)) { Wp.fill(0, w, w + 9); p[o] = ax; p[o + 1] = ay; p[o + 2] = az; continue; }
+      const k = ds2 / this.sC[i], a00 = M[w] + k, a01 = M[w + 1], a02 = M[w + 2], a11 = M[w + 4] + k, a12 = M[w + 5], a22 = M[w + 8] + k;
+      const c00 = a11 * a22 - a12 * a12, c01 = a02 * a12 - a01 * a22, c02 = a01 * a12 - a02 * a11;
+      const c11 = a00 * a22 - a02 * a02, c12 = a01 * a02 - a00 * a12, c22 = a00 * a11 - a01 * a01;
+      const id = 1 / (a00 * c00 + a01 * c01 + a02 * c02);
+      Wp[w] = c00 * id; Wp[w + 1] = c01 * id; Wp[w + 2] = c02 * id;
+      Wp[w + 3] = c01 * id; Wp[w + 4] = c11 * id; Wp[w + 5] = c12 * id;
+      Wp[w + 6] = c02 * id; Wp[w + 7] = c12 * id; Wp[w + 8] = c22 * id;
+      const ex = k * (ax - px), ey = k * (ay - py), ez = k * (az - pz);
+      p[o] = px + Wp[w] * ex + Wp[w + 1] * ey + Wp[w + 2] * ez;
+      p[o + 1] = py + Wp[w + 3] * ex + Wp[w + 4] * ey + Wp[w + 5] * ez;
+      p[o + 2] = pz + Wp[w + 6] * ex + Wp[w + 7] * ey + Wp[w + 8] * ez;
+    }
+  }
+
+  /* Each seal's force from momentum: what moved its node off its prediction, less the stretch-shear multipliers' share,
+     the same multipliers rootForce reads. Over its ceiling, with sealBreak on, the seal lets go before the next substep. */
+  _held(ds2) {
+    const n = this.n, p = this.p, M = this.Mp, P = this._sP, lS = this.lamS, ll = this.ll, acc = this._sAcc, brk = this.knobs.sealBreak;
+    for (let i = 0; i <= n; i++) {
+      if (!this.sealed[i]) continue;
+      const o = 3 * i, w = 9 * i, dx = p[o] - P[o], dy = p[o + 1] - P[o + 1], dz = p[o + 2] - P[o + 2];
+      let gx = 0, gy = 0, gz = 0;
+      if (i < n) { gx -= lS[o] / ll[i]; gy -= lS[o + 1] / ll[i]; gz -= lS[o + 2] / ll[i]; }
+      if (i > 0) { gx += lS[o - 3] / ll[i - 1]; gy += lS[o - 2] / ll[i - 1]; gz += lS[o - 1] / ll[i - 1]; }
+      const fx = (M[w] * dx + M[w + 1] * dy + M[w + 2] * dz - gx) / ds2;
+      const fy = (M[w + 3] * dx + M[w + 4] * dy + M[w + 5] * dz - gy) / ds2;
+      const fz = (M[w + 6] * dx + M[w + 7] * dy + M[w + 8] * dz - gz) / ds2;
+      acc[o] += fx; acc[o + 1] += fy; acc[o + 2] += fz;
+      if (brk && Math.hypot(fx, fy, fz) > this.sMax[i]) { this.unseal(i); this.sealBroke[i] = 1; }
+    }
   }
 
   /* Each node's inverse mass, with the water dragged sideways by each element it touches along that element's own
@@ -348,7 +456,7 @@ export class Rod {
     for (let i = 0; i <= n; i++) {
       const o = 9 * i;
       if (this.fixedRoot && i === 0) { Wp.fill(0, o, o + 9); continue; }
-      const m = this.mN[i];
+      const m = this._aLive ? this.mN[i] + this.addM[i] : this.mN[i];
       let a00 = m, a01 = 0, a02 = 0, a11 = m, a12 = 0, a22 = m, perp = m, ap = 0, bp = 0, apar = 0, nx = 0, ny = 0, nz = 0;
       for (let e = i - 1; e <= i; e++) {
         if (e < 0 || e >= n) continue;
@@ -371,7 +479,8 @@ export class Rod {
       const M = this.Mp, v = this.v;
       if (this._mOld) {
         const vx = v[3 * i], vy = v[3 * i + 1], vz = v[3 * i + 2];
-        const px = M[o] * vx + M[o + 1] * vy + M[o + 2] * vz, py = M[o + 3] * vx + M[o + 4] * vy + M[o + 5] * vz, pz = M[o + 6] * vx + M[o + 7] * vy + M[o + 8] * vz;
+        let px = M[o] * vx + M[o + 1] * vy + M[o + 2] * vz, py = M[o + 3] * vx + M[o + 4] * vy + M[o + 5] * vz, pz = M[o + 6] * vx + M[o + 7] * vy + M[o + 8] * vz;
+        if (this._aLive) { const da = this.addM[i] - this._aIn[i]; px += da * vx; py += da * vy; pz += da * vz; }
         v[3 * i] = Wp[o] * px + Wp[o + 1] * py + Wp[o + 2] * pz;
         v[3 * i + 1] = Wp[o + 3] * px + Wp[o + 4] * py + Wp[o + 5] * pz;
         v[3 * i + 2] = Wp[o + 6] * px + Wp[o + 7] * py + Wp[o + 8] * pz;
@@ -382,6 +491,7 @@ export class Rod {
       this.mPerp[i] = perp; this.aPerp[i] = ap; this.bPerp[i] = bp; this.aPar[i] = apar;
     }
     this._mOld = true;
+    if (this._aLive) { this._aIn.set(this.addM); this._aLive = this.addM.some((v) => v > 0); }
     for (let j = 0; j < n; j++) {
       const qx = q[4 * j], qy = q[4 * j + 1], qz = q[4 * j + 2], qw = q[4 * j + 3], o = 9 * j, iJ = 1 / this.J1[j];
       const dx = 2 * (qx * qz + qw * qy), dy = 2 * (qy * qz - qw * qx), dz = 1 - 2 * (qx * qx + qy * qy);
@@ -407,7 +517,7 @@ export class Rod {
       const wx = vx - u[0], wy = vy - u[1], wz = vz - u[2], t0 = this.tN[3 * i], t1 = this.tN[3 * i + 1], t2 = this.tN[3 * i + 2];
       const wa = wx * t0 + wy * t1 + wz * t2;
       const px = wx - wa * t0, py = wy - wa * t1, pz = wz - wa * t2, pl = Math.hypot(px, py, pz);
-      const mp = Math.max(1e-12, this.mPerp[i]), ma = Math.max(1e-12, this.mN[i]);
+      const mp = Math.max(1e-12, this.mPerp[i]), ma = Math.max(1e-12, this._aLive ? this.mN[i] + this.addM[i] : this.mN[i]);
       const sp = pl > 0 ? slow(pl, ds * this.aPerp[i] / mp, ds * this.bPerp[i] / mp) / pl : 1;
       let qa = this.aPar[i], qb = 0;
       if (i === n && k.tipCap && wa > 0) {

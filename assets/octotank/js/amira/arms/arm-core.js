@@ -2,6 +2,7 @@
    reach, grip, fetch, and idle programs; and the contact passes that make an arm drape instead of clip. */
 
 import { plantTargets, makePlant, trailTargets, spreadTargets, tuckTargets } from './arm-plant-core.js';
+import { MuscleArm, GROUPS } from './muscle-core.js';
 
 export const ARM_KNOBS = {
   points: 24,
@@ -104,6 +105,11 @@ export const ARM_KNOBS = {
   headOn: 0.9,           // a contact normal this square against a segment meets it head-on
   unfoldRate: 1.5,       // rad/s a fold contact forced past a joint's limit straightens at once contact lets go
   catchUp: 0.3,          // rad/s a segment may turn toward its pose beyond the pose's own turn, once contact lets it go
+  muscle: 0,             // 1: the programs' bends, stretch, and twist go through the muscle map and come back as what it can make
+  reachAct: 0.526,       // sucker-side longitudinal activation at a reach's traveling bend; reachAmplitude's bend at mid-arm
+  braceMax: 0.4,         // co-contraction where a program stiffens the arm all the way, as behind a reach's bend
+  curlAct: 0.62,         // sucker-side activation at the tip of a resting curl in muscle mode, rising from the base on curlActPow
+  curlActPow: 2.5,
 };
 
 export function minJerk(u) {
@@ -984,6 +990,10 @@ export class Arm {
     this.stiffGoal = new Float64Array(S);
     this.dragGoal = new Float64Array(S);    // per segment: how much of it trails behind its pose
     this.drag = new Float64Array(S);
+    this.actBump = new Float64Array(S);     // in muscle mode, a reach's bend as the sucker side's activation per segment
+    this.actIdle = new Float64Array(S);     // and a resting curl's
+    this.act = null;                        // in muscle mode, the activations (muscle-core.js) and what they make
+    this.mus = null;
     this.gripB = new Float64Array(S * 2);
     this.out = new Float64Array(S * 2);
     this.D = new Float64Array(S * 3);       // posed segment directions
@@ -1101,6 +1111,7 @@ export class Arm {
   /* A program letting go. With `stay`, exploring carries on around where the arm ended up for a wander interval,
      so a reached-for spot keeps her interest (and her heading) instead of the arm swinging back to an old pick. */
   _letGo(stay) {
+    this._lastKind = this.goal?.kind;
     this.goal = null;
     const k = this.knobs, X = this.X, i = Math.min(this.n - 1, Math.round(k.wanderReach * (this.n - 1)));
     if (stay && Number.isFinite(X[i * 3] + X[i * 3 + 1] + X[i * 3 + 2])) {
@@ -1160,6 +1171,19 @@ export class Arm {
     } else if (this.goal?.kind === 'lead') this._letGo(true);
   }
 
+  /* Hold the pose the arm has now, at idle stiffness: the chain's bends, stretch, and twist become the targets at full weight,
+     the springs stop where they are, and what contact left in the bends is frozen, so only what touches the arm moves it. */
+  still() {
+    const S = this.n - 1, B = this.bend, Rb = this.rest, bend = new Float64Array(S * 2);
+    // The chain as it lies, not the pose: a grip's blend or a dragged segment's lag would otherwise keep closing on it.
+    if (this.started && Number.isFinite(this.X[this.n * 3 - 1])) { this.bendsFromPoints(this.X, B); this._clampBends(B, null); } else B.set(this.out);
+    for (let a = 0; a < S * 2; a++) bend[a] = B[a] - Rb[a];
+    this.goal = { kind: 'still', t: 0, bend, lam: Float64Array.from(this.lam), twist: Float64Array.from(this.twist) };
+    this.vel.fill(0); this.twistV.fill(0);
+    this.w = 1; this.gw = 0;
+    return true;
+  }
+
   get busy() { return !!this.goal; }
 
   /* A touch that's done: a reach or hold lets go and the arm looks elsewhere; an exploring arm picks a new spot now. */
@@ -1215,7 +1239,9 @@ export class Arm {
     T.fill(0);
     for (let j = 0; j < S; j++) {
       const s = j / (S - 1);
-      this._curl(j, T, rw);
+      // In muscle mode the resting curl is the sucker side contracting, so the girth shapes it; the root turn stays authored.
+      if (k.muscle) this.actIdle[j] = rw * k.curlAct * Math.pow((this.arc0[j] + this.len0[j] / 2) / this._length, k.curlActPow);
+      if (!k.muscle || j === 0) this._curl(j, T, rw);
       this._push(j, T, A[0], A[1], (k.awakeBase + k.awakeTip * Math.pow(s, k.curlPow)) * (1 - rw));
       const w = s * k.noiseWave;
       const amp = noise * (0.4 + s);
@@ -1256,12 +1282,17 @@ export class Arm {
   _goalTargets(dt) {
     const k = this.knobs, S = this.n - 1, g = this.goal, T = this.goalT, K = this.stiffGoal;
     g.t += dt;
-    T.fill(0); this.lamGoal.fill(1); this.dragGoal.fill(0);
+    T.fill(0); this.lamGoal.fill(1); this.dragGoal.fill(0); this.actBump.fill(0);
     if (g.kind === 'lead') {
       const dir = this._t, F = this.frame;
       dir[0] = g.target[0] - F.p[0]; dir[1] = g.target[1] - F.p[1]; dir[2] = g.target[2] - F.p[2];
       K.fill(k.stiffBehind * 0.3);
       if (len3(dir[0], dir[1], dir[2]) > 1e-6) { normalize3(dir); this._aim(dir[0], dir[1], dir[2], 1, T); }
+      return 0;
+    }
+    if (g.kind === 'still') {
+      T.set(g.bend); this.lamGoal.set(g.lam); this.twistAim.set(g.twist);
+      K.fill(k.stiffIdle);
       return 0;
     }
     if (g.kind === 'fetch') return this._fetchTargets(T, K);
@@ -1344,8 +1375,10 @@ export class Arm {
       const a = this.arc0[j];
       const m = j === 0 ? 1 : Math.max(0, Math.min(1, (beta - a) / width + 0.5));
       T[j * 2] = m * aim[j * 2]; T[j * 2 + 1] = m * aim[j * 2 + 1];
-      const z = (a - beta) / width, bump = amp * Math.exp(-z * z);
-      T[j * 2] += F.cu * bump; T[j * 2 + 1] += F.cv * bump;
+      // In muscle mode the bend is a contraction centered on the segments around β, so the girth sets its size; the
+      // root turn, which no arm muscle makes, keeps the authored bend.
+      if (k.muscle) { const z = (a + this.len0[j] / 2 - beta) / width; this.actBump[j] = k.reachAct * amp / Math.max(1e-6, k.reachAmplitude) * Math.exp(-z * z); }
+      if (!k.muscle || j === 0) { const z = (a - beta) / width, bump = amp * Math.exp(-z * z); T[j * 2] += F.cu * bump; T[j * 2 + 1] += F.cv * bump; }
       K[j] = k.stiffDrag + (k.stiffBehind - k.stiffDrag) * m * ramp;
       const mn = Math.max(0, Math.min(1, (beta - this.arc0[j + 1]) / width + 0.5));
       this.dragGoal[j] = 1 - mn;
@@ -1586,31 +1619,75 @@ export class Arm {
     }
   }
 
-  /* Lengths follow their program but come back slowly: a lengthened segment recovers at recoverRate, and going
+  /* The muscle map on this arm's rest geometry, rebuilt when that changes. */
+  _muscleArm() {
+    if (this._musArm && this._musGen === this.restGen) return this._musArm;
+    const S = this.n - 1;
+    this._musArm = new MuscleArm({ len: this.len0, rad: this.rad0 });
+    this._musGen = this.restGen;
+    this.act ??= new Float64Array(GROUPS * S);
+    this.mus ??= { lam: new Float64Array(S), bend: new Float64Array(S * 2), twist: new Float64Array(S), bendStiff: new Float64Array(S).fill(1), axialStiff: new Float64Array(S).fill(1) };
+    this._mw ??= { bend: new Float64Array(S * 2), lam: new Float64Array(S), twist: new Float64Array(S), brace: new Float64Array(S) };
+    this._oral ??= [0, 1];
+    return this._musArm;
+  }
+
+  /* Muscle mode: the programs' blended bends, stretch, and twist become activations and come back as what the muscles
+     can make, braced wherever a program stiffens the arm; joint 0, the turn off her body, stays the program's. */
+  _muscles() {
+    const k = this.knobs, S = this.n - 1, w = this.w, m = this._muscleArm(), W = this._mw, A = this.act, M = this.mus;
+    const iT = this.idleT, gT = this.goalT, G = this.lamGoal, Ta = this.twistAim, kb = Math.max(1e-6, k.stiffBehind - k.stiffIdle);
+    for (let j = 0; j < S; j++) {
+      W.bend[j * 2] = iT[j * 2] + (gT[j * 2] - iT[j * 2]) * w;
+      W.bend[j * 2 + 1] = iT[j * 2 + 1] + (gT[j * 2 + 1] - iT[j * 2 + 1]) * w;
+      W.lam[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], 1 + (G[j] - 1) * w));
+      W.twist[j] = this.twistIdle[j] * (1 - w) + Ta[j] * w;
+      W.brace[j] = k.braceMax * Math.max(0, Math.min(1, (this.stiffGoal[j] - k.stiffIdle) * w / kb));
+    }
+    this._oral[0] = this.frame.cu; this._oral[1] = this.frame.cv;
+    m.allocate(W, this._oral, A);
+    // A reach's bend and a resting curl ride on top as the sucker-side longitudinal (group L0) contracting.
+    for (let j = 0; j < S; j++) A[S + j] = Math.min(1, A[S + j] + this.actBump[j] * w + this.actIdle[j] * (1 - w));
+    m.equilibrium(A, this._oral, M);
+    // A fetch's folds and a plant's held foot are placed geometry, past what the map lets a joint bend; they keep their
+    // bends, fading out with their weight, and the map only braces them.
+    const kind = this.goal?.kind ?? (w > 1e-3 ? this._lastKind : null);
+    if (kind === 'fetch' || kind === 'plant') M.bend.set(W.bend);
+    // A held pose is the one the muscles already made; the map's nearest pose to it would drift the arm off.
+    else if (kind === 'still') { M.bend.set(W.bend); M.lam.set(W.lam); M.twist.set(W.twist); }
+    else { M.bend[0] = W.bend[0]; M.bend[1] = W.bend[1]; }
+  }
+
+  /* Lengths follow their program (in muscle mode, what the muscles make of it) but come back slowly: a lengthened segment recovers at recoverRate, and going
      below rest is muscle shortening, which runs at shortenSpeed over the whole arm. */
   _stepStretch(dt) {
     const k = this.knobs, S = this.n - 1, L = this.lam, G = this.lamGoal, w = this.w;
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.stretchTau));
     const shorten = k.shortenSpeed / Math.max(1e-3, this._length);
-    const plant = this.goal?.kind === 'plant' ? this.goal.lamTo : -1;
+    const plant = this.goal?.kind === 'plant' ? this.goal.lamTo : -1, M = k.muscle ? this.mus.lam : null;
     for (let j = 0; j < S; j++) {
       // A plant's length is the geometry's, set outright, or its anchored suckers would slide.
       if (j <= plant) { L[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], G[j])); continue; }
-      const want = Math.max(k.stretchMin, Math.min(this.lamMax[j], 1 + (G[j] - 1) * w));
+      const want = Math.max(k.stretchMin, Math.min(this.lamMax[j], M ? M[j] : 1 + (G[j] - 1) * w));
       let d = (want - L[j]) * f;
       if (d < 0) d = Math.max(d, -(L[j] > 1 ? k.recoverRate : shorten) * dt);
       L[j] = !this.started ? want : Math.max(k.stretchMin, Math.min(Math.max(this.lamMax[j], L[j]), L[j] + d));
     }
   }
 
+  /* The aim fades with the program, unless the program faces something or holds still; with none it relaxes away on its own. */
+  _fadeAim(dt) {
+    if (this.goal?.face || this.goal?.kind === 'still') return;
+    const f = Math.exp(-dt / Math.max(1e-3, this.knobs.release)), Ta = this.twistAim;
+    for (let j = 0; j < Ta.length; j++) Ta[j] *= f;
+  }
+
   _stepTwist(dt) {
     const k = this.knobs, S = this.n - 1, tw = this.twist, V = this.twistV, w = this.w;
     const kk = k.stiffTwist, c = 2 * k.damping * Math.sqrt(kk);
-    const Ta = this.twistAim, lim = Math.max(k.twistMax, k.aimTwistMax * w);
+    const Ta = this.twistAim, lim = Math.max(k.twistMax, k.aimTwistMax * w), M = k.muscle ? this.mus.twist : null;
     for (let j = 0; j < S; j++) {
-      // The aim fades with the program; without one it relaxes away on its own.
-      if (!this.goal?.face) Ta[j] *= Math.exp(-dt / Math.max(1e-3, k.release));
-      const want = this.twistIdle[j] * (1 - w) + Ta[j] * w;
+      const want = M ? M[j] : this.twistIdle[j] * (1 - w) + Ta[j] * w;
       if (!this.started) { tw[j] = want; V[j] = 0; continue; }
       V[j] = (V[j] + dt * kk * (want - tw[j])) / (1 + dt * c + dt * dt * kk);
       tw[j] = Math.max(-lim, Math.min(lim, tw[j] + V[j] * dt));
@@ -1645,16 +1722,18 @@ export class Arm {
     this.gw += Math.max(-gRate, Math.min(gRate, gripWant - this.gw));
     // Drag follows its program in, and fades with the program's weight on the way out.
     for (let j = 0; j < S; j++) this.drag[j] = this.goal ? this.dragGoal[j] * this.w : this.drag[j] * Math.max(0, 1 - rate);
+    this._fadeAim(dt);
+    if (k.muscle) this._muscles();
     this._stepStretch(dt);
     this._stepTwist(dt);
     this._syncLive();
-    const w = this.w, T = this.tgt, B = this.bend, V = this.vel;
+    const w = this.w, T = this.tgt, B = this.bend, V = this.vel, MB = k.muscle ? this.mus.bend : null;
     // A fetch places the grasp at her mouth exactly; what contact left in the bends would hold it short.
-    const Rb = this.rest, relax = Math.exp(-dt / Math.max(1e-3, k.contactRelax)), rw = this.goal?.kind === 'fetch' ? 1 - w : 1;
+    const Rb = this.rest, relax = this.goal?.kind === 'still' ? 1 : Math.exp(-dt / Math.max(1e-3, k.contactRelax)), rw = this.goal?.kind === 'fetch' ? 1 - w : 1;
     for (let j = 0; j < S; j++) {
       Rb[j * 2] *= relax; Rb[j * 2 + 1] *= relax;
-      T[j * 2] = this.idleT[j * 2] + (this.goalT[j * 2] - this.idleT[j * 2]) * w + Rb[j * 2] * rw;
-      T[j * 2 + 1] = this.idleT[j * 2 + 1] + (this.goalT[j * 2 + 1] - this.idleT[j * 2 + 1]) * w + Rb[j * 2 + 1] * rw;
+      T[j * 2] = (MB ? MB[j * 2] : this.idleT[j * 2] + (this.goalT[j * 2] - this.idleT[j * 2]) * w) + Rb[j * 2] * rw;
+      T[j * 2 + 1] = (MB ? MB[j * 2 + 1] : this.idleT[j * 2 + 1] + (this.goalT[j * 2 + 1] - this.idleT[j * 2 + 1]) * w) + Rb[j * 2 + 1] * rw;
     }
     if (!this.started) {
       B.set(T); V.fill(0);
@@ -1965,6 +2044,8 @@ export class Arm {
      the bends follow through the springs (nothing in the pose jumps) and come to rest against it; then it relaxes.
      The contact is this chain's own unless src ({ X, touched, hit }) brings another's. */
   _feedback(src = null) {
+    // A held pose bakes nothing in: its contact offsets are frozen with it.
+    if (this.goal?.kind === 'still') return;
     // A resting curl keeps pressing into what it wraps, so feedback fades out with rest.
     const k = this.knobs, w = k.contactFeedback * (1 - this.restW * k.feedbackRest), S = this.n - 1;
     const X = src ? src.X : this.X, h = src ? src.hit : this._hit, Tc = src ? src.touched : this._touched;

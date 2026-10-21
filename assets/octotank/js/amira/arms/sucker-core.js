@@ -227,4 +227,12 @@ export class SuckerBank {
 
   /* Everything lets go at once: a command, or a grip torn off. */
   releaseAll() { this.sealed.fill(0); this.segSealed.fill(0); this.segForce.fill(0); this.segCeil.fill(0); this.sealedCount = 0; }
+
+  /* One segment's suckers let go: a seal torn off there. */
+  releaseSeg(j) {
+    if (!(j >= 0 && j < this.L.S)) return;
+    this.sealed.fill(0, this.L.segStart[j], this.L.segStart[j + 1]);
+    this.sealedCount -= this.segSealed[j];
+    this.segSealed[j] = 0; this.segForce[j] = 0; this.segCeil[j] = 0;
+  }
 }

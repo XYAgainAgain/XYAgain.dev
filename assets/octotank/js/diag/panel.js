@@ -23,6 +23,18 @@ const load = () => { try { return plain(JSON.parse(localStorage.getItem(STORE)))
 const save = (s) => { try { localStorage.setItem(STORE, JSON.stringify(s)); } catch { /* storage blocked */ } };
 const tag = (name, props = {}, ...kids) => { const e = Object.assign(document.createElement(name), props); e.append(...kids); return e; };
 
+/* The most active arm's peak activation per muscle group (transverse, the four longitudinals from the sucker side, the
+   two obliques) and the stiffest its bracing makes any joint. */
+function muscleLine(arms) {
+  let best = null, most = -1;
+  for (const arm of arms.arms) { if (!arm.act) continue; let s = 0; for (const v of arm.act) s += v; if (s > most) { most = s; best = arm; } }
+  if (!best) return 'Muscles  on';
+  const S = best.n - 1, A = best.act, peak = (g) => { let m = 0; for (let j = 0; j < S; j++) m = Math.max(m, A[g * S + j]); return m.toFixed(2); };
+  let brace = 1;
+  for (let j = 0; j < S; j++) brace = Math.max(brace, best.mus.bendStiff[j]);
+  return `Muscles  arm ${best.index}   T ${peak(0)}   L ${peak(1)} ${peak(2)} ${peak(3)} ${peak(4)}   O ${peak(5)} ${peak(6)}   braced ×${brace.toFixed(2)}`;
+}
+
 export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say }) {
   const { phys, mantle, arms, pose } = ctx;
   const loco = ctx.loco, bench = ctx.bench ?? null;
@@ -85,6 +97,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       { key: 'f', name: 'Fetch held', label: () => 'Fetch held', run: () => arms.fetchHolding() },
       { key: 'g', name: 'Grip/let go', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
       { key: 'z', name: 'Resting/awake', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
+      { key: 'e', name: 'Muscles', label: () => (arms.knobs.muscle ? 'Muscles: on' : 'Muscles: off'), run: () => { arms.knobs.muscle = arms.knobs.muscle ? 0 : 1; } },
     ],
     loco: loco ? [{ key: 'w', name: 'Wander', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } }] : [],
   };
@@ -275,6 +288,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
           `Render   ${mean ? Math.round(1000 / mean) : '–'} fps   frame ${mean.toFixed(1)} ms   p95 ${p95.toFixed(1)}`,
           `Physics  step ${s.mean.toFixed(2)} ms   p95 ${s.p95.toFixed(2)}   tick ${s.js.mean.toFixed(2)} ms   arms ${am.mean.toFixed(2)}`,
           ...bench.describe(),
+          ...(arms.knobs.muscle ? [muscleLine(arms)] : []),
           `Arm      ${bench.arm.goal?.kind ?? 'exploring'}${arms.resting ? ', resting' : ''}`,
           `Suckers  ${arms.suckerReport().map((r) => `${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
         ].join('\n');
@@ -294,6 +308,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Attend   ${ctx.attention?.describe() ?? '–'}`,
         `Gait     ${loco ? `${loco.describe()}   ${loco.stats().mean.toFixed(3)} ms` : '–'}`,
         `Arms     ${busyText}`,
+        ...(arms.knobs.muscle ? [muscleLine(arms)] : []),
         ...(ctx.rods?.describe() ?? []),
         `Water    ${ctx.water?.enabled ? `on, surface ${ctx.water.knobs.surfaceY} m, ${(s.water?.mean ?? 0).toFixed(3)} ms` : 'off (?water=0)'}${ctx.water?.knobs.tint ? '   tint: pale = floats or near neutral, darker = denser' : ''}`,
         `Suckers  ${arms.suckerReport().map((r, i) => `${i} ${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
