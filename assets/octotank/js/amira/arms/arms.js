@@ -4,7 +4,11 @@ import { moveInputs } from '../locomotion/loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
 import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad } from './arm-rod.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
-import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
+import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
+import { ArmRecords } from './arm-records.js';
+import { ArmCrowd } from './arm-crowd.js';
+import { ArmReflexes } from './arm-reflex.js';
+import { ArmBlocked } from './arm-blocked.js';
 
 /* Eight arm programs (arm-core.js) driving a kinematic Jolt capsule per segment. Each tick: root frames, programs and
    contact, arm-on-arm rounds, the suckers (touch, taste, flicker, grips), then the capsules follow the solved chains.
@@ -52,6 +56,7 @@ export class Arms {
     this.rodKnobs = { ...ROD_ARM_KNOBS, ...rodKnobs };
     const armsMass = bodyMass ?? (mantle.restVolume > 0 ? mantle.restVolume * this.rodKnobs.density : null);
     if (rods.length && !(armsMass > 0)) console.warn('arms: no body mass to share among the rod arms; each weighs its own drawn volume');
+    this.armsMass = armsMass > 0 ? armsMass : null;
     const caps = this._rootCaps(rods);
     this.rods = this.arms.map((arm, s) => (rods.includes(arm.index) ? new RodArm(arm, this.rodKnobs, armsMass > 0 ? armsMass * armMassShare(arm.index, this.knobs, this.rodKnobs) : null, { cap: caps[s] }) : null));
     this.shadow = rodMode === 'shadow';
@@ -89,6 +94,10 @@ export class Arms {
     this._buildWorld();
     this._build();
     this._initSuckers(seed);
+    this.records = new ArmRecords(this);
+    this.crowd = new ArmCrowd(this);
+    this.reflexes = new ArmReflexes(this);
+    this.blocked = new ArmBlocked(this);
     this.tick(0, 0, true);
   }
 
@@ -138,7 +147,7 @@ export class Arms {
     this.anchorCount = new Int32Array(count);
     // The brain's override: with it off, no sucker ever seals on her own skin or arms.
     this.gripSelf = false;
-    this.counts = { selfTouch: 0, selfSealed: 0, grips: 0, breaks: 0, release: 0, moveOn: 0, reject: 0, lapse: 0, fetches: 0, pushes: 0, pushMaxN: 0, seals: 0, sealBreaks: 0, sealDrops: 0 };
+    this.counts = { selfTouch: 0, selfSealed: 0, grips: 0, breaks: 0, release: 0, moveOn: 0, reject: 0, lapse: 0, reflex: 0, fetches: 0, pushes: 0, pushMaxN: 0, seals: 0, sealBreaks: 0, sealDrops: 0 };
     this.pushPen = new Float64Array(count * this.loose.length);
     this.pushNP = new Float64Array(count * this.loose.length * 6);
     this.toyImpulse = new Float64Array(count * this.loose.length * 3);   // N·s each arm gave each loose thing this tick
@@ -322,6 +331,7 @@ export class Arms {
     this._poseLoose();
     this.body.fit(m.positions, m.shell.faces, m.shell.count, m.origin, this.rootsW, k.bodyScale);
     this._slots();
+    if (dt > 0) this.crowd.tick(dt);
     for (let a = 0; a < arms.length; a++) {
       const arm = arms[a];
       arm.setLead(this.lead);
@@ -391,9 +401,9 @@ export class Arms {
     }
     if (this._anyRod && !teleport) this.rodMs[this.rodCount++ % WINDOW] = rodMs;
     this.allSdf.skip = -1;
-    if (dt > 0) { this._touches(); this._taste(dt); this._suckers(dt); }
+    if (dt > 0) { this._touches(); this._taste(dt); this.reflexes.tick(dt); this._suckers(dt); this.blocked.tick(dt); }
     this._place(dt, teleport);
-    if (dt > 0) { this._moveProxies(dt); this._pushToys(dt); }
+    if (dt > 0) { this._moveProxies(dt); this._pushToys(dt); this.records.tick(dt); }
     this.ms = performance.now() - t0;
     if (!teleport) this.msBuf[this.msCount++ % WINDOW] = this.ms;
   }
@@ -466,13 +476,14 @@ export class Arms {
       const l = Math.hypot(dx, dy, dz);
       const off = l > 1e-6 ? (size * this.knobs.toyStandoff + body.rad[arm.n - 1]) / l : 0;
       out[0] = x + dx * off; out[1] = y + dy * off; out[2] = z + dz * off;
-      return out;
+      return arm.goal.keepOut ? this.reflexes.keepOut(a, out) : out;
     }
     const fl = Math.hypot(dx, dz), ci = arm.gripAt;
     const ux = fl > 1e-6 ? 0.5 * dx / fl : 0, uz = fl > 1e-6 ? 0.5 * dz / fl : 0, ul = Math.hypot(ux, 1, uz);
     const off = (size + body.rad[ci] + this.knobs.toyClear) / ul, sl = this.slot[a];
     out[0] = x + ux * off + this.slotDir[a * 2] * sl; out[1] = y + off; out[2] = z + uz * off + this.slotDir[a * 2 + 1] * sl;
-    return out;
+    // A careful try after a recoil stops short of the noxious thing (arm-reflex.js).
+    return arm.goal?.keepOut ? this.reflexes.keepOut(a, out) : out;
   }
 
   /* The slot holding arm number `index`, or -1. Methods that take an arm take its number and resolve it here. */
@@ -570,7 +581,7 @@ export class Arms {
     return true;
   }
 
-  /* Take arm i at a tier (idle < attend < stroke < mode < held); false while a stronger one holds it. */
+  /* Take arm i at a tier (idle < attend < stroke < reflex < mode < held); false while a stronger one holds it. */
   claim(i, tier) { return this._claim(this.slotOf(i), tier); }
 
   _claim(i, tier) {
@@ -698,7 +709,7 @@ export class Arms {
   }
 
   /* Every touch on the sucker side is tasted and reported, idle arms included: `tastes` holds one entry per arm per thing
-     it touches this tick (the segment nearest the base, the touched point, tag, taste, salience, idle), and a touch that
+     it touches this tick (the segment nearest the base, the touched point, tag, taste, salience, idle, discovery), and a touch that
      just began also goes into `tasteLog` (the last tasteLogSize, numbered by `tasteSeq`) and `lastTaste`. */
   _taste(dt) {
     const arms = this.arms, S = this.S, TK = this.touchKind, TP = this.touchP, list = this.tastes, sk = this.suckerKnobs, now = this.time, fam = this.familiar;
@@ -713,13 +724,15 @@ export class Arms {
         if (!kind) continue;
         const entry = kind === 3 ? 'self' : this.touchEntry[q] ?? this.touchTaste[q];
         if (now2.has(entry)) { list[now2.get(entry)].segs++; continue; }
-        const o = list[n] ??= { arm: 0, seg: 0, segs: 0, point: [0, 0, 0], tag: null, taste: null, salience: 0, idle: false, fresh: false, seq: 0 };
+        const o = list[n] ??= { arm: 0, seg: 0, segs: 0, point: [0, 0, 0], tag: null, taste: null, salience: 0, idle: false, discovery: false, fresh: false, seq: 0 };
         // Reaching for it, or holding it, is meaning to touch it; any other program is busy; none at all is idle.
         const meant = !!g && g.kind !== 'lead' && (this.track[a] === entry || this.episodes[a]?.toy === entry);
         const state = meant ? 'reach' : g ? 'busy' : 'idle';
         o.arm = a; o.seg = j; o.segs = 1; o.point[0] = TP[q * 3]; o.point[1] = TP[q * 3 + 1]; o.point[2] = TP[q * 3 + 2];
         o.tag = kind === 3 ? 'self' : entry?.tag ?? 'wall'; o.taste = this.touchTaste[q]; o.idle = state === 'idle';
         o.salience = tasteSalience(o.taste, state, fam.novelty(entry, now), sk);
+        // A loose thing touched on the way to another is a discovery: _maybeStart passes it over while the task runs.
+        o.discovery = kind === 2 && isDiscovery(g?.kind, meant || (g?.kind === 'plant' && g.entry === entry), o.taste, sk);
         // A touch that flickers off for less than tasteGap is the same touch, not a new taste.
         const prior = was.get(entry);
         o.fresh = !prior || now - prior.at > sk.tasteGap;
@@ -814,12 +827,17 @@ export class Arms {
   }
 
   _maybeStart(a) {
-    const S = this.S;
+    const S = this.S, sk = this.suckerKnobs, goal = this.arms[a].goal;
     for (let j = 0; j < S; j++) {
       const g = a * S + j;
       if (this.touchKind[g] !== 2 || this.refr[g] > this.time) continue;
       const toy = this.touchEntry[g];
-      if (toy && !this._ignored(a, toy)) return this._start(a, toy);
+      if (!toy || this._ignored(a, toy)) continue;
+      const taste = toy.taste ?? toy.tag;
+      // Never an episode on a noxious thing: even gripless, its end would moveOn the reach the reflex means to resume.
+      if (tasteRule(taste, sk, this).recoil) continue;
+      if (isDiscovery(goal?.kind, this.track[a] === toy || (goal?.kind === 'plant' && goal.entry === toy), taste, sk)) continue;
+      return this._start(a, toy);
     }
     return null;
   }
@@ -830,6 +848,11 @@ export class Arms {
       toy, taste, rule, t0: this.time, hold: sampleHold(rule.holdMean, rule.holdSd, this.epRng[a]), hard: rule.hard, commanded: false,
       h: null, arc: 0, seg: -1, off: [0, 0, 0], load: [0, 0, 0], vel: null, gripT: 0, ticks: 0, fEma: 0, cap: 0, capEma: 0, seen: this.time, weak: 0, fetched: false,
     };
+    // Under keepTask, the reached-for thing holds her interest at least until the reach's own hold is over, and a tenth of a second past it.
+    const g = this.arms[a].goal;
+    if (this.suckerKnobs.keepTask && this.track[a] === toy && (g?.kind === 'reach' || g?.kind === 'hold')) {
+      ep.hold = Math.max(ep.hold, (g.kind === 'reach' ? g.duration - g.t + g.hold : g.hold - g.ht) + 0.1);
+    }
     this.episodes[a] = ep;
     return ep;
   }
@@ -877,8 +900,13 @@ export class Arms {
         this.counts.fetches++;
       }
     }
-    // A rejection runs its course to the tip; anything else not held by command lasts its taste's hold.
-    if (!ep.commanded && !(ep.h && ep.rule.reject) && t - ep.t0 > ep.hold) this._end(a, true, 'moveOn');
+    // A rejection runs its course to the tip; anything else not held by command lasts its taste's hold. Under keepTask,
+    // one outliving it into a task the arm took since waits out a longer reach for it, or yields without moving it on.
+    if (!ep.commanded && !(ep.h && ep.rule.reject) && t - ep.t0 > ep.hold) {
+      const g = arm.goal, task = this.suckerKnobs.keepTask && TASK_GOALS.has(g?.kind) && !(ep.fetched && g.kind === 'fetch');
+      if (task && this.track[a] === ep.toy && (g.kind === 'reach' || g.kind === 'hold')) ep.hold = t - ep.t0 + (g.kind === 'reach' ? g.duration - g.t + g.hold : g.hold - g.ht) + 0.1;
+      else this._end(a, true, task ? 'task' : 'moveOn');
+    }
   }
 
   /* A grip: the toy pinned at the touched point to this arm's proxy, which follows that spot on the arm from now on. */
@@ -900,6 +928,7 @@ export class Arms {
     ep.load.fill(0); ep.vel = null;
     this.owner[a] = 'held';
     this.counts.grips++;
+    this.records.note(a, 'grip', ep.toy);
   }
 
   /* The arm already gripping this toy, or -1. One grip per toy: two rigid proxies on one body fight without limit, so a
@@ -997,6 +1026,7 @@ export class Arms {
     if ((why === 'moveOn' || why === 'reject') && this.arms[a].goal?.kind !== 'lead') this.arms[a].moveOn();
     else if (ep.stowed && this.arms[a].goal?.kind === 'fetch') this.arms[a].idle();
     if (why in this.counts) this.counts[why]++;
+    this.records.note(a, why, ep.toy);
   }
 
   _anchors(a) {

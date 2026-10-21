@@ -9,7 +9,7 @@ export function attachDebug(ctx) {
   const { phys, mantle, arms, pose, panel, layoutKnobs } = ctx;
   const tank = {
     phys, mantle, arms, pose, toys: ctx.toys,
-    knobs: { mantle: mantle.knobs, arms: arms.knobs, pose: pose?.knobs, layout: layoutKnobs, suckers: arms.suckerKnobs, rod: arms.rodKnobs },
+    knobs: { mantle: mantle.knobs, arms: arms.knobs, pose: pose?.knobs, layout: layoutKnobs, suckers: arms.suckerKnobs, rod: arms.rodKnobs, reflexes: arms.reflexes.knobs, blocked: arms.blocked.knobs },
     get stats() { return { step: phys.stats(), sim: phys.time, verts: mantle.shell.count, drive: mantle.drive, iterations: mantle.knobs.iterations, backend: document.documentElement.dataset.backend }; },
     resetStats: () => phys.resetStats(),
     setPressure: (pa) => mantle.setPressurePa(pa),
@@ -19,8 +19,14 @@ export function attachDebug(ctx) {
     tip: (angle, axis) => mantle.tip(angle, axis),
     up: () => mantle.up(),
     squeeze: (opts) => squeeze(ctx, opts),
-    // What a sucker tastes on toy i, so food, spoiled, and slick can be tried without new art.
-    taste: (i, taste = 'toy') => { const t = ctx.toys[i]; if (!t) return null; t.taste = String(taste); return t.taste; },
+    // What a sucker tastes on toy i, so food, spoiled, slick, and noxious (with a severity in (0, 1]) can be tried without new art.
+    taste: (i, taste = 'toy', severity) => {
+      const t = ctx.toys[i];
+      if (!t) return null;
+      t.taste = String(taste);
+      if (severity !== undefined) t.severity = +severity;
+      return t.taste;
+    },
     loco: ctx.loco ?? null,
     scenario: (name, opts) => runScenario(name, ctx, opts),
     get scenarioPhase() { return ctx.phase ?? null; },

@@ -28,7 +28,8 @@ export const CARRY_KNOBS = {
   reelHold: 3,            // s a reeled-in thing that is too big for the web is held at the mouth
 };
 
-export const CLAIM_TIERS = { idle: 0, attend: 1, stroke: 2, mode: 3, held: 4 };
+// A reflex takes an arm from attention or a stroke, never from a jet's mode or a hold.
+export const CLAIM_TIERS = { idle: 0, attend: 1, stroke: 2, reflex: 3, mode: 4, held: 5 };
 
 /* Whether a claim at `tier` takes an arm `owner` holds: never from a stronger tier, always from its own or a weaker. */
 export function claimWins(owner, tier, T = CLAIM_TIERS) {

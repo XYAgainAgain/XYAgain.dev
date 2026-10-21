@@ -1,5 +1,7 @@
-/* The plant goal, THREE-free: an arm whose foot holds still on a surface while her body moves on it. arm-core.js
-   dispatches to these; the arm's length from root to anchor follows the chord, so planted suckers never slide. */
+/* Goals past the reach, THREE-free, which arm-core.js dispatches to: the plant (a foot held still while her body moves
+   on it, its length following the chord so planted suckers never slide), the jet's three, and the recoil. */
+
+import { REFLEX_KNOBS, recoilTime } from './reflex-core.js';
 
 function finite3(p) { return !!p && Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2]); }
 
@@ -166,5 +168,87 @@ export function spreadTargets(arm, T, K) {
 export function tuckTargets(arm, T, K) {
   const g = arm.goal, k = arm.knobs, S = arm.n - 1;
   for (let j = 0; j < S; j++) { arm._curl(j, T, g.curl); K[j] = k.stiffIdle * 2; }
+  return 0;
+}
+
+/* The recoil: the arm holds the pose it has, and the joints at and behind a noxious touch bend so the touched segment
+   leaves along the touch's outward normal (from the thing into the arm). */
+
+const smooth = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+const share = (v, d) => (Number.isFinite(v) && v >= 0 ? v : d);
+
+function midDot(P, s, nx, ny, nz) {
+  const o = s * 3;
+  return ((P[o] + P[o + 3]) * nx + (P[o + 1] + P[o + 4]) * ny + (P[o + 2] + P[o + 5]) * nz) / 2;
+}
+
+/* A recoil goal off touch { seg, severity in (0, 1], normal, point? }, shaped by REFLEX_KNOBS unless opts overrides
+   them (opts.duration, else the recoil law); null on junk. A zero normal falls back to off the solved sucker side. */
+export function makeRecoil(arm, touch, opts = {}) {
+  const S = arm.n - 1, n = arm.n, seg = touch?.seg, sv = touch?.severity;
+  if (!Number.isInteger(seg) || seg < 0 || seg >= S || !(sv > 0) || !Number.isFinite(sv)) return null;
+  const k = { ...REFLEX_KNOBS, ...opts }, s = Math.min(1, sv), X = arm.X, N = touch.normal;
+  let nl = finite3(N) ? Math.hypot(N[0], N[1], N[2]) : 0, nx, ny, nz;
+  if (nl > 1e-9) { nx = N[0] / nl; ny = N[1] / nl; nz = N[2] / nl; }
+  else {
+    nx = -arm.SK[seg * 3]; ny = -arm.SK[seg * 3 + 1]; nz = -arm.SK[seg * 3 + 2]; nl = Math.hypot(nx, ny, nz);
+    if (!(nl > 1e-9)) return null;
+    nx /= nl; ny /= nl; nz /= nl;
+  }
+  // The pose it holds is the chain as it lies, as still() takes it.
+  const from = new Float64Array(S * 2);
+  if (arm.started && Number.isFinite(X[n * 3 - 1])) { arm.bendsFromPoints(X, from); arm._clampBends(from, null); } else from.set(arm.out);
+  if (!from.every(Number.isFinite)) return null;
+  // Each joint's bends live in a frame carried down the bent, twisted chain, so the way to bend is read off the pose
+  // itself: the gradient of the segment's height along n, its length over the lever being how much a bend there helps.
+  const B = Float64Array.from(from), P = new Float64Array(n * 3), delta = new Float64Array(S * 2), lim = arm.lim;
+  const lo = Math.max(0, seg - Math.max(1, Math.round(k.smear) || 1) + 1), amp = k.bend * (1 + k.gain * s), eps = 1e-6;
+  arm.poseFromBends(B, P, null);
+  const mx = (P[seg * 3] + P[seg * 3 + 3]) / 2, my = (P[seg * 3 + 1] + P[seg * 3 + 4]) / 2, mz = (P[seg * 3 + 2] + P[seg * 3 + 5]) / 2;
+  for (let j = lo; j <= seg; j++) {
+    const lever = Math.hypot(mx - P[j * 3], my - P[j * 3 + 1], mz - P[j * 3 + 2]), gr = [0, 0];
+    if (!(lever > 1e-9)) continue;
+    for (let c = 0; c < 2; c++) {
+      const a = j * 2 + c, b0 = B[a];
+      B[a] = b0 + eps; arm.poseFromBends(B, P, null); const up = midDot(P, seg, nx, ny, nz);
+      B[a] = b0 - eps; arm.poseFromBends(B, P, null); gr[c] = (up - midDot(P, seg, nx, ny, nz)) / (2 * eps);
+      B[a] = b0;
+    }
+    const du = amp * gr[0] / lever, dv = amp * gr[1] / lever;
+    // Kept inside the joint's limit along its own direction: |from + t·delta| = lim for the largest t up to 1.
+    const fu = from[j * 2], fv = from[j * 2 + 1], dd = du * du + dv * dv, fd = fu * du + fv * dv, L2 = lim[j] * lim[j];
+    if (!(dd > 1e-24) || !Number.isFinite(dd)) continue;
+    const tt = Math.max(0, Math.min(1, (-fd + Math.sqrt(Math.max(0, fd * fd - dd * (fu * fu + fv * fv - L2)))) / dd));
+    delta[j * 2] = du * tt; delta[j * 2 + 1] = dv * tt;
+  }
+  // Springs' targets have what contact left in the bends added back each tick, so the held pose is taken without it.
+  const base = new Float64Array(S * 2);
+  for (let a = 0; a < S * 2; a++) base[a] = from[a] - arm.rest[a];
+  const dur = Number.isFinite(opts.duration) && opts.duration > 0 ? opts.duration : recoilTime(s, k);
+  const shorten = Math.min(0.5, k.shorten * (1 + k.gain * s));
+  return {
+    kind: 'recoil', t: 0, seg, lo, severity: s, normal: [nx, ny, nz], point: finite3(touch.point) ? [touch.point[0], touch.point[1], touch.point[2]] : null,
+    entry: touch.entry ?? null, duration: dur > 0 ? dur : REFLEX_KNOBS.recoilBase, hold: k.hold >= 0 ? k.hold : REFLEX_KNOBS.hold,
+    from, base, delta, lam: Float64Array.from(arm.lam), twist: Float64Array.from(arm.twist),
+    stiff: share(k.stiff, REFLEX_KNOBS.stiff), baseStiff: share(k.baseStiff, REFLEX_KNOBS.baseStiff),
+    shorten: shorten >= 0 ? shorten : 0, rate: share(k.shortenRate, REFLEX_KNOBS.shortenRate), muscle: k.muscle === 'map' ? 'map' : 'pass',
+    pulseIn: Math.max(1e-3, Math.min(1, share(k.shortenIn, REFLEX_KNOBS.shortenIn))), pulseOut: Math.min(0.999, share(k.shortenOut, REFLEX_KNOBS.shortenOut)),
+  };
+}
+
+/* The held pose plus the flinch, stiff where it bends and before it holding, the part past the touch soft and trailing
+   in the water; the flinching part shortens early on and lengthens back, and the twist holds. */
+export function recoilTargets(arm, T, K) {
+  const g = arm.goal, k = arm.knobs, S = arm.n - 1, G = arm.lamGoal, D = arm.dragGoal, A = g.base, F = g.delta;
+  const u = g.duration > 0 ? g.t / g.duration : 1, sh = g.shorten * smooth(0, g.pulseIn, u) * (1 - smooth(g.pulseOut, 1, u));
+  for (let j = 0; j < S; j++) {
+    const at = j >= g.lo && j <= g.seg;
+    T[j * 2] = A[j * 2] + F[j * 2]; T[j * 2 + 1] = A[j * 2 + 1] + F[j * 2 + 1];
+    K[j] = at ? k.stiffBehind * g.stiff : j < g.lo ? k.stiffBehind * g.baseStiff : k.stiffDrag;
+    D[j] = j > g.seg ? 1 : 0;
+    G[j] = at ? Math.max(k.stretchMin, g.lam[j] * (1 - sh)) : g.lam[j];
+  }
+  arm.twistAim.set(g.twist);
+  if (g.t >= g.duration + g.hold) arm._letGo(false);
   return 0;
 }

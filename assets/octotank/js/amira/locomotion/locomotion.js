@@ -67,6 +67,7 @@ export class Locomotion {
     this.anchorTaste = new Array(n).fill(null);
     this.desire = null;
     this.hold = false;        // a probe holds the mantle's arm modes; the controller keeps its hands off them
+    this.holdBy = null;       // a hold that gives way to a jet (the den's settle), by its release(why)
     this.time = 0;
     this.c = [0, 0, 0]; this._cPrev = [0, 0, 0]; this._started = false;
     this.v = [0, 0, 0];

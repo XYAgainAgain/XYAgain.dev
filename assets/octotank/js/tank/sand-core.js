@@ -1,9 +1,12 @@
 import { createRng, deriveSeed } from '../../../pond/js/rng.js';
 
 export const SAND_KNOBS = {
-  seed: 420, depth: 0.05, unevenness: 0.008, limit: 0.04, minimum: 0.01,
-  tileSize: 0.35, relief: 0.45, strength: 1, healHalfLife: 60, slump: 2,
+  seed: 420, depth: 0.05, unevenness: 0.01, limit: 0.04, minimum: 0.01,
+  tileSize: 0.35, relief: 0.45, strength: 1.5, healHalfLife: 60, slump: 1,
+  intentHalfLife: 86400,   // s: gravel moved on purpose (a den) heals this slowly once she leaves; scuffs keep healHalfLife
 };
+// m above the bed a contact's bottom may float and still count as touching it.
+export const TOUCH_GAP = 0.012;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const smooth = (v) => v * v * (3 - 2 * v);
 
@@ -14,6 +17,16 @@ function noise(table, x, z) {
   return (a + (b - a) * u) * (1 - v) + (c + (d - c) * u) * v;
 }
 
+/* A body's load (N) shared over whichever of its points touch the bed, each by its own weight (its mass), into out;
+   the points off the bed press nothing. Returns how many touch. */
+export function shareLoad(load, weights, touching, out, count = weights.length) {
+  let sum = 0, n = 0;
+  for (let i = 0; i < count; i++) if (touching[i] && weights[i] > 0) { sum += weights[i]; n++; }
+  const each = Number.isFinite(load) && load > 0 && sum > 0 ? load / sum : 0;
+  for (let i = 0; i < count; i++) out[i] = touching[i] && weights[i] > 0 ? weights[i] * each : 0;
+  return n;
+}
+
 export class SandField {
   constructor(width, depth, nx = 256, nz = 128, knobs = {}) {
     Object.assign(this, { width, depth, nx, nz });
@@ -21,7 +34,7 @@ export class SandField {
     this.dx = width / (nx - 1); this.dz = depth / (nz - 1);
     const n = nx * nz;
     for (const name of ['base', 'h', 'cut', 'ridge', 'removed']) this[name] = new Float32Array(n);
-    this.blocked = new Uint8Array(n); this.occupied = new Uint8Array(n);
+    this.blocked = new Uint8Array(n); this.occupied = new Uint8Array(n); this.intent = new Uint8Array(n);
     this.pending = new Int32Array(n); this.marked = new Uint8Array(n); this.pendingCount = 0;
     this.island = new Int32Array(n);
     this.region = new Int32Array(n); this.queue = new Int32Array(n);
@@ -42,8 +55,8 @@ export class SandField {
       const p = j * this.nx + i;
       this.base[p] = this.h[p] = Math.max(this.knobs.minimum, this.knobs.depth + value / sum * this.knobs.unevenness);
     }
-    this.cut.fill(0); this.ridge.fill(0); this.occupied.fill(0); this.marked.fill(0); this.pendingCount = 0;
-    this.active = null; this.touch(0, this.nx - 1, 0, this.nz - 1);
+    this.cut.fill(0); this.ridge.fill(0); this.occupied.fill(0); this.marked.fill(0); this.intent.fill(0); this.pendingCount = 0;
+    this.intentClock = 0; this.active = null; this.touch(0, this.nx - 1, 0, this.nz - 1);
   }
 
   touch(x0, x1, z0, z1) {
@@ -110,9 +123,14 @@ export class SandField {
 
   beginContacts() { this.occupied.fill(0); }
 
+  /* Whether a contact whose bottom is at height `bottom` over (x, z) rests on the bed, by the gate contact() uses. */
+  touches(x, bottom, z) {
+    return Number.isFinite(x + bottom + z) && Math.abs(x) <= this.width / 2 && Math.abs(z) <= this.depth / 2 && bottom <= this.sample(x, z) + TOUCH_GAP;
+  }
+
   contact(x, bottom, z, radius, speed, force, dt) {
     if (!Number.isFinite(x + bottom + z + radius + speed + force + dt) || radius <= 0 || dt <= 0) return;
-    if (bottom > this.sample(x, z) + 0.012 || Math.abs(x) > this.width / 2 || Math.abs(z) > this.depth / 2) return;
+    if (!this.touches(x, bottom, z)) return;
     const r = Math.max(radius, this.dx * 1.5, this.dz * 1.5), reach = r * 2.4;
     const cx = (x + this.width / 2) / this.dx, cz = (z + this.depth / 2) / this.dz;
     const center = clamp(Math.round(cz), 0, this.nz - 1) * this.nx + clamp(Math.round(cx), 0, this.nx - 1), region = this.region[center];
@@ -132,6 +150,51 @@ export class SandField {
       else if (square < 5.76 && amount > 0) this.ridge[p] = Math.max(this.ridge[p], (1 - Math.abs(Math.sqrt(square) - 1.7) / 0.7) ** 2);
     }
     if (amount > 0) this.wake(x0, x1, z0, z1);
+  }
+
+  /* A bowl dug on purpose: cells within radius go `share` of the way to base − depth·(1 − s²)², the gravel banks on a rim
+     at 1–1.7 radii, and all of it is marked intent. Returns volumes { missing: still to dig, total: the whole bowl, moved }; share 0 only looks. */
+  bowl(cx, cz, radius, depth, share = 1) {
+    const out = { missing: 0, total: 0, moved: 0 };
+    if (!Number.isFinite(cx + cz + radius + depth + share) || radius <= 0 || depth <= 0) return out;
+    const k = this.knobs, h = this.h, base = this.base, f = clamp(share, 0, 1), area = this.dx * this.dz, reach = radius * 1.7;
+    const fx = (cx + this.width / 2) / this.dx, fz = (cz + this.depth / 2) / this.dz;
+    const center = clamp(Math.round(fz), 0, this.nz - 1) * this.nx + clamp(Math.round(fx), 0, this.nx - 1), region = this.region[center];
+    if (region < 0) return out;
+    const x0 = Math.max(0, Math.floor(fx - reach / this.dx)), x1 = Math.min(this.nx - 1, Math.ceil(fx + reach / this.dx));
+    const z0 = Math.max(0, Math.floor(fz - reach / this.dz)), z1 = Math.min(this.nz - 1, Math.ceil(fz + reach / this.dz));
+    const dug = [], rim = [];
+    for (let j = z0; j <= z1; j++) for (let i = x0; i <= x1; i++) {
+      const p = j * this.nx + i;
+      if (this.region[p] !== region || this.blocked[p]) continue;
+      const dx = (i - fx) * this.dx / radius, dz = (j - fz) * this.dz / radius, s = Math.sqrt(dx * dx + dz * dz);
+      if (s < 1) {
+        const target = Math.max(k.minimum, base[p] - k.limit, base[p] - depth * (1 - s * s) ** 2), excess = Math.max(0, h[p] - target);
+        out.total += (base[p] - target) * area; out.missing += excess * area;
+        const take = Math.min(excess, (base[p] - target) * f);
+        if (take > 0) { h[p] -= take; out.moved += take; dug.push(p, take); this.intent[p] = 1; }
+      } else if (s < 1.7) rim.push(p, (1 - Math.abs(s - 1.3) / 0.4) ** 2);
+    }
+    // A rim cell can fill to the pile-up limit, so what it can't hold goes round again, and any left goes back in the bowl.
+    let budget = out.moved;
+    for (let pass = 0; pass < 3 && budget > 1e-12; pass++) {
+      let weights = 0;
+      for (let r = 0; r < rim.length; r += 2) if (base[rim[r]] + k.limit - h[rim[r]] > 1e-9) weights += rim[r + 1];
+      if (!(weights > 0)) break;
+      const each = budget / weights;
+      for (let r = 0; r < rim.length; r += 2) {
+        const p = rim[r], rise = Math.min(Math.max(0, base[p] + k.limit - h[p]), each * rim[r + 1]);
+        if (rise > 0) { h[p] += rise; budget -= rise; this.intent[p] = 1; }
+      }
+    }
+    if (budget > 1e-12 && out.moved > 0) {
+      const back = budget / out.moved;
+      for (let d = 0; d < dug.length; d += 2) h[dug[d]] += dug[d + 1] * back;
+      out.moved -= budget;
+    }
+    out.moved *= area;
+    if (out.moved > 0) { this.wake(x0, x1, z0, z1); this.touch(x0, x1, z0, z1); }
+    return out;
   }
 
   wake(x0, x1, z0, z1) {
@@ -175,11 +238,16 @@ export class SandField {
       this.ridge[p] = 0; this.marked[p] = 0;
     });
     this.pendingCount = 0;
-    const keep = k.healHalfLife > 0 ? Math.exp(-Math.LN2 * dt / k.healHalfLife) : 1;
+    const keepAll = k.healHalfLife > 0 ? Math.exp(-Math.LN2 * dt / k.healHalfLife) : 1;
+    // A day's half-life moves a cell less per tick than Float32 can hold, so a den heals in steps a 144th of it apart.
+    this.intentClock = k.intentHalfLife > 0 ? this.intentClock + dt : 0;
+    const keepIntent = k.intentHalfLife > 0 && this.intentClock >= k.intentHalfLife / 144 ? Math.exp(-Math.LN2 * this.intentClock / k.intentHalfLife) : 1;
+    if (keepIntent < 1) this.intentClock = 0;
     each((p, i, j) => {
       if (this.blocked[p] || occupied[p]) return;
-      const old = h[p], delta = old - this.base[p];
+      const old = h[p], delta = old - this.base[p], keep = this.intent[p] ? keepIntent : keepAll;
       h[p] = keep < 1 && Math.abs(delta) < 1e-6 ? this.base[p] : this.base[p] + delta * keep;
+      if (Math.abs(h[p] - this.base[p]) < 1e-6) this.intent[p] = 0;
       for (let axis = 0; axis < 2; axis++) {
         const q = axis ? (j < z1 ? p + this.nx : -1) : (i < x1 ? p + 1 : -1);
         if (q < 0 || this.blocked[q] || occupied[q]) continue;

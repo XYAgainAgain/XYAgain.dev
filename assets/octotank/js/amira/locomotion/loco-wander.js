@@ -37,6 +37,14 @@ export class Wander {
       this.desire = null; this.state = 'off';
       return;
     }
+    // Resting, she stays home: her own trip ends and no new one starts. A click or a scenario still sends her.
+    if (loco.arms.resting) {
+      if (this.desire && loco.desire === this.desire) loco.stop('resting');
+      if (this.looking && loco.pose.focus?.point === this.looking) loco.pose.attend(null);
+      this.looking = null;
+      this.desire = null; this.state = 'rest'; this.next = Math.max(this.next, this.time + k.wanderMin);
+      if (!loco.desire) return;
+    }
     // A click or a scenario takes over until its own desire ends.
     if (loco.desire && loco.desire !== this.desire) { this.desire = null; this.state = 'yield'; this.next = Math.max(this.next, this.time + k.wanderMin); return; }
     if (this.desire) {
@@ -53,7 +61,7 @@ export class Wander {
       this.looking = null;
       this.state = 'wait'; this.next = this.time + this.rng.range(k.wanderMin, Math.max(k.wanderMin, k.wanderMax));
     }
-    if (this.state === 'off' || this.state === 'yield') this.state = 'wait';
+    if (this.state === 'off' || this.state === 'yield' || this.state === 'rest') this.state = 'wait';
     // Without arms that can plant she can't get anywhere, so she doesn't set out.
     if (this.time >= this.next && loco.canPlant) this._pick();
   }

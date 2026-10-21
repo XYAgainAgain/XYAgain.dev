@@ -60,10 +60,9 @@ export class Jet {
      Returns true, or a string saying why not. */
   start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true } = {}) {
     const L = this.loco, k = this.k, m = this.mantle;
-    // Sinking after one counts as free (the hold on her gait is the glide's own): another jet takes her back up, once
-    // her heart allows.
+    // Her own glide's hold and a den's settle both give way to a fresh jet, once her heart allows; any other hold is a probe's.
     if (this.phase === 'thrust') return 'already moving';
-    if (L.hold && this.phase !== 'glide') return 'held by a probe';
+    if (L.hold && this.phase !== 'glide' && !L.holdBy) return 'held by a probe';
     if (this.arms.lead) return 'the scripted squeeze has the arms';
     if (!k.enabled || L.pose.rigid || m.drive !== 'force') return 'no soft drive';
     if (kind === 'jet' && !this.debt.ready) return this.debt.debt > k.jetReady ? 'oxygen debt' : 'resting';
@@ -83,6 +82,7 @@ export class Jet {
     this.reason = reason;
     this.stopAtWalls = stopAtWalls === 'touch' ? 'touch' : stopAtWalls !== false;
     // The crawl stands down: strokes and stations let go, the stance lets go, every patch is left free.
+    L.holdBy?.release('jet');
     L.standDown(0);
     L.hold = true;
     this._claimArms();

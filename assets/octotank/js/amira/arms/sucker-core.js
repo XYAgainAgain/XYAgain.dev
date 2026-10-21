@@ -33,11 +33,14 @@ export const SUCKER_KNOBS = {
   foodHold: 240.5,
   foodSpread: 165.5,
   spoiledGrip: 0.35,     // what a spoiled taste leaves of the grip
+  noxiousHold: 0.3,      // s mean, and its spread, of the hold a noxious touch is given; it never grips and starts no episode
+  noxiousSpread: 0.1,
+  noxiousSeverity: 0.7,  // a noxious thing's severity in (0, 1] when it carries none of its own
   rejectSpeed: 0.2,      // m/s a rejected thing travels out along the arm
   refractory: 1,         // s a patch stays unsealed after the arm moves on
   ignoreTime: 4,         // s an arm leaves a thing it moved on from alone
   // What a touch is worth to the brain, before the arm's state and the thing's novelty scale it.
-  tasteWeight: { food: 1, spoiled: 0.9, toy: 0.5, slick: 0.5, rock: 0.25, floor: 0.15, glass: 0.15, lid: 0.15, wall: 0.15, self: 0.05 },
+  tasteWeight: { noxious: 1, food: 1, spoiled: 0.9, toy: 0.5, slick: 0.5, rock: 0.25, floor: 0.15, glass: 0.15, lid: 0.15, wall: 0.15, self: 0.05 },
   busySalience: 0.6,     // a touch by an arm busy with something else
   idleSalience: 0.35,    // and by an idle one, against an arm reaching for that very thing
   familiarTime: 40,      // s of touching that halve a thing's novelty
@@ -45,7 +48,13 @@ export const SUCKER_KNOBS = {
   novelFloor: 0.25,      // what a wholly familiar thing still weighs
   tasteLogSize: 64,      // touches the log keeps for the brain to read
   tasteGap: 0.25,        // s a touch may lapse and still be the same one
+  // An arm on a reach, hold, fetch, or plant keeps it through touches on anything else: they are tasted and logged as
+  // discoveries but start no episode, whose moveOn would end the task. A taste listed in discoveryOverrides still defects.
+  keepTask: false,
+  discoveryOverrides: ['food'],
 };
+
+export const TASK_GOALS = new Set(['reach', 'hold', 'fetch', 'plant']);
 
 /* Where the suckers sit on one arm and what each can hold. Pitch follows sucker size, so they crowd toward the tip. */
 export function layoutSuckers(len0, rad0, arc0, armIndex, k = SUCKER_KNOBS) {
@@ -99,14 +108,27 @@ export function suckerCeiling(area, k = SUCKER_KNOBS) {
 }
 
 /* What a taste does: grip (fraction of the sucker force left), hard (seal near all, at the ceiling), the hold's mean
-   and spread in seconds, fetch (pull it to the mouth), reject (send it out along the arm), self (a no-op). */
+   and spread in seconds, fetch (pull it to the mouth), reject (send it out along the arm), self (a no-op), recoil (flinch off it, never an episode). */
 export function tasteRule(tag, k = SUCKER_KNOBS, { gripSelf = false } = {}) {
-  const boring = { grip: 1, hard: false, holdMean: k.boringHold, holdSd: k.boringSpread, fetch: false, reject: false, self: false };
+  const boring = { grip: 1, hard: false, holdMean: k.boringHold, holdSd: k.boringSpread, fetch: false, reject: false, self: false, recoil: false };
   if (tag === 'food') return { ...boring, hard: true, holdMean: k.foodHold, holdSd: k.foodSpread, fetch: true };
   if (tag === 'spoiled') return { ...boring, grip: k.spoiledGrip, reject: true };
   if (tag === 'slick') return { ...boring, grip: 0 };
+  if (tag === 'noxious') return { ...boring, grip: 0, holdMean: k.noxiousHold, holdSd: k.noxiousSpread, recoil: true };
   if (tag === 'self') return gripSelf ? boring : { ...boring, grip: 0, holdMean: 0, holdSd: 0, self: true };
   return boring;
+}
+
+/* A noxious thing's severity: its own when it carries one in (0, 1], else the knob's. */
+export function severityOf(thing, k = SUCKER_KNOBS) {
+  const v = thing?.severity;
+  return v > 0 ? Math.min(1, v) : k.noxiousSeverity;
+}
+
+/* Whether a touch by an arm whose goal is goalKind is a discovery: the policy is on, the arm has a task, the touched
+   thing isn't what the task is about (meant), and its taste isn't one allowed to pull the arm off its task. */
+export function isDiscovery(goalKind, meant, taste, k = SUCKER_KNOBS) {
+  return !!k.keepTask && TASK_GOALS.has(goalKind) && !meant && !(k.discoveryOverrides?.includes(taste) ?? false);
 }
 
 /* A lognormal draw with this mean and standard deviation, so a hold is never negative. */

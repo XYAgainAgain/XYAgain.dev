@@ -57,7 +57,9 @@ export class WallOptics {
     view.coordinateSystem = r.coordinateSystem;
     view.projectionMatrix.makePerspective(Math.min(...xs), Math.max(...xs), Math.max(...ys), Math.min(...ys), view.near, view.far, r.coordinateSystem);
     this.matrix.value.set(0.5, 0, 0, 0.5, 0, -0.5, 0, 0.5, 0, 0, 0.5, 0.5, 0, 0, 0, 1).multiply(view.projectionMatrix).multiply(view.matrixWorldInverse);
-    const plane = new THREE.Plane(new THREE.Vector3(-sign, 0, 0), TANK.w / 2 - 0.002).applyMatrix4(view.matrixWorldInverse);
+    // The cut sits just past the sand's edge skirt (0.75 mm out) and short of the glass (2 mm out): inside it, the near
+    // side of the bed is gone and the pane looks into the sand from beneath its surface.
+    const plane = new THREE.Plane(new THREE.Vector3(-sign, 0, 0), TANK.w / 2 + 0.0015).applyMatrix4(view.matrixWorldInverse);
     const coefficients = new THREE.Vector4(plane.normal.x, plane.normal.y, plane.normal.z, plane.constant);
     if (!clipProjection(view.projectionMatrix.elements, coefficients, r.coordinateSystem === THREE.WebGPUCoordinateSystem)) { this.group.visible = false; return; }
     view.projectionMatrixInverse.copy(view.projectionMatrix).invert();

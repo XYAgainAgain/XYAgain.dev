@@ -165,6 +165,7 @@ export class TankSand {
         ['Terrain unevenness', 'unevenness', [0, 0.003, 0.005, 0.008, 0.01, 0.015], (v) => `${Math.round(v * 1000)} mm`],
         ['Dig strength', 'strength', [0, 0.25, 0.5, 1, 1.5, 2, 3], (v) => `${v}×`],
         ['Healing half-life', 'healHalfLife', [0, 15, 30, 60, 120, 300], (v) => v ? `${v} sec` : 'off'],
+        ['Den healing half-life', 'intentHalfLife', [0, 3600, 21600, 86400, 604800], (v) => v ? `${+(v / 3600).toFixed(1)} hr` : 'off'],
         ['Gravel settling', 'slump', [0, 0.5, 1, 2, 4, 8], (v) => `${v}×`],
         ['Excavation limit', 'limit', [0.01, 0.02, 0.03, 0.04], (v) => `${Math.round(v * 100)} cm`],
       ].map(([name, key, values, format]) => ({ type: 'range', name, values, get: () => this.knobs[key], label: () => `${name}: ${format(this.knobs[key])}`,

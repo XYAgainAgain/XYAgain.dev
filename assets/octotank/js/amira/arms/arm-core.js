@@ -1,7 +1,7 @@
 /* Amira's arms without THREE or Jolt: a 24-point chain per arm posed from per-joint bends, stretch, and twist; the
    reach, grip, fetch, and idle programs; and the contact passes that make an arm drape instead of clip. */
 
-import { plantTargets, makePlant, trailTargets, spreadTargets, tuckTargets } from './arm-plant-core.js';
+import { plantTargets, makePlant, trailTargets, spreadTargets, tuckTargets, makeRecoil, recoilTargets } from './arm-plant-core.js';
 import { MuscleArm, GROUPS } from './muscle-core.js';
 
 export const ARM_KNOBS = {
@@ -110,6 +110,14 @@ export const ARM_KNOBS = {
   braceMax: 0.4,         // co-contraction where a program stiffens the arm all the way, as behind a reach's bend
   curlAct: 0.62,         // sucker-side activation at the tip of a resting curl in muscle mode, rising from the base on curlActPow
   curlActPow: 2.5,
+  crowd: 0,              // 1: each arm feels the other arms' bodies near it (arm-crowd.js) and its programs steer off the crowded side
+  crowdRange: 0.05,      // m of clearance under which another arm crowds a sample; its push rises as (1 - gap/range)²
+  crowdSamples: 6,       // points per arm that feel the crowd, evenly spaced from crowdFrom of the way out to the tip
+  crowdFrom: 0.3,
+  crowdTau: 1,           // s the idle lean follows the push over; it fades out while a program holds the arm
+  crowdWander: 2,        // a wander or awake pick into the crowd mirrors toward the open side by this × the lean, at most all the way
+  crowdAim: 0.6,         // share of the wander distance a full lean moves the target the idle aim follows
+  crowdReach: 0.05,      // rad per joint past a reach's contact point a full push bends the trailing arm off the crowd
 };
 
 export function minJerk(u) {
@@ -1021,6 +1029,9 @@ export class Arm {
     this.wander = [0, 0, 0];
     this.wanderPick = [0, 0, 0];
     this.wanderAt = 0;
+    // World push off the other arms' bodies near this one (arm-crowd.js, |push| ≤ 1), the idle program's smoothed lean on it,
+    // and whether a reach may steer too (not over a driving rod, whose grip point any bend can move).
+    this.crowd = { push: [0, 0, 0], lean: [0, 0, 0], reach: true };
     this.started = false;
     this._dt = 0;
     this._t = [0, 0, 0]; this._n = [0, 0, 0];
@@ -1151,6 +1162,19 @@ export class Arm {
     return true;
   }
 
+  /* Flinch off a noxious touch { seg, severity, normal } (arm-plant-core.js), replacing whatever goal the arm had. As in
+     still(), the springs start from the chain as it lies, so a grip's blend dropped at once never pops the pose. */
+  recoil(touch, opts) {
+    const g = makeRecoil(this, touch, opts);
+    if (!g) return false;
+    this.goal = g;
+    this.bend.set(g.from); this.vel.fill(0); this.twistV.fill(0);
+    this.w = 1; this.gw = 0;
+    // Outlives the goal, so the recoil's fade keeps the muscle-map choice it was made with.
+    this._recoilMap = g.muscle === 'map';
+    return g;
+  }
+
   /* Bring what the arm grasped at `grasp` (fraction of its length; default where the last reach touched) to the
      mouth. Only ever started from outside: an arm never decides to fetch on its own. */
   fetch(mouth, { hold, grasp, duration } = {}) {
@@ -1236,6 +1260,22 @@ export class Arm {
     const A = this.awake, Ap = this.awakePick;
     if (!this.started) { this._pickAwake(); A[0] = Ap[0]; A[1] = Ap[1]; }
     A[0] += (Ap[0] - A[0]) * f; A[1] += (Ap[1] - A[1]) * f;
+    // The lean off a crowded side (arm-crowd.js), across the arm in the root frame and never toward the suckers (from her crown,
+    // down and in under her, where nothing has room); it fades under a program. A pick into it mirrors to the open side.
+    let lu = 0, lv = 0, mirror = 0;
+    if (k.crowd) {
+      const p = this.crowd.push, L = this.crowd.lean, on = this.goal ? 0 : 1, fc = this.started ? 1 - Math.exp(-dt / Math.max(1e-3, k.crowdTau)) : 1;
+      for (let i = 0; i < 3; i++) L[i] += (p[i] * on - L[i]) * fc;
+      if (!Number.isFinite(L[0] + L[1] + L[2])) L[0] = L[1] = L[2] = 0;
+      lu = L[0] * F.u[0] + L[1] * F.u[1] + L[2] * F.u[2]; lv = L[0] * F.v[0] + L[1] * F.v[1] + L[2] * F.v[2];
+      const so = lu * F.cu + lv * F.cv;
+      if (so > 0) { lu -= so * F.cu; lv -= so * F.cv; }
+      const ll = len2(lu, lv);
+      if (ll > 1e-9 && !this.goal) mirror = 2 * Math.min(1, ll * k.crowdWander) / (ll * ll);
+      // The awake pick, every tick: the bend follows it at its own pace, so a curl into a neighbor swings off it, never whips.
+      const q = mirror * Math.min(0, Ap[0] * lu + Ap[1] * lv);
+      Ap[0] -= q * lu; Ap[1] -= q * lv;
+    }
     T.fill(0);
     for (let j = 0; j < S; j++) {
       const s = j / (S - 1);
@@ -1255,7 +1295,9 @@ export class Arm {
       this.wanderAt = this.time + k.wanderMin + this.rng() * (k.wanderMax - k.wanderMin);
       const cone = Math.min(1.4, k.wanderCone);
       const spin = this.rng() * 2 * Math.PI, off = Math.tan(cone * Math.sqrt(this.rng()));
-      const a = off * Math.cos(spin), b = off * Math.sin(spin), dir = this._t;
+      let a = off * Math.cos(spin), b = off * Math.sin(spin);
+      if (mirror > 0) { const q = mirror * Math.min(0, a * lu + b * lv); a -= q * lu; b -= q * lv; }
+      const dir = this._t;
       dir[0] = F.d[0] + a * F.u[0] + b * F.v[0];
       dir[1] = F.d[1] + a * F.u[1] + b * F.v[1];
       dir[2] = F.d[2] + a * F.u[2] + b * F.v[2];
@@ -1274,6 +1316,7 @@ export class Arm {
     W[0] += (P[0] - W[0]) * f; W[1] += (P[1] - W[1]) * f; W[2] += (P[2] - W[2]) * f;
     const dir = this._t;
     dir[0] = W[0] - F.p[0]; dir[1] = W[1] - F.p[1]; dir[2] = W[2] - F.p[2];
+    if (k.crowd) { const r = k.crowdAim * k.wanderReach * this._length; for (let i = 0; i < 3; i++) dir[i] += (lu * F.u[i] + lv * F.v[i]) * r; }
     const aim = k.idleAim * (1 - rw * (1 - k.restAim));
     if (len3(dir[0], dir[1], dir[2]) > 1e-6) { normalize3(dir); this._aim(dir[0], dir[1], dir[2], aim, T); }
   }
@@ -1297,6 +1340,7 @@ export class Arm {
     }
     if (g.kind === 'fetch') return this._fetchTargets(T, K);
     if (g.kind === 'plant') return plantTargets(this, T, K, dt);
+    if (g.kind === 'recoil') return recoilTargets(this, T, K);
     if (g.kind === 'trail' || g.kind === 'spread' || g.kind === 'tuck') return (g.kind === 'trail' ? trailTargets : g.kind === 'spread' ? spreadTargets : tuckTargets)(this, T, K);
     return this._reachTargets(T, K, dt);
   }
@@ -1387,6 +1431,17 @@ export class Arm {
     let ci = this.n - 1;
     if (!g.tip) { ci = 2; for (let i = 2; i < this.n; i++) if (Math.abs(this.arc0[i] - cArc) < Math.abs(this.arc0[ci] - cArc)) ci = i; }
     this.gripAt = ci;
+    // Past the contact point the trailing arm bends off a crowded side (never toward its suckers), in each joint's own frame
+    // as last posed; no joint there poses the grip point or moves the bend. A pinned contact is locomotion's foot, left alone.
+    if (k.crowd && this.crowd.reach && !g.tip && !g.cFix && this.started) {
+      const q = this.crowd.push, Dp = this.D, Sp = this.SKp, c0 = this.arc0[ci];
+      for (let j = ci + 1; j < S; j++) {
+        const o = (j - 1) * 3, sx = Sp[o], sy = Sp[o + 1], sz = Sp[o + 2], dx = Dp[o], dy = Dp[o + 1], dz = Dp[o + 2];
+        const ps = Math.min(0, q[0] * sx + q[1] * sy + q[2] * sz), pw = q[0] * (dy * sz - dz * sy) + q[1] * (dz * sx - dx * sz) + q[2] * (dx * sy - dy * sx);
+        const c = k.crowdReach * smoothstep(0, width, this.arc0[j] - c0);
+        T[j * 2] += (F.cu * ps - F.cv * pw) * c; T[j * 2 + 1] += (F.cv * ps + F.cu * pw) * c;
+      }
+    }
     if (g.face) this._aimSuckers(g.face, ci, dt);
     if (!hold && u >= 1) { g.kind = 'hold'; g.ht = 0; }
     if (hold && g.ht >= g.hold) this._letGo(true);
@@ -1649,10 +1704,10 @@ export class Arm {
     // A reach's bend and a resting curl ride on top as the sucker-side longitudinal (group L0) contracting.
     for (let j = 0; j < S; j++) A[S + j] = Math.min(1, A[S + j] + this.actBump[j] * w + this.actIdle[j] * (1 - w));
     m.equilibrium(A, this._oral, M);
-    // A fetch's folds and a plant's held foot are placed geometry, past what the map lets a joint bend; they keep their
-    // bends, fading out with their weight, and the map only braces them.
+    // A fetch's folds, a plant's held foot, and a recoil's flinch are placed geometry, past what the map lets a joint bend;
+    // they keep their bends, fading out with their weight, and the map only braces them (a recoil may ask for the map).
     const kind = this.goal?.kind ?? (w > 1e-3 ? this._lastKind : null);
-    if (kind === 'fetch' || kind === 'plant') M.bend.set(W.bend);
+    if (kind === 'fetch' || kind === 'plant' || (kind === 'recoil' && !this._recoilMap)) M.bend.set(W.bend);
     // A held pose is the one the muscles already made; the map's nearest pose to it would drift the arm off.
     else if (kind === 'still') { M.bend.set(W.bend); M.lam.set(W.lam); M.twist.set(W.twist); }
     else { M.bend[0] = W.bend[0]; M.bend[1] = W.bend[1]; }
@@ -1665,19 +1720,23 @@ export class Arm {
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.stretchTau));
     const shorten = k.shortenSpeed / Math.max(1e-3, this._length);
     const plant = this.goal?.kind === 'plant' ? this.goal.lamTo : -1, M = k.muscle ? this.mus.lam : null;
+    const rc = this.goal?.kind === 'recoil' ? this.goal : null;
     for (let j = 0; j < S; j++) {
       // A plant's length is the geometry's, set outright, or its anchored suckers would slide.
       if (j <= plant) { L[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], G[j])); continue; }
       const want = Math.max(k.stretchMin, Math.min(this.lamMax[j], M ? M[j] : 1 + (G[j] - 1) * w));
       let d = (want - L[j]) * f;
-      if (d < 0) d = Math.max(d, -(L[j] > 1 ? k.recoverRate : shorten) * dt);
+      // A recoil's flinching segments shorten at its own pace, which a reflex needs and a program's shortening never would.
+      const r = L[j] > 1 ? k.recoverRate : shorten;
+      if (d < 0) d = Math.max(d, -(rc && j >= rc.lo && j <= rc.seg ? Math.max(r, rc.rate) : r) * dt);
       L[j] = !this.started ? want : Math.max(k.stretchMin, Math.min(Math.max(this.lamMax[j], L[j]), L[j] + d));
     }
   }
 
-  /* The aim fades with the program, unless the program faces something or holds still; with none it relaxes away on its own. */
+  /* The aim fades with the program, unless the program faces something or holds still (a recoil holds its twist, since
+     its held bends live in frames the twist rolls); with none it relaxes away on its own. */
   _fadeAim(dt) {
-    if (this.goal?.face || this.goal?.kind === 'still') return;
+    if (this.goal?.face || this.goal?.kind === 'still' || this.goal?.kind === 'recoil') return;
     const f = Math.exp(-dt / Math.max(1e-3, this.knobs.release)), Ta = this.twistAim;
     for (let j = 0; j < Ta.length; j++) Ta[j] *= f;
   }
@@ -1728,8 +1787,9 @@ export class Arm {
     this._stepTwist(dt);
     this._syncLive();
     const w = this.w, T = this.tgt, B = this.bend, V = this.vel, MB = k.muscle ? this.mus.bend : null;
-    // A fetch places the grasp at her mouth exactly; what contact left in the bends would hold it short.
-    const Rb = this.rest, relax = this.goal?.kind === 'still' ? 1 : Math.exp(-dt / Math.max(1e-3, k.contactRelax)), rw = this.goal?.kind === 'fetch' ? 1 - w : 1;
+    // A held pose (still, a recoil) keeps what contact bent into it; a fetch places the grasp at her mouth exactly,
+    // where what contact left in the bends would hold it short.
+    const Rb = this.rest, relax = this.goal?.kind === 'still' || this.goal?.kind === 'recoil' ? 1 : Math.exp(-dt / Math.max(1e-3, k.contactRelax)), rw = this.goal?.kind === 'fetch' ? 1 - w : 1;
     for (let j = 0; j < S; j++) {
       Rb[j * 2] *= relax; Rb[j * 2 + 1] *= relax;
       T[j * 2] = (MB ? MB[j * 2] : this.idleT[j * 2] + (this.goalT[j * 2] - this.idleT[j * 2]) * w) + Rb[j * 2] * rw;
@@ -2044,8 +2104,9 @@ export class Arm {
      the bends follow through the springs (nothing in the pose jumps) and come to rest against it; then it relaxes.
      The contact is this chain's own unless src ({ X, touched, hit }) brings another's. */
   _feedback(src = null) {
-    // A held pose bakes nothing in: its contact offsets are frozen with it.
-    if (this.goal?.kind === 'still') return;
+    // A held pose bakes nothing in: its contact offsets are frozen with it. A recoil holds its flinch the same way, or
+    // contact would press it back onto the thing it flinched from.
+    if (this.goal?.kind === 'still' || this.goal?.kind === 'recoil') return;
     // A resting curl keeps pressing into what it wraps, so feedback fades out with rest.
     const k = this.knobs, w = k.contactFeedback * (1 - this.restW * k.feedbackRest), S = this.n - 1;
     const X = src ? src.X : this.X, h = src ? src.hit : this._hit, Tc = src ? src.touched : this._touched;

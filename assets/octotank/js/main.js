@@ -18,6 +18,7 @@ import { installClimb } from './amira/locomotion/loco-climb.js';
 import { installSqueeze } from './amira/locomotion/loco-squeeze.js';
 import { installJet } from './amira/locomotion/loco-jet.js';
 import { installFew } from './amira/locomotion/loco-few.js';
+import { Den } from './amira/locomotion/loco-den.js';
 import { isRunning } from './diag/scenarios.js';
 import { BodyParts } from './amira/body/body-parts.js';
 import { attachDebug } from './diag/debug.js';
@@ -29,6 +30,7 @@ import { TankCamera } from './tank/camera.js';
 import { TankGlass } from './tank/glass.js';
 import { wallGeometry } from './tank/geometry.js';
 import { TankSand } from './tank/sand.js';
+import { registerWeight } from './tank/sand-weight.js';
 import { WallOptics } from './tank/wall-optics.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 import { RodDiag } from './diag/rod-diag.js';
@@ -37,7 +39,7 @@ import { RodDiag } from './diag/rod-diag.js';
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
-   ?rods=3,4 (those of her arms get rod bodies)  ?rodmode=shadow (the rods run beside her authored arms, touching nothing) */
+   ?rods=3,4 (those of her arms get rod bodies)  ?rodmode=shadow (the rods run beside her authored arms, touching nothing)  ?den=0 (no settling in) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -105,10 +107,12 @@ async function boot() {
   const armKnobs = params.has('collider') ? { collider: params.get('collider') } : {};
   // Her arms run on their muscles; ?muscle=0 runs them on the authored targets alone, as before the muscle map.
   armKnobs.muscle = params.get('muscle') === '0' ? 0 : 1;
+  // Her arms steer off each other before they touch, which thins the tangles but still lets two meet; ?crowd=0 turns it off.
+  armKnobs.crowd = params.get('crowd') === '0' ? 0 : 1;
   // The bench sets her aside: a mount holds one arm (a rod unless ?rod=0), and nothing of her body, posture, attention,
   // or locomotion is built.
   const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
-  let mantle, arms, pose = null, attention = null, loco = null, carry = null, jet = null, bench = null;
+  let mantle, arms, pose = null, attention = null, loco = null, carry = null, jet = null, bench = null, den = null;
   if (benchOn) {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
@@ -129,7 +133,15 @@ async function boot() {
     installSqueeze(loco, { apertures: apertures(layoutKnobs) });
     jet = installJet(loco);
     installFew(loco, { carry });
+    // Resting on the sand she settles into a den she digs; ?den=0 leaves her lying on the bed as it is.
+    if (sand) den = new Den({ loco, mantle, arms, sand, jet }, { knobs: params.get('den') === '0' ? { on: false } : {} });
+    // The records read locomotion's roles to tell a stroke from a station; Arms itself never sees locomotion.
+    arms.records.setLoco(loco);
   }
+  // An incidental touch can't end an arm's task, and a held reach that something blocks side-steps once, then moves on;
+  // ?keeptask=0 and ?blocked=0 show her without either.
+  arms.suckerKnobs.keepTask = params.get('keeptask') !== '0';
+  arms.blocked.knobs.on = params.get('blocked') !== '0';
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();
@@ -193,6 +205,7 @@ async function boot() {
   if (bench) { tank.bench = bench; tank.knobs.bench = bench.mount.k; }
   tank.attention = attention; if (attention) tank.knobs.attention = attention.knobs;
   tank.carry = carry;
+  if (den) { tank.den = den; tank.knobs.den = den.knobs; }
   tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
   const armView = tank.armView = new ArmView(arms, mantle, scene, Number(params.get('girth')) > 0 ? { girth: +params.get('girth') } : {});
@@ -208,18 +221,7 @@ async function boot() {
   tank.cameraRig = cameraRig; tank.knobs.camera = cameraRig.knobs;
   if (sand) {
     tank.sand = sand; tank.knobs.sand = sand.knobs;
-    sand.contacts.register(mantle, (emit) => {
-      const p = mantle.positions, o = mantle.origin, radius = mantle.knobs.vertexRadius ?? 0.004;
-      for (let i = 0; i < p.length; i += 3) emit(p[i] + o[0], p[i + 1] + o[1], p[i + 2] + o[2], radius, 0.05);
-    });
-    sand.contacts.register(arms, (emit) => {
-      for (let a = 0; a < arms.bodies.length; a++) {
-        const arm = arms.bodies[a];
-        if (arm.valid === false) continue;
-        const R = arm.drawRad ?? arm.rad;
-        for (let i = 0; i < arm.n; i++) emit(arm.X[i * 3], arm.X[i * 3 + 1], arm.X[i * 3 + 2], R[i], Math.max(0.02, mantle.armForce[a] / arm.n));
-      }
-    });
+    registerWeight(sand.contacts, sand.field, mantle, arms);
   }
   addEventListener('resize', () => {
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -261,6 +263,7 @@ async function boot() {
       attention.tick(dt);
       pose.tick(dt, arms);
       loco.tick(dt);
+      den?.tick(dt);
       mantle.tick(dt);
       mantle.sync();
     }

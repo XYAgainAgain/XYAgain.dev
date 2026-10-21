@@ -35,6 +35,9 @@ function muscleLine(arms) {
   return `Muscles  arm ${best.index}   T ${peak(0)}   L ${peak(1)} ${peak(2)} ${peak(3)} ${peak(4)}   O ${peak(5)} ${peak(6)}   braced ×${brace.toFixed(2)}`;
 }
 
+/* One arm-record event: the arm (omitted on the bench), the new label or the event and what it concerns, and its repeats. */
+const eventText = (e, arm = true) => `${arm ? `${e.arm} ` : ''}${e.kind === 'label' ? `→ ${e.text}` : `${e.kind}${e.text ? ` ${e.text}` : ''}`}${e.count > 1 ? ` ×${e.count}` : ''}`;
+
 export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say }) {
   const { phys, mantle, arms, pose } = ctx;
   const loco = ctx.loco, bench = ctx.bench ?? null;
@@ -283,20 +286,19 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       const mean = n ? sorted.reduce((x, y) => x + y, 0) / n : 0, p95 = n ? sorted[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
       const s = phys.stats(), h = mantle.health(), am = arms.stats();
       if (bench) {
+        const slot = Math.max(0, arms.slotOf(bench.index)), rec = arms.records.state[slot];
         readout.textContent = [
           `${document.documentElement.dataset.backend ?? '?'} · seed ${seed} · bench, arm ${bench.index}${state.paused ? ' · PAUSED' : ''}`,
           `Render   ${mean ? Math.round(1000 / mean) : '–'} fps   frame ${mean.toFixed(1)} ms   p95 ${p95.toFixed(1)}`,
           `Physics  step ${s.mean.toFixed(2)} ms   p95 ${s.p95.toFixed(2)}   tick ${s.js.mean.toFixed(2)} ms   arms ${am.mean.toFixed(2)}`,
           ...bench.describe(),
           ...(arms.knobs.muscle ? [muscleLine(arms)] : []),
-          `Arm      ${bench.arm.goal?.kind ?? 'exploring'}${arms.resting ? ', resting' : ''}`,
+          `Arm      ${rec.label}${rec.reason ? ` (${rec.reason})` : ''}${arms.resting ? ', resting' : ''}`,
+          `Events   ${arms.records.recent(slot, 3).map((e) => eventText(e, false)).join('  ·  ') || '–'}`,
           `Suckers  ${arms.suckerReport().map((r) => `${Math.round(r.share * 100)}%${r.holds ? ` ${r.hard ? 'HARD ' : ''}${r.holds}` : r.tastes ? ` ~${r.tastes}` : ''}`).join('  ')}`,
         ].join('\n');
         return;
       }
-      const busy = {};
-      for (const arm of arms.arms) if (arm.goal) busy[arm.goal.kind] = (busy[arm.goal.kind] ?? 0) + 1;
-      const busyText = Object.entries(busy).map(([k, v]) => `${v} ${k}`).join(', ') || 'all exploring';
       const breath = mantle.knobs.breathDepth > 0 ? `${Math.round(mantle.pace?.rate ?? mantle.knobs.breathRate)}/min, breathing ${inhaling ? 'in' : 'out'}` : 'held';
       readout.textContent = [
         `${document.documentElement.dataset.backend ?? '?'} · seed ${seed} · ${mantle.shell.count} verts · ${mantle.drive} drive${state.paused ? ' · PAUSED' : ''}`,
@@ -307,7 +309,8 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Heading  ${deg(pose.yaw)}${pose.turning ? ', turning' : ''}   breath ${breath}`,
         `Attend   ${ctx.attention?.describe() ?? '–'}`,
         `Gait     ${loco ? `${loco.describe()}   ${loco.stats().mean.toFixed(3)} ms` : '–'}`,
-        `Arms     ${busyText}`,
+        `Arms     ${arms.records.state.map((r, i) => `${i} ${r.label}`).join('  ')}`,
+        `Events   ${arms.records.recent(-1, 3).map((e) => eventText(e)).join('  ·  ') || '–'}`,
         ...(arms.knobs.muscle ? [muscleLine(arms)] : []),
         ...(ctx.rods?.describe() ?? []),
         `Water    ${ctx.water?.enabled ? `on, surface ${ctx.water.knobs.surfaceY} m, ${(s.water?.mean ?? 0).toFixed(3)} ms` : 'off (?water=0)'}${ctx.water?.knobs.tint ? '   tint: pale = floats or near neutral, darker = denser' : ''}`,
