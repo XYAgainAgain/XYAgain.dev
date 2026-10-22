@@ -89,6 +89,8 @@ export class RodDiag {
       const st = this.stats[i], rod = A.rods[s], tag = many || rootLabel === 'Root' ? `arm ${rod.index}  ` : '';
       lines.push(`Lag      ${tag}tip ${cm(st.tipLag)} cm   shape rms ${cm(st.shapeRms)} cm, max ${cm(st.shapeMax)} cm   fastest ${st.speedMax.toFixed(2)} m/s${rod.mass ? `   ${Math.round(rod.mass * 1000)} g` : ''}`);
       lines.push(`${rootLabel.padEnd(9)}${tag}pull ${(st.rootN * 1000).toFixed(0)} mN   twist ${(st.rootNm * 1000).toFixed(1)} mN·m   motion ${(st.kinetic * 1000).toFixed(2)} mJ`);
+      const W = A.rootLoad.subarray(s * 6, s * 6 + 6);
+      if (k.wrench && !A.shadow) lines.push(`Into her ${tag}pull ${(Math.hypot(W[0], W[1], W[2]) * 1000).toFixed(0)} mN   twist ${(Math.hypot(W[3], W[4], W[5]) * 1000).toFixed(1)} mN·m`);
       const L = this.wrench[i].last, idN = Math.hypot(L[6], L[7], L[8]), gap = Math.hypot(L[0] - L[6], L[1] - L[7], L[2] - L[8]);
       if (this.wrench[i].n) lines.push(`ID       ${tag}pull ${(idN * 1000).toFixed(0)} mN   twist ${(Math.hypot(L[9], L[10], L[11]) * 1000).toFixed(1)} mN·m   gap ${idN > 1e-6 ? Math.round(gap / idN * 100) : 0}%`);
     });

@@ -2,7 +2,7 @@ import { LAYERS } from '../../config.js';
 import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from '../locomotion/loco-carry-core.js';
 import { moveInputs } from '../locomotion/loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
-import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad } from './arm-rod.js';
+import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench } from './arm-rod.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
@@ -157,6 +157,7 @@ export class Arms {
     this.rodToyN = this.rods.map((r) => (r ? new Float64Array(N * 3) : null));
     this.rodToyPen = this.rods.map((r) => (r ? new Float64Array(N) : null));
     this.rodOther = new Float64Array(count * 3);   // N·s the rest of a rod's contact (furniture, her body, the other arms) gave it
+    this.rootLoad = new Float64Array(count * 6);   // N and N·m about its root each rod put into her this tick (zero when none)
     this.seals = this.rods.map((r) => (r ? { rod: null, kind: new Uint8Array(S), at: new Float64Array(S), t0: new Float64Array(S), cap: new Float64Array(S), toy: new Array(S).fill(null), A: new Float64Array(S * 3), lift: new Float64Array(S), plant: null, plantSeg: -1 } : null));
     this.lastSealBreak = null;
     this._rec = -1;
@@ -325,7 +326,7 @@ export class Arms {
     // With the Stage 4 loads off, nothing of theirs touches the rod: her body runs as it did before them.
     if (this.rodKnobs.gripLoad || this._loadLive) this._gripLoads(dt);
     this.pushPen.fill(0);
-    this.toyImpulse.fill(0); this.rodOther.fill(0);
+    this.toyImpulse.fill(0); this.rodOther.fill(0); this.rootLoad.fill(0);
     if (this.rodKnobs.toyPush === 'rod') for (let a = 0; a < arms.length; a++) if (this.rodToy[a]) { this.rodToy[a].fill(0); this.rodToyPen[a].fill(0); }
     this._frames();
     this._poseLoose();
@@ -397,6 +398,7 @@ export class Arms {
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
       const H = this.holdDelta[a], R = arms[a].rest;
       for (let i = 0; i < H.length; i++) H[i] = R[i] - H[i];
+      if (this.rodKnobs.wrench && !shadow && dt > 0) this._rootWrench(a);
       rodMs += performance.now() - t1;
     }
     if (this._anyRod && !teleport) this.rodMs[this.rodCount++ % WINDOW] = rodMs;
@@ -1144,6 +1146,20 @@ export class Arms {
     }
   }
 
+  /* A driving rod's root wrench into her body, taken by her next tick, less a planted end's hold while her patch spring
+     pulls her to it: the spring on now, or a plant letting go this tick, whose seal still held through this step. */
+  _rootWrench(a) {
+    const body = this.rods[a], m = this.mantle, L = this.rootLoad, F = this._wF ??= [0, 0, 0], T = this._wT ??= [0, 0, 0];
+    if (body._placed || body.intent.valid === false || typeof m.addWrench !== 'function') return false;
+    const hold = m.armMode?.[a] === 1 || this.seals[a]?.plantSeg >= 0;
+    if (!rootWrench(body.rod, hold, F, T) || !m.addWrench(a, F, T, this.rodKnobs.wrenchSpread === 'body')) return false;
+    for (let c = 0; c < 3; c++) { L[a * 6 + c] = F[c]; L[a * 6 + 3 + c] = T[c]; }
+    return true;
+  }
+
+  /* Whether slot a's grip already weighs on her through its rod's root, so a carry mustn't pull her patch with it too. */
+  gripAtRoot(a) { return !!this.rods[a] && !this.shadow && !!this.rodKnobs.wrench && !!this.rodKnobs.gripLoad; }
+
   /* keepPlant leaves the released plant on record, so the same plant can't seal its foot again until the goal changes. */
   _dropSeals(a, keepPlant = false) {
     const st = this.seals[a];
@@ -1202,8 +1218,16 @@ export class Arms {
       const j = Math.max(0, Math.min(S - 1, pg.seg)), r = body.rad[j + 1];
       drop(j);
       for (let i = 0; i < 3; i++) A[j * 3 + i] = pg.point[i] + pg.normal[i] * r;
+      const W = st.plantAt ??= [0, 0, 0];
+      W[0] = pg.point[0]; W[1] = pg.point[1]; W[2] = pg.point[2];
       st.kind[j] = 4; st.plant = pg; st.plantSeg = j; st.t0[j] = t; st.cap[j] = bank.segCeil[j];
       this.counts.seals++;
+    } else if (pg && st.plantSeg >= 0 && st.plant === pg) {
+      // A haul's plant rides its toy (the carry moves its point each tick), so its foot's anchor follows; a still one stays.
+      const P = pg.point, W = st.plantAt, j = st.plantSeg;
+      if ((P[0] !== W[0] || P[1] !== W[1] || P[2] !== W[2]) && Number.isFinite(P[0] + P[1] + P[2])) {
+        for (let i = 0; i < 3; i++) { A[j * 3 + i] = P[i] + pg.normal[i] * body.rad[j + 1]; W[i] = P[i]; }
+      }
     }
     const fc = 1 - Math.exp(-dt / Math.max(1e-3, k.capTau));
     for (let j = 0; j < S; j++) {

@@ -701,6 +701,45 @@ export function neutralizeAccel(A, P, m, n, mode, spin = [0, 0, 0]) {
   return A;
 }
 
+/* A wrench (force F, torque T about root) as accelerations on `verts` into acc, taken as a rigid patch would take it:
+   the split with the least Σ m·|a|². A patch too near a line (inertia det ≤ flat × (trace/3)³) takes the force alone.
+   Returns 2 (both), 1 (force alone), or 0 with nothing written if any input is unusable (not finite, or no mass). */
+export function spreadWrench(F, T, root, P, m, verts, acc, flat = 1e-3) {
+  const nv = verts.length;
+  if (!nv || !Number.isFinite(F[0] + F[1] + F[2] + T[0] + T[1] + T[2] + root[0] + root[1] + root[2])) return 0;
+  let M = 0, cx = 0, cy = 0, cz = 0;
+  for (let k = 0; k < nv; k++) {
+    const v = verts[k] * 3, w = m[verts[k]];
+    if (!(w > 0) || !Number.isFinite(w + P[v] + P[v + 1] + P[v + 2])) return 0;
+    M += w; cx += w * P[v]; cy += w * P[v + 1]; cz += w * P[v + 2];
+  }
+  cx /= M; cy /= M; cz /= M;
+  let xx = 0, yy = 0, zz = 0, xy = 0, xz = 0, yz = 0;
+  for (let k = 0; k < nv; k++) {
+    const v = verts[k] * 3, w = m[verts[k]], ex = P[v] - cx, ey = P[v + 1] - cy, ez = P[v + 2] - cz;
+    xx += w * ex * ex; yy += w * ey * ey; zz += w * ez * ez; xy += w * ex * ey; xz += w * ex * ez; yz += w * ey * ez;
+  }
+  // The torque left once the force acts through the centroid, then the spin the patch's own inertia takes from it.
+  const dx = cx - root[0], dy = cy - root[1], dz = cz - root[2];
+  const tx = T[0] - (dy * F[2] - dz * F[1]), ty = T[1] - (dz * F[0] - dx * F[2]), tz = T[2] - (dx * F[1] - dy * F[0]);
+  const a = yy + zz, b = -xy, c = -xz, d = xx + zz, e = -yz, f = xx + yy, tr = (a + d + f) / 3;
+  const A = d * f - e * e, B = c * e - b * f, C = b * e - c * d, det = a * A + b * B + c * C;
+  let wx = 0, wy = 0, wz = 0, out = 1;
+  if (tr > 0 && det > flat * tr * tr * tr) {
+    wx = (A * tx + B * ty + C * tz) / det;
+    wy = (B * tx + (a * f - c * c) * ty + (b * c - a * e) * tz) / det;
+    wz = (C * tx + (b * c - a * e) * ty + (a * d - b * b) * tz) / det;
+    out = 2;
+  }
+  const fx = F[0] / M, fy = F[1] / M, fz = F[2] / M;
+  if (!Number.isFinite(fx + fy + fz + wx + wy + wz)) return 0;
+  for (let k = 0; k < nv; k++) {
+    const v = verts[k] * 3, ex = P[v] - cx, ey = P[v + 1] - cy, ez = P[v + 2] - cz;
+    acc[v] = fx + wy * ez - wz * ey; acc[v + 1] = fy + wz * ex - wx * ez; acc[v + 2] = fz + wx * ey - wy * ex;
+  }
+  return out;
+}
+
 /* Her eyes. Pupils are W-shaped, a cuttlefish trait kept as an Osminoki one: a W in bright light, round in the dark. */
 export const EYE_KNOBS = {
   light: 0.6,             // 0 dark to 1 bright, until the tank has a lighting cycle

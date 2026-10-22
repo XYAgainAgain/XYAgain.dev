@@ -16,7 +16,7 @@ export const ROD_ARM_KNOBS = {
   rootShare: 0.033,      // the drawn arm's root radius over the full arm's length, the front pair's too
   rootGap: 0.002,        // m a rod's collision radius keeps clear of its neighbors' roots on her crown
   current: true,         // the tank's currents push the rod
-  // The loads stay on the bench (main.js turns them on there) until Stage 6 brings the root wrench into her body.
+  // Off in core; main.js turns the loads on for the bench, and ?loads=1 the loads and the root wrench for her rod arms.
   toyPush: 'capped',     // 'rod': a toy takes the rod's own contact momentum, split by the two inverse masses; 'capped': pushN per toy
   gripLoad: false,       // what a grip holds weighs on the rod's grip nodes, a tick late
   gripMass: true,        // and the held toy's mass rides those nodes, so its inertia is the rod's own, not a late pull that rings
@@ -26,6 +26,8 @@ export const ROD_ARM_KNOBS = {
   sealCompliance: 1e-4,  // m/N
   sealGrace: 0.15,       // s a segment's seal outlasts its suckers all flickering off at once
   sealLift: 0.04,        // m the intent chain may draw a sealed node's point off its anchor before the arm lets go there
+  wrench: false,         // the root's force and torque reach her body, a tick late; explicit, so at her mass it grows
+  wrenchSpread: 'body',  // over all of her as a rigid body would take it, or 'patch', the arm's own
 };
 
 const len3 = (x, y, z) => Math.sqrt(x * x + y * y + z * z);
@@ -57,6 +59,22 @@ export function splitPush(W, i, nx, ny, nz, d, h, wt, out) {
   const den = nx * ax + ny * ay + nz * az + Math.max(0, wt), j = den > 0 && d > 0 && h > 0 ? d / h / den : 0;
   out[0] = ax * j * h; out[1] = ay * j * h; out[2] = az * j * h;
   return j;
+}
+
+/* What the rod puts on her through its root, into F and T (N, and N·m about node 0); with `hold`, less what its seals bore and
+   their moments, since her patch spring already pulls her to that anchor. False if any of it is not finite. */
+export function rootWrench(rod, hold, F, T) {
+  const x = rod.x, f = rod.sF, rf = rod.rootForce, rt = rod.rootTorque;
+  F[0] = rf[0]; F[1] = rf[1]; F[2] = rf[2]; T[0] = rt[0]; T[1] = rt[1]; T[2] = rt[2];
+  // Every node's seal force, not only the sealed ones: a seal that broke inside the step still bore its share of it.
+  if (hold) for (let i = 1; i <= rod.n; i++) {
+    const o = 3 * i, fx = f[o], fy = f[o + 1], fz = f[o + 2];
+    if (fx === 0 && fy === 0 && fz === 0) continue;
+    const rx = x[o] - x[0], ry = x[o + 1] - x[1], rz = x[o + 2] - x[2];
+    F[0] -= fx; F[1] -= fy; F[2] -= fz;
+    T[0] -= ry * fz - rz * fy; T[1] -= rz * fx - rx * fz; T[2] -= rx * fy - ry * fx;
+  }
+  return Number.isFinite(F[0] + F[1] + F[2] + T[0] + T[1] + T[2]);
 }
 
 /* A grip's load L (N on the arm) shared between the two nodes of segment j, fr of the way along it. */

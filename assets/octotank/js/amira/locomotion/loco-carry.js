@@ -190,15 +190,15 @@ export class Carry {
     m.armCap[i] = Math.max(0, Math.min(j.capU, safety * ep.capEma));
   }
 
-  /* What the grips pull with reaches her through each gripping arm's patch, smoothed and capped, as a raw force: the
-     proxies are kinematic, so without this a carried toy weighs nothing to her. */
+  /* What the grips pull with reaches her through each gripping arm's patch, smoothed and capped, since the proxies are
+     kinematic; a rod arm with the wrench and grip load on reaches her through its root instead. */
   _feel(dt) {
     const k = this.knobs, A = this.arms, m = this.mantle, F = this.felt, R = A.reaction;
     if (!k.feelGrips || !m.driven || !R) { F.fill(0); return; }
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.feelTau));
     let any = false;
     for (let i = 0; i < this.job.length; i++) {
-      const live = A.episodes[i]?.h && this.job[i]?.kind !== 'haul';
+      const live = A.episodes[i]?.h && this.job[i]?.kind !== 'haul' && !A.gripAtRoot?.(i);
       for (let a = 0; a < 3; a++) F[i * 3 + a] += ((live ? R[i * 3 + a] : 0) - F[i * 3 + a]) * f;
       const mag = Math.hypot(F[i * 3], F[i * 3 + 1], F[i * 3 + 2]);
       if (mag > k.feelCap) for (let a = 0; a < 3; a++) F[i * 3 + a] *= k.feelCap / mag;

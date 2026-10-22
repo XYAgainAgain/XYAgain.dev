@@ -1,5 +1,5 @@
 import { LAYERS } from '../../config.js';
-import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVolume6, vertexNeighbors, domeWeights, BodyFieldFit, SHAPE_KNOBS, BREATH_KNOBS, breathPace, exhaleAt, breathWeights, vertexAreas, spinFor, inhaleShare, neutralizeAccel } from './mantle-core.js';
+import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVolume6, vertexNeighbors, domeWeights, BodyFieldFit, SHAPE_KNOBS, BREATH_KNOBS, breathPace, exhaleAt, breathWeights, vertexAreas, spinFor, inhaleShare, neutralizeAccel, spreadWrench } from './mantle-core.js';
 
 /* Her pressurized soft body: mantle, head, and arm crown in one shell. Vertex positions live in Jolt's heap and are
    read in place each frame; with mUpdatePosition off and the body at `origin`, a vertex's local position is world
@@ -350,6 +350,23 @@ export class Mantle {
     const X = this._extra;
     for (let i = 0; i < n * 3; i++) X[i] += A[i];
     this._extraOn = true;
+    return true;
+  }
+
+  /* Arm r's root wrench (N, and N·m about its root) through addAccel raw, so the next tick takes it: on the patch that
+     arm drives (the force drive only), or with `body` on all of her. A pinned drive ignores it. */
+  addWrench(r, F, T, body = false) {
+    if (this.drive === 'pin' || (!body && this.drive !== 'force') || !(r >= 0 && r < this.roots.length)) return false;
+    if (this._wFor !== this.driven) {
+      this._wFor = this.driven;
+      this._wVerts = this.roots.map((_, a) => Int32Array.from(this.driven.filter((_, d) => this.drivenArm[d] === a)));
+    }
+    const V = body ? (this._wAll ??= Int32Array.from({ length: this.shell.count }, (_, i) => i)) : this._wVerts[r], acc = this._wAcc ??= new Float32Array(this.shell.count * 3), ri = this.roots[r] * 3, P = this.positions, root = this._wRoot ??= [0, 0, 0];
+    root[0] = P[ri]; root[1] = P[ri + 1]; root[2] = P[ri + 2];
+    if (!spreadWrench(F, T, root, P, this.vertexMass, V, acc)) return false;
+    this.addAccel(acc, { neutral: false });
+    if (body) acc.fill(0);
+    else for (let k = 0; k < V.length; k++) acc.fill(0, V[k] * 3, V[k] * 3 + 3);
     return true;
   }
 

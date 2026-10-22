@@ -39,7 +39,8 @@ import { RodDiag } from './diag/rod-diag.js';
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
-   ?rods=3,4 (those of her arms get rod bodies)  ?rodmode=shadow (the rods run beside her authored arms, touching nothing)  ?den=0 (no settling in) */
+   ?rods=3,4 (those of her arms get rod bodies)  ?rodmode=shadow (the rods run beside her authored arms, touching nothing)  ?loads=1 (her rods with
+   their loads and root wrench, unstable)  ?den=0 (no settling in) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -121,7 +122,10 @@ async function boot() {
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
     const rods = [...new Set((params.get('rods') ?? '').split(',').filter((v) => /^[0-7]$/.test(v.trim())).map(Number))];
-    arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive' });
+    // ?loads=1: her rod arms push toys, bear their grips, seal, and pass it all on to her through their roots. Off by
+    // default, since the root wrench fed back a tick late grows tick on tick at her mass.
+    const rodKnobs = params.get('loads') === '1' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
+    arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive' });
     const locoOn = params.get('loco') !== '0';
     pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
     pose.tick(0);
@@ -254,7 +258,7 @@ async function boot() {
 
   // Headless runs skip drawing so the sim keeps real time; a screenshot asks for one frame.
   const headless = params.get('render') === '0';
-  let wantFrame = !headless, afterFrame = null;
+  let wantFrame = !headless, afterFrame = null, drawnTick = -1;
   tank.renderOnce = () => new Promise((resolve) => { wantFrame = true; afterFrame = resolve; });
   let last = performance.now();
   const preTick = (dt) => {
@@ -281,19 +285,24 @@ async function boot() {
     if (!diag.state.paused) phys.step(dt, preTick);
     if (!wantFrame) return;
     if (headless) { wantFrame = false; }
-    mantle.sync();
-    mantleGeo.attributes.position.needsUpdate = true;
-    mantleGeo.computeVertexNormals();
-    if (bodyParts) { attention.aimEyes(bodyParts); bodyParts.update(); }
-    tank.suckerView.update();
-    armView.update();
-    for (let r = 0; r < mantle.roots.length; r++) {
-      mantle.rootWorld(r, tmp3);
-      m4.makeTranslation(tmp3[0], tmp3[1], tmp3[2]);
-      rootMarkers.setMatrixAt(r, m4);
+    // Her shapes only change on a physics tick, so a frame between two ticks would rebuild them identically; a drawing
+    // knob changed meanwhile shows on the next tick, at most 1/60 s later.
+    if (phys.stepTotal !== drawnTick || diag.state.paused || afterFrame) {
+      drawnTick = phys.stepTotal;
+      mantle.sync();
+      mantleGeo.attributes.position.needsUpdate = true;
+      mantleGeo.computeVertexNormals();
+      if (bodyParts) { attention.aimEyes(bodyParts); bodyParts.update(); }
+      tank.suckerView.update();
+      armView.update();
+      for (let r = 0; r < mantle.roots.length; r++) {
+        mantle.rootWorld(r, tmp3);
+        m4.makeTranslation(tmp3[0], tmp3[1], tmp3[2]);
+        rootMarkers.setMatrixAt(r, m4);
+      }
+      rootMarkers.instanceMatrix.needsUpdate = true;
+      syncRigid();
     }
-    rootMarkers.instanceMatrix.needsUpdate = true;
-    syncRigid();
     sand?.update(dt);
     cameraRig.update(dt);
     waterVisuals.update(phys.time);
