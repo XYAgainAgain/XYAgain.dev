@@ -42,7 +42,8 @@ import { rodArms } from './amira/arms/arm-rod.js';
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
    ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
-   authored arms, touching nothing)  ?loads=1 (her rods with their loads and root wrench, unstable)  ?den=0 (no settling in) */
+   authored arms, touching nothing)  ?couple=1 (her rods and body in one solve; by default each rod steps alone on a root
+   dragged to her, nothing fed back)  ?loads=1 (her rods with their loads; a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -124,11 +125,13 @@ async function boot() {
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
-    const rods = rodArms(params.get('rods'));
-    // ?loads=1: her rod arms push toys, bear their grips, seal, and pass it all on to her through their roots. Off by
-    // default, since the root wrench fed back a tick late grows tick on tick at her mass.
+    // Off by default: coupled, her body answers her arms but fights her locomotion's patch springs and squashes in a
+    // crawl, climb, or squeeze (Shared-Solve-Wiring-Notes.md). The panel's Shared solve switch turns it on live.
+    const rods = rodArms(params.get('rods')), couple = params.get('couple') === '1';
+    // ?loads=1: her rod arms push toys, bear their grips, and seal. Off by default; a rod outside the shared solve passes
+    // it on through the explicit root wrench, which fed back a tick late grows tick on tick at her mass.
     const rodKnobs = params.get('loads') === '1' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
-    arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive' });
+    arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive', couple });
     const locoOn = params.get('loco') !== '0';
     pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
     pose.tick(0);

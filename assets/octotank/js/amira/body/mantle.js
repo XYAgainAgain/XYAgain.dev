@@ -1,5 +1,6 @@
 import { LAYERS } from '../../config.js';
 import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVolume6, vertexNeighbors, domeWeights, BodyFieldFit, SHAPE_KNOBS, BREATH_KNOBS, breathPace, exhaleAt, breathWeights, vertexAreas, spinFor, inhaleShare, neutralizeAccel, spreadWrench } from './mantle-core.js';
+import { rigidState, addRigidVelocity, addRigidMomentum, newRigid } from '../arms/rod-coupler-core.js';
 
 /* Her pressurized soft body: mantle, head, and arm crown in one shell. Vertex positions live in Jolt's heap and are
    read in place each frame; with mUpdatePosition off and the body at `origin`, a vertex's local position is world
@@ -95,6 +96,10 @@ export class Mantle {
     this.breathHold = null;   // { exhale, depth, outflow? }: the breathing muscles held at a phase instead of cycling
     this._extra = new Float32Array(this.shell.count * 3);
     this._extraOn = false;
+    // Momentum the arms' shared solve gave her beyond the velocity it wrote, added first thing next tick.
+    this._oweP = [0, 0, 0];
+    this._oweL = [0, 0, 0];
+    this._owed = false;
     this._scratch = new Float32Array(this.shell.count * 3);
     this._delta = new Float64Array(arms * 3);
     // Mass-weighted shares of the mantle and the head, for the axis between them.
@@ -217,7 +222,7 @@ export class Mantle {
     return p;
   }
 
-  /* Each fixed tick: her breathing muscles, the dome's lift, then every driven vertex toward its world target.
+  /* Each fixed tick: momentum the shared solve owes her, her breathing muscles, the dome's lift, then every driven vertex toward its world target.
      Pinned roots keep sliding at whatever velocity they last had (Jolt integrates inverse-mass-0 vertices too), so the
      velocity is written every tick, after the rest so a pin always wins; the roots' share of the lift is lost. */
   tick(dt) {
@@ -225,6 +230,10 @@ export class Mantle {
     this.sync();
     // The pin drive and the force readout divide by dt; a zero step would write NaN into Jolt's velocities.
     if (!(dt > 0)) return;
+    if (this._owed) {
+      if (this.drive !== 'pin') addRigidMomentum(H, this.posAt, this.velAt, s, this.shell.count, this.vertexMass, this.origin, this._oweP, this._oweL, this._oweScratch ??= newRigid());
+      this._owed = false;
+    }
     this._breathe(dt);
     if (k.righting) {
       const lift = k.righting * dt, dome = this.dome;
@@ -375,6 +384,51 @@ export class Mantle {
     return true;
   }
 
+  /* Her rigid state from the heap (rod-coupler-core.js): mass, center, velocity, angular momentum, inertia, spin. */
+  rigidState(out) {
+    return rigidState(this.J.HEAPF32, this.posAt, this.velAt, this.stride, this.shell.count, this.vertexMass, this.origin, out ?? (this._rigid ??= newRigid()));
+  }
+
+  /* Every vertex gains dv + dw × (x − c) before Jolt steps, so this tick's step carries it. False under the pin drive,
+     whose roots ignore it, or for anything not finite. */
+  addRigidVelocity(dv, dw, c) {
+    if (this.drive === 'pin' || !Number.isFinite(dv[0] + dv[1] + dv[2] + dw[0] + dw[1] + dw[2] + c[0] + c[1] + c[2])) return false;
+    addRigidVelocity(this.J.HEAPF32, this.posAt, this.velAt, this.stride, this.shell.count, this.origin, c, dv, dw);
+    return true;
+  }
+
+  /* The patches her force drive holds toward the world this tick (an arm on 1 or 2), for the arms' shared solve: each
+     patch's center and mass, and the spring's gains per unit mass. Empty under any other drive. */
+  springAnchors() {
+    const R = this.roots.length, out = this._anchors ??= { n: 0, x: new Float64Array(3 * R), m: new Float64Array(R), K: 0, D: 0 };
+    out.n = 0; out.K = this.knobs.forceK; out.D = this.knobs.forceDamp;
+    if (this.drive !== 'force') return out;
+    if (this._aFor !== this.driven) {
+      this._aFor = this.driven;
+      this._aVerts = this.roots.map((_, a) => Int32Array.from(this.driven.filter((_, d) => this.drivenArm[d] === a)));
+    }
+    const P = this.positions, o = this.origin, V = this.vertexMass;
+    for (let r = 0; r < R; r++) {
+      // A patch whose cap is spent pushes nothing, so it can't brace her against the arms either.
+      if (this.armMode[r] === 0 || !(this.armCap[r] > 0)) continue;
+      let m = 0, x = 0, y = 0, z = 0;
+      for (const i of this._aVerts[r]) { const w = V[i]; m += w; x += w * P[3 * i]; y += w * P[3 * i + 1]; z += w * P[3 * i + 2]; }
+      if (!(m > 0)) continue;
+      const h = out.n++;
+      out.x[3 * h] = x / m + o[0]; out.x[3 * h + 1] = y / m + o[1]; out.x[3 * h + 2] = z / m + o[2]; out.m[h] = m;
+    }
+    return out;
+  }
+
+  /* Momentum and angular momentum about her center still owed her, taken as a rigid field at the start of the next tick. */
+  owe(dP, dL) {
+    if (!Number.isFinite(dP[0] + dP[1] + dP[2] + dL[0] + dL[1] + dL[2])) return false;
+    const P = this._oweP, L = this._oweL, keep = this._owed ? 1 : 0;
+    for (let i = 0; i < 3; i++) { P[i] = keep * P[i] + dP[i]; L[i] = keep * L[i] + dL[i]; }
+    this._owed = true;
+    return true;
+  }
+
   /* Her net weight in water, N: the soft body's, or with `whole` the animal's, since her arms weigh what her body does. */
   weightInWater(whole = false) { return (whole ? 2 : 1) * this.knobs.mass * 9.81 * this.knobs.gravityFactor; }
 
@@ -444,6 +498,7 @@ export class Mantle {
     const H = this.J.HEAPF32, s = this.stride;
     const l = Math.hypot(axis[0], axis[1], axis[2]);
     if (!(l > 0) || !Number.isFinite(angle)) return;
+    this._owed = false;
     const ax = axis[0] / l, ay = axis[1] / l, az = axis[2] / l;
     const c = Math.cos(angle), sn = Math.sin(angle), t = 1 - c;
     const m = this.centroid().map((v, i) => v - this.origin[i]);

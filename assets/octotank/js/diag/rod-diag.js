@@ -22,6 +22,18 @@ export function rodStat(arm, rod, out) {
   return out;
 }
 
+/* The shared solve's last tick: the rods in it (one-way among them), the push and twist it gave her, its substeps and
+   iterations, the root gap her shell had opened since the tick before, and any rod it gave up on or handoff it refused. */
+export function coupledLine(A) {
+  const c = A.coupled;
+  if (!A.coupling) return 'Into her shared solve off: each rod steps alone';
+  if (!c) return 'Into her shared solve on, no rod joined this tick';
+  let n = 0, one = 0;
+  for (let a = 0; a < A.joined.length; a++) { n += A.joined[a]; one += A.oneWay[a]; }
+  const dt = A.coupledDt > 0 ? A.coupledDt : 1, mN = (v) => (Math.hypot(v[0], v[1], v[2]) / dt * 1000);
+  return `Into her ${n} rods, ${one} one-way   push ${mN(c.impulseP).toFixed(0)} mN   twist ${mN(c.impulseL).toFixed(1)} mN·m   S ${c.S}, ${c.iters} iters   gap ${(c.gap * 1000).toFixed(2)} mm, ${(c.gapTurn * 180 / Math.PI).toFixed(2)}°${c.failed ? `   FAILED ${c.failed}` : ''}${c.refused ? '   REFUSED' : ''}`;
+}
+
 /* Which of several stats is worst by f: its index, or -1 for none. */
 export function worstOf(stats, f) {
   let best = -1;
@@ -109,6 +121,7 @@ export class RodDiag {
       lines.push(`Tip lag  ${this.slots.map((s, i) => `${A.rods[s].index} ${cm(st[i].tipLag)}`).join('  ')} cm`);
       lines.push(`Worst    shape rms ${cm(st[sh].shapeRms)} cm (arm ${arm(sh)})   fastest ${st[sp].speedMax.toFixed(2)} m/s (arm ${arm(sp)})   pull ${(st[pu].rootN * 1000).toFixed(0)} mN (arm ${arm(pu)})   motion ${(st.reduce((s, x) => s + x.kinetic, 0) * 1000).toFixed(2)} mJ in all`);
     }
+    if (A.canCouple) lines.push(coupledLine(A));
     for (const i of many ? [this.pick % this.slots.length] : this.slots.keys()) {
       const s = this.slots[i], x = st[i], rod = A.rods[s], tag = many || rootLabel === 'Root' ? `arm ${rod.index}  ` : '';
       lines.push(`Lag      ${tag}tip ${cm(x.tipLag)} cm   shape rms ${cm(x.shapeRms)} cm, max ${cm(x.shapeMax)} cm   fastest ${x.speedMax.toFixed(2)} m/s${rod.mass ? `   ${Math.round(rod.mass * 1000)} g` : ''}`);
@@ -130,8 +143,9 @@ export class RodDiag {
     add({ key: 'k', name: 'Rest source', label: () => `Rest: ${k.rest}`, run: () => { k.rest = k.rest === 'bends' ? 'chain' : k.rest === 'chain' ? 'targets' : 'bends'; }, disabled: !on });
     add({ key: 'p', name: 'Contact hold', label: () => `Hold: ${A.shadow ? 'its arm' : k.hold}`, run: () => { k.hold = k.hold === 'rod' ? 'ghost' : k.hold === 'ghost' ? 'off' : 'rod'; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'u', name: 'Current', label: () => (k.current ? 'Current: on' : 'Current: off'), run: () => { k.current = !k.current; }, disabled: !on });
-    add({ key: 'v', name: 'Aim through the rod', label: () => (k.aim ? 'Aim: through the rod' : 'Aim: as posed'), run: () => { k.aim = !k.aim; }, disabled: !on || holdLocked || A.shadow });
+    add({ key: '9', name: 'Aim through the rod', label: () => (k.aim ? 'Aim: through the rod' : 'Aim: as posed'), run: () => { k.aim = !k.aim; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'x', name: 'Reset the rod', label: () => (this.slots.length > 1 ? 'Reset the rods' : 'Reset the rod'), run: () => this.reset(), disabled: !on });
+    add({ key: '8', name: 'Shared solve', label: () => (A.coupling ? 'Shared solve: on' : 'Shared solve: off'), run: () => { A.coupling = !A.coupling; }, disabled: !A.canCouple });
     if (!on) return;
     const sci = (v) => v.toExponential(1).replace('e+', 'e');
     const range = (label, values, get, set, fmt) => add({ type: 'range', name: label, values, get, set, label: () => `${label} ${fmt(get())}` });

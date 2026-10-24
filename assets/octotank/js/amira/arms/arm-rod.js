@@ -1,4 +1,5 @@
-import { Rod, ROD_KNOBS, frameQuat } from './arm-rod-core.js';
+import { ROD_KNOBS, frameQuat } from './arm-rod-core.js';
+import { CoupledRod } from './arm-rod-coupled.js';
 import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, bodyRadius } from './arm-core.js';
 
 /* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
@@ -180,7 +181,8 @@ export class RodArm {
     drawnRadii(arm, this.k, this.drawRad0);
     this.drawRad.set(this.drawRad0);
     for (let i = 0; i < this.n; i++) this.rad[i] = this.rad0[i] = Math.min(this.drawRad0[i], this.cap);
-    this.rod = new Rod({ len: arm.len0, rad: this.drawRad0, mass: this.mass }, this.k);
+    // Its step() is the stock Rod's, so an arm the shared solve leaves out moves exactly as a plain rod would.
+    this.rod = new CoupledRod({ len: arm.len0, rad: this.drawRad0, mass: this.mass }, this.k);
     this.restGen = arm.restGen;
     this.started = false;
     this._resets = 0;
@@ -217,8 +219,16 @@ export class RodArm {
   /* After the intent arm's step: the root from its frame, the rest shape from its bends, then the rod's own step.
      ambient(x, y, z, out) is the water's velocity. */
   step(dt, ambient) {
+    this.prepare(dt, ambient, false);
+    this.commit();
+  }
+
+  /* step() up to the rod's own step. With join, a started rod skips that step and returns true: the shared solve
+     (rod-coupler-core.js) steps it with her body, at the root frame _q built here, and commit() follows. */
+  prepare(dt, ambient, join) {
     const arm = this.intent;
-    if (arm.valid === false) return;
+    this._joined = false;
+    if (arm.valid === false) return false;
     this._sync();
     const rod = this.rod, F = arm.frame, q = frameQuat(F.u, F.v, F.d, this._q);
     // A root that jumped (a reset, a teleport) laid the intent chain afresh; dragged there, the rod would whip.
@@ -230,11 +240,19 @@ export class RodArm {
       rod.poseFromPoints(arm.X);
       this._fresh = true;
     } else if (dt > 0) {
+      if (join) return (this._joined = true);
       rod.setRoot(F.p, q);
       rod.step(dt, ambient);
-      const resets = rod.resets ?? 0;
-      if (resets !== this._resets) { this._resets = resets; this._fresh = true; }
     }
+    return false;
+  }
+
+  /* The rest of step() once the rod has stepped, alone or in the shared solve. */
+  commit() {
+    if (this.intent.valid === false) return;
+    const rod = this.rod, resets = rod.resets ?? 0;
+    // Either solve starts a non-finite rod over from its rest pose.
+    if (resets !== this._resets) { this._resets = resets; this._fresh = true; }
     // A rod laid out afresh may lie inside something; that push-out is a placement, not a shove, so it leaves no speed.
     this._placed = this._fresh;
     if (this.started) this.P.set(this.X);
@@ -294,10 +312,14 @@ export class RodArm {
      its inward speed, or it goes back in); then the frames turn onto the corrected segments. */
   settle(dt) {
     if (this.intent.valid === false) return;
-    const rod = this.rod, X = this.X, x = rod.x, n = this.n, h = this._placed ? 0 : dt;
+    const rod = this.rod, X = this.X, x = rod.x, n = this.n, h = this._placed ? 0 : dt, joined = this._joined;
     for (let i = 1; i < n; i++) {
       const o = i * 3, dx = X[o] - x[o], dy = X[o + 1] - x[o + 1], dz = X[o + 2] - x[o + 2];
-      if (dx !== 0 || dy !== 0 || dz !== 0) rod.displace(i, dx, dy, dz, h);
+      if (dx === 0 && dy === 0 && dz === 0) continue;
+      // Coupled, the push-out only stops the node's closing speed, along the push through its own inverse mass: any more,
+      // or any sideways, would reach her through the solve as a fling or a drift.
+      if (joined) rod.pushOut(i, dx, dy, dz, h);
+      else rod.displace(i, dx, dy, dz, h);
     }
     rod.alignFrames();
     X.set(x);

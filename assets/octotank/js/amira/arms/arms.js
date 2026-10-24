@@ -3,6 +3,7 @@ import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from '../locomot
 import { moveInputs } from '../locomotion/loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
 import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench, aimStep } from './arm-rod.js';
+import { RodCoupler } from './rod-coupler-core.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
@@ -45,8 +46,8 @@ export class Arms {
   /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
      numbers that get rod bodies, rodKnobs their knobs over ROD_ARM_KNOBS; rodMode: 'drive' (the rod is the arm) or
      'shadow' (it runs beside the authored arm, touching nothing); bodyMass: her body's kg, which her arms together
-     match (else the mantle's own mass, then her rest volume's). */
-  constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, rodMode = 'drive', bodyMass = null } = {}) {
+     match (else the mantle's own mass, then her rest volume's); couple: driving rods and her body share one solve. */
+  constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, rodMode = 'drive', bodyMass = null, couple = false } = {}) {
     this.phys = phys;
     this.mantle = mantle;
     this.knobs = { ...ARM_KNOBS, ...knobs };
@@ -64,6 +65,16 @@ export class Arms {
     this.bodies = this.arms.map((arm, s) => (this.shadow ? arm : this.rods[s] ?? arm));
     this.holdDelta = this.rods.map((rod, s) => (rod ? new Float64Array(this.arms[s].rest.length) : null));
     this._anyRod = this.rods.some(Boolean);
+    // Her body and her driving rods in one solve (rod-coupler-core.js): never on the bench, whose mount is no body.
+    this.canCouple = this._anyRod && !this.shadow && typeof mantle.rigidState === 'function';
+    this.coupling = !!couple && this.canCouple;
+    this.coupler = new RodCoupler({ carry: true });
+    this.coupled = null;                              // the shared solve's last report, null on a tick none joined
+    this.coupledDt = 0;
+    this.joined = new Uint8Array(count);              // per slot, stepped in the shared solve this tick
+    this.oneWay = new Uint8Array(count);              // and of those, carried by her spring without pushing back
+    this._joinList = [];
+    this._joinEntry = this.arms.map(() => ({ rod: null, p: null, q: null, oneWay: false }));
     // The water's velocity at a point, for the rods' drag: set once the tank's currents exist.
     this.ambient = null;
     this.rodMs = new Float32Array(WINDOW);
@@ -334,6 +345,12 @@ export class Arms {
     this.body.fit(m.positions, m.shell.faces, m.shell.count, m.origin, this.rootsW, k.bodyScale);
     this._slots();
     if (dt > 0) this.crowd.tick(dt);
+    // Her rigid state as Jolt will start its step: nothing below writes her velocities before the shared solve does.
+    const ambient = this.rodKnobs.current ? this.ambient : null, list = this._joinList;
+    const rigid = this.coupling && this.canCouple && dt > 0 && m.drive !== 'pin' ? m.rigidState() : null;
+    const join = !!rigid && rigid.M > 0 && Number.isFinite(rigid.c[0] + rigid.c[1] + rigid.c[2] + rigid.v[0] + rigid.v[1] + rigid.v[2] + rigid.w[0] + rigid.w[1] + rigid.w[2]);
+    list.length = 0;
+    this.joined.fill(0); this.oneWay.fill(0);
     for (let a = 0; a < arms.length; a++) {
       const arm = arms[a];
       arm.setLead(this.lead);
@@ -365,10 +382,25 @@ export class Arms {
         this.holdDelta[a].set(arm.rest);
         // Seals turned off let go before the solve, not after it.
         if (!this.rodKnobs.seals && rod.rod.nSeals) this._dropSeals(a);
-        rod.step(dt, this.rodKnobs.current ? this.ambient : null);
+        if (rod.prepare(dt, ambient, join)) {
+          // A patch her spring drives carries its arm and takes nothing back: that spring is already her push and hold.
+          const e = this._joinEntry[a], one = m.drive === 'force' && m.armMode[a] !== 0;
+          e.rod = rod.rod; e.p = arm.frame.p; e.q = rod._q; e.oneWay = one;
+          list.push(e);
+          this.joined[a] = 1; this.oneWay[a] = one ? 1 : 0;
+        } else rod.commit();
         rodMs += performance.now() - t1;
       }
     }
+    if (list.length) {
+      // Her patch springs are inside the solve, so the arms' push and the springs' hold settle together.
+      const t1 = performance.now(), out = this.coupler.step(dt, rigid, list, ambient, m.springAnchors?.() ?? null);
+      // The momentum owed next tick was worked out against this velocity; if it did not land, neither does that.
+      if (m.addRigidVelocity(out.dv, out.dw, rigid.c)) m.owe(out.dP, out.dL);
+      for (let a = 0; a < arms.length; a++) if (this.joined[a]) this.rods[a].commit();
+      this.coupled = out; this.coupledDt = dt;
+      rodMs += performance.now() - t1;
+    } else this.coupled = null;
     // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which has the last word; a driving
     // rod's intent chain contacts on its own, and a shadow rod meets only the world and her body, shoving nothing.
     const C = this.contact, rounds = Math.max(1, k.finishIters), hold = this.rodKnobs.hold, shadow = this.shadow;
@@ -402,7 +434,8 @@ export class Arms {
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
       const H = this.holdDelta[a], R = arms[a].rest;
       for (let i = 0; i < H.length; i++) H[i] = R[i] - H[i];
-      if (this.rodKnobs.wrench && !shadow && dt > 0) this._rootWrench(a);
+      // A rod in the shared solve already moved her; the explicit wrench is only for ?loads=1 without it.
+      if (this.rodKnobs.wrench && !shadow && dt > 0 && !this.joined[a]) this._rootWrench(a);
       rodMs += performance.now() - t1;
     }
     if (this._anyRod && !teleport) this.rodMs[this.rodCount++ % WINDOW] = rodMs;
@@ -1187,8 +1220,13 @@ export class Arms {
     return true;
   }
 
-  /* Whether slot a's grip already weighs on her through its rod's root, so a carry mustn't pull her patch with it too. */
-  gripAtRoot(a) { return !!this.rods[a] && !this.shadow && !!this.rodKnobs.wrench && !!this.rodKnobs.gripLoad; }
+  /* Whether slot a's grip already weighs on her through its rod's root, so a carry mustn't pull her patch with it too:
+     a rod in the shared solve whose patch hangs free, or the explicit wrench. */
+  gripAtRoot(a) {
+    if (!this.rods[a] || this.shadow || !this.rodKnobs.gripLoad) return false;
+    if (this.joined[a]) return !(this.mantle.drive === 'force' && this.mantle.armMode[a] !== 0);
+    return !!this.rodKnobs.wrench;
+  }
 
   /* keepPlant leaves the released plant on record, so the same plant can't seal its foot again until the goal changes. */
   _dropSeals(a, keepPlant = false) {
