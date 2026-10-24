@@ -1,11 +1,13 @@
 import { list as scenarioList, isRunning, onRegister } from './scenarios.js';
 
-/* The dev panel: collapsible sections of controls, each a button and a key, a key legend on ?, and the readout.
+/* The dev panel: tabs of collapsible sections of controls, each a button and a key, a key legend on ?, and the readout.
    Each action is { key, name, label(), run(), disabled? }; the first action to claim a key keeps it. */
 
 const FRAMES = 120;
 const STORE = 'octotank.panel';
 const SECTIONS = [['sim', 'Sim'], ['view', 'View'], ['body', 'Body'], ['bench', 'Bench'], ['arms', 'Arms'], ['rod', 'Rod'], ['loco', 'Locomotion']];
+// Section ids per tab, in display order; a section no tab names lands in the last one. A tab with no sections hides.
+const TABS = [['amira', 'Amira', ['body', 'loco']], ['arms', 'Arms', ['arms', 'rod', 'bench']], ['tank', 'Tank', ['sim', 'sand']], ['view', 'View', ['view', 'camera']], ['more', 'More', []]];
 
 const queued = [];
 let attach = null;
@@ -53,6 +55,52 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   if (!head) el.prepend(head = tag('div', { className: 'panel-head' }));
   if (!legend) head.after(legend = tag('div', { id: 'panel-keys', hidden: true }));
   const readoutBox = readout.closest('details');
+
+  let tablist = el.querySelector('[role="tablist"]');
+  if (!tablist) {
+    controls.before(tablist = tag('div', { className: 'panel-tabs' }));
+    tablist.setAttribute('role', 'tablist');
+    tablist.setAttribute('aria-label', 'Panel sections');
+  }
+  let active = null, ready = false;
+  const tabs = TABS.map(([id, title, members]) => {
+    const tab = tag('button', { type: 'button', id: `panel-tab-${id}`, textContent: title, hidden: true, tabIndex: -1 });
+    const pane = tag('div', { id: `panel-pane-${id}`, hidden: true });
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', 'false');
+    tab.setAttribute('aria-controls', pane.id);
+    pane.setAttribute('role', 'tabpanel');
+    pane.setAttribute('aria-labelledby', tab.id);
+    tablist.append(tab);
+    controls.append(pane);
+    return { id, tab, pane, members };
+  });
+  const select = (t, focus = false) => {
+    for (const x of tabs) {
+      const on = x === t;
+      x.tab.setAttribute('aria-selected', String(on));
+      x.tab.tabIndex = on ? 0 : -1;
+      x.pane.hidden = !on;
+    }
+    active = t;
+    if (focus) t.tab.focus();
+  };
+  const choose = (t, focus) => { select(t, focus); stored.tab = t.id; remember(); };
+  for (const t of tabs) t.tab.addEventListener('click', () => choose(t));
+  tablist.addEventListener('keydown', (ev) => {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const shown = tabs.filter((x) => !x.tab.hidden), i = shown.findIndex((x) => x.tab === ev.target);
+    const next = i < 0 ? undefined : { ArrowRight: i + 1, ArrowLeft: i - 1 + shown.length, Home: 0, End: shown.length - 1 }[ev.key];
+    if (next === undefined) return;
+    ev.preventDefault();
+    choose(shown[next % shown.length], true);
+  });
+  /* Shows a tab once it holds a section; a late-arriving section can still restore the remembered tab. */
+  const reveal = (t) => {
+    if (!t.tab.hidden) return;
+    t.tab.hidden = false;
+    if (ready && (!active || t.id === stored.tab)) select(t);
+  };
 
   const squeeze = async () => {
     if (ctx.watch) return;
@@ -160,7 +208,8 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       kbd.textContent = hintOf(k);
       a.button.setAttribute('aria-keyshortcuts', k === '?' ? 'Shift+?' : hintOf(k));
     }
-    const groups = [['Panel', headActions], ...sections.map((s) => [s.title, [...s.actions, ...s.scenarios]])];
+    const ordered = [...sections].sort((x, y) => x.order[0] - y.order[0] || x.order[1] - y.order[1]);
+    const groups = [['Panel', headActions], ...ordered.map((s) => [s.title, [...s.actions, ...s.scenarios]])];
     legend.replaceChildren(tag('p', { className: 'keys-title', textContent: 'Keys' }), ...groups.filter(([, as]) => as.some((a) => a.bound)).map(([title, as]) => tag('dl', {},
       tag('dt', { textContent: title }),
       tag('dd', {}, ...as.filter((a) => a.bound).map((a) => tag('span', {}, tag('kbd', { textContent: hintOf(a.bound) }), ` ${a.name}`))))));
@@ -180,8 +229,11 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     const scRow = tag('div', { className: 'row' }), checks = tag('div', { className: 'row checks' });
     details.append(tag('summary', { textContent: title }), row, scRow, checks);
     details.addEventListener('toggle', () => { stored.open[id] = details.open; remember(); });
-    controls.append(details);
-    s = { id, title, details, row, scRow, checks, actions: [], scenarios: [] };
+    const t = tabs.find((x) => x.members.includes(id)) ?? tabs[tabs.length - 1];
+    const rank = (sid) => { const r = t.members.indexOf(sid); return r < 0 ? t.members.length : r; };
+    t.pane.insertBefore(details, [...t.pane.children].find((d) => rank(d.dataset.section) > rank(id)) ?? null);
+    reveal(t);
+    s = { id, title, details, row, scRow, checks, actions: [], scenarios: [], order: [tabs.indexOf(t), rank(id)] };
     sections.push(s);
     return s;
   };
@@ -251,6 +303,9 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     d.addEventListener('toggle', () => { stored.open[id] = d.open; remember(); });
   }
   if (stored.hidden) el.classList.add('collapsed');
+  const first = tabs.find((t) => t.id === stored.tab && !t.tab.hidden) ?? tabs.find((t) => !t.tab.hidden);
+  if (first) select(first);
+  ready = true;
   relabel();
 
   addEventListener('keydown', (ev) => {

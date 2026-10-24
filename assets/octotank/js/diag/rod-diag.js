@@ -3,7 +3,7 @@ import { section } from './panel.js';
 export const WRENCH_WINDOW = 1800;
 
 /* The rod arms' live numbers and controls, shared by the bench and her body: how far each rod lies from its arm's
-   intent chain, what its root bears, its cost, and the panel's limp, ghost, rest, hold, current, reset, and sliders. */
+   intent chain, what its root bears, its cost, and the panel's limp, ghost, detail, rest, hold, current, reset, and sliders. */
 
 /* One rod against its intent chain, into out: tip gap, shape error, root force and torque, motion, fastest node. */
 export function rodStat(arm, rod, out) {
@@ -22,6 +22,13 @@ export function rodStat(arm, rod, out) {
   return out;
 }
 
+/* Which of several stats is worst by f: its index, or -1 for none. */
+export function worstOf(stats, f) {
+  let best = -1;
+  for (let i = 0; i < stats.length; i++) if (best < 0 || f(stats[i]) > f(stats[best])) best = i;
+  return best;
+}
+
 export class RodDiag {
   /* name: the panel section; view(): the ArmView once it exists; limp: the bending scale a limp rod takes;
      holdLocked: the hold source stays as it is (the bench's twin check needs it off). */
@@ -30,19 +37,23 @@ export class RodDiag {
     this.slots = arms.rods.map((r, s) => (r ? s : -1)).filter((s) => s >= 0);
     this.stats = this.slots.map(() => ({ tipLag: 0, shapeRms: 0, shapeMax: 0, rootN: 0, rootNm: 0, kinetic: 0, speedMax: 0 }));
     // Each tick's root wrench, the rod's from its multipliers and the inverse-dynamics one off the intent chain (the
-    // scout's c-lite), six components each in rootForce's sense: what the arm puts on its mount.
-    this.wrench = this.slots.map((s) => ({ rod: new Float32Array(WRENCH_WINDOW * 6), id: new Float32Array(WRENCH_WINDOW * 6), n: 0, k: 0, P: null, P2: null, last: new Float64Array(12) }));
+    // scout's c-lite), six components each in rootForce's sense: what the arm puts on its mount. The windows are allocated once the first wrench is ready.
+    this.wrench = this.slots.map(() => ({ rod: null, id: null, n: 0, k: 0, P: null, P2: null, last: new Float64Array(12) }));
     this.limpStiff = limp;
     this.limp = false;
+    // With several rods the readout sums them up and details one: an index into slots.
+    this.pick = 0;
     this._controls(name, view, holdLocked);
   }
 
-  /* After the arms each tick; the fixed step dt (none, no wrench). */
+  /* The bench calls this after the arms each tick, with the fixed step dt: the stats and the wrench window its checks read.
+     On her body only describe() measures, at the readout's pace. */
   tick(dt) {
+    if (!(dt > 0)) return;
     for (let i = 0; i < this.slots.length; i++) {
       const arm = this.arms.arms[this.slots[i]], rod = this.arms.rods[this.slots[i]];
       rodStat(arm, rod, this.stats[i]);
-      if (dt > 0) this._wrench(this.wrench[i], arm, rod, dt);
+      this._wrench(this.wrench[i], arm, rod, dt);
     }
   }
 
@@ -68,6 +79,8 @@ export class RodDiag {
     (W.P ??= new Float64Array(X.length)).set(X);
     W.k = rod.started ? W.k + 1 : 0;
     if (!ready) return;
+    W.rod ??= new Float32Array(WRENCH_WINDOW * 6);
+    W.id ??= new Float32Array(WRENCH_WINDOW * 6);
     const F = r.rootForce, T = r.rootTorque, o = (W.n++ % WRENCH_WINDOW) * 6;
     L[0] = F[0]; L[1] = F[1]; L[2] = F[2]; L[3] = T[0]; L[4] = T[1]; L[5] = T[2];
     L[6] = fx; L[7] = fy; L[8] = fz; L[9] = tx; L[10] = ty; L[11] = tz;
@@ -81,20 +94,31 @@ export class RodDiag {
 
   reset() { for (const s of this.slots) this.arms.rods[s].reset(); }
 
-  /* The readout's rod lines; rootLabel names what each root hangs from, tail rides the cost line. */
+  /* The arm number shown in detail. */
+  get picked() { return this.slots.length ? this.arms.rods[this.slots[this.pick % this.slots.length]].index : -1; }
+
+  /* The readout's rod lines; rootLabel names what each root hangs from, tail rides the cost line. One rod gets its full
+     lines; several get every tip's lag on one line, the worst of the rest, and the picked arm's full lines. */
   describe(rootLabel = 'Root', tail = '') {
-    const A = this.arms, k = A.rodKnobs, rs = A.rodStats(), cm = (v) => (v * 100).toFixed(1), many = this.slots.length > 1;
-    const lines = [`Rod      ${A.shadow ? 'shadow' : 'drive'}   E ${k.E0.toExponential(1)} Pa × ${k.tipStiff} at the tip   rest ${k.rest}   hold ${A.shadow ? 'its arm' : k.hold}${this.limp ? '   LIMP' : ''}`];
-    this.slots.forEach((s, i) => {
-      const st = this.stats[i], rod = A.rods[s], tag = many || rootLabel === 'Root' ? `arm ${rod.index}  ` : '';
-      lines.push(`Lag      ${tag}tip ${cm(st.tipLag)} cm   shape rms ${cm(st.shapeRms)} cm, max ${cm(st.shapeMax)} cm   fastest ${st.speedMax.toFixed(2)} m/s${rod.mass ? `   ${Math.round(rod.mass * 1000)} g` : ''}`);
-      lines.push(`${rootLabel.padEnd(9)}${tag}pull ${(st.rootN * 1000).toFixed(0)} mN   twist ${(st.rootNm * 1000).toFixed(1)} mN·m   motion ${(st.kinetic * 1000).toFixed(2)} mJ`);
+    const A = this.arms, k = A.rodKnobs, rs = A.rodStats(), cm = (v) => (v * 100).toFixed(1), many = this.slots.length > 1, st = this.stats;
+    // Measured now, at the readout's pace, rather than every tick on her body.
+    this.slots.forEach((s, i) => rodStat(A.arms[s], A.rods[s], st[i]));
+    const lines = [`Rod      ${many ? `${this.slots.length} arms, ` : ''}${A.shadow ? 'shadow' : 'drive'}   E ${k.E0.toExponential(1)} Pa × ${k.tipStiff} at the tip   rest ${k.rest}   hold ${A.shadow ? 'its arm' : k.hold}${this.limp ? '   LIMP' : ''}`];
+    if (many) {
+      const arm = (i) => A.rods[this.slots[i]].index, sh = worstOf(st, (x) => x.shapeRms), sp = worstOf(st, (x) => x.speedMax), pu = worstOf(st, (x) => x.rootN);
+      lines.push(`Tip lag  ${this.slots.map((s, i) => `${A.rods[s].index} ${cm(st[i].tipLag)}`).join('  ')} cm`);
+      lines.push(`Worst    shape rms ${cm(st[sh].shapeRms)} cm (arm ${arm(sh)})   fastest ${st[sp].speedMax.toFixed(2)} m/s (arm ${arm(sp)})   pull ${(st[pu].rootN * 1000).toFixed(0)} mN (arm ${arm(pu)})   motion ${(st.reduce((s, x) => s + x.kinetic, 0) * 1000).toFixed(2)} mJ in all`);
+    }
+    for (const i of many ? [this.pick % this.slots.length] : this.slots.keys()) {
+      const s = this.slots[i], x = st[i], rod = A.rods[s], tag = many || rootLabel === 'Root' ? `arm ${rod.index}  ` : '';
+      lines.push(`Lag      ${tag}tip ${cm(x.tipLag)} cm   shape rms ${cm(x.shapeRms)} cm, max ${cm(x.shapeMax)} cm   fastest ${x.speedMax.toFixed(2)} m/s${rod.mass ? `   ${Math.round(rod.mass * 1000)} g` : ''}`);
+      lines.push(`${rootLabel.padEnd(9)}${tag}pull ${(x.rootN * 1000).toFixed(0)} mN   twist ${(x.rootNm * 1000).toFixed(1)} mN·m   motion ${(x.kinetic * 1000).toFixed(2)} mJ`);
       const W = A.rootLoad.subarray(s * 6, s * 6 + 6);
       if (k.wrench && !A.shadow) lines.push(`Into her ${tag}pull ${(Math.hypot(W[0], W[1], W[2]) * 1000).toFixed(0)} mN   twist ${(Math.hypot(W[3], W[4], W[5]) * 1000).toFixed(1)} mN·m`);
       const L = this.wrench[i].last, idN = Math.hypot(L[6], L[7], L[8]), gap = Math.hypot(L[0] - L[6], L[1] - L[7], L[2] - L[8]);
       if (this.wrench[i].n) lines.push(`ID       ${tag}pull ${(idN * 1000).toFixed(0)} mN   twist ${(Math.hypot(L[9], L[10], L[11]) * 1000).toFixed(1)} mN·m   gap ${idN > 1e-6 ? Math.round(gap / idN * 100) : 0}%`);
-    });
-    lines.push(`Cost     rod ${rs.p50.toFixed(3)} ms p50, ${rs.p95.toFixed(3)} p95${tail}`);
+    }
+    lines.push(`Cost     rod${many ? 's' : ''} ${rs.p50.toFixed(3)} ms p50, ${rs.p95.toFixed(3)} p95${tail}`);
     return lines;
   }
 
@@ -102,10 +126,11 @@ export class RodDiag {
     const A = this.arms, k = A.rodKnobs, on = this.slots.length > 0, add = (a) => section(name).add(a);
     add({ key: '5', name: 'Limp', label: () => (this.limp ? 'Limp: on' : 'Limp: off'), run: () => this.setLimp(!this.limp), disabled: !on });
     add({ key: 'o', name: 'Ghost', label: () => (view()?.ghost ? 'Ghost: shown' : 'Ghost: hidden'), run: () => { const v = view(); if (v) v.ghost = !v.ghost; }, disabled: !on });
+    if (this.slots.length > 1) add({ key: 'y', name: 'Rod in detail', label: () => `Detail: arm ${this.picked}`, run: () => { this.pick = (this.pick + 1) % this.slots.length; } });
     add({ key: 'k', name: 'Rest source', label: () => `Rest: ${k.rest}`, run: () => { k.rest = k.rest === 'bends' ? 'chain' : k.rest === 'chain' ? 'targets' : 'bends'; }, disabled: !on });
     add({ key: 'p', name: 'Contact hold', label: () => `Hold: ${A.shadow ? 'its arm' : k.hold}`, run: () => { k.hold = k.hold === 'rod' ? 'ghost' : k.hold === 'ghost' ? 'off' : 'rod'; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'u', name: 'Current', label: () => (k.current ? 'Current: on' : 'Current: off'), run: () => { k.current = !k.current; }, disabled: !on });
-    add({ key: 'x', name: 'Reset the rod', label: () => 'Reset the rod', run: () => this.reset(), disabled: !on });
+    add({ key: 'x', name: 'Reset the rod', label: () => (this.slots.length > 1 ? 'Reset the rods' : 'Reset the rod'), run: () => this.reset(), disabled: !on });
     if (!on) return;
     const sci = (v) => v.toExponential(1).replace('e+', 'e');
     const range = (label, values, get, set, fmt) => add({ type: 'range', name: label, values, get, set, label: () => `${label} ${fmt(get())}` });

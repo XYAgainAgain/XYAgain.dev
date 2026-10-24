@@ -34,13 +34,14 @@ import { registerWeight } from './tank/sand-weight.js';
 import { WallOptics } from './tank/wall-optics.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 import { RodDiag } from './diag/rod-diag.js';
+import { rodArms } from './amira/arms/arm-rod.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
-   ?rods=3,4 (those of her arms get rod bodies)  ?rodmode=shadow (the rods run beside her authored arms, touching nothing)  ?loads=1 (her rods with
-   their loads and root wrench, unstable)  ?den=0 (no settling in) */
+   ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
+   authored arms, touching nothing)  ?loads=1 (her rods with their loads and root wrench, unstable)  ?den=0 (no settling in) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -117,11 +118,12 @@ async function boot() {
   if (benchOn) {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off' } : {}), toyPush: 'rod', gripLoad: true, seals: true }, bodyMass: benchBodyMass(1040) });
+    // Its intent chain keeps every finishing pass, as the twin check's twin does.
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off' } : {}), toyPush: 'rod', gripLoad: true, seals: true, intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
-    const rods = [...new Set((params.get('rods') ?? '').split(',').filter((v) => /^[0-7]$/.test(v.trim())).map(Number))];
+    const rods = rodArms(params.get('rods'));
     // ?loads=1: her rod arms push toys, bear their grips, seal, and pass it all on to her through their roots. Off by
     // default, since the root wrench fed back a tick late grows tick on tick at her mass.
     const rodKnobs = params.get('loads') === '1' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
@@ -202,7 +204,7 @@ async function boot() {
 
   water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
   water.setTint(water.knobs.tint);
-  const ctx = { phys, mantle, arms, pose, attention, loco, carry, bench, rods: null, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
+  const ctx = { phys, mantle, arms, pose, attention, loco, carry, den, bench, rods: null, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
   if (bodyParts) tank.knobs.parts = bodyParts.knobs;
@@ -216,6 +218,8 @@ async function boot() {
   tank.knobs.armView = armView.knobs;
   armView.capsuleMeshes = rigidMeshes.filter((r) => r.e.tag === 'arm').map((r) => r.mesh);
   armView.capsules = params.get('capsules') === '1';
+  // Her intent chains stay hidden until asked for (O); the bench shows its ghost from the start.
+  if (!bench) armView.ghost = false;
   if (bench) bench.view = armView;
   else if (arms._anyRod) tank.rods = ctx.rods = new RodDiag(arms, { view: () => armView });
   const cameraRig = new TankCamera(camera, renderer.domElement, {
@@ -273,7 +277,6 @@ async function boot() {
     }
     arms.tick(dt, phys.time);
     bench?.after(dt);
-    ctx.rods?.tick();
     sand?.tick(dt);
     ctx.watch?.();
     ctx.probe?.(dt);

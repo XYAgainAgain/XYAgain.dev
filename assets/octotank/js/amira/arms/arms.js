@@ -370,6 +370,8 @@ export class Arms {
     // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which has the last word; a driving
     // rod's intent chain contacts on its own, and a shadow rod meets only the world and her body, shoving nothing.
     const C = this.contact, rounds = Math.max(1, k.finishIters), hold = this.rodKnobs.hold, shadow = this.shadow;
+    // A driving rod's intent chain meets no other arm between the rounds, so it runs only the last intentRounds of them.
+    const ir = Math.round(this.rodKnobs.intentRounds), intentFrom = rounds - (ir >= 1 ? Math.min(rounds, ir) : rounds);
     C.tick++;
     C.touchGap = this.suckerKnobs.touchGap; C.faceCos = this.suckerKnobs.faceCos;
     for (let it = 0; it < rounds; it++) {
@@ -378,7 +380,7 @@ export class Arms {
       for (let a = 0; a < arms.length; a++) {
         const rod = this.rods[a], drives = rod && !shadow;
         this._rec = drives ? -1 : a; this._skipHeld(a);
-        arms[a].finishPass(this.world, this.body, last, !drives || hold === 'ghost');
+        if (!drives || it >= intentFrom) arms[a].finishPass(this.world, this.body, last, !drives || hold === 'ghost');
         if (!rod) continue;
         const t1 = performance.now();
         this._rec = drives ? a : -1;

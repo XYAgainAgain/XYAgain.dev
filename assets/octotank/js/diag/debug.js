@@ -1,6 +1,6 @@
 import { penetration } from '../tank/layout.js';
 import { TANK } from '../config.js';
-import { runScenario } from './scenarios.js';
+import { runScenario, register, armWatch } from './scenarios.js';
 
 /* window.tank: live knobs, step stats, and the squeeze test. The test drives the posture through the hole and
    watches the shell every tick; the result is the spike's acceptance record. */
@@ -36,6 +36,17 @@ export function attachDebug(ctx) {
   if (ctx.loco) tank.knobs.loco = ctx.loco.knobs;
   return tank;
 }
+
+/* The squeeze test as a check of her arms: all of them lead through the slot and over its thin lips, watched as they go. */
+register('lip', {
+  label: 'Over the lip',
+  run: async (ctx, opts) => {
+    const done = armWatch(ctx);
+    let r, w;
+    try { r = await squeeze(ctx, opts); } finally { w = done(); }
+    return { squeeze: { passed: r.passed, behindAtEnd: r.behindAtEnd, penetration: r.penetration, strainMax: r.strainMax }, ...w, passed: r.passed && w.nan === 0 };
+  },
+});
 
 /* Run the posture from the near side, through the hole, to the far side; sample the shell each fixed tick. */
 async function squeeze(ctx, { approach = 3, through = 5, settle = 2, reach = 0.32 } = {}) {

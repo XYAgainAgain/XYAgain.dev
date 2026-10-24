@@ -1,4 +1,5 @@
 import { crawlAngle, wrap } from '../amira/locomotion/locomotion-core.js';
+import { TANK } from '../config.js';
 
 /* The scenario registry: each scenario has a label, an optional key, and run(ctx, opts) resolving to a result with
    `passed`. The panel builds its buttons from this list and the headless harness runs the same entries through
@@ -193,9 +194,118 @@ async function turn(ctx, { angle = 1, limit = 6, wait = 8 } = {}) {
   return { angle, stations: held, arrived: ok, t: r3(t), budget: r3(budget), releases, passed: held >= 3 && ok && t <= budget && releases === 0 };
 }
 
+/* Her arms at their worst while a check runs, every `every` ticks as health() measures them: NaN, the furniture (how deep,
+   and any center inside it), her body, arm on arm, and her skin's strain; done() adds the crossings and stops watching. */
+export function armWatch(ctx, every = 3) {
+  const { arms, mantle, loco } = ctx, c0 = arms.contact.crossings;
+  const w = { nan: 0, pen: 0, center: 0, body: 0, armOnArm: 0, strain: 0, crossings: 0 };
+  let n = 0;
+  const fn = () => {
+    if (n++ % every) return;
+    const h = arms.health();
+    w.nan += h.nan; w.pen = Math.max(w.pen, h.penetration); w.center = Math.max(w.center, h.centerPenetration);
+    w.body = Math.max(w.body, h.bodyPenetration, h.bodyMidPenetration); w.armOnArm = Math.max(w.armOnArm, h.armPenetration);
+    w.strain = Math.max(w.strain, mantle.health().strainMax);
+  };
+  loco.listeners.add(fn);
+  return () => {
+    loco.listeners.delete(fn);
+    w.crossings = arms.contact.crossings - c0;
+    for (const k of ['pen', 'center', 'body', 'armOnArm', 'strain']) w[k] = +w[k].toFixed(4);
+    return w;
+  };
+}
+
+const bodyOk = (w) => w.nan === 0 && w.strain < 1.6;
+
+/* All her arms curled in under her at once and held, then let go into her resting curl: the densest her arms pile. */
+async function pile(ctx, { curl = 2, hold = 5, rest = 6 } = {}) {
+  const { loco, arms } = ctx, n = arms.arms.length, was = arms.resting, done = armWatch(ctx);
+  let w;
+  loco.hold = true;
+  try {
+    for (let a = 0; a < n; a++) if (arms.claim(a, 'mode')) arms.tuck(a, curl);
+    await simWait(loco, hold);
+    for (let a = 0; a < n; a++) arms.unclaim(a, 'mode');
+    arms.idle();
+    arms.resting = true;
+    await simWait(loco, rest);
+  } finally {
+    w = done();
+    loco.hold = false; arms.resting = was;
+    for (let a = 0; a < n; a++) arms.unclaim(a, 'mode');
+  }
+  return { curl, ...w, passed: bodyOk(w) };
+}
+
+/* The heaviest toy thrown at one arm after another, from in front and above a point along each as it lies: an arm should be
+   shoved aside, never passed through. met counts ticks the solve found an arm inside the toy before pushing it out. */
+async function throwToy(ctx, { speed = 1.5, throws = 4, seconds = 2, along = 0.5 } = {}) {
+  const { loco, arms, phys, toys } = ctx;
+  let toy = null;
+  for (const t of toys ?? []) if (t.motion === 'dynamic' && (!toy || phys.inverseMass(t) < phys.inverseMass(toy))) toy = t;
+  if (!toy) return { passed: null, failed: 'no toys' };
+  const ti = arms.loose.indexOf(toy), w = arms.allSdf, nrm = [0, 0, 0], big = Math.max(...toy.size), n = arms.arms.length;
+  const o = { toy: toy.kind, kg: r3(1 / phys.inverseMass(toy)), speed, throws: [], met: 0, deepest: 0, inToy: 0, closest: Infinity, nan: 0 };
+  const done = armWatch(ctx), dir = [0, -0.55, -0.83], dl = Math.hypot(...dir), back = 0.06 + big;
+  let wa;
+  try {
+    await simWait(loco, 1);
+    for (let k = 0; k < throws; k++) {
+      const a = (1 + 3 * k) % n, body = arms.bodies[a], at = Math.round(along * (body.n - 1)), p = body.X.slice(at * 3, at * 3 + 3);
+      // From inside the tank, whatever wall the arm lies along.
+      const room = big + 0.02, inside = (v, half) => Math.max(-half + room, Math.min(half - room, v));
+      const from = [inside(p[0] - dir[0] / dl * back, TANK.w / 2), Math.max(big + 0.01, p[1] - dir[1] / dl * back), inside(p[2] - dir[2] / dl * back, TANK.d / 2)];
+      phys.teleport(toy, from[0], from[1], from[2], 0, 0, 0, 1);
+      phys.stopKinematic(toy); // a teleport keeps the last throw's rebound, so zero it (works on a dynamic body too)
+      phys.wake(toy);
+      const J = speed / Math.max(1e-9, phys.inverseMass(toy)) / dl;
+      phys.impulseAt(toy, dir[0] * J, dir[1] * J, dir[2] * J, from[0], from[1], from[2]);
+      const one = { arm: a, met: 0, inToy: 0 };
+      await until(loco, () => {
+        const met = arms.pushPen[a * arms.loose.length + ti];
+        if (met > 0) { one.met++; o.deepest = Math.max(o.deepest, met); }
+        const c = toy.body.GetPosition(), cx = c.GetX(), cy = c.GetY(), cz = c.GetZ();
+        w.unfocus();
+        for (const b of arms.bodies) {
+          const X = b.X;
+          for (let i = 1; i < b.n; i++) {
+            if (!Number.isFinite(X[i * 3] + X[i * 3 + 1] + X[i * 3 + 2])) { o.nan++; continue; }
+            const pen = w.collide(X[i * 3], X[i * 3 + 1], X[i * 3 + 2], b.rad[i], nrm);
+            if (pen > 0 && w.hit === arms._looseAt + ti) { one.inToy = Math.max(one.inToy, pen); o.inToy = Math.max(o.inToy, pen); }
+            o.closest = Math.min(o.closest, Math.hypot(X[i * 3] - cx, X[i * 3 + 1] - cy, X[i * 3 + 2] - cz) - big - b.rad[i]);
+          }
+        }
+        return false;
+      }, seconds);
+      o.met += one.met; one.inToy = r3(one.inToy);
+      o.throws.push(one);
+    }
+  } finally { wa = done(); }
+  o.deepest = r3(o.deepest); o.inToy = r3(o.inToy); o.closest = r3(o.closest);
+  return { ...o, watch: wa, passed: o.nan === 0 && bodyOk(wa) && o.met > 0 };
+}
+
+/* Resting where she is until she has dug in and lies snug in her den (or the time runs out), then a few seconds more. */
+async function denRest(ctx, { limit = 40, after = 5 } = {}) {
+  const { loco, arms, den } = ctx;
+  if (!den) return { passed: null, failed: 'no den (?den=0, or no sand)' };
+  const was = arms.resting, done = armWatch(ctx);
+  arms.resting = true;
+  let snug = false, w;
+  try {
+    snug = await until(loco, () => den.state === 'snug', limit);
+    await simWait(loco, after);
+  } finally { w = done(); arms.resting = was; }
+  return { snug, den: den.last, ...w, passed: snug && bodyOk(w) };
+}
+
 register('ball', { label: 'Ball', key: '1' });
 register('crawl', { label: 'Crawl', key: '2', run: crawl });
 register('climb', { label: 'Climb', key: '3' });
 register('squeeze', { label: 'Squeeze slot', key: '4' });
 register('pull', { label: 'One-arm pull', run: pull });
 register('turn', { label: 'Turn 1 rad', run: turn });
+register('pile', { label: 'Arm pile', run: pile });
+register('throw', { label: 'Toy thrown', run: throwToy });
+register('den', { label: 'Den rest', run: denRest });

@@ -1,5 +1,5 @@
 import { Rod, ROD_KNOBS, frameQuat } from './arm-rod-core.js';
-import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends } from './arm-core.js';
+import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, bodyRadius } from './arm-core.js';
 
 /* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
    rod, with mass, water, and contact of its own, is where the arm is; it reaches the intent only through _feedback. */
@@ -15,6 +15,10 @@ export const ROD_ARM_KNOBS = {
   stiffRef: 90,          // 1/s² of authored joint stiffness that leaves the rod's bending as is, in targets mode
   rootShare: 0.033,      // the drawn arm's root radius over the full arm's length, the front pair's too
   rootGap: 0.002,        // m a rod's collision radius keeps clear of its neighbors' roots on her crown
+  intentRounds: 1,       // finishing passes a driving rod's intent chain runs, the last of the arm-on-arm rounds (0: all)
+  cutFixes: 3,           // pushes the last contact round may give one segment still cutting into something
+  cutSkin: true,         // and those pushes count a segment's middle sunk in her skin too
+  girthFloor: 0.8,       // stretch under which a squeezed segment stops thickening, the authored arm's stretchMin (0: no floor)
   current: true,         // the tank's currents push the rod
   // Off in core; main.js turns the loads on for the bench, and ?loads=1 the loads and the root wrench for her rod arms.
   toyPush: 'capped',     // 'rod': a toy takes the rod's own contact momentum, split by the two inverse masses; 'capped': pushN per toy
@@ -31,6 +35,13 @@ export const ROD_ARM_KNOBS = {
 };
 
 const len3 = (x, y, z) => Math.sqrt(x * x + y * y + z * z);
+
+/* Her arm numbers that get rod bodies from the ?rods flag: all of them when it is absent or 'all', else the listed ones
+   (so 'none', or an empty list, gives none). */
+export function rodArms(value, count = 8) {
+  if (value == null || value.trim() === 'all') return Array.from({ length: count }, (_, i) => i);
+  return [...new Set(value.split(',').map((v) => v.trim()).filter((v) => /^\d$/.test(v) && +v < count).map(Number))];
+}
 
 /* The drawn arm's radii at each of arm's points: the canon root on the authored taper to the authored tip. */
 export function drawnRadii(arm, k, out = new Float64Array(arm.n)) {
@@ -217,18 +228,24 @@ export class RodArm {
       else projectPoint(this, i, world, body);
     }
     if (last && world) {
-      const nrm = this._n;
+      const nrm = this._n, nb = this._mb ??= [0, 0, 0], fixes = Math.max(1, Math.round(this.k.cutFixes) || 1);
       for (let i = 1; i < n; i++) {
         const a = (i - 1) * 3, o = i * 3;
-        const pen = world.collide((X[a] + X[o]) / 2, (X[a + 1] + X[o + 1]) / 2, (X[a + 2] + X[o + 2]) / 2, (this.rad[i - 1] + this.rad[i]) / 2, nrm, i);
-        if (!(pen > 0)) continue;
-        // Only the far end moves, twice the depth, carried there around whatever it meets: the near one has already
-        // cleared, and a middle's push can point into a thin wall the end lies beyond.
-        const fx = X[o], fy = X[o + 1], fz = X[o + 2];
-        X[o] += 2 * pen * nrm[0]; X[o + 1] += 2 * pen * nrm[1]; X[o + 2] += 2 * pen * nrm[2];
-        travelPoint(this, i, world, body, fx, fy, fz);
-        this._touched[i] = 1;
-        if (i < this._hit) this._hit = i;
+        // A segment dragged across a rounded lip can still cut it after one push, its far end stopped on the way out.
+        for (let f = 0; f < fixes; f++) {
+          const mx = (X[a] + X[o]) / 2, my = (X[a + 1] + X[o + 1]) / 2, mz = (X[a + 2] + X[o + 2]) / 2, mr = (this.rad[i - 1] + this.rad[i]) / 2;
+          let pen = world.collide(mx, my, mz, mr, nrm, i), dir = nrm;
+          // Her skin too, where a segment spans her curves: its points sit on her, its middle sinks in.
+          if (body && this.k.cutSkin) { const pb = body.collide(mx, my, mz, bodyRadius(mr, i - 0.5, k.bodySkip), nb); if (pb > pen) { pen = pb; dir = nb; } }
+          if (!(pen > 0)) break;
+          // Only the far end moves, twice the depth, carried there around whatever it meets: the near one has already
+          // cleared, and a middle's push can point into a thin wall the end lies beyond.
+          const fx = X[o], fy = X[o + 1], fz = X[o + 2];
+          X[o] += 2 * pen * dir[0]; X[o + 1] += 2 * pen * dir[1]; X[o + 2] += 2 * pen * dir[2];
+          travelPoint(this, i, world, body, fx, fy, fz);
+          this._touched[i] = 1;
+          if (i < this._hit) this._hit = i;
+        }
       }
     }
     Q.set(X);
@@ -254,7 +271,13 @@ export class RodArm {
 
   _radii() {
     this.rod.radii(this.drawRad);
-    for (let i = 0; i < this.n; i++) this.rad[i] = Math.min(this.drawRad[i], this.cap);
+    // A segment squeezed shorter than girthFloor keeps that girth: contact did the squeezing, and up to 3× its girth (the
+    // rod's own floor) would swell back into whatever squeezed it.
+    const g = this.k.girthFloor > 0 ? 1 / Math.sqrt(this.k.girthFloor) : Infinity;
+    for (let i = 0; i < this.n; i++) {
+      this.drawRad[i] = Math.min(this.drawRad[i], this.drawRad0[i] * g);
+      this.rad[i] = Math.min(this.drawRad[i], this.cap);
+    }
   }
 
   /* Each segment's live stretch, and its sucker side from the rod's own frame, as poseFromBends lays it on the posed one. */
