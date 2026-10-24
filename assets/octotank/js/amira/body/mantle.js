@@ -6,14 +6,15 @@ import { buildShell, rootPatches, uniqueEdges, restLengths, edgeStrain, signedVo
    minus origin. */
 
 export const MANTLE_KNOBS = {
-  mass: 0.5,              // kg in the soft body: half of her 1 kg, since eight arms weigh about as much as the rest
+  mass: null,             // kg in the soft body; null takes her drawn rest volume at tissueDensity, so a reshape moves it
+  tissueDensity: 1040,    // kg/m³
   pressurePa: null,       // gauge pressure; null takes the shell's own from LEVEL_PRESSURE
-  compliance: 2e-4,       // m/N on the mantle's edges; the shear term is set to the same
-  bendCompliance: 2e-3,
-  headStiffness: 4,       // the head's and crown's compliance is the mantle's divided by these
-  crownStiffness: 4,
-  headDensity: 2.5,       // mass per vertex against the mantle's; at these masses XPBD is iteration-bound, so
-  crownDensity: 2.5,      // weight, not compliance, is what keeps the head and crown from ballooning
+  compliance: 0.002,      // m/N on the mantle's edges, the shear term the same; this and the bend's sit in XPBD's live
+  bendCompliance: 0.1,    // range at her mass, so her skin gives under a press instead of moving her whole
+  headStiffness: 4,       // the head's and crown's compliance is the mantle's divided by these; the crown, all arm-base
+  crownStiffness: 8,      // muscle, is firmer so her roots hold their ring, but not so firm it can't fold through a slot
+  headDensity: 2.5,       // mass per vertex against the mantle's, standing in for the brain capsule and beak
+  crownDensity: 2.5,
   bend: 'distance',       // dihedral folds past flat at a hole's lip and the shell explodes; distance does not
   iterations: 5,
   damping: 2.0,           // 1/s; stands in for water drag
@@ -25,7 +26,8 @@ export const MANTLE_KNOBS = {
   pinSpeed: 1.2,          // m/s cap on a pinned root, so one step cannot cross a panel
   forceK: 4000,           // force drive: an implicit PD pull on each arm's skin patch, in 1/s² and 1/s, so per unit
   forceDamp: 90,          // mass: the newtons scale with the patch's mass by themselves
-  forceN: 40,             // newtons one arm base can exert, as measured in vivo; the cap is spread over its patch
+  forceN: 71,             // newtons one arm base can exert, spread over its patch: the in-vivo 40 N on a 0.5 kg body,
+                          // raised with her drawn mass so a stroke still moves her as fast
   patchRadius: 0.02,      // meters around a root that one arm base grips
   lateralDamp: 0,         // 1/s across a spring arm's own line when set (0 keeps forceDamp on every axis)
   breathPa: null,         // muscle pressure per unit of breath depth on the mantle's front; null takes LEVEL_BREATH
@@ -34,13 +36,13 @@ export const MANTLE_KNOBS = {
   ...SHAPE_KNOBS,
 };
 
-/* Below these, a mantle-first squeeze can leave a dent the shell never pops back out of (coarser shells need more);
-   above about 250 the finest shell's short crease edges overstretch at rest. Keyed by vertex count. */
-export const LEVEL_PRESSURE = { 152: 400, 296: 300, 488: 250 };
+/* Gauge pressure per shell, keyed by vertex count: each holds her at about 1.10–1.15× her drawn volume at rest, and a
+   mantle-first squeeze pops back out at all three. The coarsest shell's long edges need more to stay round. */
+export const LEVEL_PRESSURE = { 152: 250, 296: 200, 488: 200 };
 
 /* Calibrated per shell in the sim: the muscle pressure on the breathing skin that moves her volume by its whole
    amount, so a breath of depth d swings it by d. Stiffer shells (higher rest pressure, fewer edges) need more. */
-export const LEVEL_BREATH = { 152: 28500, 296: 13700, 488: 8650 };
+export const LEVEL_BREATH = { 152: 11000, 296: 7900, 488: 6100 };
 
 const DRIVES = ['pin', 'force', 'free'];
 
@@ -52,14 +54,17 @@ export class Mantle {
     const shape = {};
     for (const key in SHAPE_KNOBS) shape[key] = this.knobs[key];
     this.shell = buildShell(n, shape);
-    this.knobs.pressurePa ??= LEVEL_PRESSURE[this.shell.count] ?? 250;
-    this.knobs.breathPa ??= LEVEL_BREATH[this.shell.count] ?? 8650;
+    this.knobs.pressurePa ??= LEVEL_PRESSURE[this.shell.count] ?? 200;
+    this.knobs.breathPa ??= LEVEL_BREATH[this.shell.count] ?? 6100;
     this.origin = [...origin];
     this.drive = drive;
     this.roots = Array.from(this.shell.roots);
     this.edges = uniqueEdges(this.shell.faces);
     this.rest = restLengths(this.shell.positions, this.edges);
     this.restVolume = signedVolume6(this.shell.positions, this.shell.faces) / 6;
+    const mass = this.knobs.mass > 0 ? this.knobs.mass : this.restVolume * this.knobs.tissueDensity;
+    // A zero, negative, or endless mass or density from the URL falls back to the canon tissue, never into Jolt.
+    this.knobs.mass = mass > 0 && Number.isFinite(mass) ? mass : this.restVolume * MANTLE_KNOBS.tissueDensity;
     this.neighbors = vertexNeighbors(this.shell.faces, this.shell.count);
     this.patches = rootPatches(this.shell.positions, this.roots, this.knobs.patchRadius, this.neighbors);
     this.vertexMass = regionMasses(this.shell, this.knobs);
@@ -369,6 +374,9 @@ export class Mantle {
     else for (let k = 0; k < V.length; k++) acc.fill(0, V[k] * 3, V[k] * 3 + 3);
     return true;
   }
+
+  /* Her net weight in water, N: the soft body's, or with `whole` the animal's, since her arms weigh what her body does. */
+  weightInWater(whole = false) { return (whole ? 2 : 1) * this.knobs.mass * 9.81 * this.knobs.gravityFactor; }
 
   /* The unit axis from her head toward the far end of her mantle, from the two regions' mass-weighted centroids. */
   mantleAxis(out = [0, 0, 0]) {

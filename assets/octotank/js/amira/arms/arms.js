@@ -2,7 +2,7 @@ import { LAYERS } from '../../config.js';
 import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from '../locomotion/loco-carry-core.js';
 import { moveInputs } from '../locomotion/loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
-import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench } from './arm-rod.js';
+import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench, aimStep } from './arm-rod.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
@@ -30,6 +30,7 @@ export const ARM_KNOBS = {
   capTau: 0.2,           // s the sealed force a tear is judged against is averaged over, as seals flicker
   gripSkip: 2,           // segments either side of a grip's that may lie into the toy it holds
   gripTau: 0.1,          // s the proxy smooths the grip point over, so the toy follows the arm and not its contact jitter
+  toyBodyClear: 0.008,   // m a held toy's proxy keeps it off her skin, past the skin vertices' 4 mm radius; under 0, off
   minGrip: 0.05,         // N of sealed force under which a grip has nothing left holding it
   lostGrace: 0.3,        // s an arm's interest survives without touching the thing, or a grip without a seal
   fetchBeat: 0.25,       // s between food sealing on and the fetch starting
@@ -44,7 +45,7 @@ export class Arms {
   /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
      numbers that get rod bodies, rodKnobs their knobs over ROD_ARM_KNOBS; rodMode: 'drive' (the rod is the arm) or
      'shadow' (it runs beside the authored arm, touching nothing); bodyMass: her body's kg, which her arms together
-     match (else her rest volume's). */
+     match (else the mantle's own mass, then her rest volume's). */
   constructor(phys, mantle, knobs = {}, { seed = 1, indices = null, rods = [], rodKnobs = {}, rodMode = 'drive', bodyMass = null } = {}) {
     this.phys = phys;
     this.mantle = mantle;
@@ -54,7 +55,7 @@ export class Arms {
     this.arms = Array.from({ length: count }, (_, s) => new Arm(indices ? indices[s] : s, this.knobs, seed));
     this._slotOf = indices ? new Map(indices.map((i, s) => [i, s])) : null;
     this.rodKnobs = { ...ROD_ARM_KNOBS, ...rodKnobs };
-    const armsMass = bodyMass ?? (mantle.restVolume > 0 ? mantle.restVolume * this.rodKnobs.density : null);
+    const armsMass = bodyMass ?? (mantle.knobs?.mass > 0 ? mantle.knobs.mass : mantle.restVolume > 0 ? mantle.restVolume * this.rodKnobs.density : null);
     if (rods.length && !(armsMass > 0)) console.warn('arms: no body mass to share among the rod arms; each weighs its own drawn volume');
     this.armsMass = armsMass > 0 ? armsMass : null;
     const caps = this._rootCaps(rods);
@@ -356,6 +357,7 @@ export class Arms {
       }
       // A driving rod's intent chain is a ghost: what it pokes into, its rod pushes.
       const rod = this.rods[a];
+      if (rod) { rod.gripping = !!this.episodes?.[a]?.h; if (!this.shadow) this._aimRod(a, dt); }
       this._rec = rod && !this.shadow ? -1 : a; this._skipHeld(a);
       arm.step(dt, this.world, this.body);
       if (rod) {
@@ -482,12 +484,28 @@ export class Arms {
       out[0] = x + dx * off; out[1] = y + dy * off; out[2] = z + dz * off;
       return arm.goal.keepOut ? this.reflexes.keepOut(a, out) : out;
     }
-    const fl = Math.hypot(dx, dz), ci = arm.gripAt;
+    const fl = Math.hypot(dx, dz), ci = arm.gripAt, rk = this.rodKnobs;
     const ux = fl > 1e-6 ? 0.5 * dx / fl : 0, uz = fl > 1e-6 ? 0.5 * dz / fl : 0, ul = Math.hypot(ux, 1, uz);
-    const off = (size + body.rad[ci] + this.knobs.toyClear) / ul, sl = this.slot[a];
+    const clear = this.knobs.toyClear - (this.rods[a] && !this.shadow && rk.aim ? rk.aimPress : 0);
+    const off = (size + body.rad[ci] + clear) / ul, sl = this.slot[a];
     out[0] = x + ux * off + this.slotDir[a * 2] * sl; out[1] = y + off; out[2] = z + uz * off + this.slotDir[a * 2 + 1] * sl;
     // A careful try after a recoil stops short of the noxious thing (arm-reflex.js).
     return arm.goal?.keepOut ? this.reflexes.keepOut(a, out) : out;
+  }
+
+  /* A driving rod's reach or fetch (a stroke's foot too) aims through its rod: the intent chain goes for goal.aim, its target
+     moved by how far the rod hangs off it, so a soft arm's sag and lag land where meant; goal.target stays the program's. */
+  _aimRod(a, dt) {
+    const k = this.rodKnobs, arm = this.arms[a], rod = this.rods[a], g = arm.goal, fetch = g?.kind === 'fetch';
+    if (!g || (g.kind !== 'reach' && g.kind !== 'hold' && !fetch) || !g.target) return;
+    // Off, an aim already set is cleared with its offset; one never set stays unset, so the twin check's goals still match.
+    if (!k.aim || !rod.started || arm.valid === false) { if (g.aim) { g.aim = null; g.aimOff = null; } return; }
+    const off = g.aimOff ??= [0, 0, 0], A = g.aim ??= [0, 0, 0], T = g.target, i = fetch ? arm.fetchJoints(g.grasp)[2] : arm.gripAt;
+    // Weighed as the grip itself comes in, so a reach's travel (and a grip point left over from the last goal) adds nothing.
+    const u = g.kind === 'hold' ? 1 : Math.min(1, g.t / Math.max(1e-6, g.duration)), from = arm.knobs.gripFrom;
+    const s = Math.max(0, Math.min(1, (u - from) / Math.max(1e-6, 1 - from))), w = s * s * (3 - 2 * s);
+    if (dt > 0 && w > 0) aimStep(off, arm.X, rod.X, i * 3, (1 - Math.exp(-dt / Math.max(1e-3, k.aimTau))) * w, k.aimMax);
+    A[0] = T[0] + off[0]; A[1] = T[1] + off[1]; A[2] = T[2] + off[2];
   }
 
   /* The slot holding arm number `index`, or -1. Methods that take an arm take its number and resolve it here. */
@@ -990,16 +1008,26 @@ export class Arms {
     }
   }
 
-  /* A rigid proxy would drive what it holds into the floor or a wall until the grip tore: where the held toy's center,
-     carried along with the proxy, would sink into the furniture, the proxy's target rises out by that much. */
+  /* A rigid proxy would drive what it holds into the furniture, or across her own skin dragging every vertex it rides
+     over: where the held toy, carried along with the proxy, would sink into either, the proxy's target backs out. */
   _keepOut(a, toy, G) {
     const pp = this.proxies[a].body.GetPosition(), px = pp.GetX(), py = pp.GetY(), pz = pp.GetZ();
-    const tp = toy.body.GetPosition(), sz = toy.size, nrm = this._f3;
+    const tp = toy.body.GetPosition(), sz = toy.size, nrm = this._f3, k = this.knobs;
     const r = toy.kind === 'box' ? Math.min(sz[0], sz[1], sz[2]) : toy.kind === 'sphere' ? sz[0] : sz[1];
-    const o = a * 3, cx = G[o] + tp.GetX() - px, cy = G[o + 1] + tp.GetY() - py, cz = G[o + 2] + tp.GetZ() - pz;
-    this.sdf.unfocus();
-    const pen = this.sdf.collide(cx, cy, cz, r, nrm);
-    if (pen > 0 && Number.isFinite(pen)) { G[o] += nrm[0] * pen; G[o + 1] += nrm[1] * pen; G[o + 2] += nrm[2] * pen; }
+    const o = a * 3, dx = tp.GetX() - px, dy = tp.GetY() - py, dz = tp.GetZ() - pz;
+    const skin = k.toyBodyClear >= 0 && this.body.active;
+    const R = (toy.kind === 'box' ? Math.max(sz[0], sz[1], sz[2]) : toy.kind === 'capsule' ? sz[0] + sz[1] : Math.max(sz[0], sz[1] ?? 0)) + k.toyBodyClear;
+    // Two rounds, so a toy the furniture pushes back into her skin goes out again wherever there is room between them.
+    for (let round = 0; round < 2; round++) {
+      if (skin) {
+        const pen = this.body.collide(G[o] + dx, G[o + 1] + dy, G[o + 2] + dz, R, nrm);
+        if (pen > 0 && Number.isFinite(pen)) { G[o] += nrm[0] * pen; G[o + 1] += nrm[1] * pen; G[o + 2] += nrm[2] * pen; }
+      }
+      this.sdf.unfocus();
+      const pen = this.sdf.collide(G[o] + dx, G[o + 1] + dy, G[o + 2] + dz, r, nrm);
+      if (pen > 0 && Number.isFinite(pen)) { G[o] += nrm[0] * pen; G[o + 1] += nrm[1] * pen; G[o + 2] += nrm[2] * pen; }
+      if (!skin || !(pen > 0)) break;
+    }
   }
 
   /* Out along the arm and off the tip, with a little shove. */

@@ -4,11 +4,12 @@ import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, 
 /* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
    rod, with mass, water, and contact of its own, is where the arm is; it reaches the intent only through _feedback. */
 
-// Fitted on the bench: a reach arrives about 0.1 s behind its program and a still arm's tip hangs about 2 cm low.
 export const ROD_ARM_KNOBS = {
   ...ROD_KNOBS,
-  E0: 1e6,
-  tipStiff: 2,
+  // Relaxed tissue, root to tip alike: COOMM's 10 kPa arm times the k = 26 her muscle map scales its stresses by, so tissue
+  // and muscle keep COOMM's ratio. Bracing firms it (braceGain); 1e6 with a 2× tip was the authored look's fit.
+  E0: 2.6e5,
+  tipStiff: 1,
   rest: 'chain',         // the rest shape: the intent's chain as its contact laid it, its posed bends ('bends', which can
                          // run through her body), or 'targets' (its programs' own, with the rod as their spring)
   hold: 'rod',           // whose contact bends later rest shapes: 'rod', 'ghost' (the intent chain's own), or 'off'
@@ -20,6 +21,13 @@ export const ROD_ARM_KNOBS = {
   cutSkin: true,         // and those pushes count a segment's middle sunk in her skin too
   girthFloor: 0.8,       // stretch under which a squeezed segment stops thickening, the authored arm's stretchMin (0: no floor)
   current: true,         // the tank's currents push the rod
+  braceGain: 12,         // times the passive bending and axial stiffness a fully braced stretch of arm adds on top
+  reachBrace: 0.25,      // share of that bracing a reach takes on its way out (4×, the old 1e6 fit); the rest comes as it grabs
+  grabTau: 0.25,         // s for the arm to firm up once it holds, grips, plants, or fetches, and to let go of it
+  aim: true,             // a reach aims through the rod: its target moves until the rod's own grip point lands there
+  aimTau: 0.3,           // s the aim's correction takes to catch up with the rod's miss
+  aimMax: 0.08,          // m the aim may move off where the program meant
+  aimPress: 0.006,       // m closer to a toy than the program's clearance a middle grip aims: aimed true, the rod would hover over it
   // Off in core; main.js turns the loads on for the bench, and ?loads=1 the loads and the root wrench for her rod arms.
   toyPush: 'capped',     // 'rod': a toy takes the rod's own contact momentum, split by the two inverse masses; 'capped': pushN per toy
   gripLoad: false,       // what a grip holds weighs on the rod's grip nodes, a tick late
@@ -88,6 +96,28 @@ export function rootWrench(rod, hold, F, T) {
   return Number.isFinite(F[0] + F[1] + F[2] + T[0] + T[1] + T[2]);
 }
 
+/* How braced joint j is, 0–1: its program's stiffness above idle as a share of a reach's braced base, the same share
+   the muscle map's co-contraction takes (the map itself gives her no stiffening from it). */
+export function braceShare(arm, j) {
+  const k = arm.knobs, span = k.stiffBehind - k.stiffIdle, s = (arm.stiffGoal[j] - k.stiffIdle) * arm.w / span;
+  return span > 0 && s > 0 ? Math.min(1, s) : 0;
+}
+
+/* What bracing b (0–1) multiplies the passive stiffness by: a reach on its way out takes reachBrace of it, a grab (0–1) the rest. */
+export function braceFactor(b, grab, k) {
+  const r = Math.max(0, Math.min(1, k.reachBrace)), g = Math.max(0, Math.min(1, grab));
+  return 1 + Math.max(0, k.braceGain) * b * (r + (1 - r) * g);
+}
+
+/* One tick of a reach aimed through its rod: off moves f of the way to the intent chain's grip point (I at o) less the rod's
+   (X at o), never past max. Only the rod's own miss is fed back, so a target the program can't reach never winds it up. */
+export function aimStep(off, I, X, o, f, max) {
+  for (let c = 0; c < 3; c++) { const e = I[o + c] - X[o + c]; if (Number.isFinite(e)) off[c] += f * (e - off[c]); }
+  const m = Math.hypot(off[0], off[1], off[2]);
+  if (!(m <= max)) { const s = m > 0 && Number.isFinite(m) && max > 0 ? max / m : 0; off[0] *= s; off[1] *= s; off[2] *= s; }
+  return off;
+}
+
 /* A grip's load L (N on the arm) shared between the two nodes of segment j, fr of the way along it. */
 export function spreadLoad(ext, j, fr, L) {
   const f = Math.max(0, Math.min(1, fr)), o = 3 * j;
@@ -117,6 +147,8 @@ export class RodArm {
     this.rod = null;
     this.restGen = -1;
     this.stiff = 1;                       // the whole rod's bending, scaled (the bench's limp)
+    this.grab = 0;                        // 0–1, how far the arm has firmed for a hold; gripping is set from outside
+    this.gripping = false;
     this.started = false;
     this._fresh = true;
     this._first = true;
@@ -156,8 +188,10 @@ export class RodArm {
 
   /* The rest shape from the intent chain: its posed bends, the bends of its chain as its own contact laid it, or in
      targets mode its programs' targets with each joint's authored stiffness scaling the rod's bending there. */
-  _rest() {
+  _rest(dt = 0) {
     const arm = this.intent, rod = this.rod, k = this.k;
+    const kind = arm.goal?.kind, want = this.gripping || kind === 'hold' || kind === 'plant' || kind === 'fetch' ? 1 : 0;
+    this.grab = !this.started ? want : this.grab + (want - this.grab) * (dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.grabTau)) : 0);
     if (k.rest === 'targets') {
       rod.setRestFromBends(arm.tgt, arm.twist, arm.lam);
       const ak = arm.knobs, ref = k.stiffRef > 0 ? k.stiffRef : ROD_ARM_KNOBS.stiffRef;
@@ -170,10 +204,13 @@ export class RodArm {
     } else {
       const s = this._s3, B = k.rest === 'chain' && arm.X.every(Number.isFinite) ? chainBends(arm.frame, arm.twist, arm.X, this._B, this.n - 1, s[0], s[1], s[2]) : arm.out;
       rod.setRestFromBends(B, arm.twist, arm.lam);
-      // Muscle mode: a braced stretch of arm is as much stiffer as its co-contraction makes it, a relaxed one is not.
-      const M = arm.knobs.muscle ? arm.mus : null;
-      if (M) for (let j = 0; j < rod.n; j++) { rod.bendScale[j] = this.stiff * M.bendStiff[j]; rod.stretchScale[j] = M.axialStiff[j]; }
-      else { rod.bendScale.fill(this.stiff); rod.stretchScale.fill(1); }
+      // Soft tissue, firmed where the program braces: a braced stretch of arm is braceFactor times stiffer, a relaxed one is
+      // the passive tissue (with the muscle map's own small change in muscle mode).
+      const M = arm.knobs.muscle ? arm.mus : null, g = this.grab;
+      for (let j = 0; j < rod.n; j++) {
+        const f = braceFactor(braceShare(arm, j), g, k);
+        rod.bendScale[j] = this.stiff * (M ? M.bendStiff[j] : 1) * f; rod.stretchScale[j] = (M ? M.axialStiff[j] : 1) * f;
+      }
     }
   }
 
@@ -186,7 +223,7 @@ export class RodArm {
     const rod = this.rod, F = arm.frame, q = frameQuat(F.u, F.v, F.d, this._q);
     // A root that jumped (a reset, a teleport) laid the intent chain afresh; dragged there, the rod would whip.
     if (arm._jumped) this.started = false;
-    this._rest();
+    this._rest(dt);
     if (!this.started) {
       // On the intent chain as it lies, which its own contact has already laid clear at full length.
       rod.setRoot(F.p, q, true);

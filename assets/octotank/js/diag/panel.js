@@ -149,8 +149,21 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       { key: 'g', name: 'Grip/let go', label: () => (arms.episodes.some((e) => e?.commanded) ? 'Let go' : 'Grip/let go'), run: () => say(`grip: ${arms.toggleGrip()}`) },
       { key: 'z', name: 'Resting/awake', label: () => (arms.resting ? 'Arms: resting' : 'Arms: awake'), run: () => { arms.resting = !arms.resting; } },
       { key: 'e', name: 'Muscles', label: () => (arms.knobs.muscle ? 'Muscles: on' : 'Muscles: off'), run: () => { arms.knobs.muscle = arms.knobs.muscle ? 0 : 1; } },
+      { type: 'range', name: 'Held toy off her skin', values: [-1, 0, 0.004, 0.008, 0.015], get: () => arms.knobs.toyBodyClear, set: (v) => { arms.knobs.toyBodyClear = v; }, label: () => (arms.knobs.toyBodyClear < 0 ? 'Held toy off her skin: off' : `Held toy off her skin ${Math.round(arms.knobs.toyBodyClear * 1000)} mm`) },
     ],
-    loco: loco ? [{ key: 'w', name: 'Wander', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } }] : [],
+    loco: loco ? [
+      { key: 'w', name: 'Wander', label: () => (loco.knobs.wander ? 'Wander: on' : 'Wander: off'), run: () => { loco.knobs.wander = !loco.knobs.wander; } },
+      { name: 'Righting', label: () => (loco.knobs.rightOn ? 'Righting: on' : 'Righting: off'), run: () => { loco.knobs.rightOn = !loco.knobs.rightOn; } },
+      ...[
+        ['Righting pull', 'rightN', [0, 0.6, 1.2, 2, 3], ' N'], ['Righting from', 'rightDot', [0, 0.17, 0.34, 0.5], ''],
+        ['Righting done at', 'rightDone', [0.7, 0.85, 0.95], ''], ['Righting after', 'rightAfter', [0, 0.25, 0.5, 1], ' s'],
+        ['Righting reach', 'rightReach', [0.02, 0.04, 0.06, 0.1], ' m'], ['Righting ramp', 'rightRamp', [0, 1.5, 3, 6], ' s'],
+        ['Righting tries another way', 'rightSwap', [1.5, 3, 5], ' s'], ['Righting gives up', 'rightMax', [6, 12, 20], ' s'],
+        ['Righting rests', 'rightRest', [2, 4, 8], ' s'], ['Righting near a surface', 'rightNear', [0.08, 0.12, 0.16], ' m'],
+        ['Righting below', 'rightHigh', [0.2, 0.3, 0.4], ' m'], ['Righting lets a lean be after', 'rightStill', [0.75, 1.5, 3], ' s'],
+      ].map(([name, key, values, unit]) => ({ type: 'range', name, values, get: () => loco.knobs[key], set: (v) => { loco.knobs[key] = v; }, label: () => `${name} ${loco.knobs[key]}${unit}` })),
+      { name: 'Flip her', label: () => 'Flip her', run: () => mantle.tip(2.9) },
+    ] : [],
   };
 
   const keys = new Map(), warned = new Set();

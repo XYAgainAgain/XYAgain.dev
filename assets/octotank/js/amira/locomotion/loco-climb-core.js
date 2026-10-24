@@ -14,7 +14,7 @@ export const CLIMB_KNOBS = {
   behindTol: 0.02,        // m a hold may fall behind the travel before its pull ends (design)
   holdSafety: 3,          // what the holds left after a release must bear, in multiples of her in-water weight (design)
   minWallHolds: 2,        // holds kept on anything steeper than a floor (design)
-  weightN: 0.39,          // N, her whole in-water weight (derived in the Water Report)
+  weightN: 0.7,           // N, her whole in-water weight, 1.77 kg × 0.04 × 9.81; Locomotion takes it from her live body
   domeWall: 0.25,         // the dome's share while she hangs on two or more wall holds (design)
   pullStallT: 3,          // s the stall's front-arm pull stays open on the floor after the stall asks for it (design)
   wallStandMax: 0.12,     // m off the spot along the wall's normal she may be and still have arrived on it (design, 2× her standoff)

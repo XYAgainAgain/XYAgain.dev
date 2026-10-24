@@ -46,6 +46,8 @@ export class Locomotion {
     this.toys = toys;
     this.knobs = { ...LOCO_KNOBS, ...knobs };
     this.knobs.pairWeights = [...this.knobs.pairWeights];
+    // The climb's and squeeze's hold rule weighs her as built, whichever installs first.
+    if (typeof mantle.weightInWater === 'function') this.knobs.weightN ??= mantle.weightInWater(true);
     const n = this.n = mantle.roots.length;
     this.modes = new Map([['push', PUSH]]);
     this._modeList = [PUSH];
@@ -68,6 +70,7 @@ export class Locomotion {
     this.desire = null;
     this.hold = false;        // a probe holds the mantle's arm modes; the controller keeps its hands off them
     this.holdBy = null;       // a hold that gives way to a jet (the den's settle), by its release(why)
+    this.flipped = false;     // the righting reflex has her: nothing plants and the stance stays off until she is over
     this.time = 0;
     this.c = [0, 0, 0]; this._cPrev = [0, 0, 0]; this._started = false;
     this.v = [0, 0, 0];
@@ -287,7 +290,7 @@ export class Locomotion {
     if (!d && level && Number.isFinite(pose.command) && Math.abs(eYaw) > band * 0.3 && this.canPlant) { if (this.anchorDown() > 0) this.stanceOn = false; }
     // The stance: with nowhere to go and nothing planted, each patch holds where she settled, until a stroke plants.
     if (d ? st.planted > 0 : st.stations > 0) this.stanceOn = false;
-    else if (!this.stanceOn && !d && this.settleT >= k.stanceSettle) {
+    else if (!this.stanceOn && !d && !this.flipped && this.settleT >= k.stanceSettle) {
       for (let a = 0; a < this.n; a++) m.rootWorld(a, this._p3), this.stanceP.set(this._p3, a * 3);
       this.stanceOn = true;
     }
@@ -346,7 +349,7 @@ export class Locomotion {
 
   _idle(a, dt, d, helpMin, crowdF, widen) {
     const k = this.knobs, A = this.arms;
-    if (!this.canPlant) return;
+    if (!this.canPlant || this.flipped) return;
     if (!d) {
       // Settled: an idle arm sealed on the furniture may hold her where she is.
       if (this.state.stations >= k.stations || !(A.anchorCount?.[a] > 0) || !fires(this.rng[a], k.stationRate, dt)) return;
@@ -390,7 +393,7 @@ export class Locomotion {
 
   _plant(a, o) {
     const A = this.arms;
-    if (!this.canPlant || (A.claim && !A.claim(a, 'stroke'))) return false;
+    if (!this.canPlant || this.flipped || (A.claim && !A.claim(a, 'stroke'))) return false;
     if (!A.plant(a, o)) { if (this.role[a] !== SEEK) A.unclaim?.(a, 'stroke'); return false; }
     const g = A.arms[a].goal;
     if (g) g.loco = this;
@@ -544,7 +547,7 @@ export class Locomotion {
     const arms = st.roles.map((r, a) => (r === 'planted' ? a : -1)).filter((a) => a >= 0);
     const what = d ? `${d.source} → ${d.kind === 'toy' ? `toy ${this.toys.indexOf(d.entry)}` : d.kind === 'furniture' ? d.entry.taste : d.point.map((v) => v.toFixed(2)).join(', ')}` : this.wander?.describe() ?? 'idle';
     const move = d ? `  ${(st.speed * 100).toFixed(1)} cm/s, urgency ${d.urgency.toFixed(2)}${st.stallT > 0.5 ? `, stalled ${st.stallT.toFixed(1)} s` : ''}` : '';
-    const note = this.canPlant ? '' : '  (no plant support yet)';
+    const note = (this.canPlant ? '' : '  (no plant support yet)') + (this.flipped ? `  ${this.rightMode?.describe?.() ?? 'righting'}` : '');
     return `${what}${move}  planted ${arms.join(',') || '–'}${st.seeking ? `  seeking ${st.seeking}` : ''}${st.stations ? `  stations ${st.stations}` : ''}${st.failed && !d ? `  last: ${st.failed}` : ''}${note}`;
   }
 }

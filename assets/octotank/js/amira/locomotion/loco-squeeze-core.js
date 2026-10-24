@@ -30,7 +30,7 @@ export const SQUEEZE_KNOBS = {
   cavityShare: 0.06,      // of her volume the full exhale sends out (design: a breath moves 3–4%, the cavity is unmeasured)
   lengthenTarget: 1.2,    // her length along the slot, over rest, while inside (design; thins her to 0.91× across, derived)
   lengthenK: 150,         // 1/s² at full drive (design, tuned by measurement)
-  capHaul: 8,             // N a far hold hauls with (design: the visible stretch that recovers, Body Rework Report)
+  capHaul: 14,            // N a far hold hauls with (design: the visible stretch that recovers, Body Rework Report)
   threadSpread: 0.1,      // m across the slot's width each threading arm's target leads its root by, along its bearing (design)
   squeezeLimit: 90,       // s the scenario allows for the whole passage (design)
 };

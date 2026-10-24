@@ -227,12 +227,13 @@ function aheadOf(loco, arms, dist) {
   const m = loco.mantle, c = m.ring().c, rf = { p: [0, 0, 0], n: [0, 0, 0], t: [0, 0, 0] };
   let dx = 0, dz = 0;
   for (const a of arms) { m.rootFrame(a, rf); dx -= rf.n[0]; dz -= rf.n[2]; }
-  const base = Math.atan2(dz, dx), sdf = loco.arms.sdf, nrm = [0, 0, 0];
+  const base = Math.atan2(dz, dx), sdf = loco.arms.sdf, nrm = [0, 0, 0], ground = loco.arms.phys?.terrain?.field;
   sdf?.unfocus?.();
   for (const off of [0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2]) {
     const p = [c[0] + dist * Math.cos(base + off), 0, c[2] + dist * Math.sin(base + off)];
-    // Sampled above the floor's own reach, so only walls, rocks, and the panel count against a spot.
-    if (!sdf || sdf.distance(p[0], 0.12, p[2], nrm) > 0.1) return p;
+    // Sampled 12 cm over the ground here, sand included, so only walls, rocks, and the panel count against a spot.
+    const y = (ground?.sample(p[0], p[2]) ?? 0) + 0.12;
+    if (!sdf || sdf.distance(p[0], y, p[2], nrm) > 0.1) return p;
   }
   return null;
 }

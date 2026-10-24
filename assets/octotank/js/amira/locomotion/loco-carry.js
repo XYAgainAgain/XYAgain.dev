@@ -44,6 +44,12 @@ export class Carry {
     this.arms = arms;
     this.loco = loco;
     this.knobs = { ...CARRY_KNOBS, ...knobs };
+    if (typeof mantle.weightInWater === 'function') {
+      this.knobs.bodyMass = knobs.bodyMass ?? 2 * mantle.knobs.mass;
+      this.knobs.bodyWeight = knobs.bodyWeight ?? mantle.weightInWater(true);
+      // 0.49 is Jolt's geometric mean of her skin's 0.4 friction and the floor's 0.6.
+      this.knobs.bodyToll = knobs.bodyToll ?? 0.49 * mantle.weightInWater();
+    }
     const n = arms.arms.length;
     this.job = new Array(n).fill(null);
     this.felt = new Float64Array(n * 3);
@@ -137,6 +143,8 @@ export class Carry {
       j.t += dt;
       const ep = A.episodes[i];
       if (!ep?.h || ep.toy !== j.toy) { this._end(i, j.kind === 'haul' ? 'lost' : 'ended'); continue; }
+      // On her back a haul's spring would pin her against the righting roll, so it ends and the grip goes back to the constraint.
+      if (j.kind === 'haul' && L?.flipped) { this._end(i, 'lost'); continue; }
       if (j.kind === 'haul') this._haul(i, j, ep, dt);
       else if (j.kind === 'stow') this._keepStowed(i, j, ep, dt);
       else if (j.kind === 'reel' && A.arms[i].goal?.kind !== 'fetch') this._end(i, 'ended');

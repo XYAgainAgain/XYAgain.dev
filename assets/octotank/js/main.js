@@ -14,6 +14,7 @@ import { Attention } from './amira/attention.js';
 import { Locomotion } from './amira/locomotion/locomotion.js';
 import { Wander } from './amira/locomotion/loco-wander.js';
 import { Carry } from './amira/locomotion/loco-carry.js';
+import { installRight } from './amira/locomotion/loco-right.js';
 import { installClimb } from './amira/locomotion/loco-climb.js';
 import { installSqueeze } from './amira/locomotion/loco-squeeze.js';
 import { installJet } from './amira/locomotion/loco-jet.js';
@@ -118,8 +119,8 @@ async function boot() {
   if (benchOn) {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
-    // Its intent chain keeps every finishing pass, as the twin check's twin does.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off' } : {}), toyPush: 'rod', gripLoad: true, seals: true, intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
@@ -139,6 +140,7 @@ async function boot() {
     installSqueeze(loco, { apertures: apertures(layoutKnobs) });
     jet = installJet(loco);
     installFew(loco, { carry });
+    installRight(loco);
     // Resting on the sand she settles into a den she digs; ?den=0 leaves her lying on the bed as it is.
     if (sand) den = new Den({ loco, mantle, arms, sand, jet }, { knobs: params.get('den') === '0' ? { on: false } : {} });
     // The records read locomotion's roles to tell a stroke from a station; Arms itself never sees locomotion.

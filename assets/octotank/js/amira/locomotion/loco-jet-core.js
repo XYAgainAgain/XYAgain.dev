@@ -1,13 +1,13 @@
 /* Jets, the swim, and the few-arm gaits without THREE or Jolt: the oxygen debt, the thrust law, the steering field, the
    dome's share while she thrusts, being adrift, and the two-arm overlap. loco-jet.js and loco-few.js run them on her
-   live body; every number is a knob on tank.knobs.loco. Newtons here are sim forces on the 0.5 kg soft body. */
+   live body; every number is a knob on tank.knobs.loco. Newtons here are sim forces on the 0.89 kg soft body. */
 
 export const JET_KNOBS = {
   jetUrgency: 0.85,       // a startle this urgent jets; a gentler one crawls away
   vJetMin: 0.45,          // m/s at jetUrgency: the measured mean jet, 45.3 cm/s (A. aculeatus, Huffard 2006)
   vJetMax: 1.0,           // m/s at urgency 1: 70.1 cm/s measured in A. aculeatus, 100 cm/s in O. vulgaris (Wells 1990)
   jetKv: 6,               // 1/s the thrust closes a speed error at, over what holds the speed against drag
-  jetMaxN: 3,             // N: 6 m/s² of headroom on 0.5 kg, about 0.2 s to 1 m/s
+  jetMaxN: 5.3,           // N: 6 m/s² of headroom on her drawn 0.89 kg, about 0.2 s to 1 m/s
   jetMeters: 3,           // m of jetting that spends the whole oxygen debt ("more than a few meters is impossible")
   jetRecover: 30,         // s the debt takes to clear from full; recovery after a jet is unmeasured
   jetReady: 0.5,          // debt above which no new jet starts

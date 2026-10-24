@@ -3,7 +3,7 @@ import { section } from './panel.js';
 export const WRENCH_WINDOW = 1800;
 
 /* The rod arms' live numbers and controls, shared by the bench and her body: how far each rod lies from its arm's
-   intent chain, what its root bears, its cost, and the panel's limp, ghost, detail, rest, hold, current, reset, and sliders. */
+   intent chain, what its root bears, its cost, and the panel's limp, ghost, detail, rest, hold, current, aim, reset, and sliders. */
 
 /* One rod against its intent chain, into out: tip gap, shape error, root force and torque, motion, fastest node. */
 export function rodStat(arm, rod, out) {
@@ -103,7 +103,7 @@ export class RodDiag {
     const A = this.arms, k = A.rodKnobs, rs = A.rodStats(), cm = (v) => (v * 100).toFixed(1), many = this.slots.length > 1, st = this.stats;
     // Measured now, at the readout's pace, rather than every tick on her body.
     this.slots.forEach((s, i) => rodStat(A.arms[s], A.rods[s], st[i]));
-    const lines = [`Rod      ${many ? `${this.slots.length} arms, ` : ''}${A.shadow ? 'shadow' : 'drive'}   E ${k.E0.toExponential(1)} Pa × ${k.tipStiff} at the tip   rest ${k.rest}   hold ${A.shadow ? 'its arm' : k.hold}${this.limp ? '   LIMP' : ''}`];
+    const lines = [`Rod      ${many ? `${this.slots.length} arms, ` : ''}${A.shadow ? 'shadow' : 'drive'}   E ${k.E0.toExponential(1)} Pa × ${k.tipStiff} at the tip, braced +${k.braceGain}×   rest ${k.rest}   hold ${A.shadow ? 'its arm' : k.hold}${this.limp ? '   LIMP' : ''}`];
     if (many) {
       const arm = (i) => A.rods[this.slots[i]].index, sh = worstOf(st, (x) => x.shapeRms), sp = worstOf(st, (x) => x.speedMax), pu = worstOf(st, (x) => x.rootN);
       lines.push(`Tip lag  ${this.slots.map((s, i) => `${A.rods[s].index} ${cm(st[i].tipLag)}`).join('  ')} cm`);
@@ -130,12 +130,19 @@ export class RodDiag {
     add({ key: 'k', name: 'Rest source', label: () => `Rest: ${k.rest}`, run: () => { k.rest = k.rest === 'bends' ? 'chain' : k.rest === 'chain' ? 'targets' : 'bends'; }, disabled: !on });
     add({ key: 'p', name: 'Contact hold', label: () => `Hold: ${A.shadow ? 'its arm' : k.hold}`, run: () => { k.hold = k.hold === 'rod' ? 'ghost' : k.hold === 'ghost' ? 'off' : 'rod'; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'u', name: 'Current', label: () => (k.current ? 'Current: on' : 'Current: off'), run: () => { k.current = !k.current; }, disabled: !on });
+    add({ key: 'v', name: 'Aim through the rod', label: () => (k.aim ? 'Aim: through the rod' : 'Aim: as posed'), run: () => { k.aim = !k.aim; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'x', name: 'Reset the rod', label: () => (this.slots.length > 1 ? 'Reset the rods' : 'Reset the rod'), run: () => this.reset(), disabled: !on });
     if (!on) return;
     const sci = (v) => v.toExponential(1).replace('e+', 'e');
     const range = (label, values, get, set, fmt) => add({ type: 'range', name: label, values, get, set, label: () => `${label} ${fmt(get())}` });
-    range('Stiffness', [3e4, 1e5, 2e5, 3e5, 5e5, 1e6, 2e6, 5e6], () => k.E0, (v) => { k.E0 = v; }, (v) => `${sci(v)} Pa`);
+    range('Tissue', [3e4, 1e5, 2e5, 2.6e5, 5e5, 1e6, 2e6, 5e6], () => k.E0, (v) => { k.E0 = v; }, (v) => `${sci(v)} Pa`);
     range('Tip ×', [0.1, 0.25, 0.5, 1, 2, 4], () => k.tipStiff, (v) => { k.tipStiff = v; }, (v) => `${v}`);
+    range('Bracing', [0, 1, 2, 4, 6, 8, 12, 16], () => k.braceGain, (v) => { k.braceGain = v; }, (v) => `+${v}×`);
+    range('Reach brace', [0, 0.1, 0.25, 0.4, 0.6, 0.8, 1], () => k.reachBrace, (v) => { k.reachBrace = v; }, (v) => `${Math.round(v * 100)}%`);
+    range('Firm-up', [0.05, 0.1, 0.25, 0.5, 1], () => k.grabTau, (v) => { k.grabTau = v; }, (v) => `${v} s`);
+    range('Aim reach', [0, 0.02, 0.04, 0.08, 0.12], () => k.aimMax, (v) => { k.aimMax = v; }, (v) => `${Math.round(v * 100)} cm`);
+    range('Aim pace', [0.1, 0.2, 0.3, 0.5, 1], () => k.aimTau, (v) => { k.aimTau = v; }, (v) => `${v} s`);
+    range('Aim press', [0, 0.002, 0.004, 0.006, 0.01], () => k.aimPress, (v) => { k.aimPress = v; }, (v) => `${(v * 1000).toFixed(0)} mm`);
     range('Weight', [0, 0.02, 0.04, 0.08, 0.15, 0.3], () => k.weightFactor, (v) => { k.weightFactor = v; }, (v) => `${Math.round(v * 100)}% g`);
     range('Added mass', [0, 0.5, 1], () => k.addedMass, (v) => { k.addedMass = v; }, (v) => `${v}`);
     range('Substeps', [1, 2, 3, 4], () => k.substeps, (v) => { k.substeps = v; }, (v) => `${v}`);

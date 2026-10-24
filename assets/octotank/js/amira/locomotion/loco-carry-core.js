@@ -14,9 +14,9 @@ export const CARRY_KNOBS = {
   floorGap: 0.005,        // m between a toy's lowest point and the floor under which it rests on it
   floorCos: 0.7,          // a surface whose normal is this near up is a floor
   floorMu: 0.55,          // toy on floor, √(0.5 × 0.6) by Jolt's geometric mean
-  bodyWeight: 0.39,       // N, her whole animal in water
-  bodyToll: 0.1,          // N to drag her soft body along the floor: 0.49 × 0.196 N
-  bodyMass: 1,            // kg
+  bodyWeight: 0.7,        // N, her whole animal in water; Carry takes these three from her live body
+  bodyToll: 0.17,         // N to drag her soft body along the floor: 0.49 × 0.35 N
+  bodyMass: 1.77,         // kg, her body and arms
   verticalCos: 0.5,       // a pull this steep is a lift, judged by weight in water
   feelGrips: true,        // what she carries pulls on the patch of the arm carrying it
   feelCap: 1.5,           // N the most a carry's pull on her patch gets

@@ -10,7 +10,7 @@ export const ARM_KNOBS = {
   frontArms: [0, 7],
   frontScale: 0.92,      // her first pair runs a little shorter than the rest
   tipLenRatio: 0.45,     // last segment's rest length over the first's
-  rootRadius: 0.014,     // fuller than the measured arm scaled to her 1 kg (11.5 mm), still 4 mm clear of the next root
+  rootRadius: 0.014,     // fuller than the measured arm scaled to a 1 kg animal (11.5 mm), still 4 mm clear of the next root
   tipRadius: 0.003,
   taperPow: 2,           // radius falls as (1 - s)^taperPow along the arc; arm mass isn't simulated, so this is a look
   bendBase: 0.32,        // rad per joint at the base, loosening toward the tip on a bendPow ramp
@@ -1382,8 +1382,9 @@ export class Arm {
 
   _reachTargets(T, K, dt) {
     const k = this.knobs, F = this.frame, S = this.n - 1, g = this.goal, Lr = this._length;
-    const dir = this._t;
-    dir[0] = g.target[0] - F.p[0]; dir[1] = g.target[1] - F.p[1]; dir[2] = g.target[2] - F.p[2];
+    // A rod arm's reach may aim off its target by how far its rod hangs off this chain (Arms._aimRod).
+    const dir = this._t, tg = g.aim ?? g.target;
+    dir[0] = tg[0] - F.p[0]; dir[1] = tg[1] - F.p[1]; dir[2] = tg[2] - F.p[2];
     const D = len3(dir[0], dir[1], dir[2]);
     if (D > 1e-6) normalize3(dir);
     const hold = g.kind === 'hold';
@@ -1529,7 +1530,7 @@ export class Arm {
       // The suckers face into the fold, so the elbow bows to the arm's back; taken once, or the fold would chase itself.
       g.bow = [-this.SK[i1 * 3], -this.SK[i1 * 3 + 1], -this.SK[i1 * 3 + 2]];
     }
-    const [d10, d20, d30] = g.d0, M = g.target, J = g.J;
+    const [d10, d20, d30] = g.d0, M = g.aim ?? g.target, J = g.J;
     // Where the links end: the base keeps its line, then a two-link solve from the first joint into the mouth.
     const Ex = F.p[0] + d10[0] * l1, Ey = F.p[1] + d10[1] * l1, Ez = F.p[2] + d10[2] * l1;
     let mx = M[0] - Ex, my = M[1] - Ey, mz = M[2] - Ez;
@@ -1816,7 +1817,7 @@ export class Arm {
     const gripping = this.goal && (this.goal.kind === 'reach' || this.goal.kind === 'hold' || this.goal.kind === 'plant');
     if (this.gw > 1e-4 && this.started && (gripping || this._lastGrip)) {
       if (gripping) {
-        const G = this.G, tg = this.goal.target, gi = this.gripAt;
+        const G = this.G, tg = this.goal.aim ?? this.goal.target, gi = this.gripAt;
         if (Number.isFinite(this.X[this.n * 3 - 1])) G.set(this.X); else this.poseFromBends(O, G, null);
         G[0] = this.frame.p[0]; G[1] = this.frame.p[1]; G[2] = this.frame.p[2];
         const cone = this._cone ??= { cos: this.limCos, sin: this.limSin, rootLim: 0, root: this.frame.d };

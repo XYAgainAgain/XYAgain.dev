@@ -8,14 +8,14 @@ export const LOCO_KNOBS = {
   speedHurried: 0.19,     // m/s at urgency 1, under the measured 21.3 cm/s crawl maximum
   arriveR: 0.08,          // m, about half her mantle
   wallStandoff: 0.06,     // m her crown can't get closer to a wall than, added to arriveR when a place is up a wall
-  capCalm: 1.5,           // N per planted arm at urgency 0 and 1, under what the skin bears without visible stretch
-  capHurried: 5,
-  capHaul: 8,
+  capCalm: 2.7,           // N per planted arm at urgency 0 and 1, sized to her drawn 0.89 kg: 1.77× the caps that set her
+  capHurried: 8.9,        // pace at 0.5 kg, so a stroke accelerates her as much
+  capHaul: 14,
   anchorSafety: 0.6,      // share of the anchor's sealed hold an arm may pull with
   helpMin: 0.25,          // an arm whose line lies this far off the travel no longer helps
   toneK: 0,               // 1/s² pulling free patches toward their rest shape; momentum-neutral, off unless the ring folds
   yawGain: 4,             // heading error (rad) times a root's radius times this, as a tangential offset on its target
-  yawMax: 0.05,           // m, the most that offset gets: about 1 N on a patch at the measured 0.2 N/cm
+  yawMax: 0.05,           // m, the most that offset gets: about 1.8 N on a patch, the 0.2 N/cm measured at 0.5 kg scaled with her mass
   stallShare: 0.2,        // stalled while the crown makes under this share of the wanted speed along the travel
   stallT: 1.5,            // s stalled before recruitment widens
   stallPull: 4,           // s before the front arms would reach ahead for a hold (with a pull mode registered)
@@ -42,15 +42,15 @@ export const LOCO_KNOBS = {
   recoverTol: 0.03,       // stretch over rest a recovered arm may keep
   floorCos: 0.7,          // a support whose normal is this near up is a floor
   climbSin: 0.42,         // a travel this steep is a climb
-  stationN: 0.5,          // N a station hold pulls with
+  stationN: 0.9,          // N a station hold pulls with
   stations: 3,            // stations at most at once; she plants them to turn on the spot
   stationRate: 0,         // 1/s an idle arm on the furniture becomes a station unasked (off: stations are for turning)
   stationMax: 30,         // s a station lasts
   stationLinger: 1,       // s stations stay after a turn on them has finished
-  stanceN: 1.5,           // N each patch holds her body where it settled while she stands still
+  stanceN: 2.7,           // N each patch holds her body where it settled while she stands still
   stanceSpeed: 0.01,      // m/s under which her crown counts as settled
   stanceSettle: 0.5,      // s settled before the stance takes hold
-  turnCap: 1.5,           // N a station may pull with while she turns on it
+  turnCap: 2.7,           // N a station may pull with while she turns on it
   pairWeights: [0.3, 0.5, 1.0, 0.9, 0.9, 1.0, 0.5, 0.3],   // by arm: pair 3 pushes most, then 4, 2, and 1
   wanderMin: 8,           // s between her own destinations, at random in this range
   wanderMax: 20,

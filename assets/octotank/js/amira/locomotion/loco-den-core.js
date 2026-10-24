@@ -18,7 +18,7 @@ export const DEN_KNOBS = {
   shimmy: 0.003,         // m her arm bases slide side to side with each rock
   axisTurn: 6,           // s the rocking's axis takes to come round, so she rocks every which way
   ease: 1,               // s the wiggle swells in over and dies away over
-  holdN: 1.5,            // N each arm base holds her with while she settles, the stance's own
+  holdN: 2.7,            // N each arm base holds her with while she settles, the stance's own
   hunker: 0.003,         // m she presses down past the bed's drop, lying low
 };
 
