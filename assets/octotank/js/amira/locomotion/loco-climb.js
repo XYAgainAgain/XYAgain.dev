@@ -2,14 +2,14 @@ import { TANK } from '../../config.js';
 import { ROLE, lerp } from './locomotion-core.js';
 import {
   CLIMB_KNOBS, surfaceMode, ellMin, pullRate, holdAhead, pullRelease, releaseSafe, supportNormal, wallHolds, arrivedWall,
-  pullUsefulness, reachPoint, wallAt, wallReachPoint, domeShare,
+  pullUsefulness, reachPoint, wallAt, wallReachPoint, domeShare, stationSpare,
 } from './loco-climb-core.js';
 import { until, register } from '../../diag/scenarios.js';
 
 /* The climb: on walls, under the lid, and wherever her travel is steep, an arm reaches ahead, seals, and shortens its spring's rest
    length to haul her to the hold; holds let go hand over hand, never below the safety rule, and stay as stations she hangs from on arrival. */
 
-const { idle: IDLE, planted: PLANTED, station: STATION } = ROLE;
+const { idle: IDLE, seek: SEEK, planted: PLANTED, station: STATION } = ROLE;
 const VOLUNTARY = new Set(['short', 'behind', 'long', 'full']);
 const UP = [0, 1, 0];
 
@@ -26,6 +26,8 @@ export class Pull {
     this.made = new Uint8Array(n);
     this.madeT = new Float64Array(n);           // the arm's role time when last seen as Pull's station: a restart means a new station
     this.wallReachAt = new Float64Array(n);
+    this.freedT = new Float64Array(n).fill(-Infinity);   // when a stalled hang last let this arm's station go to pull
+    this._pullerAt = -1; this._pullerA = -1;
     this._pinned = false;
     this.holding = new Uint8Array(n);
     this.support = [0, 1, 0];
@@ -57,8 +59,8 @@ export class Pull {
       if (this.made[a] && L.role[a] === STATION) L._release(a, 'reset');
       if (this.wallReachAt[a] > 0 && L.role[a] === IDLE) { if (A.arms[a].goal?.loco === L) A.arms[a].idle(); A.unclaim?.(a, 'stroke'); }
     }
-    this.made.fill(0); this.hangSet.fill(0); this.wallReachAt.fill(0);
-    this._pinned = false; this.stallUntil = -Infinity; this._at = -1; this.dome = 1;
+    this.made.fill(0); this.hangSet.fill(0); this.wallReachAt.fill(0); this.freedT.fill(-Infinity);
+    this._pinned = false; this.stallUntil = -Infinity; this._at = -1; this._pullerAt = -1; this.dome = 1;
     L.mantle.knobs.righting = this._domeSet = this._domeBase;
   }
 
@@ -78,7 +80,8 @@ export class Pull {
     const below = dist ? dist(L.c[0], L.c[1] - k.standH, L.c[2], this._nb) : NaN;
     this.standing = Number.isFinite(below) && below <= 0;
     this.walls = wallHolds(L.anchorN, this.holding, k);
-    this.steep = !this.standing && !(this.support[1] > k.floorCos) && this.holding.some(Boolean);
+    // Holds on opposed faces (a chimney) average to a normal that can read as a floor, so enough wall holds alone count.
+    this.steep = !this.standing && this.holding.some(Boolean) && (!(this.support[1] > k.floorCos) || this.walls >= k.minWallHolds);
     const d = L.desire;
     // Standing, only the travel's own slope opens a pull: rock beside her mustn't turn a floor crawl into hauling.
     this.pullOn = !!d && (this.steep || L.time < this.stallUntil || surfaceMode(this.standing ? UP : this.support, L.d3, k) === 'pull');
@@ -155,6 +158,7 @@ export class Pull {
     if (!safe) this.stats.unsafeLost++;
     this.stats.releases[why]++;
     // Later arms this tick judge their own release without this hold.
+    if (this.holding[a] && !(loco.anchorN[a * 3 + 1] > k.floorCos)) this.walls--;
     this.holding[a] = 0;
     return why;
   }
@@ -202,14 +206,40 @@ export class Pull {
     }
   }
 
-  /* While she hangs, a station outlasts the linger and the station clock; with somewhere to go, it lets go after the
-     controller's 0.3 s once the other holds would still bear her. */
+  /* While she hangs a station outlasts the linger and the station clock. With somewhere to go and the other holds bearing her, a spare lets
+     go once a pull has taken its place; stalled with nothing pulling or reaching, the station best placed to pull does, hand over hand. */
   holdStation(loco, a) {
     this._refresh();
     if (!this.steep) return false;
-    if (!loco.desire || loco.roleT[a] <= 0.3 || !releaseSafe(loco.holdF, this.holding, a, true, this.k)) return true;
+    // A squeeze threading a slot sets its stations' lines and lets them go by its own rule, so the hang's rules wait outside it.
+    const k = this.k, sq = loco.modes.get('squeeze'), own = !(sq?.active && loco.desire === sq.desire);
+    let pulls = 0, reaching = false;
+    for (let b = 0; b < loco.n; b++) {
+      if (loco.role[b] === PLANTED && this.holding[b] && !(loco.anchorN[b * 3 + 1] > k.floorCos)) pulls++;
+      if (loco.role[b] === SEEK && loco.strokeMode[b] === this) reaching = true;
+    }
+    // While a pull hauls her, a held station's line gives way to its chord rather than holding her back; _settle pins it after.
+    if (own && pulls > 0 && loco.desire) loco.ell[a] = loco.chord[a];
+    if (!loco.desire || loco.roleT[a] <= 0.3 || !releaseSafe(loco.holdF, this.holding, a, true, k)) return true;
+    const free = own && !pulls && !reaching && loco.phase >= 1 && this.walls > k.minWallHolds && a === this._puller(loco);
+    if (own && !free && !stationSpare(this.walls, pulls, k)) return true;
+    if (free) this.freedT[a] = loco.time;
     this.holding[a] = 0;
+    if (!(loco.anchorN[a * 3 + 1] > k.floorCos)) this.walls--;
     return false;
+  }
+
+  /* The wall station past the controller's 0.3 s whose root bears most along the travel, once a tick; -1 if none helps. */
+  _puller(loco) {
+    if (this._pullerAt === loco.time) return this._pullerA;
+    let best = -1, use = 0;
+    for (let b = 0; b < loco.n; b++) {
+      if (loco.role[b] !== STATION || loco.roleT[b] <= 0.3 || loco.anchorN[b * 3 + 1] > this.k.floorCos) continue;
+      const u = pullUsefulness(loco.mantle.rootFrame(b, this._rf).n, this.up, loco.d3);
+      if (u > use) { use = u; best = b; }
+    }
+    this._pullerAt = loco.time;
+    return (this._pullerA = best);
   }
 
   /* A sealed patch of arm a on a wall, off its current anchor, or null. */
@@ -236,7 +266,8 @@ export class Pull {
     let short = this.walls < k.minWallHolds;
     for (let a = 0; a < L.n && this.walls < want; a++) {
       const g = L.arms.arms[a].goal;
-      if (L.role[a] !== IDLE || (g && g.loco !== L)) continue;
+      // A station freed to pull gets its reach and its cool-down before it may hold again.
+      if (L.role[a] !== IDLE || (g && g.loco !== L) || L.time < this.freedT[a] + k.seekMax + k.seekCool) continue;
       const o = this._wallAnchor(a);
       if (o && L.plantStation(a, o)) { this.walls++; this.holding[a] = 1; this.made[a] = 1; this.madeT[a] = L.roleT[a]; this.stats.toppedUp++; if (this._pinned) this._settle(a); }
       else if (short && !g && this._reachWall(a)) short = false;

@@ -13,6 +13,7 @@ export const RIGHT_KNOBS = {
   rightRamp: 3,           // s over which that pull doubles while she stays over
   rightSwap: 3,           // s without her coming any further up before the arms try rolling her another way
   rightHigh: 0.3,         // m: only with her body's center under this, so a hang up the glass, mantle below her arms, is no flip
+  rightHang: 0.5,         // how far below level (about 30°) her up may dip on the glass and still read as hanging
   rightStill: 1.5,        // s lying still the right way up, leaning on something, before the reflex lets her be
   rightMax: 12,           // s the reflex tries at most before it rests
   rightRest: 4,           // s it rests after giving up
@@ -26,10 +27,22 @@ export function supportDot(up, support) {
   return l > 1e-9 ? dot3(up, support) / l : up[1];
 }
 
-/* The latch's next state. `hang`: she hangs from the walls the right way round; `lying`: something solid lies under her
-   body, and while it does a rock flank by her crown reading as upright never ends the latch. */
-export function flipped(was, dot, upY, near, hang, lying, k = RIGHT_KNOBS) {
-  if (!Number.isFinite(dot)) return false;
+/* Wall holds that don't mean a flip. Her up clearly above level they make a lean; with nothing under her body she hangs down to
+   rightHang below level, or past it on two holds the right way round; with the floor under her, only at a wall's foot. */
+export function clinging(steep, walls, upY, dot, lying, k = RIGHT_KNOBS) {
+  if (!(walls >= 1)) return false;
+  if (upY > k.rightDot) return true;
+  // Past rightHang below level with nothing under her, only the two-hold hang the right way round holds; less lets go and rights.
+  if (!lying) return upY > -k.rightHang || (walls >= 2 && dot >= -k.rightDot);
+  // At a wall's foot, the floor under her body: off it by her crown (steep) on two holds, her up not turned into them and
+  // dipping no more than rightHang.
+  return !!steep && walls >= 2 && upY > -k.rightHang && dot >= -k.rightDot;
+}
+
+/* The latch's next state, never on while she clings. `hang`: she hangs from the walls the right way round; `lying`: something solid
+   lies under her body, and while it does a rock flank by her crown reading as upright never ends the latch. */
+export function flipped(was, dot, upY, near, hang, lying, k = RIGHT_KNOBS, cling = false) {
+  if (!Number.isFinite(dot) || cling) return false;
   if (upY >= k.rightDone) return false;
   if (was) return lying || dot < k.rightDone;
   return near && (dot < -k.rightDot || (!hang && upY < -k.rightDot));

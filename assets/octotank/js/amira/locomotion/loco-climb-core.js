@@ -62,6 +62,10 @@ export function releaseSafe(force, holding, a, steep = true, k = CLIMB_KNOBS) {
   return n >= k.minWallHolds && f >= k.holdSafety * k.weightN;
 }
 
+/* Whether a hang's station may let go with somewhere to go: only once a pull has taken its place and she holds more than
+   minWallHolds and a spare. Without the pull, the freed arm only re-plants beside where she has sagged to. */
+export function stationSpare(walls, pulls, k = CLIMB_KNOBS) { return pulls > 0 && walls > k.minWallHolds + k.spareHolds; }
+
 /* The mean outward normal of the holding arms' anchors (flat, 3 per arm), or the fallback when none hold. */
 export function supportNormal(anchorN, holding, fallback, out) {
   let x = 0, y = 0, z = 0;

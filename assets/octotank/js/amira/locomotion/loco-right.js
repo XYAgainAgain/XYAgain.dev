@@ -1,5 +1,5 @@
 import { ROLE } from './locomotion-core.js';
-import { RIGHT_KNOBS, ROLL_TURNS, supportDot, flipped, rollDir, turnDir, nearSide, rightPull } from './loco-right-core.js';
+import { RIGHT_KNOBS, ROLL_TURNS, supportDot, clinging, flipped, rollDir, turnDir, nearSide, rightPull } from './loco-right-core.js';
 
 /* The righting reflex: on her back, every hold and the stance let go (they only pin her there) and the arm bases she
    leans toward pull down to the floor until she rolls over. Listens after the climb, whose support it reads. */
@@ -53,7 +53,8 @@ export class Right {
     const sp = this._cPrev ? Math.hypot(c[0] - this._cPrev[0], c[1] - this._cPrev[1], c[2] - this._cPrev[2]) / dt : 0;
     this._cPrev ??= [0, 0, 0];
     this._cPrev[0] = c[0]; this._cPrev[1] = c[1]; this._cPrev[2] = c[2];
-    this.on = flipped(was, dot, up[1], near, hang, lying, k) && (was || L.time >= this.restUntil);
+    const cling = clinging(pull?.steep, pull?.walls ?? 0, up[1], dot, lying, k);
+    this.on = flipped(was, dot, up[1], near, hang, lying, k, cling) && (was || L.time >= this.restUntil);
     // Still and leaning the right way up, or past rightMax, it rests: a latch that never let go would keep every arm unplanted.
     this.still = this.on && up[1] > 0 && sp < k.stanceSpeed ? this.still + dt : 0;
     if (this.on && (this.still > k.rightStill || this.t > k.rightMax)) { this.on = false; this.restUntil = L.time + k.rightRest; this.stats.gaveUp++; }
