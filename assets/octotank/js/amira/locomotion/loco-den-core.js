@@ -1,5 +1,5 @@
 /* The den's numbers, engine-free: when a bowl under her is already comfortable, how far along the dig is, the wiggle's
-   envelope, and where each arm base goes as she rocks, twists, and shimmies herself down into the gravel. */
+   envelope, and where each arm base goes as she rocks, twists, and shimmies herself down into the gravel and glides back out. */
 
 export const DEN_KNOBS = {
   on: true,
@@ -20,7 +20,34 @@ export const DEN_KNOBS = {
   ease: 1,               // s the wiggle swells in over and dies away over
   holdN: 2.7,            // N each arm base holds her with while she settles, the stance's own
   hunker: 0.003,         // m she presses down past the bed's drop, lying low
+  exitTime: 2.5,         // s she takes to glide up out of the bowl when she sets off from it; 0 leaves it to the crawl
+  exitDist: 1.4,         // radii she glides toward where she's going, her center past the rim's crest at 1.3
 };
+
+/* The flat way out of a den at (cx, cz) toward (px, pz), into out as [x, z]; null when the place lies inside minDist,
+   where she'd arrive before she was out of the bowl anyway. */
+export function exitWay(cx, cz, px, pz, minDist, out) {
+  const dx = px - cx, dz = pz - cz, l = Math.hypot(dx, dz);
+  if (!(l > minDist) || !Number.isFinite(l)) return null;
+  out[0] = dx / l; out[1] = dz / l;
+  return out;
+}
+
+/* How far along the glide out she is at u (0–1) of it, as a share of its distance, and that share's rate per unit u:
+   eased in and out, so she neither jerks off the bowl's floor nor lands on the crawl moving. */
+export function exitEase(u) {
+  const v = u <= 0 ? 0 : u >= 1 ? 1 : u;
+  return { at: v * v * (3 - 2 * v), rate: 6 * v * (1 - v) };
+}
+
+/* Where an arm base that began the glide at (ax, az) goes, into out as [x, z]: turned by theta about (px, pz), her center
+   when the glide began, so she faces the way her heading asks, and slid dist along the way (wx, wz). */
+export function exitSpot(ax, az, px, pz, theta, wx, wz, dist, out) {
+  const c = Math.cos(theta), s = Math.sin(theta), rx = ax - px, rz = az - pz;
+  out[0] = px + rx * c - rz * s + wx * dist;
+  out[1] = pz + rx * s + rz * c + wz * dist;
+  return out;
+}
 
 /* What the bowl under her asks for: a light settle when it already fits, and the share of it still to dig. */
 export function denPlan(missing, total, k = DEN_KNOBS) {
