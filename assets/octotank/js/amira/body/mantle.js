@@ -492,7 +492,7 @@ export class Mantle {
     }
   }
 
-  /* Turn her by `angle` radians about a world axis through her centroid, at rest, so righting can be watched. */
+  /* Turn her by `angle` radians about a world axis through her mass center (the rigid state's), at rest, so righting can be watched. */
   tip(angle, axis = [0, 0, 1]) {
     this.sync();
     const H = this.J.HEAPF32, s = this.stride;
@@ -501,7 +501,10 @@ export class Mantle {
     this._owed = false;
     const ax = axis[0] / l, ay = axis[1] / l, az = axis[2] / l;
     const c = Math.cos(angle), sn = Math.sin(angle), t = 1 - c;
-    const m = this.centroid().map((v, i) => v - this.origin[i]);
+    const P = this.positions, w = this.vertexMass, m = [0, 0, 0];
+    let M = 0;
+    for (let i = 0, n = this.shell.count; i < n; i++) { M += w[i]; m[0] += w[i] * P[i * 3]; m[1] += w[i] * P[i * 3 + 1]; m[2] += w[i] * P[i * 3 + 2]; }
+    m[0] /= M; m[1] /= M; m[2] /= M;
     for (let i = 0, n = this.shell.count; i < n; i++) {
       const po = this.posAt + i * s, vo = this.velAt + i * s;
       const x = H[po] - m[0], y = H[po + 1] - m[1], z = H[po + 2] - m[2];

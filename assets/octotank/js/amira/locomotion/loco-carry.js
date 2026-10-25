@@ -205,8 +205,11 @@ export class Carry {
     if (!k.feelGrips || !m.driven || !R) { F.fill(0); return; }
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.feelTau));
     let any = false;
+    const own = this._atRoot ??= new Uint8Array(this.job.length);
     for (let i = 0; i < this.job.length; i++) {
-      const live = A.episodes[i]?.h && this.job[i]?.kind !== 'haul' && !A.gripAtRoot?.(i);
+      const root = !!A.gripAtRoot?.(i), live = A.episodes[i]?.h && this.job[i]?.kind !== 'haul' && !root;
+      // A grip handed between her patch and a joined root hands its felt pull over at once: eased, both would carry it a while.
+      if (root !== !!own[i]) { own[i] = root ? 1 : 0; for (let a = 0; a < 3; a++) F[i * 3 + a] = live ? R[i * 3 + a] : 0; }
       for (let a = 0; a < 3; a++) F[i * 3 + a] += ((live ? R[i * 3 + a] : 0) - F[i * 3 + a]) * f;
       const mag = Math.hypot(F[i * 3], F[i * 3 + 1], F[i * 3 + 2]);
       if (mag > k.feelCap) for (let a = 0; a < 3; a++) F[i * 3 + a] *= k.feelCap / mag;

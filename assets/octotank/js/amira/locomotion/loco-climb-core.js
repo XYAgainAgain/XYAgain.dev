@@ -102,16 +102,44 @@ export function pullUsefulness(n, up, d) {
    `distance(x, y, z, normalOut)`. Null when that surface lies over snapMax away or behind the crown. */
 export function reachPoint(c, d, distance, out, nrm, k = CLIMB_KNOBS) {
   out[0] = c[0] + d[0] * k.reachAhead; out[1] = c[1] + d[1] * k.reachAhead; out[2] = c[2] + d[2] * k.reachAhead;
+  if (!snap(out, distance, nrm, k)) return null;
+  return holdAhead(out, c, d) > 0 ? out : null;
+}
+
+function snap(out, distance, nrm, k) {
   let moved = 0;
   for (let it = 0; it < 4; it++) {
     const s = distance(out[0], out[1], out[2], nrm);
-    if (!Number.isFinite(s)) return null;
+    if (!Number.isFinite(s)) return false;
     out[0] -= nrm[0] * s; out[1] -= nrm[1] * s; out[2] -= nrm[2] * s;
     moved += Math.abs(s);
     if (Math.abs(s) < 1e-5) break;
   }
-  if (moved > k.snapMax || !Number.isFinite(out[0] + out[1] + out[2])) return null;
-  return holdAhead(out, c, d) > 0 ? out : null;
+  return moved <= k.snapMax && Number.isFinite(out[0] + out[1] + out[2]);
+}
+
+/* The wall a place up off the floor sits on: the surface nearest P, its point written to W and outward normal to n.
+   False when that surface is a floor (a rock's top is walked to, not climbed) or there is none. */
+export function wallAt(P, distance, W, n, k = LOCO_KNOBS) {
+  const s = distance(P[0], P[1], P[2], n);
+  if (!Number.isFinite(s) || n[1] > k.floorCos) return false;
+  W[0] = P[0] - n[0] * s; W[1] = P[1] - n[1] * s; W[2] = P[2] - n[2] * s;
+  return true;
+}
+
+/* The reach up the wall through W (outward normal n) toward T: from the crown's foot on its plane, along its tangent, reachAhead
+   from the crown, then onto the surface; along the 3D travel the last stretch under a spot turns straight up, off the glass. */
+export function wallReachPoint(c, T, W, n, distance, out, nrm, k = CLIMB_KNOBS) {
+  const h = (c[0] - W[0]) * n[0] + (c[1] - W[1]) * n[1] + (c[2] - W[2]) * n[2];
+  if (!(h > -k.holdTol && h < k.reachAhead)) return null;
+  const vx = T[0] - c[0], vy = T[1] - c[1], vz = T[2] - c[2], a = vx * n[0] + vy * n[1] + vz * n[2];
+  let tx = vx - a * n[0], ty = vy - a * n[1], tz = vz - a * n[2];
+  const l = Math.hypot(tx, ty, tz), hp = Math.max(0, h), s = Math.sqrt(k.reachAhead * k.reachAhead - hp * hp);
+  if (!(l > 1e-6)) return null;
+  tx /= l; ty /= l; tz /= l;
+  out[0] = c[0] - n[0] * h + tx * s; out[1] = c[1] - n[1] * h + ty * s; out[2] = c[2] - n[2] * h + tz * s;
+  if (!snap(out, distance, nrm, k)) return null;
+  return (out[0] - c[0]) * tx + (out[1] - c[1]) * ty + (out[2] - c[2]) * tz > 0 ? out : null;
 }
 
 /* The share of the dome she keeps: domeWall while two or more holds are on the walls, all of it otherwise. */

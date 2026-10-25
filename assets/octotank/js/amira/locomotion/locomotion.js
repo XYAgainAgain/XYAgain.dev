@@ -61,6 +61,7 @@ export class Locomotion {
     this.max = new Float64Array(n);
     this.rate = new Float64Array(n);
     this.lostT = new Float64Array(n);
+    this.slipT = new Float64Array(n);
     this.holdF = new Float64Array(n);
     this.anchorP = new Float64Array(n * 3);
     this.anchorN = new Float64Array(n * 3);
@@ -132,8 +133,9 @@ export class Locomotion {
 
   stop(why = 'stopped') { if (this.desire) this._finish(false, why); }
 
-  /* A clean slate between scenarios: the desire stops, and every listener with a reset (a carry) drops what it holds. */
-  reset(why = 'reset') { this.stop(why); for (const f of this.listeners) f.reset?.(why); }
+  /* A clean slate between scenarios: the desire stops, the arms forget their stings and seal history, and every listener
+     with a reset (a carry) drops what it holds. */
+  reset(why = 'reset') { this.stop(why); this.arms.resetHistory?.(); for (const f of this.listeners) f.reset?.(why); }
 
   _resolve(target) {
     if (typeof target === 'number') target = this.toys[target];
@@ -334,8 +336,19 @@ export class Locomotion {
         m.armAxis[a * 3] = 0; m.armAxis[a * 3 + 1] = 0; m.armAxis[a * 3 + 2] = 0;
         m.armVel[a * 3] = 0; m.armVel[a * 3 + 1] = 0; m.armVel[a * 3 + 2] = 0;
         m.armCap[a] = k.stanceN;
+      } else if (turning && A.coupling && k.turnFreeCoupled > 0 && Number.isFinite(pose.command) && role !== BUSY && !A.episodes?.[a]?.h) {
+        // A commanded turn, sharing her arms' solve: every free arm's base pushes along it too, or their drag holds her back.
+        const p = m.rootWorld(a, this._p3), y = yawTerm(p[0] - this.c[0], p[2] - this.c[2], eYaw, k, this._f3);
+        m.armMode[a] = 1;
+        m.armTarget[a * 3] = p[0] + y[0]; m.armTarget[a * 3 + 1] = p[1]; m.armTarget[a * 3 + 2] = p[2] + y[2];
+        m.armAxis[a * 3] = 0; m.armAxis[a * 3 + 1] = 0; m.armAxis[a * 3 + 2] = 0;
+        m.armVel[a * 3] = 0; m.armVel[a * 3 + 1] = 0; m.armVel[a * 3 + 2] = 0;
+        m.armCap[a] = Math.max(k.stationN, k.turnCap) * k.turnFreeCoupled;
       } else m.armCap[a] = Infinity;
       if (role === SEEK) seeking++;
+      // An arm swinging to its next hold, and in a turn or a squeeze every arm nothing else holds, rides her (Arms.carried):
+      // their swing, drag, and contact would otherwise fight the very motion her springs make.
+      if (A.carried && role !== BUSY && !A.episodes?.[a]?.h && (role === SEEK || turning || d?.source === 'squeeze')) A.carried[a] = 1;
       st.roles[a] = springy || !this.stanceOn ? ROLE_NAMES[role] : 'stance';
     }
     st.planted = planted; st.seeking = seeking; st.stations = stations;
@@ -402,7 +415,7 @@ export class Locomotion {
     this.anchorEntry[a] = A.touchEntry?.[a * A.S + o.seg] ?? null;
     this.anchorTaste[a] = o.taste ?? null;
     this.holdF[a] = o.force ?? 0;
-    this.lostT[a] = 0;
+    this.lostT[a] = 0; this.slipT[a] = 0;
     this.chord[a] = this._chordNow(a);
     return true;
   }
@@ -448,6 +461,7 @@ export class Locomotion {
   _station(a, d, dt, turning) {
     const k = this.knobs;
     this._anchorHold(a, dt);
+    this._firm(a, dt);
     this.chord[a] = this._chordNow(a);
     for (const m of this._modeList) if (m.holdStation?.(this, a)) return this.lostT[a] > k.anchorGrace ? this._release(a, 'lost') : undefined;
     // Turning, a station's line gives way and only its tangential term pulls; at rest it holds its length.
@@ -457,6 +471,17 @@ export class Locomotion {
     if (this.lostT[a] > k.anchorGrace) return this._release(a, 'lost');
     if (this.roleT[a] > k.stationMax || (this._calmT > k.stationLinger && !this.pose.command)) return this._release(a, 'done');
     if (this.anchorN[a * 3 + 1] > k.floorCos) this.state.floorT += dt;
+  }
+
+  /* A firm station seals its foot on purpose (arms.js holds those suckers hard), so the flicker can't lose it; what
+     can is the arm's point there sliding off the anchor, which counts toward anchorGrace as a lost seal does. */
+  _firm(a, dt) {
+    const k = this.knobs, g = this.arms.arms[a].goal;
+    if (g?.loco === this && g.kind === 'plant') g.firm = !!k.stationFirm;
+    if (!k.stationFirm) return;
+    const X = this.arms.bodies?.[a]?.X, o = (this.anchorSeg[a] + 1) * 3, P = this.anchorP, i = a * 3;
+    const slip = X && o >= 3 ? Math.hypot(X[o] - P[i], X[o + 1] - P[i + 1], X[o + 2] - P[i + 2]) : 0;
+    if (slip > k.stationSlip) { this.slipT[a] += dt; this.lostT[a] = Math.max(this.lostT[a], this.slipT[a]); } else this.slipT[a] = 0;
   }
 
   _anchorN(a) { const n = this._n3; n[0] = this.anchorN[a * 3]; n[1] = this.anchorN[a * 3 + 1]; n[2] = this.anchorN[a * 3 + 2]; return n; }

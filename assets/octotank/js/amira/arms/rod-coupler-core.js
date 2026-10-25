@@ -41,7 +41,10 @@ function qlog(q, out) {
 
 function inv3(A, O) {
   const a = A[0], b = A[1], c = A[2], d = A[3], e = A[4], f = A[5], g = A[6], h = A[7], i = A[8];
-  const C0 = e * i - f * h, C1 = f * g - d * i, C2 = d * h - e * g, id = 1 / (a * C0 + b * C1 + c * C2);
+  const C0 = e * i - f * h, C1 = f * g - d * i, C2 = d * h - e * g, det = a * C0 + b * C1 + c * C2, tr = a + e + i;
+  // A shell squashed onto a line has no inertia about it: no turn at all beats an infinite one.
+  if (!(Math.abs(det) > 1e-12 * tr * tr * tr)) { for (let k = 0; k < 9; k++) O[k] = 0; return O; }
+  const id = 1 / det;
   O[0] = C0 * id; O[1] = (c * h - b * i) * id; O[2] = (b * f - c * e) * id;
   O[3] = C1 * id; O[4] = (a * i - c * g) * id; O[5] = (c * d - a * f) * id;
   O[6] = C2 * id; O[7] = (b * g - a * h) * id; O[8] = (a * e - b * d) * id;
@@ -110,16 +113,22 @@ const _dv = [0, 0, 0], _dw = [0, 0, 0];
 export function addRigidMomentum(H, posAt, velAt, stride, n, mass, origin, dP, dL, s = newRigid()) {
   rigidState(H, posAt, velAt, stride, n, mass, origin, s);
   _dv[0] = dP[0] / s.M; _dv[1] = dP[1] / s.M; _dv[2] = dP[2] / s.M;
-  addRigidVelocity(H, posAt, velAt, stride, n, origin, s.c, _dv, mv3(s.Ii, dL[0], dL[1], dL[2], _dw));
+  mv3(s.Ii, dL[0], dL[1], dL[2], _dw);
+  // Checked before any write: one bad number here would reach every vertex.
+  if (!Number.isFinite(_dv[0] + _dv[1] + _dv[2] + _dw[0] + _dw[1] + _dw[2] + s.c[0] + s.c[1] + s.c[2])) return false;
+  addRigidVelocity(H, posAt, velAt, stride, n, origin, s.c, _dv, _dw);
+  return true;
 }
 
 const finite6 = (a) => Number.isFinite(a[0] + a[1] + a[2] + a[3] + a[4] + a[5]);
 
 export class RodCoupler {
-  /* carry: each rod is carried rigidly onto her shell's root before the solve, so where her shell went other than the solve
-     said (her springs, the sand, her skin's own motion) never drives the arm as a motor. */
-  constructor({ carry = false } = {}) {
+  /* carry rides each rod rigidly onto her shell's root before the solve, so motion the solve didn't make (springs, sand, her skin) never drives an arm as a motor.
+     carryTurn caps that turn per tick (rad), so a flipped root frame can't swing an arm through the scene; extra is the iterations a short step may add. */
+  constructor({ carry = false, carryTurn = Infinity, extra = 3 } = {}) {
     this.carry = carry;
+    this.carryTurn = carryTurn;
+    this.extra = extra;
     // now: her velocity and spin change to write before Jolt steps, so its step lands her where the rods ended;
     // later: the momentum still owed, to add at the start of the next tick before her own forces.
     this.out = {
@@ -130,7 +139,7 @@ export class RodCoupler {
     this._n = 0;
     this._Ab = new Float64Array(36); this._rb = new Float64Array(6); this._dy = new Float64Array(6); this._t6 = new Float64Array(6); this._sum = new Float64Array(6);
     this._Ip = new Float64Array(9); this._Iip = new Float64Array(9); this._T = new Float64Array(9); this._Is = new Float64Array(9); this._Iis = new Float64Array(9);
-    this._Bs = new Float64Array(36); this._x6 = new Float64Array(6); this._ra = [0, 0, 0]; this._gc = [0, 0, 0, 1];
+    this._Bs = new Float64Array(36); this._x6 = new Float64Array(6); this._hy = new Float64Array(6); this._ra = [0, 0, 0]; this._gc = [0, 0, 0, 1];
     this._o3 = [0, 0, 0]; this._g = [0, 0, 0, 1]; this._gr = [0, 0, 0, 1]; this._r = [0, 0, 0];
     this._cc = [0, 0, 0]; this._cp = [0, 0, 0]; this._dq = [0, 0, 0, 1]; this._dqp = [0, 0, 0, 1]; this._P = [0, 0, 0]; this._L = [0, 0, 0];
     this._vecs = [this.out.dv, this.out.dw, this.out.dP, this.out.dL, this.out.impulseP, this.out.impulseL];
@@ -170,7 +179,12 @@ export class RodCoupler {
       // Carried, the root starts the tick on her shell and only her own motion moves it.
       if (this.carry) {
         const gc = this._gc;
-        for (let i = 0; i < 4; i++) gc[i] = ge[j + i];
+        // A turn past carryTurn goes that far toward her shell's frame; the rest waits for the ticks after.
+        const f = ang > this.carryTurn ? this.carryTurn / ang : 1;
+        if (f < 1) {
+          const th = 0.5 * ang, sn = Math.sin(th), a0 = Math.sin((1 - f) * th) / sn, a1 = Math.sin(f * th) / sn;
+          for (let i = 0; i < 4; i++) gc[i] = ge[j + i] = a0 * gs[j + i] + a1 * ge[j + i];
+        } else for (let i = 0; i < 4; i++) gc[i] = ge[j + i];
         rod.carryTo(p[0], p[1], p[2], gc);
         for (let i = 0; i < 3; i++) rs[o + i] = re[o + i];
         for (let i = 0; i < 4; i++) gs[j + i] = rod.qg[i];
@@ -213,6 +227,15 @@ export class RodCoupler {
     for (let a = 0; a < na; a++) list[a].rod.beginTick();
     for (let s = 0; s < S; s++) {
       const t = (s + 1) / S;
+      // A load on a two-way rod's root node (a grip on its first segment) is a load on her: the rod's own step skips that node.
+      for (let a = 0; a < na; a++) {
+        const rod = list[a].rod, e = rod.ext;
+        if (list[a].oneWay || rod.failed || !(e[0] || e[1] || e[2])) continue;
+        const rx = rod.x[0] - cc[0], ry = rod.x[1] - cc[1], rz = rod.x[2] - cc[2];
+        const lx = ds * (ry * e[2] - rz * e[1]), ly = ds * (rz * e[0] - rx * e[2]), lz = ds * (rx * e[1] - ry * e[0]);
+        for (let i = 0; i < 3; i++) { P[i] += ds * e[i]; out.impulseP[i] += ds * e[i]; }
+        L[0] += lx; L[1] += ly; L[2] += lz; out.impulseL[0] += lx; out.impulseL[1] += ly; out.impulseL[2] += lz;
+      }
       // Her free flight through the substep: spin from her momentum and the inertia she has now, so she turns as a body does.
       turnInertia(dq, I0, Is, T); inv3(Is, Iis);
       const w = mv3(Iis, L[0], L[1], L[2], r3);
@@ -248,11 +271,11 @@ export class RodCoupler {
         let amin = 1, short = false;
         for (let a = 0; a < na; a++) {
           const rod = list[a].rod;
-          if (rod.failed) continue;
+          if (rod.failed || list[a].oneWay) continue;
           rod.backsolve(dy);
           const al = rod.stepLimit();
           if (al < 1) short = true;
-          if (!list[a].oneWay) amin = Math.min(amin, al);
+          amin = Math.min(amin, al);
         }
         // One scale for her and every two-way rod, inside her own limits too: no more than stepTurn of turn or half a root segment.
         const mv = Math.hypot(dy[0], dy[1], dy[2]), tr = Math.hypot(dy[3], dy[4], dy[5]);
@@ -262,18 +285,17 @@ export class RodCoupler {
         if (alpha < 1) short = true;
         sum.fill(0);
         for (let a = 0; a < na; a++) {
-          const rod = list[a].rod, one = list[a].oneWay;
-          if (rod.failed) continue;
-          const al = one ? rod.alphaOwn : alpha;
-          rod.apply(al);
-          out.alphaMin = Math.min(out.alphaMin, al);
-          if (one) continue;
+          const rod = list[a].rod;
+          if (rod.failed || list[a].oneWay) continue;
+          rod.apply(alpha);
+          out.alphaMin = Math.min(out.alphaMin, alpha);
           if (!finite6(rod.gl)) { rod.failed = true; continue; }
           for (let i = 0; i < 6; i++) sum[i] += rod.gl[i];
         }
         // Her step is what the applied multipliers push her by, and her momentum takes exactly that impulse; a held patch's
         // spring takes its share of the step to the world.
         for (let i = 0; i < 3; i++) { out.impulseP[i] += sum[i] / ds; out.impulseL[i] += sum[3 + i] / ds; }
+        const hy = this._hy;
         if (nh) {
           chol6(Bs, 0);
           cholSolve6(Bs, 0, sum, 0, 1, x6, 0, 1, t6);
@@ -281,13 +303,25 @@ export class RodCoupler {
           const Iw = mv3(Ip, x6[3], x6[4], x6[5], r3);
           for (let i = 0; i < 3; i++) { cp[i] += x6[i]; P[i] += M * x6[i] / ds; L[i] += Iw[i] / ds; }
           qturn(dqp, x6[3], x6[4], x6[5]);
+          hy.set(x6);
         } else {
-          for (let i = 0; i < 3; i++) { cp[i] += sum[i] / M; P[i] += sum[i] / ds; L[i] += sum[3 + i] / ds; }
+          for (let i = 0; i < 3; i++) { cp[i] += sum[i] / M; P[i] += sum[i] / ds; L[i] += sum[3 + i] / ds; hy[i] = sum[i] / M; }
           const r = mv3(Iip, sum[3], sum[4], sum[5], r3);
           qturn(dqp, r[0], r[1], r[2]);
+          hy[3] = r[0]; hy[4] = r[1]; hy[5] = r[2];
+        }
+        // A one-way rod answers the step she actually took (the two-way rods' scale of the one solved for), not the full one.
+        for (let a = 0; a < na; a++) {
+          const rod = list[a].rod;
+          if (rod.failed || !list[a].oneWay) continue;
+          rod.backsolve(hy);
+          const al = rod.stepLimit();
+          if (al < 1) short = true;
+          rod.apply(al);
+          out.alphaMin = Math.min(out.alphaMin, al);
         }
         place(t);
-        if (short && extra < 3) extra++;
+        if (short && extra < this.extra) extra++;
       }
       for (let a = 0; a < na; a++) list[a].rod.endSubstep(ds);
       for (let i = 0; i < 3; i++) cc[i] = cp[i];

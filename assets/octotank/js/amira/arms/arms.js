@@ -5,7 +5,7 @@ import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArm
 import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench, aimStep } from './arm-rod.js';
 import { RodCoupler } from './rod-coupler-core.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
-import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD } from './sucker-core.js';
+import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD, toFrame, spanStretch, worstStretch } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
 import { ArmCrowd } from './arm-crowd.js';
 import { ArmReflexes } from './arm-reflex.js';
@@ -73,6 +73,7 @@ export class Arms {
     this.coupledDt = 0;
     this.joined = new Uint8Array(count);              // per slot, stepped in the shared solve this tick
     this.oneWay = new Uint8Array(count);              // and of those, carried by her spring without pushing back
+    this.carried = new Uint8Array(count);             // set by her locomotion each tick: an arm whose stroke carries it, as a driven patch would
     this._joinList = [];
     this._joinEntry = this.arms.map(() => ({ rod: null, p: null, q: null, oneWay: false }));
     // The water's velocity at a point, for the rods' drag: set once the tank's currents exist.
@@ -170,7 +171,10 @@ export class Arms {
     this.rodToyPen = this.rods.map((r) => (r ? new Float64Array(N) : null));
     this.rodOther = new Float64Array(count * 3);   // N·s the rest of a rod's contact (furniture, her body, the other arms) gave it
     this.rootLoad = new Float64Array(count * 6);   // N and N·m about its root each rod put into her this tick (zero when none)
-    this.seals = this.rods.map((r) => (r ? { rod: null, kind: new Uint8Array(S), at: new Float64Array(S), t0: new Float64Array(S), cap: new Float64Array(S), toy: new Array(S).fill(null), A: new Float64Array(S * 3), lift: new Float64Array(S), plant: null, plantSeg: -1 } : null));
+    this.seals = this.rods.map((r) => (r ? { rod: null, kind: new Uint8Array(S), at: new Float64Array(S), t0: new Float64Array(S), cap: new Float64Array(S), toy: new Array(S).fill(null), A: new Float64Array(S * 3), lift: new Float64Array(S), plant: null, plantSeg: -1, beat: new Float64Array(S), loc: new Float64Array(S * 3), grip: new Float64Array(S) } : null));
+    this._sealSeed = seed;
+    this.sealLogSize = 512;
+    this._freshSeals();
     this.lastSealBreak = null;
     this._rec = -1;
     // What every arm tastes: this tick's touches (one per arm per thing), and the touches that just began, for the brain.
@@ -221,10 +225,21 @@ export class Arms {
     const all = this.allSdf = makeSdfWorld(prims.concat(lp), { fixed: prims.length });
     this._looseAt = prims.length;
     const phys = this.phys, knobs = this.knobs, sdf = this.sdf;
+    this._berth = false;
+    this._berthN = [0, 0, 0];
     this.world = {
       collide: (x, y, z, r, out, pt) => {
-        if (knobs.collider !== 'jolt') {
-          const w = knobs.looseContact ? all : sdf, pen = w.collide(x, y, z, r, out, pt);
+        const jolt = knobs.collider === 'jolt', w = knobs.looseContact ? all : sdf;
+        this.world.berthHit = false;
+        let pen = jolt ? phys.collideStaticSphere(x, y, z, r, out) : w.collide(x, y, z, r, out, pt);
+        if (jolt && !(pen > 0)) pen = 0;
+        // A thing that has stung her enough wears a berth every arm keeps out of, yielding into it as into any loose
+        // thing; it pushes no toy (no toy push is recorded), and her touches and tastes still read the real shape.
+        if (this._berth && this.reflexes?.berths.length) {
+          const B = this._berthN, pb = this.reflexes.berth(x, y, z, r, B);
+          if (pb > pen) { out[0] = B[0]; out[1] = B[1]; out[2] = B[2]; this.world.loose = true; this.world.berthHit = true; return pb; }
+        }
+        if (!jolt) {
           // The arm yields to a loose thing over a few ticks rather than being thrown out of it in one; a rod pushing by
           // momentum takes the whole push-out, which splitPush then shares with the toy.
           this.world.loose = pen > 0 && w === all && all.hit >= this._looseAt && !(this._rec >= 0 && this.rodToy[this._rec] && this.rodKnobs.toyPush === 'rod');
@@ -241,9 +256,8 @@ export class Arms {
           }
           return pen;
         }
-        const a = phys.collideStaticSphere(x, y, z, r, out);
         this.world.loose = false;
-        return a > 0 ? a : 0;
+        return pen;
       },
       distance: sdf.distance,
       focus: (lo, hi) => { if (knobs.collider !== 'jolt') (knobs.looseContact ? all : sdf).focus(lo, hi); },
@@ -342,6 +356,8 @@ export class Arms {
     if (this.rodKnobs.toyPush === 'rod') for (let a = 0; a < arms.length; a++) if (this.rodToy[a]) { this.rodToy[a].fill(0); this.rodToyPen[a].fill(0); }
     this._frames();
     this._poseLoose();
+    // The berths too, so this tick's contact keeps off where a latched thing is, not where it was.
+    if (this.reflexes.berths.length) this.reflexes.poseBerths();
     this.body.fit(m.positions, m.shell.faces, m.shell.count, m.origin, this.rootsW, k.bodyScale);
     this._slots();
     if (dt > 0) this.crowd.tick(dt);
@@ -375,16 +391,22 @@ export class Arms {
       // A driving rod's intent chain is a ghost: what it pokes into, its rod pushes.
       const rod = this.rods[a];
       if (rod) { rod.gripping = !!this.episodes?.[a]?.h; if (!this.shadow) this._aimRod(a, dt); }
+      // Coupled, the intent chain lies on things at its rod's girth: laid at its own thinner one, the rest shape it hands the
+      // rod sinks into the floor, and the floor's push on the rod lifts and rolls her.
+      if (rod) { arm.contactRad0 = this.coupling ? rod.rad0 : null; rod.coupled = this.coupling; }
       this._rec = rod && !this.shadow ? -1 : a; this._skipHeld(a);
+      this._berth = true;
       arm.step(dt, this.world, this.body);
+      this._berth = false;
       if (rod) {
         const t1 = performance.now();
         this.holdDelta[a].set(arm.rest);
         // Seals turned off let go before the solve, not after it.
         if (!this.rodKnobs.seals && rod.rod.nSeals) this._dropSeals(a);
         if (rod.prepare(dt, ambient, join)) {
-          // A patch her spring drives carries its arm and takes nothing back: that spring is already her push and hold.
-          const e = this._joinEntry[a], one = m.drive === 'force' && m.armMode[a] !== 0;
+          // A patch her spring drives carries its arm and takes nothing back: that spring is already her push and hold. So does
+          // an arm her stroke carries between holds, or its swing for the next one shoves her into the wall she climbs.
+          const e = this._joinEntry[a], one = m.drive === 'force' && (m.armMode[a] !== 0 || this.carried[a] === 1);
           e.rod = rod.rod; e.p = arm.frame.p; e.q = rod._q; e.oneWay = one;
           list.push(e);
           this.joined[a] = 1; this.oneWay[a] = one ? 1 : 0;
@@ -392,13 +414,20 @@ export class Arms {
         rodMs += performance.now() - t1;
       }
     }
+    this.carried.fill(0);
     if (list.length) {
       // Her patch springs are inside the solve, so the arms' push and the springs' hold settle together.
-      const t1 = performance.now(), out = this.coupler.step(dt, rigid, list, ambient, m.springAnchors?.() ?? null);
+      const C = this.coupler, rk = this.rodKnobs;
+      C.carryTurn = rk.coupleTurn > 0 ? rk.coupleTurn : Infinity; C.extra = Math.max(0, Math.round(rk.coupleExtra) || 0);
+      const t1 = performance.now(), out = C.step(dt, rigid, list, ambient, m.springAnchors?.() ?? null);
       // The momentum owed next tick was worked out against this velocity; if it did not land, neither does that.
       if (m.addRigidVelocity(out.dv, out.dw, rigid.c)) m.owe(out.dP, out.dL);
       for (let a = 0; a < arms.length; a++) if (this.joined[a]) this.rods[a].commit();
       this.coupled = out; this.coupledDt = dt;
+      // Her as the joined rods' contact finds her: moving as the solve left her, taking back what her skin pushes them by.
+      const her = this._her ??= { body: this.body, c: [0, 0, 0], v: [0, 0, 0], w: [0, 0, 0], M: 0, Ii: null, P: [0, 0, 0], L: [0, 0, 0] };
+      for (let i = 0; i < 3; i++) { her.c[i] = rigid.c[i]; her.v[i] = rigid.v[i] + out.dv[i]; her.w[i] = rigid.w[i] + out.dw[i]; her.P[i] = 0; her.L[i] = 0; }
+      her.M = rigid.M; her.Ii = rigid.Ii;
       rodMs += performance.now() - t1;
     } else this.coupled = null;
     // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which has the last word; a driving
@@ -414,11 +443,14 @@ export class Arms {
       for (let a = 0; a < arms.length; a++) {
         const rod = this.rods[a], drives = rod && !shadow;
         this._rec = drives ? -1 : a; this._skipHeld(a);
+        this._berth = true;
         if (!drives || it >= intentFrom) arms[a].finishPass(this.world, this.body, last, !drives || hold === 'ghost');
+        this._berth = false;
         if (!rod) continue;
         const t1 = performance.now();
-        this._rec = drives ? a : -1;
+        this._rec = drives ? a : -1; this._berth = drives;
         rod.contact(this.world, this.body, last);
+        this._berth = false;
         rodMs += performance.now() - t1;
       }
     }
@@ -428,7 +460,8 @@ export class Arms {
       if (!rod) continue;
       const t1 = performance.now();
       if (!shadow && dt > 0 && this.rodKnobs.toyPush === 'rod') this._rodPush(a, dt);
-      rod.settle(dt);
+      // A one-way rod's momentum never reaches her, so neither does its push off her skin.
+      rod.settle(dt, this.joined[a] && !this.oneWay[a] ? this._her : null);
       // The contact hold comes from the rod: what it lies on bends the program's later rest shapes, never its sag.
       if (hold === 'rod' && !shadow) arms[a]._feedback(rod.contactHold);
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
@@ -437,6 +470,12 @@ export class Arms {
       // A rod in the shared solve already moved her; the explicit wrench is only for ?loads=1 without it.
       if (this.rodKnobs.wrench && !shadow && dt > 0 && !this.joined[a]) this._rootWrench(a);
       rodMs += performance.now() - t1;
+    }
+    const her = this.coupled ? this._her : null;
+    if (her && (her.P[0] || her.P[1] || her.P[2] || her.L[0] || her.L[1] || her.L[2])) {
+      const I = her.Ii, L = her.L, dv = this._hv ??= [0, 0, 0], dw = this._hw ??= [0, 0, 0];
+      for (let i = 0; i < 3; i++) { dv[i] = her.P[i] / her.M; dw[i] = I[3 * i] * L[0] + I[3 * i + 1] * L[1] + I[3 * i + 2] * L[2]; }
+      m.addRigidVelocity(dv, dw, her.c);
     }
     if (this._anyRod && !teleport) this.rodMs[this.rodCount++ % WINDOW] = rodMs;
     this.allSdf.skip = -1;
@@ -559,7 +598,8 @@ export class Arms {
 
   _reachToy(i, toy, opts) {
     const arm = this.arms[i];
-    if (!arm || !toy) return false;
+    // No arm reaches for a thing that has stung her enough to latch.
+    if (!arm || !toy || this.reflexes?.latched(toy)) return false;
     // The goal decides tip or middle, and the target depends on which, so place it once the goal exists.
     const p = toy.body.GetPosition(), face = [p.GetX(), p.GetY(), p.GetZ()];
     if (!arm.reach(this._toyTarget(i, toy, [0, 0, 0]), { face, ...opts })) return false;
@@ -816,6 +856,7 @@ export class Arms {
   _suckers(dt) {
     const arms = this.arms, S = this.S, sk = this.suckerKnobs, t = this.time, mode = this._mode, scale = this._scale, c = this.counts;
     this._tickNo++;
+    this.sealStats.live = 0; this.sealStats.stretch = 1;
     for (let a = 0; a < arms.length; a++) {
       const arm = arms[a], bank = this.banks[a];
       if (arm.restGen !== this._layoutGen[a]) {
@@ -830,6 +871,7 @@ export class Arms {
       if (held >= 0) { this.touchKind[a * S + held] = 2; this.touchEntry[a * S + held] = ep.toy; this.touchTaste[a * S + held] = ep.taste; }
       // So does a planted foot on the furniture, and its neighbors where they touch: they hold still while the body moves.
       const pg = arm.goal?.kind === 'plant' ? arm.goal : null, ps = pg ? pg.seg : -9;
+      const st = this.seals[a], grab = !!st && this.rodKnobs.seals && this.rodKnobs.grabby && !this.shadow;
       if (pg && !this.touchKind[a * S + ps]) {
         const q = a * S + ps;
         this.touchKind[q] = 1; this.touchEntry[q] = pg.entry ?? null; this.touchTaste[q] = pg.taste ?? 'floor';
@@ -838,14 +880,17 @@ export class Arms {
       for (let j = 0; j < S; j++) {
         const g = a * S + j, kind = this.touchKind[g];
         mode[j] = SEAL_NONE; scale[j] = 1;
+        // A patch pinned where it took hold stays attached when the pull lifts the rest of its segment off the surface.
+        if (grab && st.kind[j] && !kind && !(this.refr[g] > t)) { mode[j] = SEAL_HARD; scale[j] = st.grip[j] || 1; continue; }
         if (!kind || (this.refr[g] > t && j !== held)) continue;
         if (kind === 3) { c.selfTouch++; if (this.gripSelf) mode[j] = SEAL_WORK; continue; }
         const entry = this.touchEntry[g], mine = kind === 2 && ep?.toy === entry;
         if (kind === 2 && !mine && this._ignored(a, entry)) continue;
-        if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && this._sliding(this.bodies[a], j, g, kind === 2 ? entry : null, dt)) continue;
+        if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && !(grab && st.kind[j]) && this._sliding(this.bodies[a], j, g, kind === 2 ? entry : null, dt)) continue;
         const rule = mine ? ep.rule : tasteRule(this.touchTaste[g], sk, this);
         if (!(rule.grip > 0)) continue;
-        mode[j] = mine && ep.hard ? SEAL_HARD : SEAL_WORK;
+        // A firm plant (a station) holds its foot on purpose, and so does a segment whose rod has taken hold there.
+        mode[j] = (mine && ep.hard) || (pg?.firm && kind === 1 && Math.abs(j - ps) <= 1) || (grab && st.kind[j]) ? SEAL_HARD : SEAL_WORK;
         scale[j] = rule.grip;
       }
       bank.step(dt, mode, scale);
@@ -1197,6 +1242,9 @@ export class Arms {
           this.phys.impulseAt(toy, -nx * j, -ny * j, -nz * j, cx, cy, cz);
           const q = (a * nL + t) * 3;
           TI[q] -= nx * j; TI[q + 1] -= ny * j; TI[q + 2] -= nz * j;
+          // Joined, the node takes its share as speed here: settle's coupled push-out only stops closing speed, which gives a
+          // still node nothing and a fast one too much. x moving with X leaves settle nothing of this push to stop again.
+          if (body._joined) for (let u = 0; u < 3; u++) { x[o + u] += s[u]; rod.v[o + u] += s[u] / dt; }
           X[o] += s[0]; X[o + 1] += s[1]; X[o + 2] += s[2];
           c.pushes++;
           if (j / dt > c.pushMaxN) c.pushMaxN = j / dt;
@@ -1239,12 +1287,14 @@ export class Arms {
 
   /* A driving rod's seals follow its suckers: a segment with sealed suckers on the furniture (or a loose thing, behind
      toySeals) holds its far node where it sealed until its suckers have all been off for sealGrace, its touch changes,
-     the intent chain draws that point sealLift away, or it tears; a plant's foot holds at the plant's own point. */
+     the intent chain draws that point sealLift away, or it tears; a plant's foot holds at the plant's own point. Grabby
+     (rodKnobs.grabby), an exploring arm's seal holds a beat first, the draw is judged in the arm's root frame so her body
+     walking off stretches the arm, and an arm drawn out past popStretch pops every seal at once. */
   _seals(a, dt) {
     const st = this.seals[a];
     if (!st) return;
     const body = this.rods[a], rod = body.rod, rk = this.rodKnobs, k = this.knobs, sk = this.suckerKnobs, S = this.S, t = this.time, bank = this.banks[a];
-    const A = st.A, X = body.X, I = body.intent.X, f3 = this._f3, q = this._q, c = this._c;
+    const A = st.A, X = body.X, I = body.intent.X, f3 = this._f3, q = this._q, c = this._c, grab = !!rk.grabby, Fr = body.intent.frame, G = body.intent.G;
     if (st.rod !== rod) { st.rod = rod; st.kind.fill(0); st.toy.fill(null); st.plant = null; st.plantSeg = -1; }
     st.live = rk.seals;
     if (this.shadow || !rk.seals || body._placed || body.intent.valid === false) { this._dropSeals(a); rod.sealBroke.fill(0); return; }
@@ -1264,12 +1314,13 @@ export class Arms {
       if (st.kind[j]) rod.unseal(j + 1);
       // A torn foot stays torn until the plant ends: st.plant is kept so the same plant cannot seal it again.
       if (st.kind[j] === 4) st.plantSeg = -1;
+      if (st.kind[j]) this._sealEnd(a, j, `tear-${by}`);
       st.kind[j] = 0; st.toy[j] = null;
       this.refr[a * S + j] = t + sk.refractory;
       bank.releaseSeg(j);
       this.counts.sealBreaks++;
     };
-    const drop = (j) => { if (st.kind[j]) { react(j); rod.unseal(j + 1); this.counts.sealDrops++; } st.kind[j] = 0; st.toy[j] = null; };
+    const drop = (j, why) => { if (st.kind[j]) { react(j); rod.unseal(j + 1); this.counts.sealDrops++; this._sealEnd(a, j, why); } st.kind[j] = 0; st.toy[j] = null; };
     const pose = (toy) => {
       const b = toy.body, p = b.GetPosition(), r = b.GetRotation();
       c[0] = p.GetX(); c[1] = p.GetY(); c[2] = p.GetZ(); q[0] = r.GetX(); q[1] = r.GetY(); q[2] = r.GetZ(); q[3] = r.GetW();
@@ -1280,15 +1331,35 @@ export class Arms {
       rod.sealBroke[j + 1] = 0;
       if (st.kind[j]) { rod.sealForce(j + 1, f3); tear(j, Math.hypot(f3[0], f3[1], f3[2]), Math.max(k.minGrip, st.cap[j]), 'rod'); }
     }
+    // Stuck and drawn out past popStretch of its own length (her body walking off, a toy dragging it), every seal pops.
+    if (grab && rod.nSeals) {
+      const worst = worstStretch(X, I, st.kind, S), ss = this.sealStats;
+      if (worst > ss.stretch) ss.stretch = worst;
+      if (worst > ss.stretchMax) ss.stretchMax = worst;
+      if (worst >= rk.popStretch) {
+        for (let j = 0; j < S; j++) {
+          if (!st.kind[j]) continue;
+          // A popped foot stays off for the rest of its plant, as a torn one does.
+          if (st.kind[j] === 4) st.plantSeg = -1;
+          drop(j, 'pop');
+          this.refr[a * S + j] = t + rk.popRest;
+          bank.releaseSeg(j);
+        }
+        ss.pops++;
+        ss.lastPop = { arm: a, t, stretch: worst };
+      }
+    }
     const ep = this.episodes[a], held = ep?.h ? this._segAt(body, ep.arc) : -99, pg = body.intent.goal?.kind === 'plant' ? body.intent.goal : null;
-    if (st.plant && st.plant !== pg) { if (st.plantSeg >= 0) drop(st.plantSeg); st.plant = null; st.plantSeg = -1; }
-    if (pg && !st.plant && pg.point?.every(Number.isFinite)) {
-      const j = Math.max(0, Math.min(S - 1, pg.seg)), r = body.rad[j + 1];
-      drop(j);
+    if (st.plant && st.plant !== pg) { if (st.plantSeg >= 0) drop(st.plantSeg, 'plant'); st.plant = null; st.plantSeg = -1; }
+    const pj = pg ? Math.max(0, Math.min(S - 1, pg.seg)) : -1;
+    // A plant skips the refractory but not the stretch: a foot sealed on a span already past popStretch only pops.
+    if (pg && !st.plant && pg.point?.every(Number.isFinite) && !(grab && spanStretch(X, I, pj + 1) >= rk.popStretch)) {
+      const j = pj, r = body.rad[j + 1];
+      drop(j, 'plant');
       for (let i = 0; i < 3; i++) A[j * 3 + i] = pg.point[i] + pg.normal[i] * r;
       const W = st.plantAt ??= [0, 0, 0];
       W[0] = pg.point[0]; W[1] = pg.point[1]; W[2] = pg.point[2];
-      st.kind[j] = 4; st.plant = pg; st.plantSeg = j; st.t0[j] = t; st.cap[j] = bank.segCeil[j];
+      st.kind[j] = 4; st.plant = pg; st.plantSeg = j; st.t0[j] = t; st.cap[j] = bank.segCeil[j]; st.grip[j] = 1;
       this.counts.seals++;
     } else if (pg && st.plantSeg >= 0 && st.plant === pg) {
       // A haul's plant rides its toy (the carry moves its point each tick), so its foot's anchor follows; a still one stays.
@@ -1301,14 +1372,18 @@ export class Arms {
     for (let j = 0; j < S; j++) {
       const g = a * S + j, i = j + 1, o = i * 3, kind = this.touchKind[g], entry = this.touchEntry[g], plant = st.kind[j] === 4;
       if (!plant) {
-        if (Math.abs(j - held) <= k.gripSkip) { drop(j); continue; }
-        const want = bank.segSealed[j] > 0 && !(this.refr[g] > t) && (kind === 1 || (kind === 2 && rk.toySeals && !!entry && !this._ignored(a, entry)));
+        if (Math.abs(j - held) <= k.gripSkip) { drop(j, 'grip'); continue; }
+        const want = bank.segSealed[j] > 0 && !(this.refr[g] > t) && (kind === 1 || (kind === 2 && rk.toySeals && !!entry && !this._ignored(a, entry)) || (grab && !kind && st.kind[j] > 0));
         if (st.kind[j]) {
-          if ((kind && kind !== st.kind[j]) || (kind === 2 && entry !== st.toy[j]) || this.refr[g] > t || (!want && t - st.at[j] > rk.sealGrace)) drop(j);
+          // Grabby, a seal outlasts its suckers' flicker until its beat is up.
+          const why = (kind && kind !== st.kind[j]) || (kind === 2 && entry !== st.toy[j]) ? 'touch' : this.refr[g] > t ? 'rest'
+            : !want && t - st.at[j] > rk.sealGrace && !(grab && t - st.t0[j] < st.beat[j]) ? 'grace' : null;
+          if (why) drop(j, why);
           else if (want) st.at[j] = t;
         }
-        if (!st.kind[j] && want) {
-          st.kind[j] = kind; st.toy[j] = kind === 2 ? entry : null; st.at[j] = st.t0[j] = t; st.cap[j] = bank.segCeil[j];
+        // Grabby, a patch drawn out past popStretch already can't take hold: it would only pop on the spot.
+        if (!st.kind[j] && want && !(grab && spanStretch(X, I, i) >= rk.popStretch)) {
+          st.kind[j] = kind; st.toy[j] = kind === 2 ? entry : null; st.at[j] = st.t0[j] = t; st.grip[j] = this._scale[j] || 1; st.cap[j] = grab ? bank.segHard[j] * st.grip[j] : bank.segCeil[j];
           if (kind === 2) {
             // Kept in the toy's frame, so the anchor rides the toy.
             pose(entry);
@@ -1316,6 +1391,11 @@ export class Arms {
             rotate(-q[0], -q[1], -q[2], q[3], vx, vy, vz, A, j * 3);
           } else { A[j * 3] = X[o]; A[j * 3 + 1] = X[o + 1]; A[j * 3 + 2] = X[o + 2]; }
           st.lift[j] = -1;
+          if (grab) {
+            const g0 = body.intent.goal;
+            st.beat[j] = !g0 || g0.kind === 'still' ? sampleHold(rk.sealBeat, rk.sealBeatSd, this.sealRng[a]) : 0;
+            toFrame(Fr, G[o], G[o + 1], G[o + 2], st.loc, j * 3);
+          }
           this.counts.seals++;
         }
         if (!st.kind[j]) continue;
@@ -1328,11 +1408,20 @@ export class Arms {
         rotate(q[0], q[1], q[2], q[3], ax, ay, az, f3, 0);
         ax = f3[0] + c[0]; ay = f3[1] + c[1]; az = f3[2] + c[2];
       }
-      // The program drawing that point away is the arm letting go there, as an octopus releases a sucker to move on;
-      // measured from the gap at sealing, since the intent chain rides off the rod by its sag.
-      const gap = Math.hypot(I[o] - ax, I[o + 1] - ay, I[o + 2] - az);
-      if (st.lift[j] < 0) st.lift[j] = gap;
-      if (!plant && gap - st.lift[j] > rk.sealLift) { drop(j); this.refr[g] = t + sk.refractory; continue; }
+      // The program drawing that point away is the arm letting go there, as an octopus releases a sucker to move on.
+      if (grab) {
+        // Judged on the program's own pose in the arm's frame, so her body moving or contact bending the arm never reads as
+        // moving on; inside its beat a seal holds against beatLift times the draw, dragging a little before it lets go.
+        if (!plant) {
+          const L = toFrame(Fr, G[o], G[o + 1], G[o + 2], this._f3c ??= [0, 0, 0]), l = j * 3, lift = rk.sealLift * (t - st.t0[j] < st.beat[j] ? rk.beatLift : 1);
+          if (Math.hypot(L[0] - st.loc[l], L[1] - st.loc[l + 1], L[2] - st.loc[l + 2]) > lift) { drop(j, 'lift'); this.refr[g] = t + rk.sealRest; continue; }
+        }
+      } else {
+        // Measured from the gap at sealing, since the intent chain rides off the rod by its sag.
+        const gap = Math.hypot(I[o] - ax, I[o + 1] - ay, I[o + 2] - az);
+        if (st.lift[j] < 0) st.lift[j] = gap;
+        if (!plant && gap - st.lift[j] > rk.sealLift) { drop(j, 'lift'); this.refr[g] = t + sk.refractory; continue; }
+      }
       if (rod.sealed[i]) {
         rod.sealForce(i, f3);
         const F = Math.hypot(f3[0], f3[1], f3[2]);
@@ -1341,7 +1430,30 @@ export class Arms {
         if (st.kind[j] === 2) this.phys.impulseAt(st.toy[j], -f3[0] * dt, -f3[1] * dt, -f3[2] * dt, ax, ay, az);
       }
       rod.seal(i, ax, ay, az, { compliance: rk.sealCompliance, maxForce: ceil });
+      this.sealStats.live++;
     }
+  }
+
+  /* The beat streams from their seeds and no seal history, at boot and at a scenario's clean slate. */
+  _freshSeals() {
+    const seed = this._sealSeed;
+    // Its own stream per arm, so the beats a grabby seal holds for shift nothing else.
+    this.sealRng = this.arms.map((arm) => mulberry32(((seed * 2654435761) ^ ((arm.index + 1) * 0x9E3779B1) ^ 0x5EA15) >>> 0));
+    // Every seal's end, newest last (sealLogSize of them), its reason tallied in sealEnds; sealStats is the readout's.
+    this.sealLog = [];
+    this.sealEnds = {};
+    this.sealStats = { live: 0, stretch: 0, stretchMax: 0, pops: 0, lastPop: null };
+  }
+
+  /* A scenario starts clean (Locomotion.reset): nothing latched, the beats drawn afresh, no seal history. Free life keeps it all. */
+  resetHistory() { this.reflexes.resetLatch(); this._freshSeals(); }
+
+  /* One seal's end, for the readout and the checks: arm, segment, kind, how long it held, and why it let go. */
+  _sealEnd(a, j, why) {
+    const st = this.seals[a], log = this.sealLog;
+    log.push({ t: this.time, a, j, kind: st.kind[j], life: this.time - st.t0[j], beat: st.beat[j], end: why });
+    if (log.length > this.sealLogSize) log.shift();
+    this.sealEnds[why] = (this.sealEnds[why] ?? 0) + 1;
   }
 
   /* The panel's G: a hard grip on whatever the arms are touching or holding or, once any grip is hard by command,

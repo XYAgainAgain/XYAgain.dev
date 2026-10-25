@@ -39,8 +39,21 @@ export const ROD_ARM_KNOBS = {
   sealCompliance: 1e-4,  // m/N
   sealGrace: 0.15,       // s a segment's seal outlasts its suckers all flickering off at once
   sealLift: 0.04,        // m the intent chain may draw a sealed node's point off its anchor before the arm lets go there
+  // Grabby suckers: a patch that takes hold recruits all its suckers, an exploring arm's seal holds a beat, the arm lets go
+  // as its program moves on (judged in the arm's own frame, so her body walking off stretches it), and past popStretch it pops.
+  grabby: true,
+  sealBeat: 0.5,         // s mean, and its spread, an exploring arm's seal holds against beatLift times the draw
+  sealBeatSd: 0.25,
+  beatLift: 2,
+  sealRest: 0.25,        // s a patch rests after letting go before it can take hold again
+  popStretch: 1.5,       // of the arm's own length from the root to a seal, past which every seal on it pops
+  popRest: 0.6,          // s the popped patches rest
   wrench: false,         // the root's force and torque reach her body, a tick late; explicit, so at her mass it grows
   wrenchSpread: 'body',  // over all of her as a rigid body would take it, or 'patch', the arm's own
+  // The shared solve (?couple=1) alone reads these.
+  coupleTurn: 0.08,      // rad a carry may turn a rod onto her shell's root frame in one tick
+  coupleExtra: 0,        // iterations a short coupled step may add (the lone rod's own step keeps its three)
+  looseStroke: true,     // coupled, a stroke's seek and plant don't firm the arm: braced, a foot pressed for its seal levers her over
 };
 
 const len3 = (x, y, z) => Math.sqrt(x * x + y * y + z * z);
@@ -150,11 +163,13 @@ export class RodArm {
     this.stiff = 1;                       // the whole rod's bending, scaled (the bench's limp)
     this.grab = 0;                        // 0–1, how far the arm has firmed for a hold; gripping is set from outside
     this.gripping = false;
+    this.coupled = false;                 // in the shared solve's care this tick (Arms sets it)
     this.started = false;
     this._fresh = true;
     this._first = true;
     this._resets = 0;
     this._touched = new Uint8Array(n);
+    this._berth = new Float64Array(3 * n); // what berths account for in each node's correction this tick, kept off her bill
     this._hit = n;
     this._n = [0, 0, 0];
     this._q = [0, 0, 0, 1];
@@ -192,7 +207,8 @@ export class RodArm {
      targets mode its programs' targets with each joint's authored stiffness scaling the rod's bending there. */
   _rest(dt = 0) {
     const arm = this.intent, rod = this.rod, k = this.k;
-    const kind = arm.goal?.kind, want = this.gripping || kind === 'hold' || kind === 'plant' || kind === 'fetch' ? 1 : 0;
+    const kind = arm.goal?.kind, stroke = this.coupled && k.looseStroke && !!arm.goal?.loco;
+    const want = this.gripping || ((kind === 'hold' || kind === 'plant') && !stroke) || kind === 'fetch' ? 1 : 0;
     this.grab = !this.started ? want : this.grab + (want - this.grab) * (dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.grabTau)) : 0);
     if (k.rest === 'targets') {
       rod.setRestFromBends(arm.tgt, arm.twist, arm.lam);
@@ -263,6 +279,7 @@ export class RodArm {
     // Arm-on-arm contact reads the sucker side before settle does, so it gets this tick's.
     this._frames();
     this._touched.fill(0);
+    this._berth.fill(0);
     this._hit = this.n;
     this._first = true;
     this.started = true;
@@ -297,6 +314,7 @@ export class RodArm {
           // cleared, and a middle's push can point into a thin wall the end lies beyond.
           const fx = X[o], fy = X[o + 1], fz = X[o + 2];
           X[o] += 2 * pen * dir[0]; X[o + 1] += 2 * pen * dir[1]; X[o + 2] += 2 * pen * dir[2];
+          if (dir === nrm && world.berthHit === true) { const b = this._berth; b[o] += 2 * pen * dir[0]; b[o + 1] += 2 * pen * dir[1]; b[o + 2] += 2 * pen * dir[2]; }
           travelPoint(this, i, world, body, fx, fy, fz);
           this._touched[i] = 1;
           if (i < this._hit) this._hit = i;
@@ -309,16 +327,36 @@ export class RodArm {
   }
 
   /* After the last round: what contact moved, the rod keeps as velocity (a point pushed out of a rock must not keep
-     its inward speed, or it goes back in); then the frames turn onto the corrected segments. */
-  settle(dt) {
+     its inward speed, or it goes back in); then the frames turn onto the corrected segments. her (a joined rod's, from
+     Arms): her body, center, velocity and spin, mass, inverse inertia, and the push P and turn L she takes back. */
+  settle(dt, her = null) {
     if (this.intent.valid === false) return;
-    const rod = this.rod, X = this.X, x = rod.x, n = this.n, h = this._placed ? 0 : dt, joined = this._joined;
+    const rod = this.rod, X = this.X, x = rod.x, n = this.n, h = this._placed ? 0 : dt, joined = this._joined, nb = this._nb ??= [0, 0, 0];
     for (let i = 1; i < n; i++) {
       const o = i * 3, dx = X[o] - x[o], dy = X[o + 1] - x[o + 1], dz = X[o + 2] - x[o + 2];
       if (dx === 0 && dy === 0 && dz === 0) continue;
+      // A node pushed out of her own skin pushes her back, or every arm resting on her would shove her along. Only the push
+      // along her skin's normal, as deep as the node sat in her, is hers: the rest is the floor's, a rock's, or a berth's.
+      const pen = joined && her ? her.body.collide(x[o], x[o + 1], x[o + 2], bodyRadius(this.rad[i], i, this.knobs.bodySkip), nb) : 0;
+      const B = this._berth, s = pen > 0 ? Math.min(pen, dx * nb[0] + dy * nb[1] + dz * nb[2] - Math.max(0, B[o] * nb[0] + B[o + 1] * nb[1] + B[o + 2] * nb[2])) : 0;
+      if (s > 0) {
+        const c = her.c, rx = x[o] - c[0], ry = x[o + 1] - c[1], rz = x[o + 2] - c[2], w = her.w, v = her.v, nx = nb[0], ny = nb[1], nz = nb[2];
+        const cx = ry * nz - rz * ny, cy = rz * nx - rx * nz, cz = rx * ny - ry * nx, I = her.Ii;
+        const extra = 1 / her.M + cx * (I[0] * cx + I[1] * cy + I[2] * cz) + cy * (I[3] * cx + I[4] * cy + I[5] * cz) + cz * (I[6] * cx + I[7] * cy + I[8] * cz);
+        const j = rod.pushOutOn(i, nx * s, ny * s, nz * s, h, v[0] + w[1] * rz - w[2] * ry, v[1] + w[2] * rx - w[0] * rz, v[2] + w[0] * ry - w[1] * rx, extra);
+        if (j > 0) {
+          her.P[0] -= nx * j; her.P[1] -= ny * j; her.P[2] -= nz * j; her.L[0] -= cx * j; her.L[1] -= cy * j; her.L[2] -= cz * j;
+          // The next contact, on any rod, meets her as this one left her: against a frozen her, many at once over-push.
+          const iM = j / her.M;
+          v[0] -= nx * iM; v[1] -= ny * iM; v[2] -= nz * iM;
+          w[0] -= (I[0] * cx + I[1] * cy + I[2] * cz) * j; w[1] -= (I[3] * cx + I[4] * cy + I[5] * cz) * j; w[2] -= (I[6] * cx + I[7] * cy + I[8] * cz) * j;
+        }
+        const qx = dx - nx * s, qy = dy - ny * s, qz = dz - nz * s;
+        if (qx * qx + qy * qy + qz * qz > 1e-12) rod.pushOut(i, qx, qy, qz, h);
+      }
       // Coupled, the push-out only stops the node's closing speed, along the push through its own inverse mass: any more,
       // or any sideways, would reach her through the solve as a fling or a drift.
-      if (joined) rod.pushOut(i, dx, dy, dz, h);
+      else if (joined) rod.pushOut(i, dx, dy, dz, h);
       else rod.displace(i, dx, dy, dz, h);
     }
     rod.alignFrames();

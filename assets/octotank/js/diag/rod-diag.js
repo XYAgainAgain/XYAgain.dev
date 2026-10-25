@@ -146,6 +146,7 @@ export class RodDiag {
     add({ key: '9', name: 'Aim through the rod', label: () => (k.aim ? 'Aim: through the rod' : 'Aim: as posed'), run: () => { k.aim = !k.aim; }, disabled: !on || holdLocked || A.shadow });
     add({ key: 'x', name: 'Reset the rod', label: () => (this.slots.length > 1 ? 'Reset the rods' : 'Reset the rod'), run: () => this.reset(), disabled: !on });
     add({ key: '8', name: 'Shared solve', label: () => (A.coupling ? 'Shared solve: on' : 'Shared solve: off'), run: () => { A.coupling = !A.coupling; }, disabled: !A.canCouple });
+    if (A.canCouple) this._coupledControls(add);
     if (!on) return;
     const sci = (v) => v.toExponential(1).replace('e+', 'e');
     const range = (label, values, get, set, fmt) => add({ type: 'range', name: label, values, get, set, label: () => `${label} ${fmt(get())}` });
@@ -160,5 +161,13 @@ export class RodDiag {
     range('Weight', [0, 0.02, 0.04, 0.08, 0.15, 0.3], () => k.weightFactor, (v) => { k.weightFactor = v; }, (v) => `${Math.round(v * 100)}% g`);
     range('Added mass', [0, 0.5, 1], () => k.addedMass, (v) => { k.addedMass = v; }, (v) => `${v}`);
     range('Substeps', [1, 2, 3, 4], () => k.substeps, (v) => { k.substeps = v; }, (v) => `${v}`);
+  }
+
+  /* The shared solve's own dials, read only while it runs. */
+  _coupledControls(add) {
+    const k = this.arms.rodKnobs;
+    add({ type: 'range', name: 'Carry turn', values: [0, 0.04, 0.08, 0.15, 0.3], get: () => k.coupleTurn, set: (v) => { k.coupleTurn = v; }, label: () => `Carry turn ${k.coupleTurn > 0 ? `${(k.coupleTurn * 180 / Math.PI).toFixed(1)}° a tick` : 'unbounded'}` });
+    add({ type: 'range', name: 'Shared extra iterations', values: [0, 1, 2, 3], get: () => k.coupleExtra, set: (v) => { k.coupleExtra = v; }, label: () => `Shared extra iterations ${k.coupleExtra}` });
+    add({ name: 'Stroke bracing', label: () => (k.looseStroke ? 'Stroke: loose' : 'Stroke: braced'), run: () => { k.looseStroke = !k.looseStroke; } });
   }
 }

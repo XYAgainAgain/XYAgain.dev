@@ -35,6 +35,7 @@ export class Squeeze {
     this.times = {};
     this.timedOut = false;
     this._held = false;
+    this._hold = null;
     this._angPrev = null;
     this.ratio = 1;
     // Her rest length along her own head-to-mantle line, which the lengthening reads against.
@@ -100,8 +101,12 @@ export class Squeeze {
 
   _breath(on) {
     const m = this.loco.mantle;
-    if (on) { if (!this._held || m.breathHold === null) m.breathHold = cavityHold(this.k); this._held = true; }
-    else if (this._held) { m.breathHold = null; this._held = false; }
+    if (on) { if (!this._held || m.breathHold === null) m.breathHold = this._hold = cavityHold(this.k); this._held = true; }
+    else if (this._held) {
+      // A jet that took her mid-haul found the breath held and kept ours; its own pulse takes over here.
+      if (m.breathHold === this._hold) m.breathHold = this.loco.jetMode?._hold ?? null;
+      this._hold = null; this._held = false;
+    }
   }
 
   // The controller's hooks, live only while this mode runs a passage.
@@ -182,8 +187,10 @@ export class Squeeze {
 
   /* After the controller each tick: the stage, the arms this mode sends, the haul's cap, the breath, and the muscles. */
   _tick(dt) {
-    const L = this.loco;
+    const L = this.loco, st = L.state.mode;
     if (this.desire && L.desire !== this.desire) { this._end(); return; }
+    // Held (a jet), off, or rigid, her holds are gone and a flight moves her: the passage ends, and a desire still standing replans once she is live.
+    if (st === 'off' || st === 'held' || st.startsWith('rigid')) { if (this.stage !== 'off') this._end(); return; }
     if (this.stage === 'refused') { L.stop(this.failed); return; }
     if (this.stage === 'approach') return this._approach();
     if (!this.active) return;

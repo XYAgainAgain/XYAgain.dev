@@ -35,6 +35,7 @@ import { registerWeight } from './tank/sand-weight.js';
 import { WallOptics } from './tank/wall-optics.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 import { RodDiag } from './diag/rod-diag.js';
+import { SuckerDiag } from './diag/sucker-diag.js';
 import { rodArms } from './amira/arms/arm-rod.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
@@ -42,8 +43,9 @@ import { rodArms } from './amira/arms/arm-rod.js';
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
    ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
-   authored arms, touching nothing)  ?couple=1 (her rods and body in one solve; by default each rod steps alone on a root
-   dragged to her, nothing fed back)  ?loads=1 (her rods with their loads; a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in) */
+   authored arms, touching nothing)  ?couple=0 (each rod steps alone on a root dragged to her, nothing fed back; by default
+   her rods and body share one solve)  ?loads=1 (her rods with their loads; a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in)
+   ?grabby=0 (seals under ?loads=1 as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -121,13 +123,13 @@ async function boot() {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
     // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
-    // Off by default: coupled, her body answers her arms but fights her locomotion's patch springs and squashes in a
-    // crawl, climb, or squeeze (Shared-Solve-Wiring-Notes.md). The panel's Shared solve switch turns it on live.
-    const rods = rodArms(params.get('rods')), couple = params.get('couple') === '1';
+    // Her body answers her arms: they share one solve, the arms her locomotion moves riding her (Shared-Solve-On-Notes.md).
+    // The panel's Shared solve switch turns it off live.
+    const rods = rodArms(params.get('rods')), couple = params.get('couple') !== '0';
     // ?loads=1: her rod arms push toys, bear their grips, and seal. Off by default; a rod outside the shared solve passes
     // it on through the explicit root wrench, which fed back a tick late grows tick on tick at her mass.
     const rodKnobs = params.get('loads') === '1' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
@@ -153,6 +155,11 @@ async function boot() {
   // ?keeptask=0 and ?blocked=0 show her without either.
   arms.suckerKnobs.keepTask = params.get('keeptask') !== '0';
   arms.blocked.knobs.on = params.get('blocked') !== '0';
+  // Grabby seals (under ?loads=1), the latch a thing that has stung her enough trips, and stations that hold their feet;
+  // ?grabby=0, ?latch=0, and ?firm=0 show her without each.
+  if (params.get('grabby') === '0') arms.rodKnobs.grabby = false;
+  if (params.get('latch') === '0') arms.reflexes.latchKnobs.latch = false;
+  if (params.get('firm') === '0' && loco) loco.knobs.stationFirm = false;
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();
@@ -227,6 +234,7 @@ async function boot() {
   if (!bench) armView.ghost = false;
   if (bench) bench.view = armView;
   else if (arms._anyRod) tank.rods = ctx.rods = new RodDiag(arms, { view: () => armView });
+  if (!bench) tank.suckers = ctx.suckers = new SuckerDiag(arms, { loco });
   const cameraRig = new TankCamera(camera, renderer.domElement, {
     animals: [mantleMesh, armView.tubeMesh, armView.webMesh, ...(bodyParts?.parts.map((p) => p.mesh) ?? [])].filter(Boolean),
     scenery: [...rigidMeshes.filter(({ e }) => e.tag !== 'arm').map((r) => r.mesh), ...(sand ? [sand.mesh] : [])], say,

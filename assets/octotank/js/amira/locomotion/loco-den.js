@@ -1,4 +1,4 @@
-import { DEN_KNOBS, denPlan, envelope, shovelShare, wiggleOffset, exitWay, exitEase, exitSpot } from './loco-den-core.js';
+import { DEN_KNOBS, denPlan, envelope, shovelShare, wiggleOffset, exitWay, exitEase, exitSpot, exitReach } from './loco-den-core.js';
 import { wrap } from './locomotion-core.js';
 import { section } from '../../diag/panel.js';
 
@@ -6,6 +6,15 @@ import { section } from '../../diag/panel.js';
    one already fits), then lies low in it until she sets off. She takes the crawl's patches as the jet does and hands them back as a stance. */
 
 const SHOVEL_DT = 1 / 15;
+const EXIT_STEP = 0.01;
+const EXIT_FAN = [0, 20, -20, 40, -40, 60, -60, 80, -80, 100, -100].map((d) => (d * Math.PI) / 180);
+
+/* Whether (x, z) lies over the bed, inside the tank and off the furniture's footprint; a field with no extent is all bed. */
+function onBed(f, x, z) {
+  if (!(f.width > 0)) return true;
+  if (!(Math.abs(x) <= f.width / 2 && Math.abs(z) <= f.depth / 2)) return false;
+  return !f.blocked?.[Math.round((z + f.depth / 2) / f.dz) * f.nx + Math.round((x + f.width / 2) / f.dx)];
+}
 
 export class Den {
   constructor({ loco, mantle, arms, sand, jet = null }, { knobs = {} } = {}) {
@@ -22,14 +31,21 @@ export class Den {
     this.way = [0, 0];                        // the glide out's flat direction
     this.pivot = [0, 0]; this.psiExit = 0;    // her center and heading when the glide out began, which it turns about
     this.err0 = 0;                            // the heading error she set off with, eased in over the glide
+    this.dist = 0; this.turn = 0;             // the glide's length once cleared, and the last turn her heading gave the bases
+    this.bend = 0;                            // rad the glide's way was turned off the straight bearing to find a clear one
+    this.declined = null;                     // the wish a blocked glide was refused for, so it isn't swept again every tick
     this.state = 'off';                       // off, wait, settle, snug, exit
     this.t = 0; this.phi = 0; this.end = Infinity;
     this.left = 0; this.light = false; this.share = 0; this.since = 0; this.best = Infinity; this.bestT = 0;
     this.last = null;                         // how the last settle went
-    this.counts = { settles: 0, light: 0, exits: 0, ended: { done: 0, time: 0, woke: 0, away: 0, jet: 0, tipped: 0 } };
+    this.counts = { settles: 0, light: 0, exits: 0, ended: { done: 0, time: 0, woke: 0, off: 0, away: 0, jet: 0, tipped: 0 } };
     this._o = [0, 0, 0]; this._p = [0, 0, 0]; this._u = [0, 0, 0]; this._c = [0, 0, 0];
     this._held = false;
     loco.registerMode('den', { describe: () => (this.state === 'settle' || this.state === 'exit' ? this.describe() : '') });
+    // A reset ends a glide at once, so a wish set before the next tick starts where she is; a hold someone else took stays theirs.
+    this._listen = () => {};
+    this._listen.reset = () => { if (this.state === 'exit') this._out(loco.holdBy === this, 'reset'); };
+    loco.listeners.add(this._listen);
     const loc = section('loco');
     loc.add({ name: 'Den', label: () => `Den: ${this.knobs.on ? this.state : 'off'}`, run: () => { this.knobs.on = !this.knobs.on; } });
     loc.add({ type: 'range', name: 'Den exit', values: [0, 1.5, 2.5, 4], get: () => this.knobs.exitTime, set: (v) => { this.knobs.exitTime = v; }, label: () => (this.knobs.exitTime > 0 ? `Den exit glide ${this.knobs.exitTime} s` : 'Den exit glide: off') });
@@ -41,10 +57,12 @@ export class Den {
   tick(dt) {
     if (!(dt > 0)) return;
     const k = this.knobs, L = this.loco;
-    if (this.state === 'exit') return k.on ? this._exit(dt) : this._out(true);
+    // Locomotion switched off ends whatever the den holds her in, as switching the den off does.
+    const off = !L.knobs.enabled;
+    if (this.state === 'exit') return k.on && !off ? this._exit(dt) : this._out(true);
     if (this.lying && this._leave()) return;
-    if (!k.on || !this.field || !this.arms.resting) {
-      if (this.state === 'settle') this._stop('woke');
+    if (!k.on || off || !this.field || !this.arms.resting) {
+      if (this.state === 'settle') this._stop(off ? 'off' : 'woke');
       this.state = k.on && this.field ? 'awake' : 'off';
       return;
     }
@@ -75,7 +93,8 @@ export class Den {
     const p = this._p;
     for (let a = 0; a < m.roots.length; a++) {
       m.rootWorld(a, p);
-      this.anchor.set(p, a * 3);
+      // Its first target goes in now, not next tick: the den runs just before the mantle, so a spring with a stale target pulls this tick.
+      this.anchor.set(p, a * 3); m.armTarget.set(p, a * 3);
       this.bed0[a] = f.sample(p[0], p[2]);
       m.armMode[a] = 1; m.armCap[a] = k.holdN;
       m.armAxis.fill(0, a * 3, a * 3 + 3); m.armVel.fill(0, a * 3, a * 3 + 3);
@@ -126,7 +145,7 @@ export class Den {
     const L = this.loco, m = this.mantle, k = this.knobs;
     if (this.last) Object.assign(this.last, { t: +this.t.toFixed(2), ended: why, left: +this.left.toFixed(3) });
     if (why in this.counts.ended) this.counts.ended[why]++;
-    const settled = why === 'done' || why === 'time' || why === 'woke';
+    const settled = why === 'done' || why === 'time' || why === 'woke' || why === 'off';
     if (why === 'done' || why === 'time') {
       this.dens = this.dens.filter((d) => Math.hypot(d[0] - this.center[0], d[1] - this.center[2]) > k.radius / 2);
       this.dens.unshift([this.center[0], this.center[2]]);
@@ -155,22 +174,26 @@ export class Den {
     if (!k.on || !this.field || !(k.exitTime > 0) || !L.desire || L.hold || !L._live) return false;
     if ((this.jet && this.jet.phase !== 'off') || !(m.up(this._u)[1] > 0.5)) return false;
     // A place inside the glide is one she reaches by crawling a step.
-    if (!exitWay(this.lying[0], this.lying[1], L.desire.point[0], L.desire.point[2], k.radius * k.exitDist, this.way)) return false;
+    if (L.desire === this.declined || !exitWay(this.lying[0], this.lying[1], L.desire.point[0], L.desire.point[2], k.radius * k.exitDist, this.way)) return false;
+    const p = this._p, f = this.field;
+    for (let a = 0; a < m.roots.length; a++) { m.rootWorld(a, p); this.anchor.set(p, a * 3); }
+    this.pivot[0] = c[0]; this.pivot[1] = c[2];
+    this.err0 = Number.isFinite(L.pose.yawCmd) ? wrap(L.pose.yawCmd - L.pose.yaw) : 0;
+    if (!this._bearing(k.radius * k.exitDist, k.radius * k.exitMin)) { this.declined = L.desire; return false; }
     L.standDown(0);
     L.hold = true; L.holdBy = this; this._held = true;
-    const p = this._p, f = this.field;
     for (let a = 0; a < m.roots.length; a++) {
-      m.rootWorld(a, p);
-      this.anchor.set(p, a * 3);
+      const A = a * 3;
       // Each arm base keeps the height it had over the bed, less the hunker it lay pressed down by, so it rides up the
       // bowl's wall and over the rim.
-      this.lift[a] = p[1] - f.sample(p[0], p[2]) + k.hunker;
+      this.lift[a] = this.anchor[A + 1] - f.sample(this.anchor[A], this.anchor[A + 2]) + k.hunker;
     }
-    this.pivot[0] = c[0]; this.pivot[1] = c[2]; this.psiExit = L.pose.yaw;
-    this.err0 = Number.isFinite(L.pose.yawCmd) ? wrap(L.pose.yawCmd - L.pose.yaw) : 0;
+    this.psiExit = L.pose.yaw; this.turn = 0;
     this.t = 0;
     this.state = 'exit';
     this.counts.exits++;
+    // The glide's first targets and holds go in the tick it takes her, or every patch the crawl let go of would hang loose.
+    this._exit(0);
     return true;
   }
 
@@ -181,8 +204,13 @@ export class Den {
     if (!L.desire) return this._out(true);
     if (!(m.up(this._u)[1] > 0.5) || !m.positions.every(Number.isFinite)) return this._out(false);
     this.t += dt;
-    const T = Math.max(1e-3, k.exitTime), u = this.t / T, e = exitEase(u), dist = k.exitDist * k.radius, w = this.way, v = (dist * e.rate) / T;
-    const turn = Number.isFinite(pose.yawCmd) ? wrap(pose.yawCmd - this.psiExit) - (1 - e.at) * this.err0 : 0, q = this._o;
+    const T = Math.max(1e-3, k.exitTime), u = this.t / T, e = exitEase(u), dist = this.dist, w = this.way, v = (dist * e.rate) / T;
+    // A heading gone non-finite, or one that would turn a base off the bed, keeps the last turn: zeroing it would snap every base back.
+    if (Number.isFinite(pose.yawCmd)) {
+      const turn = wrap(pose.yawCmd - this.psiExit) - (1 - e.at) * this.err0;
+      if (this._fits(turn, dist * e.at)) this.turn = turn;
+    }
+    const turn = this.turn, q = this._o;
     for (let a = 0; a < m.roots.length; a++) {
       const A = a * 3;
       exitSpot(this.anchor[A], this.anchor[A + 2], this.pivot[0], this.pivot[1], turn, w[0], w[1], dist * e.at, q);
@@ -195,6 +223,62 @@ export class Den {
     if (u >= 1) this._out(true);
   }
 
+  /* The glide only has to lift her out level; the crawl aims her after. So a straight bearing clear for less than min tries its
+     neighbors, nearest first and alternating sides: the first clear the whole way wins, else the longest clear past min. */
+  _bearing(full, min) {
+    const w = this.way, a0 = Math.atan2(w[1], w[0]);
+    let best = -1, bb = 0;
+    for (const b of EXIT_FAN) {
+      if (b) { w[0] = Math.cos(a0 + b); w[1] = Math.sin(a0 + b); }
+      const d = this._clear(full);
+      if (d >= full || (!b && d >= min)) { this.dist = d; this.bend = b; return true; }
+      if (d >= min && d > best) { best = d; bb = b; }
+    }
+    if (best < 0) return false;
+    w[0] = Math.cos(a0 + bb); w[1] = Math.sin(a0 + bb);
+    this.dist = best; this.bend = bb;
+    return true;
+  }
+
+  /* Whether every arm base, turned by turn about where she began and slid s along the way, lies over open bed. */
+  _fits(turn, s) {
+    const f = this.field, w = this.way, q = this._o;
+    for (let a = 0, A = 0; a < this.mantle.roots.length; a++, A += 3) {
+      exitSpot(this.anchor[A], this.anchor[A + 2], this.pivot[0], this.pivot[1], turn, w[0], w[1], s, q);
+      if (!onBed(f, q[0], q[1])) return false;
+    }
+    return true;
+  }
+
+  /* How much of a glide of length dist out along `way` is clear: her center, exitClear over the bed, pressing no deeper into the
+     furniture or glass than where she lies, and every arm base over open bed, turned as far as the glide will have turned it there. */
+  _clear(dist) {
+    const k = this.knobs, f = this.field, w = this.way, cx = this.pivot[0], cz = this.pivot[1];
+    const sdf = this.arms.sdf, terrain = this.arms.phys?.terrain, skip = sdf?.skip, r = k.exitClear, nrm = this._u;
+    let pen0 = 0;
+    if (sdf) {
+      sdf.unfocus();
+      // The sand is in the world too, and a bowl's wall curving up beside her would read as a wall.
+      sdf.skip = terrain && this.arms.primEntry ? this.arms.primEntry.indexOf(terrain.entry) : -1;
+      pen0 = sdf.collide(cx, f.sample(cx, cz) + r, cz, r, nrm);
+    }
+    let D = dist;
+    const free = (s) => {
+      const x = cx + w[0] * s, z = cz + w[1] * s;
+      if (sdf && sdf.collide(x, f.sample(x, z) + r, z, r, nrm) > pen0 + 1e-4) return false;
+      return this._fits((s / D) * this.err0, s);
+    };
+    try {
+      // Her bases turn in step with the slide, so a shorter glide turns them sooner: sweep again at each shorter length until one holds.
+      for (let i = 0; i <= Math.ceil(dist / EXIT_STEP); i++) {
+        const d = exitReach(D, EXIT_STEP, free);
+        if (d >= D || !(d > 0)) return d;
+        D = d;
+      }
+      return 0;
+    } finally { if (sdf) sdf.skip = skip; }
+  }
+
   /* Out of the bowl: the crawl has her where she is, held there as a stance until its first stroke. The stance takes
      her arm bases as they are, not the glide's targets they trail: a stance pulling against her lag springs her on release. */
   _out(stance, why = '') {
@@ -204,7 +288,7 @@ export class Den {
       m.armVel.fill(0);
       L.stanceOn = true;
     }
-    if (this._held && why !== 'jet') L.hold = false;
+    if (this._held && L.holdBy === this && why !== 'jet') L.hold = false;
     if (L.holdBy === this) L.holdBy = null;
     this._held = false;
     this.lying = null;

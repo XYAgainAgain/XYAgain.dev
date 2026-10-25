@@ -47,10 +47,13 @@ export const LOCO_KNOBS = {
   stationRate: 0,         // 1/s an idle arm on the furniture becomes a station unasked (off: stations are for turning)
   stationMax: 30,         // s a station lasts
   stationLinger: 1,       // s stations stay after a turn on them has finished
+  stationFirm: true,      // a station's foot seals deliberately, all its suckers holding, so only slipping loses it
+  stationSlip: 0.25,      // m the arm's anchor point may sit from where it planted before the station counts as slipping
   stanceN: 2.7,           // N each patch holds her body where it settled while she stands still
   stanceSpeed: 0.01,      // m/s under which her crown counts as settled
   stanceSettle: 0.5,      // s settled before the stance takes hold
   turnCap: 2.7,           // N a station may pull with while she turns on it
+  turnFreeCoupled: 0.5,   // sharing her arms' solve, the share of that a commanded turn's free arms push their bases along it with
   pairWeights: [0.3, 0.5, 1.0, 0.9, 0.9, 1.0, 0.5, 0.3],   // by arm: pair 3 pushes most, then 4, 2, and 1
   wanderMin: 8,           // s between her own destinations, at random in this range
   wanderMax: 20,

@@ -882,24 +882,32 @@ function markTouched(c, i) { if (i < c._hit) c._hit = i; if (c._touched) c._touc
    yields over a few ticks, pushing the toy away meanwhile, instead of being thrown off it at once. */
 function yieldPen(c, i, pen, world) { return pen > 0 && world.loose ? Math.min(pen, c.rad[i] * c.knobs.sweepStep) : pen; }
 
+// Whether penAt's deepest push was a berth's, and whether the last push in travelPoint's stop was (c._n keeps its
+// normal), for a chain that keeps a _berth record of what berths account for in each point's correction.
+let penBerth = false, nBerth = false;
+function addBerth(b, i, n, s) { b[i * 3] += n[0] * s; b[i * 3 + 1] += n[1] * s; b[i * 3 + 2] += n[2] * s; }
+
 /* Deepest penetration of point i's sphere at (x, y, z) into the world or her body, its outward normal into out. */
 function penAt(c, i, x, y, z, world, body, out) {
   let best = 0;
-  if (world) { const p = yieldPen(c, i, world.collide(x, y, z, c.rad[i], out, i), world); if (p > 0) best = p; }
+  penBerth = false;
+  if (world) { const p = yieldPen(c, i, world.collide(x, y, z, c.rad[i], out, i), world); if (p > 0) { best = p; penBerth = world.berthHit === true; } }
   if (body && i > 0) {
     const nb = c._nb ??= [0, 0, 0], p = body.collide(x, y, z, bodyRadius(c.rad[i], i, c.knobs.bodySkip), nb);
-    if (p > best) { best = p; out[0] = nb[0]; out[1] = nb[1]; out[2] = nb[2]; }
+    if (p > best) { best = p; out[0] = nb[0]; out[1] = nb[1]; out[2] = nb[2]; penBerth = false; }
   }
   return best;
 }
 
 /* Point i's sphere at (x, y, z) pushed out of every solid it is in, a few rounds for a corner, into q; whether it moved. */
 function outOf(c, i, x, y, z, world, body, q) {
-  const n = c._n;
+  const n = c._n, bv = c._berth;
   let moved = false;
   for (let round = 0; round < 3; round++) {
     const pen = penAt(c, i, x, y, z, world, body, n);
     if (!(pen > 0)) break;
+    nBerth = penBerth;
+    if (penBerth && bv) addBerth(bv, i, n, pen);
     x += n[0] * pen; y += n[1] * pen; z += n[2] * pen; moved = true;
   }
   q[0] = x; q[1] = y; q[2] = z;
@@ -918,6 +926,7 @@ export function projectPoint(c, i, world, body) {
       if (pen > 0) {
         X[i * 3] += nrm[0] * pen; X[i * 3 + 1] += nrm[1] * pen; X[i * 3 + 2] += nrm[2] * pen;
         acc[0] += nrm[0]; acc[1] += nrm[1]; acc[2] += nrm[2]; moved = true;
+        if (c._berth && world.berthHit === true) addBerth(c._berth, i, nrm, pen);
       }
     }
     if (body && i > 0) {
@@ -949,12 +958,19 @@ export function travelPoint(c, i, world, body, x, y, z) {
       const f = s / cnt, sx = x + mx * f, sy = y + my * f, sz = z + mz * f;
       pen = penAt(c, i, sx, sy, sz, world, body, n);
       if (!(pen > 0)) continue;
+      const bv = c._berth;
+      nBerth = penBerth;
+      if (penBerth && bv) addBerth(bv, i, n, pen);
       // Out on the side it came in, then the rest of the move loses its part into the surface.
       x = sx + n[0] * pen; y = sy + n[1] * pen; z = sz + n[2] * pen;
       if (outOf(c, i, x, y, z, world, body, q)) { x = q[0]; y = q[1]; z = q[2]; }
       const rx = mx * (1 - f), ry = my * (1 - f), rz = mz * (1 - f), into = rx * n[0] + ry * n[1] + rz * n[2];
       mx = rx; my = ry; mz = rz;
-      if (into < 0) { mx -= into * n[0]; my -= into * n[1]; mz -= into * n[2]; }
+      if (into < 0) {
+        mx -= into * n[0]; my -= into * n[1]; mz -= into * n[2];
+        // The cut belongs to the surface whose push came last, as its normal is the one cut along.
+        if (nBerth && bv) addBerth(bv, i, n, -into);
+      }
       stopped = true; hit = true;
       break;
     }
@@ -977,6 +993,7 @@ export class Arm {
     this.arc0 = new Float64Array(n);        // rest arc length at each point
     this.len = new Float64Array(S);         // live, after stretch
     this.rad = new Float64Array(n);         // live: a segment thins as it lengthens, keeping its volume
+    this.contactRad0 = null;                // rest radii its contact uses instead of rad0 (a coupled rod's girth)
     this.lam = new Float64Array(S).fill(1); // stretch per segment
     this.lamGoal = new Float64Array(S).fill(1);
     this.lamMax = new Float64Array(S);
@@ -1079,9 +1096,10 @@ export class Arm {
       this.len[j] = this.len0[j] * this.lam[j];
       this.lamMax[j] = 1 + (k.stretchMax - 1) * Math.max(0, 1 - (this.arc0[j] + this.len0[j] / 2) / this._length);
     }
+    const r0 = this.contactRad0 ?? this.rad0;
     for (let i = 0; i < this.n; i++) {
       const a = i > 0 ? this.lam[i - 1] : this.lam[0], b = i < S ? this.lam[i] : this.lam[S - 1];
-      this.rad[i] = this.rad0[i] / Math.sqrt(Math.max(0.1, (a + b) / 2));
+      this.rad[i] = r0[i] / Math.sqrt(Math.max(0.1, (a + b) / 2));
     }
   }
 

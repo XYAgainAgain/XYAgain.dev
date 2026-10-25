@@ -233,7 +233,8 @@ export class Jet {
     const step = this.speed * dt;
     L.meters += step; L.thrustT += dt; L.peak = Math.max(L.peak, this.speed);
     const spent = this.debt.add(step, this.kind === 'jet' ? 1 : k.swimDebt);
-    for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) this._arm(a, this.kind === 'swim' ? 'tuck' : 'trail');
+    // The arms it owns trail under its control and ride her like a stroke's (Arms.carried), so the thrust is sized for her alone.
+    for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) { this._arm(a, this.kind === 'swim' ? 'tuck' : 'trail'); this._carry(a); }
     this._emit('thrust', dt);
     if (spent) return this._endThrust('spent');
     if (this.t >= k.jetMaxT) return this._endThrust('time');
@@ -244,6 +245,9 @@ export class Jet {
       if (rayHit(this.arms.sdf.distance, this.apex, d, stop + 0.05) <= stop) return this._endThrust('wall');
     }
   }
+
+  // An arm that caught a toy on the way stays two-way: its grip's reaction is hers to feel.
+  _carry(a) { if (this.arms.carried && !this.arms.episodes?.[a]?.h) this.arms.carried[a] = 1; }
 
   _endThrust(why) {
     const m = this.mantle;
@@ -267,7 +271,7 @@ export class Jet {
     this.last.glideT += dt;
     // Still coasting fast, the arms keep trailing; once she slows they open into the parachute.
     if (this.coasting && this.speed < k.spreadSpeed) this.coasting = false;
-    for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) this._arm(a, this.kind === 'swim' ? 'tuck' : this.coasting ? 'trail' : 'spread');
+    for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) { this._arm(a, this.kind === 'swim' ? 'tuck' : this.coasting ? 'trail' : 'spread'); this._carry(a); }
     if (this.coasting) this._emit('coast', dt);
     let floorHold = false;
     for (let a = 0; a < L.n && !floorHold; a++) {
@@ -290,6 +294,7 @@ export class Jet {
       const g = A.arms[a].goal;
       if (g && (g.kind === 'trail' || g.kind === 'spread' || g.kind === 'tuck')) A.arms[a].idle();
       A.unclaim?.(a, 'mode');
+      if (A.carried) A.carried[a] = 0;
     }
     this.owned.fill(0);
     this.phase = 'off';

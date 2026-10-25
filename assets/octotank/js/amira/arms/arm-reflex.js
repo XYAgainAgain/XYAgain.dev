@@ -1,8 +1,9 @@
 /* The arms' recoil off a noxious touch: reflex-core.js's state machine per arm, turned into goals. An arm flinches off
    the thing, holds clear while it reassesses, then comes back to what it was reaching for more carefully, stopping short. */
 
-import { Reflex, REFLEX_KNOBS } from './reflex-core.js';
+import { Reflex, REFLEX_KNOBS, StingLatch, LATCH_KNOBS } from './reflex-core.js';
 import { tasteRule, severityOf } from './sucker-core.js';
+import { makeSdfWorld } from './arm-core.js';
 import { claimWins, supportDist } from '../locomotion/loco-carry-core.js';
 
 export const ARM_REFLEX_KNOBS = {
@@ -46,11 +47,62 @@ export class ArmReflexes {
     this.released = new Uint8Array(n);        // the reflex let its own recoil go, so an arm with no goal is still its own
     this.paused = new Array(n).fill(null);    // the reach a mild touch is pausing
     this.until = new Float64Array(n);         // when that pause, or a mild still, ends
-    this.counts = { recoils: 0, extends: 0, mild: 0, kept: 0, misses: 0, resumes: 0, leaves: 0, releases: 0 };
+    this.counts = { recoils: 0, extends: 0, mild: 0, kept: 0, misses: 0, resumes: 0, leaves: 0, releases: 0, latches: 0 };
     this._recoils = new Map();
     this._opts = {};
     this._q = [0, 0, 0, 1]; this._c = [0, 0, 0]; this._t = [0, 0, 0]; this._d = [0, 0, 0];
     this._was = this.knobs.on;
+    // The escalation latch: its own knobs, since its hold is not the recoil goal's.
+    this.latchKnobs = { ...LATCH_KNOBS };
+    this.latch = new StingLatch(this.latchKnobs);
+    this.berths = [];                         // per latched thing: { entry, w }, a one-shape world of it to grow by its berth
+    this._latched = [];
+    this._b3 = [0, 0, 0];
+  }
+
+  /* Whether a thing has stung her arms enough that they all keep off it. */
+  latched(entry) { return this.latch.latched(entry); }
+
+  /* The deepest a sphere sinks into the berth around any latched thing, its outward normal into out; 0 when clear. */
+  berth(x, y, z, r, out) {
+    let best = 0;
+    for (let i = 0; i < this.berths.length; i++) {
+      const b = this.berths[i], R = this.latch.berth(b.entry);
+      if (!(R > 0)) continue;
+      const pen = b.w.collide(x, y, z, r + R, this._b3);
+      if (pen > best) { best = pen; out[0] = this._b3[0]; out[1] = this._b3[1]; out[2] = this._b3[2]; }
+    }
+    return best;
+  }
+
+  /* A sting on arm a: one more toward the latch, and the trip noted on the arm that took it. */
+  _sting(a, entry) {
+    if (!this.latch.sting(entry, this.arms.time)) return;
+    this.counts.latches++;
+    this.arms.records.note(a, 'latch', entry);
+  }
+
+  /* The latches lapse on their own clock, and each latched thing gets a shape of its own (posed by poseBerths). */
+  _latchTick() {
+    const A = this.arms, B = this.berths;
+    this.latch.tick(A.time);
+    const L = this.latch.list(this._latched);
+    for (let i = B.length - 1; i >= 0; i--) if (!L.includes(B[i].entry)) B.splice(i, 1);
+    for (const e of L) {
+      if (!e?.body || B.some((b) => b.entry === e)) continue;
+      const prim = e.kind === 'box' ? { type: 'box', h: e.size } : e.kind === 'sphere' ? { type: 'sphere', r: e.size[0] } : { type: 'capsule', hh: e.size[0], r: e.size[1] };
+      B.push({ entry: e, w: makeSdfWorld([prim], { fixed: 0 }) });
+    }
+  }
+
+  /* Each berth follows its thing, as the arms' own copy does; Arms.tick poses them before any contact. */
+  poseBerths() {
+    const c = this._c, q = this._q;
+    for (const b of this.berths) {
+      const p = b.entry.body.GetPosition(), r = b.entry.body.GetRotation();
+      c[0] = p.GetX(); c[1] = p.GetY(); c[2] = p.GetZ(); q[0] = r.GetX(); q[1] = r.GetY(); q[2] = r.GetZ(); q[3] = r.GetW();
+      b.w.move(0, c, q);
+    }
   }
 
   /* After the touches are tasted and before the suckers act: each arm's noxious touches through its machine, and its
@@ -59,6 +111,7 @@ export class ArmReflexes {
     const A = this.arms, k = this.knobs;
     if (!k.on) { if (this._was) this._off(); this._was = false; return; }
     this._was = true;
+    this._latchTick();
     const S = A.S, TK = A.touchKind, TE = A.touchEntry, TT = A.touchTaste, TP = A.touchP, TN = A.touchN, sk = A.suckerKnobs;
     for (let a = 0; a < this.rx.length; a++) {
       const list = this.touches[a];
@@ -138,6 +191,7 @@ export class ArmReflexes {
     this._refr(a, touch.entry, duration);
     this.counts.recoils++;
     rec.note(a, 'recoil', touch.entry);
+    this._sting(a, touch.entry);
     return true;
   }
 
@@ -174,6 +228,7 @@ export class ArmReflexes {
     if (g2) { this.mine[a] = g2; this.entry[a] = t.entry; } else g.duration = Math.max(g.duration, g.t + tr.duration);
     this._refr(a, t.entry, tr.duration);
     A.records.note(a, 'extend', t.entry);
+    this._sting(a, t.entry);
   }
 
   /* Under the recoil threshold: no flinch. A reaching arm's bend stops for the hold, so the reach carries on after it;
@@ -270,5 +325,9 @@ export class ArmReflexes {
       this.live[a] = 0; this.released[a] = 0;
       this.state[a] = 'calm';
     }
+    this.resetLatch();
   }
+
+  /* Nothing latched and no berth worn. */
+  resetLatch() { this.latch.reset(); this.berths.length = 0; }
 }

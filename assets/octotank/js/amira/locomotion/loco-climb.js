@@ -1,7 +1,8 @@
+import { TANK } from '../../config.js';
 import { ROLE, lerp } from './locomotion-core.js';
 import {
   CLIMB_KNOBS, surfaceMode, ellMin, pullRate, holdAhead, pullRelease, releaseSafe, supportNormal, wallHolds, arrivedWall,
-  pullUsefulness, reachPoint, domeShare,
+  pullUsefulness, reachPoint, wallAt, wallReachPoint, domeShare,
 } from './loco-climb-core.js';
 import { until, register } from '../../diag/scenarios.js';
 
@@ -22,6 +23,8 @@ export class Pull {
     this.seekP = new Float64Array(n * 3);
     this.hangP = new Float64Array(n * 3);
     this.hangSet = new Uint8Array(n);
+    this.made = new Uint8Array(n);
+    this.madeT = new Float64Array(n);           // the arm's role time when last seen as Pull's station: a restart means a new station
     this.wallReachAt = new Float64Array(n);
     this._pinned = false;
     this.holding = new Uint8Array(n);
@@ -38,9 +41,25 @@ export class Pull {
     this._at = -1;
     this._rf = { p: [0, 0, 0], n: [0, 0, 0], t: [0, 0, 0] };
     this._n = [0, 1, 0]; this._nb = [0, 1, 0]; this._p = [0, 0, 0]; this._a = [0, 0, 0];
+    this._wallP = [0, 0, 0]; this._wallN = [0, 0, 1]; this._appr = [0, 0, 0]; this._apprOn = false;
     this.stats = { wallT: 0, wallPullT: 0, refused: 0, unsafeLost: 0, reanchored: 0, toppedUp: 0, wallReaches: 0, releases: { short: 0, behind: 0, long: 0, full: 0, lost: 0 } };
     this._listen = (dt) => this._tick(dt);
+    // A finished climb scenario leaves her hanging on the glass; the next scenario's opening reset lets her go.
+    this._listen.reset = (why) => { if (why !== 'scenario over') this.reset(); };
     loco.listeners.add(this._listen);
+  }
+
+  /* A scenario's reset, after the stop's finish has hung her: the stations this mode made let go, wall reaches lapse, and
+     the hang, the stall's pull, and the dome start fresh, so nothing pins her toward the old setup. */
+  reset() {
+    const L = this.loco, A = L.arms;
+    for (let a = 0; a < L.n; a++) {
+      if (this.made[a] && L.role[a] === STATION) L._release(a, 'reset');
+      if (this.wallReachAt[a] > 0 && L.role[a] === IDLE) { if (A.arms[a].goal?.loco === L) A.arms[a].idle(); A.unclaim?.(a, 'stroke'); }
+    }
+    this.made.fill(0); this.hangSet.fill(0); this.wallReachAt.fill(0);
+    this._pinned = false; this.stallUntil = -Infinity; this._at = -1; this.dome = 1;
+    L.mantle.knobs.righting = this._domeSet = this._domeBase;
   }
 
   /* Holds, support, and whether pulling is open, once per tick (the controller's hooks share them). */
@@ -83,10 +102,21 @@ export class Pull {
     return pullUsefulness(rf.n, this.up, loco.d3);
   }
 
-  /* A point reachAhead along the travel from her crown, on the surface there; middle-of-arm contact, suckers turned in. */
+  /* A place up a wall is approached at her standoff off the wall it sits on, so once she is there the travel runs in its plane. */
+  route(loco, d, T) {
+    this._apprOn = false;
+    const dist = loco.arms.sdf?.distance;
+    if (d.kind !== 'place' || !(d.point[1] > 0.05) || !dist || !wallAt(d.point, dist, this._wallP, this._wallN, this.k)) return;
+    for (let i = 0; i < 3; i++) T[i] = this._appr[i] = this._wallP[i] + this._wallN[i] * this.k.wallStandoff;
+    this._apprOn = true;
+  }
+
+  /* A point reachAhead from her crown on the surface there: up the wall along its tangent while the travel is this mode's own
+     approach and the wall is in reach, else along the 3D travel. Middle-of-arm contact, suckers turned in. */
   seek(loco, a, root, n, out) {
-    const dist = loco.arms.sdf?.distance, nrm = this._n;
-    if (!dist || !reachPoint(loco.c, loco.d3, dist, out, nrm, this.k)) return null;
+    const dist = loco.arms.sdf?.distance, nrm = this._n, T = loco.travel, w = this._appr;
+    const up = this._apprOn && T[0] === w[0] && T[1] === w[1] && T[2] === w[2];
+    if (!dist || !((up && wallReachPoint(loco.c, T, this._wallP, this._wallN, dist, out, nrm, this.k)) || reachPoint(loco.c, loco.d3, dist, out, nrm, this.k))) return null;
     this.seekP[a * 3] = out[0]; this.seekP[a * 3 + 1] = out[1]; this.seekP[a * 3 + 2] = out[2];
     return { face: [out[0] - nrm[0] * 0.05, out[1] - nrm[1] * 0.05, out[2] - nrm[2] * 0.05] };
   }
@@ -121,7 +151,7 @@ export class Pull {
     const safe = releaseSafe(loco.holdF, this.holding, a, this.steep, k);
     if (VOLUNTARY.has(why) && !safe) { this.stats.refused++; return null; }
     // A hold whose suckers all let go moves to another sealed patch of the same arm on the wall, if it has one.
-    if (!safe && this._reanchor(loco, a)) { loco._set(a, STATION); this.stats.reanchored++; return null; }
+    if (!safe && this._reanchor(loco, a)) { loco._set(a, STATION); this.made[a] = 1; this.madeT[a] = loco.roleT[a]; this.stats.reanchored++; return null; }
     if (!safe) this.stats.unsafeLost++;
     this.stats.releases[why]++;
     // Later arms this tick judge their own release without this hold.
@@ -153,6 +183,7 @@ export class Pull {
       if (loco.role[a] !== PLANTED) continue;
       if (!this.steep && loco.anchorN[a * 3 + 1] > this.k.floorCos) continue;
       loco._set(a, STATION);
+      this.made[a] = 1; this.madeT[a] = loco.roleT[a];
     }
     this._settle();
   }
@@ -207,7 +238,7 @@ export class Pull {
       const g = L.arms.arms[a].goal;
       if (L.role[a] !== IDLE || (g && g.loco !== L)) continue;
       const o = this._wallAnchor(a);
-      if (o && L.plantStation(a, o)) { this.walls++; this.holding[a] = 1; this.stats.toppedUp++; if (this._pinned) this._settle(a); }
+      if (o && L.plantStation(a, o)) { this.walls++; this.holding[a] = 1; this.made[a] = 1; this.madeT[a] = L.roleT[a]; this.stats.toppedUp++; if (this._pinned) this._settle(a); }
       else if (short && !g && this._reachWall(a)) short = false;
     }
   }
@@ -246,6 +277,8 @@ export class Pull {
     if (m.knobs.righting !== this._domeSet) this._domeBase = m.knobs.righting;
     const live = !(st === 'off' || st === 'held' || st.startsWith('rigid'));
     this._at = -1;
+    // A station released and remade between two looks (the righting runs after Pull) restarts its role clock.
+    for (let a = 0; a < L.n; a++) { if (L.role[a] !== STATION || L.roleT[a] < this.madeT[a]) this.made[a] = 0; this.madeT[a] = L.roleT[a]; }
     if (live) this._refresh();
     this.dome = live ? domeShare(this.walls, this.k) : 1;
     m.knobs.righting = this._domeSet = this._domeBase * this.dome;
@@ -304,7 +337,7 @@ export async function climb(ctx, { variant = null, to = null, urgency = 0.5, lim
   const { loco, mantle } = ctx, pull = loco.modes.get('pull');
   if (!loco.canPlant) return { passed: false, failed: 'no plant support in the arms yet' };
   if (!pull) return { passed: false, failed: 'no pull mode registered' };
-  const spot = to ?? (variant === 'lid' ? [-0.5, 0.9, 0.2] : [-0.5, 0.7, 0.35 - 0.01]);
+  const spot = to ?? (variant === 'lid' ? [-0.5, 0.9, 0.2] : [-0.5, 0.7, TANK.d / 2 - 0.01]);
   const S = pull.stats, s0 = JSON.parse(JSON.stringify(S));
   const w = { y0: loco.c[1], yMax: -Infinity, left: false, drop: 0, track: [], domeMin: 1, forcePeak: 0, wallsMax: 0, lidHoldT: 0, acc: 0 };
   const watch = (dt) => {

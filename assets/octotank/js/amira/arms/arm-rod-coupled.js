@@ -385,6 +385,23 @@ export class CoupledRod extends Rod {
     return j;
   }
 
+  /* pushOut against her own skin, which moves at (ux, uy, uz) there: the closing speed is the node's relative to her, and
+     extra (1/M + (r×n)ᵀI⁻¹(r×n)) is her share of the two-body mass, so the impulse j the node takes she takes back as −j·n. */
+  pushOutOn(i, dx, dy, dz, h, ux, uy, uz, extra) {
+    if (i === 0) return 0;
+    const x = this.x, v = this.v, W = this.Wp, o = 3 * i, w = 9 * i, d = Math.hypot(dx, dy, dz);
+    x[o] += dx; x[o + 1] += dy; x[o + 2] += dz;
+    if (!(h > 0) || !(d > 0)) return 0;
+    const nx = dx / d, ny = dy / d, nz = dz / d, vn = (v[o] - ux) * nx + (v[o + 1] - uy) * ny + (v[o + 2] - uz) * nz;
+    if (!(vn < 0)) return 0;
+    const ax = W[w] * nx + W[w + 1] * ny + W[w + 2] * nz, ay = W[w + 3] * nx + W[w + 4] * ny + W[w + 5] * nz, az = W[w + 6] * nx + W[w + 7] * ny + W[w + 8] * nz;
+    const den = nx * ax + ny * ay + nz * az + Math.max(0, extra);
+    if (!(den > 0)) return 0;
+    const j = -vn / den;
+    v[o] += ax * j; v[o + 1] += ay * j; v[o + 2] += az * j;
+    return j;
+  }
+
   /* Linear and angular momentum (about the world origin) of nodes 1..n and the elements' spins; node 0 is hers. */
   momentum(P, L) {
     const n = this.n, x = this.x, v = this.v, M = this.Mp, q = this.q, om = this.om;

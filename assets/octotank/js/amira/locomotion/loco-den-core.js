@@ -22,7 +22,16 @@ export const DEN_KNOBS = {
   hunker: 0.003,         // m she presses down past the bed's drop, lying low
   exitTime: 2.5,         // s she takes to glide up out of the bowl when she sets off from it; 0 leaves it to the crawl
   exitDist: 1.4,         // radii she glides toward where she's going, her center past the rim's crest at 1.3
+  exitClear: 0.06,       // m kept between her center and the furniture or glass along the glide: her resting radius
+  exitMin: 0.7,          // radii of clear glide below which she climbs out by crawling; short of it, her center is still low on the bowl's wall
 };
+
+/* How much of a glide of length dist stays free, sampled every `step` along it: free(s) says whether she may be s along. */
+export function exitReach(dist, step, free) {
+  const n = Math.max(1, Math.ceil(dist / step));
+  for (let i = 1; i <= n; i++) if (!free((dist * i) / n)) return (dist * (i - 1)) / n;
+  return dist;
+}
 
 /* The flat way out of a den at (cx, cz) toward (px, pz), into out as [x, z]; null when the place lies inside minDist,
    where she'd arrive before she was out of the bowl anyway. */

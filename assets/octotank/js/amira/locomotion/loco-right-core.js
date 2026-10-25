@@ -8,6 +8,7 @@ export const RIGHT_KNOBS = {
   rightNear: 0.12,        // m: her body's center this near a surface means something holds her up, not open water
   rightAfter: 0.25,       // s on her back before the reflex takes over, so a tumble in passing is left alone
   rightN: 1.2,            // N each arm base on the side she leans to pulls down with at first; 0 leaves it to the dome alone
+  rightFarCoupled: 0.5,   // sharing her arms' solve, the share of that pull her far side's bases push along the roll with; 0 leaves them be
   rightReach: 0.04,       // m out past each of those arm bases to the floor point it pulls toward, mostly down, so she rolls
   rightRamp: 3,           // s over which that pull doubles while she stays over
   rightSwap: 3,           // s without her coming any further up before the arms try rolling her another way

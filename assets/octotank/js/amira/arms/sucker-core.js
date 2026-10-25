@@ -143,6 +143,38 @@ export function gauss(rng) {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
+/* Point (x, y, z) in an arm's root frame F ({ p, d, u, v }), into out at o: what moves it is the arm, never her body. */
+export function toFrame(F, x, y, z, out, o = 0) {
+  const dx = x - F.p[0], dy = y - F.p[1], dz = z - F.p[2];
+  out[o] = dx * F.d[0] + dy * F.d[1] + dz * F.d[2];
+  out[o + 1] = dx * F.u[0] + dy * F.u[1] + dz * F.u[2];
+  out[o + 2] = dx * F.v[0] + dy * F.v[1] + dz * F.v[2];
+  return out;
+}
+
+/* How far a stuck arm is drawn out: the body chain X's arc from the root to point i over the intent chain I's arc there,
+   so stretch the program asked for never counts. 1 when either is degenerate. */
+export function spanStretch(X, I, i) {
+  let x = 0, y = 0;
+  for (let p = 0; p < i * 3; p += 3) {
+    x += Math.hypot(X[p + 3] - X[p], X[p + 4] - X[p + 1], X[p + 5] - X[p + 2]);
+    y += Math.hypot(I[p + 3] - I[p], I[p + 4] - I[p + 1], I[p + 5] - I[p + 2]);
+  }
+  const r = x / y;
+  return y > 1e-6 && Number.isFinite(r) ? r : 1;
+}
+
+/* spanStretch at the far point of every segment j whose sealed[j] is set, the worst of them (1 with none), in one pass. */
+export function worstStretch(X, I, sealed, S) {
+  let x = 0, y = 0, worst = 1;
+  for (let j = 0, p = 0; j < S; j++, p += 3) {
+    x += Math.hypot(X[p + 3] - X[p], X[p + 4] - X[p + 1], X[p + 5] - X[p + 2]);
+    y += Math.hypot(I[p + 3] - I[p], I[p + 4] - I[p + 1], I[p + 5] - I[p + 2]);
+    if (sealed[j] && y > 1e-6 && x / y > worst) worst = x / y;
+  }
+  return worst;
+}
+
 /* When she pulls on a gripped thing, the side holding on less moves: her hold is what her other arms have sealed on the
    world, the object's is what it is wedged by. Only when neither is held does mass decide. */
 export function whoMoves({ anchor = 0, objectHold = 0, objectMass = 0, bodyMass = 1 } = {}) {
@@ -200,6 +232,8 @@ export class SuckerBank {
     this.segSealed = new Uint16Array(layout.S);
     this.segForce = new Float64Array(layout.S);
     this.segCeil = new Float64Array(layout.S);
+    // What each segment bears with every sucker on it sealed hard: a patch that has taken hold recruits them all.
+    this.segHard = Float64Array.from({ length: layout.S }, (_, j) => { let f = 0; for (let i = layout.segStart[j]; i < layout.segStart[j + 1]; i++) f += layout.fHard[i]; return f; });
     this.segCount = Uint16Array.from({ length: layout.S }, (_, j) => layout.segStart[j + 1] - layout.segStart[j]);
   }
 

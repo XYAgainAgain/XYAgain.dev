@@ -74,7 +74,8 @@ export class Wander {
     const nan = (p) => { p[0] = NaN; p[1] = NaN; p[2] = NaN; };
     for (let i = 0; i < T.length; i++) {
       loco._entryPoint(T[i], P[i]);
-      if (!ok(P[i], sizeOf(T[i])) || this._held(T[i])) nan(P[i]);
+      // A toy that has stung her enough to latch is no destination: her arms keep a berth off it (arm-reflex.js).
+      if (!ok(P[i], sizeOf(T[i])) || this._held(T[i]) || loco.arms.reflexes?.latched(T[i])) nan(P[i]);
       this.seen[i] = this.attention?.seen[i] ?? this.seen[i];
     }
     for (let i = 0; i < R.length; i++) { const p = P[T.length + i]; loco._entryPoint(R[i], p); if (!ok(p, sizeOf(R[i]))) nan(p); }

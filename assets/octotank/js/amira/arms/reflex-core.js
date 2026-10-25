@@ -23,6 +23,70 @@ export const REFLEX_KNOBS = {
   muscle: 'pass',     // in muscle mode: 'pass' keeps the flinch's bends as they are, 'map' braces them through the map
 };
 
+/* The escalation latch, body-wide: a thing that has stung her `stings` times (on any arms) within `window` s is given a
+   wide berth by every arm for `hold` s after its last sting. */
+export const LATCH_KNOBS = {
+  latch: true,
+  stings: 2,
+  window: 30,
+  hold: 45,
+  berth: 0.06,        // m every arm keeps off the latched thing's surface
+  berthIn: 0.5,       // s the berth takes to grow to full, so an arm lying on the thing is eased off, not thrown
+};
+
+/* Stings per thing and the latches they trip, THREE-free. sting() returns true on the sting that trips a latch. */
+export class StingLatch {
+  constructor(knobs = LATCH_KNOBS) {
+    this.knobs = knobs;
+    this.m = new Map();       // entry → { times: sting times inside the window, since: when it latched, or -1, last }
+    this.time = 0;
+    this.trips = 0;
+  }
+
+  sting(entry, t = this.time) {
+    if (entry == null) return false;
+    const k = this.knobs;
+    let e = this.m.get(entry);
+    if (!e) this.m.set(entry, e = { times: [], since: -1, last: t });
+    e.last = t;
+    e.times.push(t);
+    while (e.times.length && t - e.times[0] > k.window) e.times.shift();
+    if (e.since >= 0 || !k.latch || e.times.length < Math.max(1, k.stings)) return false;
+    e.since = t;
+    this.trips++;
+    return true;
+  }
+
+  /* Forgets stings older than the window and lets latches lapse `hold` s after their last sting. */
+  tick(t) {
+    this.time = t;
+    const k = this.knobs;
+    for (const [entry, e] of this.m) {
+      if (e.since >= 0 && t - e.last > k.hold) e.since = -1;
+      while (e.times.length && t - e.times[0] > k.window) e.times.shift();
+      if (e.since < 0 && !e.times.length) this.m.delete(entry);
+    }
+  }
+
+  latched(entry) { const e = this.m.get(entry); return !!e && e.since >= 0 && !!this.knobs.latch; }
+
+  /* The berth around a latched thing now, growing in over berthIn; 0 when it isn't latched. */
+  berth(entry, t = this.time) {
+    const e = this.m.get(entry), k = this.knobs;
+    if (!e || e.since < 0 || !k.latch) return 0;
+    return k.berth * Math.min(1, Math.max(0, (t - e.since) / Math.max(1e-6, k.berthIn)));
+  }
+
+  /* Every latched thing, for the berth's world and the readout. */
+  list(out = []) {
+    out.length = 0;
+    if (this.knobs.latch) for (const [entry, e] of this.m) if (e.since >= 0) out.push(entry);
+    return out;
+  }
+
+  reset() { this.m.clear(); this.trips = 0; }
+}
+
 /* Seconds of recoil for a touch of this severity. */
 export function recoilTime(severity, k = REFLEX_KNOBS) { return k.recoilBase + k.recoilPer * severity; }
 

@@ -73,15 +73,20 @@ export class Right {
     else if (this.t - this.bestT > k.rightSwap) { this.turn = (this.turn + 1) % ROLL_TURNS.length; this.best = up[1]; this.bestT = this.t; }
     // Toward the floor just past each base, a point that moves with it: fixed points stall the roll once the bases reach them.
     const dir = turnDir(rollDir(up, m.bodyFrame(this._f).s, this.dir), ROLL_TURNS[this.turn]), ground = L.arms.phys?.terrain?.field;
+    // Sharing her arms' solve, the far side's bases push level along the roll too: an arm no spring drives hangs its weight,
+    // drag, and contact on her as she rolls, and those undriven arms alone held her on her back.
+    const far = L.arms.coupling ? k.rightFarCoupled : 0;
     for (let a = 0; a < L.n; a++) {
       const p = m.rootWorld(a, this._p);
-      if (L.arms.episodes?.[a]?.h || !nearSide(p, ring, dir)) continue;
+      if (L.arms.episodes?.[a]?.h) continue;
+      const near = nearSide(p, ring, dir);
+      if (!near && !(far > 0)) continue;
       const fx = p[0] + dir[0] * k.rightReach, fz = p[2] + dir[2] * k.rightReach;
       m.armMode[a] = 1;
-      m.armTarget[a * 3] = fx; m.armTarget[a * 3 + 1] = ground?.sample(fx, fz) ?? 0; m.armTarget[a * 3 + 2] = fz;
+      m.armTarget[a * 3] = fx; m.armTarget[a * 3 + 1] = near ? ground?.sample(fx, fz) ?? 0 : p[1]; m.armTarget[a * 3 + 2] = fz;
       m.armAxis[a * 3] = 0; m.armAxis[a * 3 + 1] = 0; m.armAxis[a * 3 + 2] = 0;
       m.armVel[a * 3] = 0; m.armVel[a * 3 + 1] = 0; m.armVel[a * 3 + 2] = 0;
-      m.armCap[a] = cap;
+      m.armCap[a] = near ? cap : cap * far;
     }
   }
 
