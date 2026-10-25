@@ -338,8 +338,9 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
     const l = len2(g[0], g[2]);
     if (l > 1e-6) { g[0] /= l; g[2] /= l; } else { g[0] = 1; g[2] = 0; }
   };
-  // Distance from primitive p to (x, y, z), its world gradient written to g.
-  const sdf = (p, x, y, z) => {
+  // Distance from primitive p to (x, y, z), its world gradient written to g; raw drops the contact heuristics (sealed
+  // faces and caps, a loose thing's no-down) for the plain shape.
+  const sdf = (p, x, y, z, raw = false) => {
     if (p.type === 'field') return p.distance(x, y, z, g);
     if (p.type === 'plane') {
       g[0] = p.n[0]; g[1] = p.n[1]; g[2] = p.n[2];
@@ -349,7 +350,7 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
     if (p.type === 'sphere') {
       const l = len3(dx, dy, dz);
       if (l < 1e-12) { g[0] = 0; g[1] = 1; g[2] = 0; } else { g[0] = dx / l; g[1] = dy / l; g[2] = dz / l; }
-      if (p.loose) noDown();
+      if (p.loose && !raw) noDown();
       return l - p.r;
     }
     if (p.flat) { loc[0] = dx; loc[1] = dy; loc[2] = dz; } else rotInv(p.q, dx, dy, dz, loc);
@@ -367,8 +368,8 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
         d = -Infinity;
         for (let k = 0; k < 3; k++) {
           for (let s = -1; s <= 1; s += 2) {
-            if (p.sealed?.[k * 2 + (s > 0 ? 1 : 0)]) continue;
-            if (p.loose && s * (p.flat ? (k === 1 ? 1 : 0) : p.up[k]) < -0.7) continue;
+            if (!raw && p.sealed?.[k * 2 + (s > 0 ? 1 : 0)]) continue;
+            if (!raw && p.loose && s * (p.flat ? (k === 1 ? 1 : 0) : p.up[k]) < -0.7) continue;
             const e = s * loc[k] - p.h[k];
             if (e > d) { d = e; g[0] = 0; g[1] = 0; g[2] = 0; g[k] = s; }
           }
@@ -382,14 +383,14 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
       }
     } else {
       // Past an end cap that butts against another solid the capsule is a plain cylinder: leave sideways, never into it.
-      const cy = (loc[1] > p.hh && p.sealed?.[1]) || (loc[1] < -p.hh && p.sealed?.[0]) ? loc[1] : Math.max(-p.hh, Math.min(p.hh, loc[1]));
+      const cy = !raw && ((loc[1] > p.hh && p.sealed?.[1]) || (loc[1] < -p.hh && p.sealed?.[0])) ? loc[1] : Math.max(-p.hh, Math.min(p.hh, loc[1]));
       const vx = loc[0], vy = loc[1] - cy, vz = loc[2];
       const l = len3(vx, vy, vz);
       if (l < 1e-12) { g[0] = 1; g[1] = 0; g[2] = 0; } else { g[0] = vx / l; g[1] = vy / l; g[2] = vz / l; }
       d = l - p.r;
     }
     if (!p.flat) rot(p.q, g[0], g[1], g[2], g);
-    if (p.loose) noDown();
+    if (p.loose && !raw) noDown();
     return d;
   };
   // A box face, or a capsule's end cap, is sealed when the point just past its center lies inside another primitive.
@@ -463,6 +464,14 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
         if (d < best) { best = d; out[0] = g[0]; out[1] = g[1]; out[2] = g[2]; }
       }
       return best;
+    },
+    /* One primitive's plain signed distance and outward normal, whatever is nearer: a seal's own surface. */
+    distanceTo(i, x, y, z, out) {
+      const p = P[i];
+      if (!p) return NaN;
+      const d = sdf(p, x, y, z, true);
+      out[0] = g[0]; out[1] = g[1]; out[2] = g[2];
+      return d;
     },
   };
   return api;

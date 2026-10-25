@@ -1314,13 +1314,17 @@ export class Arms {
       if (st.kind[j]) rod.unseal(j + 1);
       // A torn foot stays torn until the plant ends: st.plant is kept so the same plant cannot seal it again.
       if (st.kind[j] === 4) st.plantSeg = -1;
-      if (st.kind[j]) this._sealEnd(a, j, `tear-${by}`);
+      if (st.kind[j]) this._sealEnd(a, j, `tear-${by}`, load);
       st.kind[j] = 0; st.toy[j] = null;
       this.refr[a * S + j] = t + sk.refractory;
       bank.releaseSeg(j);
       this.counts.sealBreaks++;
     };
-    const drop = (j, why) => { if (st.kind[j]) { react(j); rod.unseal(j + 1); this.counts.sealDrops++; this._sealEnd(a, j, why); } st.kind[j] = 0; st.toy[j] = null; };
+    // Its force is read before unseal, which zeroes it.
+    const drop = (j, why) => {
+      if (st.kind[j]) { react(j); const f = rod.sealForce(j + 1, this._f3r ??= [0, 0, 0]); rod.unseal(j + 1); this.counts.sealDrops++; this._sealEnd(a, j, why, Math.hypot(f[0], f[1], f[2])); }
+      st.kind[j] = 0; st.toy[j] = null;
+    };
     const pose = (toy) => {
       const b = toy.body, p = b.GetPosition(), r = b.GetRotation();
       c[0] = p.GetX(); c[1] = p.GetY(); c[2] = p.GetZ(); q[0] = r.GetX(); q[1] = r.GetY(); q[2] = r.GetZ(); q[3] = r.GetW();
@@ -1448,10 +1452,11 @@ export class Arms {
   /* A scenario starts clean (Locomotion.reset): nothing latched, the beats drawn afresh, no seal history. Free life keeps it all. */
   resetHistory() { this.reflexes.resetLatch(); this._freshSeals(); }
 
-  /* One seal's end, for the readout and the checks: arm, segment, kind, how long it held, and why it let go. */
-  _sealEnd(a, j, why) {
+  /* One seal's end, for the readout and the checks: arm, segment, kind, how long it held, why it let go, and the N it
+     bore in its last step (force). Nothing she does reads it. */
+  _sealEnd(a, j, why, force = 0) {
     const st = this.seals[a], log = this.sealLog;
-    log.push({ t: this.time, a, j, kind: st.kind[j], life: this.time - st.t0[j], beat: st.beat[j], end: why });
+    log.push({ t: this.time, a, j, kind: st.kind[j], life: this.time - st.t0[j], beat: st.beat[j], end: why, force });
     if (log.length > this.sealLogSize) log.shift();
     this.sealEnds[why] = (this.sealEnds[why] ?? 0) + 1;
   }

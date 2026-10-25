@@ -246,8 +246,20 @@ async function throwToy(ctx, { speed = 1.5, throws = 4, seconds = 2, along = 0.5
   for (const t of toys ?? []) if (t.motion === 'dynamic' && (!toy || phys.inverseMass(t) < phys.inverseMass(toy))) toy = t;
   if (!toy) return { passed: null, failed: 'no toys' };
   const ti = arms.loose.indexOf(toy), w = arms.allSdf, nrm = [0, 0, 0], big = Math.max(...toy.size), n = arms.arms.length;
-  const o = { toy: toy.kind, kg: r3(1 / phys.inverseMass(toy)), speed, throws: [], met: 0, deepest: 0, inToy: 0, closest: Infinity, nan: 0 };
+  const o = { toy: toy.kind, kg: r3(1 / phys.inverseMass(toy)), speed, throws: [], met: 0, deepest: 0, inToy: 0, closest: Infinity, nan: 0, jumps: 0, jumpMax: 0 };
   const done = armWatch(ctx), dir = [0, -0.55, -0.83], dl = Math.hypot(...dir), back = 0.06 + big;
+  // A toy moving over 4 cm in one tick that isn't the check's own reposition is a grip dragging it.
+  let last = null, moved = false;
+  const jumpWatch = () => {
+    const c = toy.body.GetPosition(), x = [c.GetX(), c.GetY(), c.GetZ()];
+    if (last && !moved) {
+      const d = Math.hypot(x[0] - last[0], x[1] - last[1], x[2] - last[2]);
+      o.jumpMax = Math.max(o.jumpMax, d);
+      if (d > 0.04) o.jumps++;
+    }
+    last = x; moved = false;
+  };
+  loco.listeners.add(jumpWatch);
   let wa;
   try {
     await simWait(loco, 1);
@@ -256,7 +268,10 @@ async function throwToy(ctx, { speed = 1.5, throws = 4, seconds = 2, along = 0.5
       // From inside the tank, whatever wall the arm lies along.
       const room = big + 0.02, inside = (v, half) => Math.max(-half + room, Math.min(half - room, v));
       const from = [inside(p[0] - dir[0] / dl * back, TANK.w / 2), Math.max(big + 0.01, p[1] - dir[1] / dl * back), inside(p[2] - dir[2] / dl * back, TANK.d / 2)];
+      // A grip still on the toy would drag it back toward the arm after the teleport.
+      for (let g = 0; g < n; g++) if (arms.episodes[g]?.h && arms.episodes[g].toy === toy) arms._end(g, false, 'rethrow');
       phys.teleport(toy, from[0], from[1], from[2], 0, 0, 0, 1);
+      moved = true;
       phys.stopKinematic(toy); // a teleport keeps the last throw's rebound, so zero it (works on a dynamic body too)
       phys.wake(toy);
       const J = speed / Math.max(1e-9, phys.inverseMass(toy)) / dl;
@@ -281,9 +296,9 @@ async function throwToy(ctx, { speed = 1.5, throws = 4, seconds = 2, along = 0.5
       o.met += one.met; one.inToy = r3(one.inToy);
       o.throws.push(one);
     }
-  } finally { wa = done(); }
-  o.deepest = r3(o.deepest); o.inToy = r3(o.inToy); o.closest = r3(o.closest);
-  return { ...o, watch: wa, passed: o.nan === 0 && bodyOk(wa) && o.met > 0 };
+  } finally { wa = done(); loco.listeners.delete(jumpWatch); }
+  o.deepest = r3(o.deepest); o.inToy = r3(o.inToy); o.closest = r3(o.closest); o.jumpMax = r3(o.jumpMax);
+  return { ...o, watch: wa, passed: o.nan === 0 && bodyOk(wa) && o.met > 0 && o.jumps === 0 };
 }
 
 /* Resting where she is until she has dug in and lies snug in her den (or the time runs out), then a few seconds more. */

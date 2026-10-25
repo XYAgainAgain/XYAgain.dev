@@ -102,15 +102,6 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
     if (ready && (!active || t.id === stored.tab)) select(t);
   };
 
-  const squeeze = async () => {
-    if (ctx.watch) return;
-    say('squeezing');
-    try {
-      const r = await tank.squeeze();
-      console.log('squeeze', r);
-      say(r.passed ? 'squeeze: PASS' : 'squeeze: FAIL');
-    } catch (err) { say(`squeeze: ${err.message}`); }
-  };
   const setHidden = (on) => { el.classList.toggle('collapsed', on); stored.hidden = on; remember(); };
   const setLegend = (on) => { legend.hidden = !on; legendAction.button?.setAttribute('aria-expanded', String(on)); };
 
@@ -139,7 +130,6 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         },
       },
       { key: 't', name: 'Tip her', label: () => 'Tip her', run: () => mantle.tip(1.2) },
-      { key: 'q', name: 'Squeeze test', label: () => (ctx.watch ? 'Squeezing…' : 'Squeeze test'), run: squeeze },
     ],
     arms: [
       { key: 'a', name: 'Reach toys', label: () => 'Reach toys', run: () => arms.reachNearestToys(toys) },

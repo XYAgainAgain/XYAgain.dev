@@ -24,6 +24,9 @@ export const ROD_KNOBS = {
   rootTurn: 0.1,         // rad, the same for its turn
   maxSubsteps: 8,
   sealBreak: false,      // a seal pulled past its maxForce lets go; off, a seal holds whatever it bears
+  sealComp: 1,           // gain on a limited seal's learned overshoot, taken off its clip each substep; 0 clips at the bare cap
+  sealCompTau: 0.1,      // s for a learned overshoot to fade by 1/e while its seal isn't clipping
+  sealPeelSoft: true,    // a peeling seal's compliance grows as 1/k with its falling limits
 };
 
 // 3×3 row-major blocks at offsets; outputs never alias inputs.
@@ -135,6 +138,16 @@ export class Rod {
     this.sealBroke = new Uint8Array(N);              // set when a seal lets go on its own (a break or a reset); the caller clears it
     this.sA = new Float64Array(3 * N); this.sA0 = new Float64Array(3 * N); this.sC = new Float64Array(N); this.sMax = new Float64Array(N);
     this.sF = new Float64Array(3 * N); this._sAcc = new Float64Array(3 * N); this._sP = new Float64Array(3 * N); this._sLive = false;
+    // A force-limited seal (sLim 1): shear and adhesion limits, the surface normal (zero for none), the peel's remaining
+    // share and its rate per second, the slide booked since sealing; sealOver and sealPeeled are the caller's to clear.
+    this.sLim = new Uint8Array(N); this.sShear = new Float64Array(N).fill(Infinity); this.sAdh = new Float64Array(N).fill(Infinity);
+    this.sN = new Float64Array(3 * N); this.sPeelK = new Float64Array(N).fill(1); this.sPeelRate = new Float64Array(N); this.sSlip = new Float64Array(N);
+    this.sSlipAt = new Float64Array(N);             // the slip at the last placeAnchor, so a reprojection knows how far it slid since
+    this.sealOver = new Uint8Array(N); this.sealPeeled = new Uint8Array(N);
+    // The learned overshoot along and off the surface (N), its value when a peel began, the clip's force targets this
+    // substep, and which of them clipped (1 along, 2 off).
+    this.sCompT = new Float64Array(N); this.sCompN = new Float64Array(N); this.sComp0T = new Float64Array(N); this.sComp0N = new Float64Array(N);
+    this.sTgtT = new Float64Array(N); this.sTgtN = new Float64Array(N); this.sClip = new Uint8Array(N); this.sU = new Float64Array(3 * N);
     this.addM = new Float64Array(N); this._aIn = new Float64Array(N); this._aLive = false;   // kg carried at a node: a held toy's inertia
     this.configure();
     this.poseFromRest();
@@ -246,25 +259,108 @@ export class Rod {
     v[3 * i] += dx * inv; v[3 * i + 1] += dy * inv; v[3 * i + 2] += dz * inv;
   }
 
-  /* Holds node i at the world point (x, y, z), compliance in m/N; sealing it again moves the anchor (a sliding foot, a
-     toy that moves), which the next step follows across its substeps. A new seal draws its node in from where it is. */
-  seal(i, x, y, z, { compliance = 0, maxForce = Infinity } = {}) {
+  /* Holds node i at the world point (x, y, z), compliance in m/N; sealing it again moves the anchor, which the next step
+     follows across its substeps, and a new seal draws its node in from where it is. shear and adhesion (N) limit it along
+     and off the surface of outward `normal` (none: shear limits the whole pull) and, unlike compliance and maxForce,
+     persist until named again. Re-issued at sealAnchor(), a limited seal stays where its slides left it. */
+  seal(i, x, y, z, { compliance = 0, maxForce = Infinity, shear, adhesion, normal } = {}) {
     if (!Number.isInteger(i) || i < (this.fixedRoot ? 1 : 0) || i > this.n || !Number.isFinite(x + y + z)) return false;
     if (!(compliance >= 0) || !Number.isFinite(compliance) || !(maxForce > 0)) return false;
+    if (shear !== undefined && !(shear > 0)) return false;
+    if (adhesion !== undefined && !(adhesion > 0)) return false;
+    const nl = normal ? Math.hypot(normal[0], normal[1], normal[2]) : 0;
+    if (normal && !(nl > 1e-9 && Number.isFinite(nl))) return false;
+    const fresh = !this.sealed[i], sh = shear ?? (fresh ? Infinity : this.sShear[i]), ad = adhesion ?? (fresh ? Infinity : this.sAdh[i]);
+    // A rigid seal has no gap to limit: the anchor would ride onto its node every substep and hold nothing.
+    const lim = sh < Infinity || ad < Infinity;
+    if (lim && !(compliance > 0)) return false;
     const o = 3 * i;
-    if (!this.sealed[i]) {
+    if (fresh) {
       this.sealed[i] = 1; this.nSeals++;
       this.sA0[o] = this.x[o]; this.sA0[o + 1] = this.x[o + 1]; this.sA0[o + 2] = this.x[o + 2];
-    }
+      this._sealReset(i);
+    } else if (this.sCompT[i] || this.sCompN[i]) this._restate(i, compliance, sh, ad, normal, nl);
     this.sA[o] = x; this.sA[o + 1] = y; this.sA[o + 2] = z;
     this.sC[i] = compliance; this.sMax[i] = maxForce;
+    this.sShear[i] = sh; this.sAdh[i] = ad; this.sLim[i] = lim || this.sPeelRate[i] > 0 ? 1 : 0;
+    if (normal) { this.sN[o] = normal[0] / nl; this.sN[o + 1] = normal[1] / nl; this.sN[o + 2] = normal[2] / nl; }
     return true;
+  }
+
+  /* A learned overshoot is the node's carry over the compliance, so it scales with a new compliance, never exceeds a new
+     capacity, and means nothing on a surface turned more than 20° from the one it was learned on. */
+  _restate(i, c, sh, ad, normal, nl) {
+    const T = this.sCompT, Nn = this.sCompN, T0 = this.sComp0T, N0 = this.sComp0N, o = 3 * i, N = this.sN;
+    if (normal && (N[o] || N[o + 1] || N[o + 2]) && (N[o] * normal[0] + N[o + 1] * normal[1] + N[o + 2] * normal[2]) / nl < 0.94) {
+      T[i] = Nn[i] = T0[i] = N0[i] = 0;
+      return;
+    }
+    const r = c > 0 && this.sC[i] > 0 ? this.sC[i] / c : 1;
+    T[i] = Math.min(sh, T[i] * r); T0[i] = Math.min(sh, T0[i] * r); Nn[i] = Math.min(ad, Nn[i] * r); N0[i] = Math.min(ad, N0[i] * r);
+  }
+
+  _sealReset(i) {
+    this.sLim[i] = 0; this.sShear[i] = this.sAdh[i] = Infinity; this.sN.fill(0, 3 * i, 3 * i + 3);
+    this.sPeelK[i] = 1; this.sPeelRate[i] = 0; this.sSlip[i] = this.sSlipAt[i] = 0; this.sealOver[i] = this.sealPeeled[i] = 0;
+    this.sCompT[i] = this.sCompN[i] = this.sComp0T[i] = this.sComp0N[i] = 0; this.sClip[i] = 0; this.sU.fill(0, 3 * i, 3 * i + 3);
   }
 
   unseal(i) {
     if (!this.sealed[i]) return false;
     this.sealed[i] = 0; this.nSeals--;
     this.sF.fill(0, 3 * i, 3 * i + 3);
+    this._sealReset(i);
+    return true;
+  }
+
+  /* Lets seal i go over `time` seconds: both its limits fall linearly to zero inside the substeps, the anchor following
+     its node off the surface at the falling adhesion, then it unseals and sets sealPeeled. A faster peel overrides a
+     slower one. A limit still infinite starts its ramp from the force the seal bore last step. */
+  peel(i, time) {
+    if (!Number.isInteger(i) || i < 0 || i > this.n || !this.sealed[i] || !(time >= 0)) return false;
+    if (!(time > 0)) { this.unseal(i); this.sealPeeled[i] = 1; return true; }
+    if (!(this.sShear[i] < Infinity && this.sAdh[i] < Infinity)) {
+      const f = this.sF, o = 3 * i, F = Math.hypot(f[o], f[o + 1], f[o + 2]);
+      // A seal that bore nothing, or a rigid one, has nothing to ramp down: it lets go now.
+      if (!(F > 0) || !(this.sC[i] > 0)) { this.unseal(i); this.sealPeeled[i] = 1; return true; }
+      if (!(this.sShear[i] < Infinity)) this.sShear[i] = F;
+      if (!(this.sAdh[i] < Infinity)) this.sAdh[i] = F;
+    }
+    if (!(this.sPeelRate[i] > 0)) { this.sComp0T[i] = this.sCompT[i]; this.sComp0N[i] = this.sCompN[i]; }
+    this.sPeelRate[i] = Math.max(this.sPeelRate[i], 1 / time);
+    this.sLim[i] = 1;
+    return true;
+  }
+
+  sealPeeling(i) { return !!this.sealed[i] && this.sPeelRate[i] > 0; }
+
+  /* The slide booked along the surface since the seal formed (m); a peel's travel off the surface is not counted. */
+  sealSlip(i) { return this.sealed[i] ? this.sSlip[i] : 0; }
+
+  /* Where seal i's spring pulls now, after the last step's slides: the anchor to re-issue. */
+  sealAnchor(i, out = [0, 0, 0]) {
+    const o = 3 * i;
+    out[0] = this.sA[o]; out[1] = this.sA[o + 1]; out[2] = this.sA[o + 2];
+    return out;
+  }
+
+  sealNormal(i, out = [0, 0, 0]) {
+    const o = 3 * i;
+    out[0] = this.sN[o]; out[1] = this.sN[o + 1]; out[2] = this.sN[o + 2];
+    return out;
+  }
+
+  /* Moves seal i's anchor now, with no sweep across the next step and no slip booked (a reprojection onto its surface),
+     and optionally its normal. */
+  placeAnchor(i, x, y, z, normal = null) {
+    if (!this.sealed[i] || !Number.isFinite(x + y + z)) return false;
+    const o = 3 * i;
+    this.sA[o] = this.sA0[o] = x; this.sA[o + 1] = this.sA0[o + 1] = y; this.sA[o + 2] = this.sA0[o + 2] = z;
+    this.sSlipAt[i] = this.sSlip[i];
+    if (normal) {
+      const l = Math.hypot(normal[0], normal[1], normal[2]);
+      if (l > 1e-9 && Number.isFinite(l)) { this.sN[o] = normal[0] / l; this.sN[o + 1] = normal[1] / l; this.sN[o + 2] = normal[2] / l; }
+    }
     return true;
   }
 
@@ -406,10 +502,16 @@ export class Rod {
     for (let i = 0; i <= n; i++) {
       if (!this.sealed[i]) continue;
       const o = 3 * i, w = 9 * i;
-      const ax = A0[o] + (A[o] - A0[o]) * t, ay = A0[o + 1] + (A[o + 1] - A0[o + 1]) * t, az = A0[o + 2] + (A[o + 2] - A0[o + 2]) * t;
+      let ax = A0[o] + (A[o] - A0[o]) * t, ay = A0[o + 1] + (A[o + 1] - A0[o + 1]) * t, az = A0[o + 2] + (A[o + 2] - A0[o + 2]) * t;
+      let ci = this.sC[i];
+      if (this.sLim[i]) {
+        const d = this._limit(i, ax, ay, az, ds2);
+        if (!d) continue;
+        ax += d[0]; ay += d[1]; az += d[2]; ci = this._ce;
+      }
       const px = P[o] = p[o], py = P[o + 1] = p[o + 1], pz = P[o + 2] = p[o + 2];
       if (!(this.sC[i] > 0)) { Wp.fill(0, w, w + 9); p[o] = ax; p[o + 1] = ay; p[o + 2] = az; continue; }
-      const k = ds2 / this.sC[i], a00 = M[w] + k, a01 = M[w + 1], a02 = M[w + 2], a11 = M[w + 4] + k, a12 = M[w + 5], a22 = M[w + 8] + k;
+      const k = ds2 / ci, a00 = M[w] + k, a01 = M[w + 1], a02 = M[w + 2], a11 = M[w + 4] + k, a12 = M[w + 5], a22 = M[w + 8] + k;
       const c00 = a11 * a22 - a12 * a12, c01 = a02 * a12 - a01 * a22, c02 = a01 * a12 - a02 * a11;
       const c11 = a00 * a22 - a02 * a02, c12 = a01 * a02 - a00 * a12, c22 = a00 * a11 - a01 * a01;
       const id = 1 / (a00 * c00 + a01 * c01 + a02 * c02);
@@ -421,6 +523,71 @@ export class Rod {
       p[o + 1] = py + Wp[w + 3] * ex + Wp[w + 4] * ey + Wp[w + 5] * ez;
       p[o + 2] = pz + Wp[w + 6] * ex + Wp[w + 7] * ey + Wp[w + 8] * ez;
     }
+  }
+
+  /* A limited seal's substep before its spring: the gap from the predicted node to the anchor (ax, ay, az), split along the
+     normal. Past its target (the limit less the learned overshoot) times compliance, the tangential part slides the anchor
+     toward the node; the normal pull only flags sealOver, unless peeling, when the anchor follows off the surface. Returns
+     the anchor's move (also applied to both ends of its sweep), or null once a peel has let go. */
+  _limit(i, ax, ay, az, ds2) {
+    const o = 3 * i, p = this.p, A = this.sA, A0 = this.sA0, c = this.sC[i], d = this._sD ??= [0, 0, 0], U = this.sU;
+    const peeling = this.sPeelRate[i] > 0;
+    let k = 1;
+    if (peeling) {
+      k = this.sPeelK[i] = Math.max(0, this.sPeelK[i] - Math.sqrt(ds2) * this.sPeelRate[i]);
+      if (k <= 1e-9) { this.unseal(i); this.sealPeeled[i] = 1; return null; }
+    }
+    const gx = ax - p[o], gy = ay - p[o + 1], gz = az - p[o + 2], nx = this.sN[o], ny = this.sN[o + 1], nz = this.sN[o + 2];
+    let gn = 0, tx = gx, ty = gy, tz = gz;
+    if (nx || ny || nz) { gn = gx * nx + gy * ny + gz * nz; tx -= gn * nx; ty -= gn * ny; tz -= gn * nz; }
+    const lt = Math.hypot(tx, ty, tz), ux = lt > 1e-12 ? tx / lt : 0, uy = lt > 1e-12 ? ty / lt : 0, uz = lt > 1e-12 ? tz / lt : 0;
+    // A peel takes in what it learns as it goes, (1 − k) of it. Targets never go below zero: a sucker only pulls, so the
+    // anchor may come up to the node but never cross it, and the spring keeps its sense.
+    const on = this.knobs.sealComp > 0, oT = !on ? 0 : peeling ? this.sComp0T[i] + (1 - k) * (this.sCompT[i] - this.sComp0T[i]) : this.sCompT[i];
+    // A peeling seal also softens as 1/k, the rim letting go: the clip's gap holds while what the solve's carry adds shrinks.
+    const ce = this._ce = peeling && this.knobs.sealPeelSoft ? c / k : c;
+    let tgtT = Math.max(0, this.sShear[i] * k - oT), limT = tgtT * ce;
+    // Learned sliding one way, the overshoot says nothing about a slide turned more than 60° from it: a clip that way
+    // clears it first and takes the bare target.
+    if (lt > limT && lt > 1e-12 && (U[o] || U[o + 1] || U[o + 2]) && ux * U[o] + uy * U[o + 1] + uz * U[o + 2] < 0.5) {
+      this.sCompT[i] = this.sComp0T[i] = 0;
+      tgtT = Math.max(0, this.sShear[i] * k); limT = tgtT * ce;
+    }
+    this.sTgtT[i] = tgtT;
+    d[0] = d[1] = d[2] = 0; this.sClip[i] = 0;
+    if (lt > limT && lt > 1e-12) {
+      const s = limT / lt - 1;
+      d[0] = tx * s; d[1] = ty * s; d[2] = tz * s;
+      U[o] = ux; U[o + 1] = uy; U[o + 2] = uz;
+      this.sSlip[i] += lt - limT; this.sClip[i] = 1;
+    }
+    if (nx || ny || nz) {
+      // gn < 0 is the node pulled off the surface; a push into it is contact's business, never the seal's.
+      if (peeling) {
+        const oN = on ? this.sComp0N[i] + (1 - k) * (this.sCompN[i] - this.sComp0N[i]) : 0, tgtN = this.sTgtN[i] = Math.max(0, this.sAdh[i] * k - oN), off = -gn - tgtN * ce;
+        if (off > 0) { d[0] += off * nx; d[1] += off * ny; d[2] += off * nz; this.sClip[i] |= 2; }
+      } else if (-gn > this.sAdh[i] * k * c) this.sealOver[i] = 1;
+    }
+    if (d[0] || d[1] || d[2]) for (let a = 0; a < 3; a++) { A[o + a] += d[a]; A0[o + a] += d[a]; }
+    return d;
+  }
+
+  /* The clip bounds the spring at the predicted node, then the solve carries the node on, so the realized force rides past
+     the clip's target by that carry; each clipped substep measures it (along the surface, and off it while peeling) and
+     eases the learned overshoot toward it. Unclipped, it fades over sealCompTau; a peel's snapshot only ever falls with it. */
+  _learn(i, fx, fy, fz, ds) {
+    const g = Math.min(1, this.knobs.sealComp), f = this.sClip[i], T = this.sCompT, Nn = this.sCompN;
+    if (!(g > 0)) { T[i] = Nn[i] = this.sComp0T[i] = this.sComp0N[i] = 0; return; }
+    const o = 3 * i, nx = this.sN[o], ny = this.sN[o + 1], nz = this.sN[o + 2], fn = fx * nx + fy * ny + fz * nz;
+    const fade = Math.exp(-ds / (this.knobs.sealCompTau > 0 ? this.knobs.sealCompTau : ROD_KNOBS.sealCompTau));
+    if (f & 1) {
+      const U = this.sU, ft = fx * U[o] + fy * U[o + 1] + fz * U[o + 2];
+      T[i] = Math.max(0, T[i] + g * (ft - this.sTgtT[i] - T[i]));
+    } else T[i] *= fade;
+    // The seal pulls its node back toward the surface, so a pull off it reads as a force along −n.
+    if (f & 2) Nn[i] = Math.max(0, Nn[i] + g * (-fn - this.sTgtN[i] - Nn[i]));
+    else Nn[i] *= fade;
+    this.sComp0T[i] = Math.min(this.sComp0T[i], T[i]); this.sComp0N[i] = Math.min(this.sComp0N[i], Nn[i]);
   }
 
   /* Each seal's force from momentum: what moved its node off its prediction, less the stretch-shear multipliers' share,
@@ -437,6 +604,7 @@ export class Rod {
       const fy = (M[w + 3] * dx + M[w + 4] * dy + M[w + 5] * dz - gy) / ds2;
       const fz = (M[w + 6] * dx + M[w + 7] * dy + M[w + 8] * dz - gz) / ds2;
       acc[o] += fx; acc[o + 1] += fy; acc[o + 2] += fz;
+      if (this.sLim[i]) this._learn(i, fx, fy, fz, Math.sqrt(ds2));
       if (brk && Math.hypot(fx, fy, fz) > this.sMax[i]) { this.unseal(i); this.sealBroke[i] = 1; }
     }
   }
@@ -748,4 +916,32 @@ export class Rod {
       q[4 * j] = ax; q[4 * j + 1] = ay; q[4 * j + 2] = az; q[4 * j + 3] = aw;
     }
   }
+}
+
+/* What reprojectSeal found: the anchor back on its surface; an edge or lip crossed (the normal turned past maxTurn at
+   once, or faster along the slide than maxCurve allows); the anchor farther off than maxShift; or no distance, or no seal. */
+export const REPROJECT = { on: 0, edge: 1, off: 2, lost: 3 };
+
+const _rn = [0, 0, 0];
+
+/* Lays seal i's anchor back `radius` out from the surface it formed on and stores the normal there. `surface(x, y, z, out)`
+   is that one primitive's signed distance and outward normal, never the world's nearest. maxCurve (1/m) is the sharpest
+   bend a slide may follow: an edge rounds off at the node's radius, so it turns at 1/radius at any speed. Only
+   REPROJECT.on moves the anchor, and a peeling one, meant to leave its surface, is left alone. */
+export function reprojectSeal(rod, i, surface, radius, { maxTurn = 0.35, maxCurve = 0.5 / radius, maxShift = radius } = {}) {
+  if (!rod.sealed[i]) return REPROJECT.lost;
+  if (rod.sealPeeling(i)) return REPROJECT.on;
+  const o = 3 * i, A = rod.sA, ax = A[o], ay = A[o + 1], az = A[o + 2];
+  const d = surface(ax, ay, az, _rn), nl = Math.hypot(_rn[0], _rn[1], _rn[2]);
+  if (!Number.isFinite(d) || !(nl > 1e-9) || !Number.isFinite(nl)) return REPROJECT.lost;
+  const nx = _rn[0] / nl, ny = _rn[1] / nl, nz = _rn[2] / nl, sh = d - radius;
+  if (Math.abs(sh) > maxShift) return REPROJECT.off;
+  const N = rod.sN;
+  if (N[o] || N[o + 1] || N[o + 2]) {
+    const turn = Math.acos(Math.max(-1, Math.min(1, N[o] * nx + N[o + 1] * ny + N[o + 2] * nz))), arc = rod.sSlip[i] - rod.sSlipAt[i];
+    if (turn > maxTurn || (turn > 1e-6 && turn > maxCurve * arc)) return REPROJECT.edge;
+  }
+  _rn[0] = nx; _rn[1] = ny; _rn[2] = nz;
+  rod.placeAnchor(i, ax - nx * sh, ay - ny * sh, az - nz * sh, _rn);
+  return REPROJECT.on;
 }
