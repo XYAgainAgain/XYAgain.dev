@@ -10,6 +10,7 @@ export const RIGHT_KNOBS = {
   rightN: 1.2,            // N each arm base on the side she leans to pulls down with at first; 0 leaves it to the dome alone
   rightFarCoupled: 0.5,   // sharing her arms' solve, the share of that pull her far side's bases push along the roll with; 0 leaves them be
   rightReach: 0.04,       // m out past each of those arm bases to the floor point it pulls toward, mostly down, so she rolls
+  rightLevel: 0.1,        // how far below level her up must dip before that reach turns back against her lean
   rightRamp: 3,           // s over which that pull doubles while she stays over
   rightSwap: 3,           // s without her coming any further up before the arms try rolling her another way
   rightHigh: 0.3,         // m: only with her body's center under this, so a hang up the glass, mantle below her arms, is no flip
@@ -48,29 +49,77 @@ export function flipped(was, dot, upY, near, hang, lying, k = RIGHT_KNOBS, cling
   return near && (dot < -k.rightDot || (!hang && upY < -k.rightDot));
 }
 
-/* Which way her crown goes to roll her up the short way, flat on the floor; along `side`, her right, when she lies
-   flat on her back with no lean to read. */
-export function rollDir(up, side, out = [0, 0, 0]) {
-  const s = up[1] < 0 ? -1 : 1;
-  let x = s * up[0], z = s * up[2], l = Math.hypot(x, z);
-  if (!(l > 0.15)) { x = side[0]; z = side[2]; l = Math.hypot(x, z); }
-  if (!(l > 1e-9)) { x = 1; z = 0; l = 1; }
-  out[0] = x / l; out[1] = 0; out[2] = z / l;
+/* Turns a toward b by the share t of the arc between them, about axis (both unit, across it). A normalized sum would
+   cancel and flip when they oppose; `arc` ([angle]) keeps the angle unwrapped tick to tick, so the turn never jumps. */
+function arcTo(a, b, axis, t, arc, out) {
+  const px = axis[1] * a[2] - axis[2] * a[1], py = axis[2] * a[0] - axis[0] * a[2], pz = axis[0] * a[1] - axis[1] * a[0];
+  let phi = Math.atan2(b[0] * px + b[1] * py + b[2] * pz, b[0] * a[0] + b[1] * a[1] + b[2] * a[2]);
+  const last = arc?.[0];
+  if (Number.isFinite(last)) phi += 2 * Math.PI * Math.round((last - phi) / (2 * Math.PI));
+  if (arc) arc[0] = phi;
+  const c = Math.cos(t * phi), sn = Math.sin(t * phi);
+  out[0] = c * a[0] + sn * px; out[1] = c * a[1] + sn * py; out[2] = c * a[2] + sn * pz;
   return out;
+}
+
+/* u's part across the unit axis, unit, or false when u lies along it. */
+function across(u, axis, out) {
+  const d = u[0] * axis[0] + u[1] * axis[1] + u[2] * axis[2];
+  const x = u[0] - d * axis[0], y = u[1] - d * axis[1], z = u[2] - d * axis[2], n = Math.hypot(x, y, z);
+  if (!(n > 1e-9)) return false;
+  out[0] = x / n; out[1] = y / n; out[2] = z / n;
+  return true;
+}
+
+const Y = [0, 1, 0], _a = [0, 0, 0], _b = [0, 0, 0], _l = [0, 0, 0];
+
+/* Turns from `lean` to `side` across axis as the lean's length l falls under 0.15, `side` alone when there is no lean. */
+function leanToSide(lean, l, side, axis, arc, out) {
+  const hasSide = across(side, axis, _b);
+  if (!(l > 1e-9) || !across(lean, axis, _a)) {
+    if (hasSide) { out[0] = _b[0]; out[1] = _b[1]; out[2] = _b[2]; return out; }
+    if (!across([1, 0, 0], axis, out)) across([0, 0, 1], axis, out);
+    return out;
+  }
+  const t = hasSide && l < 0.15 ? 1 - l / 0.15 : 0;
+  if (t > 0) return arcTo(_a, _b, axis, t, arc, out);
+  if (arc) arc[0] = NaN;
+  out[0] = _a[0]; out[1] = _a[1]; out[2] = _a[2];
+  return out;
+}
+
+/* Downhill across her crown ring, in its plane: its lower half pulls her over, so no flip of sign as she rocks past level.
+   With no downhill to read, flat on her back, it turns toward `side`, her right. */
+export function rollDir(up, side, out = [0, 0, 0], arc = null) {
+  _l[0] = up[1] * up[0]; _l[1] = up[1] * up[1] - 1; _l[2] = up[1] * up[2];
+  return leanToSide(_l, Math.hypot(_l[0], _l[1], _l[2]), side, up, arc, out);
 }
 
 /* The ways to try in turn when one makes no headway: the short way, either side of it, then the long way round. */
 export const ROLL_TURNS = [0, Math.PI / 2, -Math.PI / 2, Math.PI];
 
-/* dir turned by angle a about world up, in place. */
-export function turnDir(dir, a) {
-  const c = Math.cos(a), s = Math.sin(a), x = dir[0], z = dir[2];
-  dir[0] = c * x - s * z; dir[2] = s * x + c * z;
+/* dir, lying across axis, turned by angle a about it in place: about her up, π pulls the upper half instead. */
+export function turnDir(dir, a, axis = [0, 1, 0]) {
+  const c = Math.cos(a), s = Math.sin(a), x = dir[0], y = dir[1], z = dir[2];
+  const cx = axis[1] * z - axis[2] * y, cy = axis[2] * x - axis[0] * z, cz = axis[0] * y - axis[1] * x;
+  dir[0] = c * x - s * cx; dir[1] = c * y - s * cy; dir[2] = c * z - s * cz;
   return dir;
 }
 
+/* Which way the level reach goes, ±1: against her lean on her back, with it from level up, and between, the last one
+   holds. Flipping at level itself, every pull swapped each tick she rocked across it, and the patch drive bucked. */
+export function rollSense(upY, last = 0, k = RIGHT_KNOBS) {
+  return upY >= 0 ? 1 : upY < -k.rightLevel || !last ? -1 : last;
+}
+
+/* The level way the bases reach to the floor, unit: along her lean by sense, turning toward `side` as she lies flat. */
+export function rollReach(up, side, sense, out = [0, 0, 0], arc = null) {
+  _l[0] = sense * up[0]; _l[1] = 0; _l[2] = sense * up[2];
+  return leanToSide(_l, Math.hypot(_l[0], _l[2]), side, Y, arc, out);
+}
+
 /* Whether arm base p lies on the half of her crown ring toward dir, the half whose arms pull her over. */
-export function nearSide(p, c, dir) { return (p[0] - c[0]) * dir[0] + (p[2] - c[2]) * dir[2] > 0; }
+export function nearSide(p, c, dir) { return (p[0] - c[0]) * dir[0] + (p[1] - c[1]) * dir[1] + (p[2] - c[2]) * dir[2] > 0; }
 
 /* The arms' pull t s into the latch: rightN once the reflex takes over, doubling over rightRamp. */
 export function rightPull(t, k = RIGHT_KNOBS) {
