@@ -48,6 +48,17 @@ export const ROD_ARM_KNOBS = {
   sealRest: 0.25,        // s a patch rests after letting go before it can take hold again
   popStretch: 1.5,       // of the arm's own length from the root to a seal, past which every seal on it pops
   popRest: 0.6,          // s the popped patches rest
+  // Grip follows intent: an arm only feeling its way seals at touch, one doing a job seals firm, sized to that job. One
+  // budget per arm, shared over its seals by contact quality, limited inside the rod's solve and kept on its surface.
+  grace: true,
+  touchArmN: 0.3,        // N one feeling arm's seals bear between them
+  adhesionShare: 0.6,    // of a seal's budget, the share that holds it on against a pull off its surface; the rest is shear
+  touchCompliance: 2e-3, // m/N
+  firmCompliance: 2e-3,
+  firmMul: 2,            // a firm arm's budget over the force its task asks for
+  firmTau: 0.25,         // s a seal whose arm goes from feeling to working takes to firm up
+  slipMax: 0.02,         // m a firm seal may slide along its surface before it lets go
+  touchSlipMax: 0.08,    // and a touch seal, which slides as feeling
   wrench: false,         // the root's force and torque reach her body, a tick late; explicit, so at her mass it grows
   wrenchSpread: 'body',  // over all of her as a rigid body would take it, or 'patch', the arm's own
   // The shared solve (?couple=1) alone reads these.

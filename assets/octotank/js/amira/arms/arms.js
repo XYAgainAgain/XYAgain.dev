@@ -3,7 +3,10 @@ import { CLAIM_TIERS, claimWins, settleOwner, whoMovesInWater } from '../locomot
 import { moveInputs } from '../locomotion/loco-carry.js';
 import { Arm, ARM_KNOBS as CORE_KNOBS, makeSdfWorld, makeArmContact, separateArms, ShellBody, BodyEllipsoid, bodyRadius, facing, mulberry32, focusChain } from './arm-core.js';
 import { RodArm, ROD_ARM_KNOBS, armMassShare, splitPush, spreadLoad, rootWrench, aimStep } from './arm-rod.js';
+import { reprojectSeal, REPROJECT } from './arm-rod-core.js';
 import { RodCoupler } from './rod-coupler-core.js';
+import { LOCO_KNOBS } from '../locomotion/locomotion-core.js';
+import { CLIMB_KNOBS } from '../locomotion/loco-climb-core.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
 import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD, toFrame, spanStretch, worstStretch } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
@@ -41,6 +44,13 @@ export const ARM_KNOBS = {
 
 const WINDOW = 1800;
 export { CLAIM_TIERS };
+
+/* What an arm's suckers mean this tick (Arms.sealIntent): nothing, feeling, or holding on for a job. */
+export const INTENT = { none: 0, touch: 1, firm: 2 };
+// A seal's normal may differ this much from its surface's raw one at birth (cos 20°, the rod's own re-issue tolerance).
+const NORMAL_AGREE = 0.94;
+const REPROJECT_WHY = ['on', 'edge', 'off', 'lost'];
+const SAND_EDGE = { maxCurve: Infinity };
 
 export class Arms {
   /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
@@ -142,6 +152,7 @@ export class Arms {
     this.touchEntry = new Array(NS).fill(null);
     this.touchP = new Float64Array(NS * 3); // the touched surface point, and its outward normal
     this.touchN = new Float64Array(NS * 3);
+    this.touchPrim = new Int32Array(NS).fill(-1);   // the allSdf primitive touched, or -1: a seal's own surface for life
     this.refr = new Float64Array(NS);       // time until which a patch that just let go can't seal
     this.slide = new Float64Array(NS * 3);  // each touching patch's averaged sliding velocity
     this.slideAt = new Int32Array(NS).fill(-2);
@@ -171,7 +182,15 @@ export class Arms {
     this.rodToyPen = this.rods.map((r) => (r ? new Float64Array(N) : null));
     this.rodOther = new Float64Array(count * 3);   // N·s the rest of a rod's contact (furniture, her body, the other arms) gave it
     this.rootLoad = new Float64Array(count * 6);   // N and N·m about its root each rod put into her this tick (zero when none)
-    this.seals = this.rods.map((r) => (r ? { rod: null, kind: new Uint8Array(S), at: new Float64Array(S), t0: new Float64Array(S), cap: new Float64Array(S), toy: new Array(S).fill(null), A: new Float64Array(S * 3), lift: new Float64Array(S), plant: null, plantSeg: -1, beat: new Float64Array(S), loc: new Float64Array(S * 3), grip: new Float64Array(S) } : null));
+    this.seals = this.rods.map((r) => (r ? { rod: null, kind: new Uint8Array(S), at: new Float64Array(S), t0: new Float64Array(S), cap: new Float64Array(S), toy: new Array(S).fill(null), A: new Float64Array(S * 3), lift: new Float64Array(S), plant: null, plantSeg: -1, beat: new Float64Array(S), loc: new Float64Array(S * 3), grip: new Float64Array(S), ...graceSeals(S) } : null));
+    // Per arm, under rodKnobs.grace: the intent resolved this tick, the force its task asks for, the budget its seals
+    // share, and what they bore through the last step (N). assigned[a] is the recruiter's say, once one hands out tasks.
+    this.sealIntent = new Uint8Array(count).fill(INTENT.touch);
+    this.sealTask = new Float64Array(count);
+    this.sealBudget = new Float64Array(count);
+    this.sealApplied = new Float64Array(count);
+    this.assigned = new Array(count).fill(null);
+    this._pend = new Int32Array(S); this._pendA = new Float64Array(S * 6);
     this._sealSeed = seed;
     this.sealLogSize = 512;
     this._freshSeals();
@@ -224,6 +243,10 @@ export class Arms {
     this.sdf = makeSdfWorld(prims);
     const all = this.allSdf = makeSdfWorld(prims.concat(lp), { fixed: prims.length });
     this._looseAt = prims.length;
+    this._primAt = new Map(this.primEntry.map((e, i) => [e, i]));
+    // The loose things at rest at the origin: a toy seal's surface as it stood at the pose its anchor was issued at.
+    this.looseLocal = makeSdfWorld(lp, { fixed: 0 });
+    this._makeSurface();
     const phys = this.phys, knobs = this.knobs, sdf = this.sdf;
     this._berth = false;
     this._berthN = [0, 0, 0];
@@ -262,6 +285,24 @@ export class Arms {
       distance: sdf.distance,
       focus: (lo, hi) => { if (knobs.collider !== 'jolt') (knobs.looseContact ? all : sdf).focus(lo, hi); },
       unfocus: () => { all.unfocus(); sdf.unfocus(); },
+    };
+  }
+
+  /* A seal's own surface as reprojectSeal reads it: allSdf primitive _surfAt, a toy's under the pose at
+     _surfPose[_surfO..+7] rather than where it stands now; the last distance is kept in _surfD. */
+  _makeSurface() {
+    const loc = [0, 0, 0], nl = [0, 0, 0];
+    this._surfAt = -1; this._surfPose = null; this._surfO = 0; this._surfD = NaN;
+    this._surface = (x, y, z, out) => {
+      const i = this._surfAt, P = this._surfPose, o = this._surfO;
+      let d;
+      if (!P) d = this.allSdf.distanceTo(i, x, y, z, out);
+      else {
+        rotate(-P[o + 3], -P[o + 4], -P[o + 5], P[o + 6], x - P[o], y - P[o + 1], z - P[o + 2], loc, 0);
+        d = this.looseLocal.distanceTo(i - this._looseAt, loc[0], loc[1], loc[2], nl);
+        rotate(P[o + 3], P[o + 4], P[o + 5], P[o + 6], nl[0], nl[1], nl[2], out, 0);
+      }
+      return (this._surfD = d);
     };
   }
 
@@ -776,12 +817,12 @@ export class Arms {
         const g = a * S + j, p = j * 3;
         const dx = X[p + 3] - X[p], dy = X[p + 4] - X[p + 1], dz = X[p + 5] - X[p + 2];
         const mx = X[p] + dx / 2, my = X[p + 1] + dy / 2, mz = X[p + 2] + dz / 2, rm = (arm.rad[j] + arm.rad[j + 1]) / 2;
-        let kind = 0, best = fc, entry = null, taste = null, d = 0;
+        let kind = 0, best = fc, entry = null, taste = null, d = 0, prim = -1;
         const pen = w.collide(mx, my, mz, rm + gap, nrm);
         if (pen > 0) {
           const f = facing(arm.SK, j, dx, dy, dz, -nrm[0], -nrm[1], -nrm[2]);
           if (f > best) {
-            const hi = w.hit;
+            const hi = prim = w.hit;
             best = f; d = rm + gap - pen;
             if (hi >= this._looseAt) { kind = 2; entry = this.loose[hi - this._looseAt]; } else { kind = 1; entry = this.primEntry[hi] ?? null; }
             taste = entry ? (entry.taste ?? entry.tag) : 'wall';
@@ -793,11 +834,11 @@ export class Arms {
           const pb = this.body.collide(mx, my, mz, bodyRadius(rm, j + 0.5, bs) + gap, nb);
           if (pb > 0) {
             const f = facing(arm.SK, j, dx, dy, dz, -nb[0], -nb[1], -nb[2]);
-            if (f > best) { best = f; kind = 3; entry = null; taste = 'self'; d = rm + gap - pb; TN[g * 3] = nb[0]; TN[g * 3 + 1] = nb[1]; TN[g * 3 + 2] = nb[2]; }
+            if (f > best) { best = f; kind = 3; entry = null; taste = 'self'; d = rm + gap - pb; prim = -1; TN[g * 3] = nb[0]; TN[g * 3 + 1] = nb[1]; TN[g * 3 + 2] = nb[2]; }
           }
         }
         if (!kind && C.touch[g]) { kind = 3; taste = 'self'; d = 0; TN[g * 3] = 0; TN[g * 3 + 1] = 0; TN[g * 3 + 2] = 0; }
-        TK[g] = kind; this.touchEntry[g] = entry; this.touchTaste[g] = taste;
+        TK[g] = kind; this.touchEntry[g] = entry; this.touchTaste[g] = taste; this.touchPrim[g] = kind === 3 ? -1 : prim;
         TP[g * 3] = mx - TN[g * 3] * d; TP[g * 3 + 1] = my - TN[g * 3 + 1] * d; TP[g * 3 + 2] = mz - TN[g * 3 + 2] * d;
       }
     }
@@ -868,13 +909,13 @@ export class Arms {
       if (ep) this._retaste(a, ep);
       // The patch a grip hangs from stays on its toy whatever the probe sees: those suckers are attached, not sliding.
       const held = ep?.h ? this._segAt(arm, ep.arc) : -1;
-      if (held >= 0) { this.touchKind[a * S + held] = 2; this.touchEntry[a * S + held] = ep.toy; this.touchTaste[a * S + held] = ep.taste; }
+      if (held >= 0) { this.touchKind[a * S + held] = 2; this.touchEntry[a * S + held] = ep.toy; this.touchTaste[a * S + held] = ep.taste; this.touchPrim[a * S + held] = this._primOf(ep.toy); }
       // So does a planted foot on the furniture, and its neighbors where they touch: they hold still while the body moves.
       const pg = arm.goal?.kind === 'plant' ? arm.goal : null, ps = pg ? pg.seg : -9;
       const st = this.seals[a], grab = !!st && this.rodKnobs.seals && this.rodKnobs.grabby && !this.shadow;
       if (pg && !this.touchKind[a * S + ps]) {
         const q = a * S + ps;
-        this.touchKind[q] = 1; this.touchEntry[q] = pg.entry ?? null; this.touchTaste[q] = pg.taste ?? 'floor';
+        this.touchKind[q] = 1; this.touchEntry[q] = pg.entry ?? null; this.touchTaste[q] = pg.taste ?? 'floor'; this.touchPrim[q] = this._primOf(pg.entry);
         for (let i = 0; i < 3; i++) { this.touchP[q * 3 + i] = pg.point[i]; this.touchN[q * 3 + i] = pg.normal[i]; }
       }
       for (let j = 0; j < S; j++) {
@@ -1280,16 +1321,15 @@ export class Arms {
   _dropSeals(a, keepPlant = false) {
     const st = this.seals[a];
     if (!st) return;
-    st.kind.fill(0); st.toy.fill(null); st.plantSeg = -1;
+    st.kind.fill(0); st.toy.fill(null); st.plantSeg = -1; st.int?.fill(0); st.riseT?.fill(-1);
     if (!keepPlant) st.plant = null;
     if (this.rods[a].rod?.nSeals) this.rods[a].rod.unsealAll();
   }
 
-  /* A driving rod's seals follow its suckers: a segment with sealed suckers on the furniture (or a loose thing, behind
-     toySeals) holds its far node where it sealed until its suckers have all been off for sealGrace, its touch changes,
-     the intent chain draws that point sealLift away, or it tears; a plant's foot holds at the plant's own point. Grabby
-     (rodKnobs.grabby), an exploring arm's seal holds a beat first, the draw is judged in the arm's root frame so her body
-     walking off stretches the arm, and an arm drawn out past popStretch pops every seal at once. */
+  /* A driving rod's seals follow its suckers: a sealed segment (furniture, or a toy behind toySeals) holds its far node until
+     its suckers are off for sealGrace, its touch changes, the draw passes sealLift, or it tears; a plant's foot holds at the
+     plant's point. Grabby holds an exploring seal a beat and pops every seal past popStretch, judged in the arm's root frame
+     so her walking off stretches it; grace limits each seal on its own surface, sharing one budget sized to _intent. */
   _seals(a, dt) {
     const st = this.seals[a];
     if (!st) return;
@@ -1329,11 +1369,38 @@ export class Arms {
       const b = toy.body, p = b.GetPosition(), r = b.GetRotation();
       c[0] = p.GetX(); c[1] = p.GetY(); c[2] = p.GetZ(); q[0] = r.GetX(); q[1] = r.GetY(); q[2] = r.GetZ(); q[3] = r.GetW();
     };
+    // Under grace, a seal that let go on its own mechanics: the patch rests sealRest and its suckers let go with it.
+    const rest = (j) => { this.refr[a * S + j] = t + rk.sealRest; bank.releaseSeg(j); };
     // What the rod let go of on its own: a seal past its ceiling with sealBreak on, or every seal when the rod reset.
     for (let j = 0; j < S; j++) {
       if (!rod.sealBroke[j + 1]) continue;
       rod.sealBroke[j + 1] = 0;
       if (st.kind[j]) { rod.sealForce(j + 1, f3); tear(j, Math.hypot(f3[0], f3[1], f3[2]), Math.max(k.minGrip, st.cap[j]), 'rod'); }
+    }
+    const grace = !!rk.grace && !!this.sealIntent, intent = grace ? this._intent(a) : INTENT.touch;
+    if (grace) {
+      // What the step just taken did to each seal: a finished peel (the rod already let go), a pull off past adhesion, a
+      // slide past its limit, an anchor its own surface no longer carries, or an arm that now means less. Each ends now.
+      let applied = 0;
+      for (let j = 0; j < S; j++) {
+        const i = j + 1;
+        // A foot let go of this way stays off for the rest of its plant, as a torn one does; the patch rests, its suckers
+        // off too, or the bank would seal it again this tick and advertise it to locomotion as an anchor.
+        if (rod.sealPeeled[i]) {
+          rod.sealPeeled[i] = 0;
+          if (st.kind[j] === 4) st.plantSeg = -1;
+          if (st.kind[j]) { react(j); rod.sealForce(i, f3); this.counts.sealDrops++; this._sealEnd(a, j, 'peel', Math.hypot(f3[0], f3[1], f3[2])); st.kind[j] = 0; st.toy[j] = null; rest(j); }
+          continue;
+        }
+        if (!st.kind[j] || !rod.sealed[i]) continue;
+        rod.sealForce(i, f3);
+        applied += Math.hypot(f3[0], f3[1], f3[2]);
+        const why = this._sealHeld(a, j, st, body);
+        if (why) { if (st.kind[j] === 4) st.plantSeg = -1; drop(j, why); rest(j); }
+        // A foot ends with its plant, below.
+        else if (st.int[j] > intent && st.kind[j] !== 4) drop(j, 'intent');
+      }
+      this.sealApplied[a] = applied;
     }
     // Stuck and drawn out past popStretch of its own length (her body walking off, a toy dragging it), every seal pops.
     if (grab && rod.nSeals) {
@@ -1361,6 +1428,7 @@ export class Arms {
       const j = pj, r = body.rad[j + 1];
       drop(j, 'plant');
       for (let i = 0; i < 3; i++) A[j * 3 + i] = pg.point[i] + pg.normal[i] * r;
+      if (grace) this._plantBirth(a, j, st, pg, r);
       const W = st.plantAt ??= [0, 0, 0];
       W[0] = pg.point[0]; W[1] = pg.point[1]; W[2] = pg.point[2];
       st.kind[j] = 4; st.plant = pg; st.plantSeg = j; st.t0[j] = t; st.cap[j] = bank.segCeil[j]; st.grip[j] = 1;
@@ -1370,8 +1438,11 @@ export class Arms {
       const P = pg.point, W = st.plantAt, j = st.plantSeg;
       if ((P[0] !== W[0] || P[1] !== W[1] || P[2] !== W[2]) && Number.isFinite(P[0] + P[1] + P[2])) {
         for (let i = 0; i < 3; i++) { A[j * 3 + i] = P[i] + pg.normal[i] * body.rad[j + 1]; W[i] = P[i]; }
+        // Moved by its carry, the foot's surface is the toy's, not where it formed.
+        if (grace) { st.prim[j] = -1; for (let i = 0; i < 3; i++) { st.P[j * 3 + i] = P[i]; st.N[j * 3 + i] = pg.normal[i]; } }
       }
     }
+    let np = 0;
     const fc = 1 - Math.exp(-dt / Math.max(1e-3, k.capTau));
     for (let j = 0; j < S; j++) {
       const g = a * S + j, i = j + 1, o = i * 3, kind = this.touchKind[g], entry = this.touchEntry[g], plant = st.kind[j] === 4;
@@ -1385,15 +1456,16 @@ export class Arms {
           if (why) drop(j, why);
           else if (want) st.at[j] = t;
         }
-        // Grabby, a patch drawn out past popStretch already can't take hold: it would only pop on the spot.
-        if (!st.kind[j] && want && !(grab && spanStretch(X, I, i) >= rk.popStretch)) {
+        // Grabby, a patch drawn out past popStretch already can't take hold: it would only pop on the spot. Under grace an arm
+        // recoiling seals nothing, and a seal forms only on a surface it can name.
+        if (!st.kind[j] && want && !(grab && spanStretch(X, I, i) >= rk.popStretch) && (!grace || (intent > INTENT.none && this._sealBirth(a, j, st, body, kind, entry)))) {
           st.kind[j] = kind; st.toy[j] = kind === 2 ? entry : null; st.at[j] = st.t0[j] = t; st.grip[j] = this._scale[j] || 1; st.cap[j] = grab ? bank.segHard[j] * st.grip[j] : bank.segCeil[j];
-          if (kind === 2) {
+          if (!grace && kind === 2) {
             // Kept in the toy's frame, so the anchor rides the toy.
             pose(entry);
             const vx = X[o] - c[0], vy = X[o + 1] - c[1], vz = X[o + 2] - c[2];
             rotate(-q[0], -q[1], -q[2], q[3], vx, vy, vz, A, j * 3);
-          } else { A[j * 3] = X[o]; A[j * 3 + 1] = X[o + 1]; A[j * 3 + 2] = X[o + 2]; }
+          } else if (!grace) { A[j * 3] = X[o]; A[j * 3 + 1] = X[o + 1]; A[j * 3 + 2] = X[o + 2]; }
           st.lift[j] = -1;
           if (grab) {
             const g0 = body.intent.goal;
@@ -1411,6 +1483,8 @@ export class Arms {
         pose(st.toy[j]);
         rotate(q[0], q[1], q[2], q[3], ax, ay, az, f3, 0);
         ax = f3[0] + c[0]; ay = f3[1] + c[1]; az = f3[2] + c[2];
+        // The pose this anchor goes out at, which next tick's read-back and reprojection must use.
+        if (grace) { const P = st.pose, w = j * 7; P[w] = c[0]; P[w + 1] = c[1]; P[w + 2] = c[2]; P[w + 3] = q[0]; P[w + 4] = q[1]; P[w + 5] = q[2]; P[w + 6] = q[3]; }
       }
       // The program drawing that point away is the arm letting go there, as an octopus releases a sucker to move on.
       if (grab) {
@@ -1433,9 +1507,156 @@ export class Arms {
         // The toy bears the opposite of what its seal put on the rod.
         if (st.kind[j] === 2) this.phys.impulseAt(st.toy[j], -f3[0] * dt, -f3[1] * dt, -f3[2] * dt, ax, ay, az);
       }
-      rod.seal(i, ax, ay, az, { compliance: rk.sealCompliance, maxForce: ceil });
+      if (grace) {
+        // Issued once every seal on the arm is known, since they share one budget.
+        const P6 = this._pendA, w = np * 6, N = st.N, l = j * 3;
+        P6[w] = ax; P6[w + 1] = ay; P6[w + 2] = az;
+        if (st.kind[j] === 2) rotate(q[0], q[1], q[2], q[3], N[l], N[l + 1], N[l + 2], P6, w + 3);
+        else { P6[w + 3] = N[l]; P6[w + 4] = N[l + 1]; P6[w + 5] = N[l + 2]; }
+        this._pend[np++] = j;
+        continue;
+      }
+      // A seal limited while grace was on lets its limits go when grace is switched off, or the sliding anchor yo-yos.
+      if (rod.sLim?.[i]) rod.seal(i, ax, ay, az, { compliance: rk.sealCompliance, maxForce: ceil, shear: Infinity, adhesion: Infinity });
+      else rod.seal(i, ax, ay, az, { compliance: rk.sealCompliance, maxForce: ceil });
       this.sealStats.live++;
     }
+    if (!grace) return;
+    // One budget per arm: touchArmN while it feels, firmMul times its task's force while it works, shared over its seals
+    // by contact quality (sealed suckers times how squarely the patch faces its surface), never past a patch's hard ceiling.
+    const firm = intent === INTENT.firm, Bt = Math.max(0, rk.touchArmN), B = firm ? Math.max(Bt, rk.firmMul * this.sealTask[a]) : intent === INTENT.none ? 0 : Bt;
+    this.sealBudget[a] = B;
+    const P6 = this._pendA, J = this._pend, Q = this._pendQ ??= new Float64Array(S), share = Math.max(0, Math.min(1, rk.adhesionShare));
+    let sum = 0;
+    for (let m = 0; m < np; m++) {
+      const j = J[m], p = j * 3, w = m * 6;
+      const f = facing(body.SK, j, X[p + 3] - X[p], X[p + 4] - X[p + 1], X[p + 5] - X[p + 2], -P6[w + 3], -P6[w + 4], -P6[w + 5]);
+      sum += Q[m] = Math.max(1, bank.segSealed[j]) * Math.max(0.05, f);
+    }
+    const nrm = this._nIss ??= [0, 0, 0];
+    for (let m = 0; m < np; m++) {
+      const j = J[m], i = j + 1, o = i * 3, w = m * 6, part = Q[m] / sum, hard = bank.segHard[j] * (st.grip[j] || 1), fresh = !rod.sealed[i];
+      let cap = Math.min(part * B, hard);
+      // A seal already holding when its arm takes up a job firms up over firmTau; one formed for the job starts firm.
+      if (!fresh && st.int[j] < intent) st.riseT[j] = t;
+      st.int[j] = intent;
+      if (st.riseT[j] >= 0) {
+        const u = rk.firmTau > 0 ? (t - st.riseT[j]) / rk.firmTau : 1, from = Math.min(part * Bt, hard);
+        if (u >= 1) st.riseT[j] = -1; else cap = from + (cap - from) * u;
+      }
+      const cc = firm ? rk.firmCompliance : rk.touchCompliance, sh = Math.max(1e-6, (1 - share) * cap), ad = Math.max(1e-6, share * cap);
+      nrm[0] = P6[w + 3]; nrm[1] = P6[w + 4]; nrm[2] = P6[w + 5];
+      // A new seal whose node sits farther off its surface than its adhesion could draw in would only let go at once.
+      const off = (X[o] - P6[w]) * nrm[0] + (X[o + 1] - P6[w + 1]) * nrm[1] + (X[o + 2] - P6[w + 2]) * nrm[2];
+      const ok = !(fresh && off > ad * cc) && rod.seal(i, P6[w], P6[w + 1], P6[w + 2], { compliance: cc, maxForce: Math.max(k.minGrip, st.cap[j]), shear: sh, adhesion: ad, normal: nrm });
+      if (ok) { st.shear[j] = sh; st.adh[j] = ad; this.sealStats.live++; continue; }
+      if (!fresh) { if (st.kind[j] === 4) st.plantSeg = -1; drop(j, 'lost'); rest(j); continue; }
+      st.kind[j] = 0; st.toy[j] = null; this.counts.seals--;
+      if (st.plantSeg === j) { st.plant = null; st.plantSeg = -1; }
+    }
+  }
+
+  /* What arm a's suckers mean this tick, once every claim on it has settled: nothing while it recoils, firm while it holds
+     something or stands on a foot, touch while it only feels; a recruiter's assignment speaks after a reflex and a grip. */
+  _intent(a) {
+    const k = this.knobs, arm = this.arms[a], g = arm.goal, ep = this.episodes[a], own = this.assigned[a];
+    let intent = INTENT.touch, task = 0;
+    if (g?.kind === 'recoil') intent = INTENT.none;
+    // A grip's job is the pull its tear rule judges (fEma), not the tear threshold, which is what its suckers could bear.
+    else if (ep?.h) { intent = INTENT.firm; task = Math.max(k.minGrip, ep.fEma); }
+    else if (own) { intent = own.intent; task = own.task ?? 0; }
+    else if (g?.kind === 'plant') { intent = INTENT.firm; task = this._footTask(a, g); }
+    // A fetch, or a hold on the toy it reached for, before its grip takes hold.
+    else if (g?.kind === 'fetch' || (g?.kind === 'hold' && !g.loco && this.track[a])) { intent = INTENT.firm; task = k.minGrip; }
+    this.sealIntent[a] = intent; this.sealTask[a] = task;
+    return intent;
+  }
+
+  /* The force a foot's job asks for: the cap locomotion gives its spring, and on a wall at least its share of the climb's
+     hand-over-hand rule; capCalm while no cap is set yet (the tick a mode plants it, or the bench). */
+  _footTask(a, g) {
+    const m = this.mantle, cap = m.armMode?.[a] === 1 ? m.armCap?.[a] : NaN;
+    let f = cap > 0 && Number.isFinite(cap) ? cap : LOCO_KNOBS.capCalm;
+    if (g.normal && !(g.normal[1] > LOCO_KNOBS.floorCos)) {
+      const C = CLIMB_KNOBS, wN = typeof m.weightInWater === 'function' ? m.weightInWater(true) : C.weightN;
+      f = Math.max(f, C.holdSafety * wN / C.minWallHolds);
+    }
+    return f;
+  }
+
+  /* The allSdf primitive a collider entry is (furniture, the sand, or a loose thing), or -1. */
+  _primOf(entry) {
+    if (!entry) return -1;
+    const i = this._primAt.get(entry);
+    if (i !== undefined) return i;
+    const l = this.loose.indexOf(entry);
+    return l >= 0 ? this._looseAt + l : -1;
+  }
+
+  /* A new seal on segment j, under grace: its node laid onto the surface it touched (that primitive's own raw distance, so
+     the first reprojection agrees), at the node's radius; on a toy, everything kept in the toy's frame. False if no surface. */
+  _sealBirth(a, j, st, body, kind, entry) {
+    const i = j + 1, o = i * 3, X = body.X, p = this.touchPrim[a * this.S + j], n = this._nb ??= [0, 0, 0];
+    if (p < 0 || (kind === 2) !== (p >= this._looseAt)) return false;
+    const P = st.pose, w = j * 7;
+    if (kind === 2) {
+      const b = entry.body, bp = b.GetPosition(), bq = b.GetRotation();
+      P[w] = bp.GetX(); P[w + 1] = bp.GetY(); P[w + 2] = bp.GetZ(); P[w + 3] = bq.GetX(); P[w + 4] = bq.GetY(); P[w + 5] = bq.GetZ(); P[w + 6] = bq.GetW();
+    }
+    this._surfAt = p; this._surfPose = kind === 2 ? P : null; this._surfO = w;
+    const d = this._surface(X[o], X[o + 1], X[o + 2], n), nl = Math.hypot(n[0], n[1], n[2]), r = body.rad[i], sh = d - r;
+    // A node more than its radius off that surface (a segment touching near its other end) has nothing there to seal on.
+    if (!Number.isFinite(d) || !(nl > 1e-9) || !Number.isFinite(nl) || Math.abs(sh) > r) return false;
+    for (let c = 0; c < 3; c++) n[c] /= nl;
+    const A = st.A, N = st.N, C = st.P, l = j * 3;
+    for (let c = 0; c < 3; c++) { A[l + c] = X[o + c] - n[c] * sh; C[l + c] = X[o + c] - n[c] * d; N[l + c] = n[c]; }
+    if (kind === 2) this._toToy(P, w, A, C, N, l);
+    st.prim[j] = p; st.int[j] = this.sealIntent[a]; st.riseT[j] = -1; st.pre[j] = NaN;
+    return true;
+  }
+
+  /* A plant's foot under grace: the plant's point and normal, unless its surface's raw normal there disagrees past the
+     re-issue tolerance; a foot on a loose thing (a haul's) is the carry's to move and is never reprojected. */
+  _plantBirth(a, j, st, pg, r) {
+    const p = this._primOf(pg.entry), A = st.A, N = st.N, C = st.P, l = j * 3, n = this._nb ??= [0, 0, 0], m = this._mb ??= [0, 0, 0];
+    const gl = Math.hypot(pg.normal[0], pg.normal[1], pg.normal[2]) || 1;
+    for (let c = 0; c < 3; c++) n[c] = pg.normal[c] / gl;
+    const fixed = p >= 0 && p < this._looseAt;
+    if (fixed) {
+      this._surfAt = p; this._surfPose = null;
+      const d = this._surface(pg.point[0], pg.point[1], pg.point[2], m), ml = Math.hypot(m[0], m[1], m[2]);
+      if (Number.isFinite(d) && ml > 1e-9 && (m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) / ml < NORMAL_AGREE) for (let c = 0; c < 3; c++) n[c] = m[c] / ml;
+    }
+    for (let c = 0; c < 3; c++) { C[l + c] = pg.point[c]; N[l + c] = n[c]; A[l + c] = pg.point[c] + n[c] * r; }
+    st.prim[j] = fixed ? p : -1; st.int[j] = this.sealIntent[a]; st.riseT[j] = -1; st.pre[j] = NaN;
+  }
+
+  /* After the step, one held seal: why it ends (over its adhesion, slid past its limit, its surface lost under it), or
+     null with its effective anchor laid back on that surface and read into st.A and st.N (a toy's at the pose the step used). */
+  _sealHeld(a, j, st, body) {
+    const rod = body.rod, rk = this.rodKnobs, i = j + 1, toy = st.kind[j] === 2, p = st.prim[j], w = j * 7, l = j * 3;
+    if (rod.sealOver[i]) return 'over';
+    if (rod.sealSlip(i) > (st.int[j] === INTENT.firm ? rk.slipMax : rk.touchSlipMax)) return 'slip';
+    if (p >= 0) {
+      this._surfAt = p; this._surfPose = toy ? st.pose : null; this._surfO = w; this._surfD = NaN;
+      // The sand is a bed of facets that her weight and her digging tilt under a still anchor: there only a sudden turn is an edge.
+      const r = body.rad[i], code = reprojectSeal(rod, i, this._surface, r, this.allSdf.prims[p].type === 'field' ? SAND_EDGE : undefined);
+      st.pre[j] = Math.abs(this._surfD - r);
+      if (code !== REPROJECT.on) return REPROJECT_WHY[code];
+    }
+    const A = st.A, N = st.N, s = this._sb ??= [0, 0, 0], m = this._sn ??= [0, 0, 0];
+    rod.sealAnchor(i, s); rod.sealNormal(i, m);
+    for (let c = 0; c < 3; c++) { A[l + c] = s[c]; N[l + c] = m[c]; }
+    if (toy) this._toToy(st.pose, w, A, null, N, l);
+    return null;
+  }
+
+  /* World anchor, contact point, and normal at l into the frame of the toy posed at P[w..w+7]. */
+  _toToy(P, w, A, C, N, l) {
+    const qx = -P[w + 3], qy = -P[w + 4], qz = -P[w + 5], qw = P[w + 6];
+    rotate(qx, qy, qz, qw, A[l] - P[w], A[l + 1] - P[w + 1], A[l + 2] - P[w + 2], A, l);
+    if (C) rotate(qx, qy, qz, qw, C[l] - P[w], C[l + 1] - P[w + 1], C[l + 2] - P[w + 2], C, l);
+    rotate(qx, qy, qz, qw, N[l], N[l + 1], N[l + 2], N, l);
   }
 
   /* The beat streams from their seeds and no seal history, at boot and at a scenario's clean slate. */
@@ -1456,7 +1677,7 @@ export class Arms {
      bore in its last step (force). Nothing she does reads it. */
   _sealEnd(a, j, why, force = 0) {
     const st = this.seals[a], log = this.sealLog;
-    log.push({ t: this.time, a, j, kind: st.kind[j], life: this.time - st.t0[j], beat: st.beat[j], end: why, force });
+    log.push({ t: this.time, a, j, kind: st.kind[j], life: this.time - st.t0[j], beat: st.beat[j], end: why, force, intent: st.int?.[j] ?? 0 });
     if (log.length > this.sealLogSize) log.shift();
     this.sealEnds[why] = (this.sealEnds[why] ?? 0) + 1;
   }
@@ -1547,6 +1768,15 @@ export class Arms {
     for (let c = 0; c < 3; c++) out[c] = F.m[c] + F.e2[c] * r * 0.9 + F.e3[c] * r * side;
     return out;
   }
+}
+
+/* Each segment's seal state under rodKnobs.grace beside st.A: contact point, normal (on a toy all in its frame), primitive,
+   the toy pose its anchor last went out at, intent, firming start (-1 none), offset before reprojection, and its limits. */
+export function graceSeals(S) {
+  return {
+    P: new Float64Array(S * 3), N: new Float64Array(S * 3), prim: new Int32Array(S).fill(-1), pose: new Float64Array(S * 7),
+    int: new Uint8Array(S), riseT: new Float64Array(S).fill(-1), pre: new Float64Array(S).fill(NaN), shear: new Float64Array(S), adh: new Float64Array(S),
+  };
 }
 
 /* The frame of arm segment j at fraction f along it: point m, direction e1, sucker side squared off it e2, and e3. */

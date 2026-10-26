@@ -161,6 +161,21 @@ export class RodDiag {
     range('Weight', [0, 0.02, 0.04, 0.08, 0.15, 0.3], () => k.weightFactor, (v) => { k.weightFactor = v; }, (v) => `${Math.round(v * 100)}% g`);
     range('Added mass', [0, 0.5, 1], () => k.addedMass, (v) => { k.addedMass = v; }, (v) => `${v}`);
     range('Substeps', [1, 2, 3, 4], () => k.substeps, (v) => { k.substeps = v; }, (v) => `${v}`);
+    this._graceControls(add, range);
+  }
+
+  /* Seals sized to what each arm means (rodKnobs.grace), read only while seals run (?loads=1, or the bench). */
+  _graceControls(add, range) {
+    const k = this.arms.rodKnobs, mm = (v) => `${(v * 1000).toFixed(1)} mm/N`, cm = (v) => `${(v * 100).toFixed(1)} cm`;
+    add({ name: 'Grip follows intent', label: () => `Grace: ${k.grace ? 'on' : 'off'}${k.seals ? '' : ' (?loads=1)'}`, run: () => { k.grace = !k.grace; } });
+    range('Touch budget', [0.1, 0.2, 0.3, 0.5, 1, 2], () => k.touchArmN, (v) => { k.touchArmN = v; }, (v) => `${v} N an arm`);
+    range('Adhesion share', [0.3, 0.4, 0.5, 0.6, 0.7, 0.8], () => k.adhesionShare, (v) => { k.adhesionShare = v; }, (v) => `${Math.round(v * 100)}%`);
+    range('Touch give', [5e-4, 1e-3, 2e-3, 5e-3, 1e-2], () => k.touchCompliance, (v) => { k.touchCompliance = v; }, mm);
+    range('Firm give', [2.5e-4, 5e-4, 1e-3, 2e-3, 5e-3], () => k.firmCompliance, (v) => { k.firmCompliance = v; }, mm);
+    range('Firm ×', [1, 1.5, 2, 3, 4], () => k.firmMul, (v) => { k.firmMul = v; }, (v) => `${v}× the task`);
+    range('Firm-up time', [0, 0.1, 0.25, 0.5, 1], () => k.firmTau, (v) => { k.firmTau = v; }, (v) => `${v} s`);
+    range('Firm slip', [0.005, 0.01, 0.02, 0.04, 0.08], () => k.slipMax, (v) => { k.slipMax = v; }, cm);
+    range('Touch slip', [0.02, 0.04, 0.08, 0.15, 0.3], () => k.touchSlipMax, (v) => { k.touchSlipMax = v; }, cm);
   }
 
   /* The shared solve's own dials, read only while it runs. */

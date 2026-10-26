@@ -46,6 +46,11 @@ export class SuckerDiag {
       this._ends = total; this._at = A.time;
       const top = Object.entries(E).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([w, v]) => `${w} ${Math.round((v / Math.max(1, total)) * 100)}%`).join(', ');
       lines.push(`Seals    ${s.live} held   ${this.rate.toFixed(1)} let go/s (${top || '–'})   stretch ×${s.stretch.toFixed(2)}, max ×${s.stretchMax.toFixed(2)}   pops ${s.pops}${k.grabby ? '' : '   grabby off'}`);
+      // Per arm: what it means (none, touch, firm), the budget its seals share, and what they bore through the last step.
+      if (k.grace) {
+        const tag = ['–', 't', 'F'], n = (v) => (v >= 10 ? v.toFixed(0) : v.toFixed(2));
+        lines.push(`Grace    ${A.rods.map((r, a) => (r ? `${a}${tag[A.sealIntent[a]]} ${n(A.sealApplied[a])}/${n(A.sealBudget[a])}` : `${a} –`)).join('  ')}   N borne/budget`);
+      } else lines.push('Grace    off: every seal at full strength');
     }
     const R = A.reflexes, list = R.latch.list(R._latchList ??= []), L = R.latchKnobs;
     const on = list.map((e) => { const m = R.latch.m.get(e); return `${this.name(e)} ${Math.max(0, L.hold - (A.time - m.last)).toFixed(0)} s`; });

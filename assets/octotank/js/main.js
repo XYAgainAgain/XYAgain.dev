@@ -123,7 +123,7 @@ async function boot() {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
     // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
@@ -155,9 +155,10 @@ async function boot() {
   // ?keeptask=0 and ?blocked=0 show her without either.
   arms.suckerKnobs.keepTask = params.get('keeptask') !== '0';
   arms.blocked.knobs.on = params.get('blocked') !== '0';
-  // Grabby seals (under ?loads=1), the latch a thing that has stung her enough trips, and stations that hold their feet;
-  // ?grabby=0, ?latch=0, and ?firm=0 show her without each.
+  // Grabby seals and seals sized to what each arm means (both under ?loads=1), the latch a thing that has stung her enough
+  // trips, and stations that hold their feet; ?grabby=0, ?grace=0, ?latch=0, and ?firm=0 show her without each.
   if (params.get('grabby') === '0') arms.rodKnobs.grabby = false;
+  if (params.get('grace') === '0') arms.rodKnobs.grace = false;
   if (params.get('latch') === '0') arms.reflexes.latchKnobs.latch = false;
   if (params.get('firm') === '0' && loco) loco.knobs.stationFirm = false;
 
