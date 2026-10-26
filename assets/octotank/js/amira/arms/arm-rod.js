@@ -46,7 +46,7 @@ export const ROD_ARM_KNOBS = {
   sealBeatSd: 0.25,
   beatLift: 2,
   sealRest: 0.25,        // s a patch rests after letting go before it can take hold again
-  popStretch: 1.5,       // of the arm's own length from the root to a seal, past which every seal on it pops
+  popStretch: 1.5,       // of the arm's length from the root to a seal, past which every seal on it pops (with peel, anatomical)
   popRest: 0.6,          // s the popped patches rest
   // Grip follows intent: an arm only feeling its way seals at touch, one doing a job seals firm, sized to that job. One
   // budget per arm, shared over its seals by contact quality, limited inside the rod's solve and kept on its surface.
@@ -59,6 +59,21 @@ export const ROD_ARM_KNOBS = {
   firmTau: 0.25,         // s a seal whose arm goes from feeling to working takes to firm up
   slipMax: 0.02,         // m a firm seal may slide along its surface before it lets go
   touchSlipMax: 0.08,    // and a touch seal, which slides as feeling
+  // Peel and emergency release (with grace): a seal lets go over a ramp, never in one tick. The arm meaning to let go peels
+  // tip first; a pull past adhesion peels that seal; stretched off its holds, skidding, or flinching, it lets go fast.
+  peel: true,
+  peelTime: 0.2,         // s a seal takes to peel when the arm means to let go, or when pulled off past its adhesion
+  peelStagger: 0.02,     // s apart, tip first, the seals of a group letting go together
+  peelFast: 3,           // ticks an emergency release takes
+  peelStretch: 1.35,     // unexpected strain (arc over the commanded length) from which it paces itself by the stretch rate
+  popHard: 1.6,          // unexpected strain at which whatever still holds lets go at once
+  // Drag relax: a firm hold being dragged off, whose job doesn't need the arm short, lengthens the span to it toward
+  // dragMax at what its suckers bear, then pops; while it runs, the hold may slide dragSlipMax.
+  dragRelax: true,
+  dragRate: 0.5,         // per second, each segment of that span
+  dragMax: 1.5,          // anatomical elongation of the span
+  dragRecover: 0.3,      // per second back, once nothing drags
+  dragSlipMax: 0.06,     // m
   wrench: false,         // the root's force and torque reach her body, a tick late; explicit, so at her mass it grows
   wrenchSpread: 'body',  // over all of her as a rigid body would take it, or 'patch', the arm's own
   // The shared solve (?couple=1) alone reads these.

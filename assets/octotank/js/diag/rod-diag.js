@@ -176,6 +176,18 @@ export class RodDiag {
     range('Firm-up time', [0, 0.1, 0.25, 0.5, 1], () => k.firmTau, (v) => { k.firmTau = v; }, (v) => `${v} s`);
     range('Firm slip', [0.005, 0.01, 0.02, 0.04, 0.08], () => k.slipMax, (v) => { k.slipMax = v; }, cm);
     range('Touch slip', [0.02, 0.04, 0.08, 0.15, 0.3], () => k.touchSlipMax, (v) => { k.touchSlipMax = v; }, cm);
+    // Peel and emergency release, then drag relax: how a seal lets go, and how a dragged firm hold lengthens its arm first.
+    add({ name: 'Peel', label: () => `Peel: ${k.peel ? 'on' : 'off'}${k.grace ? '' : ' (with grace)'}`, run: () => { k.peel = !k.peel; } });
+    range('Peel time', [0.05, 0.1, 0.2, 0.3, 0.5], () => k.peelTime, (v) => { k.peelTime = v; }, (v) => `${v} s`);
+    range('Peel stagger', [0, 0.01, 0.02, 0.04, 0.08], () => k.peelStagger, (v) => { k.peelStagger = v; }, (v) => `${Math.round(v * 1000)} ms tip first`);
+    range('Fast peel', [1, 2, 3, 5, 8], () => k.peelFast, (v) => { k.peelFast = v; }, (v) => `${v} ticks`);
+    range('Paced from', [1.2, 1.3, 1.35, 1.4, 1.5], () => k.peelStretch, (v) => { k.peelStretch = v; }, (v) => `×${v} strain`);
+    range('Hard pop', [1.5, 1.55, 1.6, 1.7, 1.8], () => k.popHard, (v) => { k.popHard = v; }, (v) => `×${v} strain`);
+    add({ name: 'Drag relax', label: () => `Drag relax: ${k.dragRelax ? 'on' : 'off'}`, run: () => { k.dragRelax = !k.dragRelax; } });
+    range('Drag rate', [0.25, 0.5, 1, 2], () => k.dragRate, (v) => { k.dragRate = v; }, (v) => `${v} a second`);
+    range('Drag to', [1.3, 1.4, 1.5, 1.6], () => k.dragMax, (v) => { k.dragMax = v; }, (v) => `×${v}`);
+    range('Drag recover', [0.1, 0.2, 0.3, 0.5, 1], () => k.dragRecover, (v) => { k.dragRecover = v; }, (v) => `${v} a second`);
+    range('Drag slip', [0.02, 0.04, 0.06, 0.08, 0.1], () => k.dragSlipMax, (v) => { k.dragSlipMax = v; }, cm);
   }
 
   /* The shared solve's own dials, read only while it runs. */

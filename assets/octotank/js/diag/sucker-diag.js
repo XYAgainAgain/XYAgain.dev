@@ -45,12 +45,17 @@ export class SuckerDiag {
       if (this._at >= 0 && A.time > this._at) this.rate += ((total - this._ends) / (A.time - this._at) - this.rate) * 0.3;
       this._ends = total; this._at = A.time;
       const top = Object.entries(E).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([w, v]) => `${w} ${Math.round((v / Math.max(1, total)) * 100)}%`).join(', ');
-      lines.push(`Seals    ${s.live} held   ${this.rate.toFixed(1)} let go/s (${top || '–'})   stretch ×${s.stretch.toFixed(2)}, max ×${s.stretchMax.toFixed(2)}   pops ${s.pops}${k.grabby ? '' : '   grabby off'}`);
+      lines.push(`Seals    ${s.live} held   ${this.rate.toFixed(1)} let go/s (${top || '–'})   stretch ×${s.stretch.toFixed(2)}, max ×${s.stretchMax.toFixed(2)}${k.grace && k.peel ? `, anatomical ×${(s.anat ?? 1).toFixed(2)}` : ''}   pops ${s.pops}${s.popHard ? ` (hard ${s.popHard})` : ''}${k.grabby ? '' : '   grabby off'}`);
       // Per arm: what it means (none, touch, firm), the budget its seals share, and what they bore through the last step.
       if (k.grace) {
         const tag = ['–', 't', 'F'], n = (v) => (v >= 10 ? v.toFixed(0) : v.toFixed(2));
         lines.push(`Grace    ${A.rods.map((r, a) => (r ? `${a}${tag[A.sealIntent[a]]} ${n(A.sealApplied[a])}/${n(A.sealBudget[a])}` : `${a} –`)).join('  ')}   N borne/budget`);
       } else lines.push('Grace    off: every seal at full strength');
+      // Per arm under peel: seals letting go (peeling or queued), unexpected strain over anatomical elongation, r while drag relax runs.
+      if (k.grace && k.peel) {
+        const peel = (a) => { const st = A.seals[a]; let p = 0; for (let j = 0; j < A.S; j++) if (st.kind[j] && (st.pKind[j] || st.pAt[j] === st.pAt[j])) p++; return p; };
+        lines.push(`Peel     ${A.rods.map((r, a) => (r ? `${a}${peel(a) ? ` ${peel(a)}p` : ''} ${A.sealStrain[a] ? A.sealStrain[a].toFixed(2) : '–'}/${A.sealAnat[a].toFixed(2)}${A.relaxing[a] ? ' r' : ''}` : `${a} –`)).join('  ')}   peeling, strain/anatomical`);
+      }
     }
     const R = A.reflexes, list = R.latch.list(R._latchList ??= []), L = R.latchKnobs;
     const on = list.map((e) => { const m = R.latch.m.get(e); return `${this.name(e)} ${Math.max(0, L.hold - (A.time - m.last)).toFixed(0)} s`; });

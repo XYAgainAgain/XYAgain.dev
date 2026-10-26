@@ -1005,6 +1005,8 @@ export class Arm {
     this.contactRad0 = null;                // rest radii its contact uses instead of rad0 (a coupled rod's girth)
     this.lam = new Float64Array(S).fill(1); // stretch per segment
     this.lamGoal = new Float64Array(S).fill(1);
+    this.relaxGoal = new Float64Array(S);   // drag relax's lengthening on top of every program's (Arms writes it)
+    this.relaxOn = false;
     this.lamMax = new Float64Array(S);
     this.twist = new Float64Array(S);       // rad, the frame's roll after each segment
     this.twistV = new Float64Array(S);
@@ -1748,11 +1750,11 @@ export class Arm {
     const f = 1 - Math.exp(-dt / Math.max(1e-3, k.stretchTau));
     const shorten = k.shortenSpeed / Math.max(1e-3, this._length);
     const plant = this.goal?.kind === 'plant' ? this.goal.lamTo : -1, M = k.muscle ? this.mus.lam : null;
-    const rc = this.goal?.kind === 'recoil' ? this.goal : null;
+    const rc = this.goal?.kind === 'recoil' ? this.goal : null, R = this.relaxOn ? this.relaxGoal : null;
     for (let j = 0; j < S; j++) {
       // A plant's length is the geometry's, set outright, or its anchored suckers would slide.
-      if (j <= plant) { L[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], G[j])); continue; }
-      const want = Math.max(k.stretchMin, Math.min(this.lamMax[j], M ? M[j] : 1 + (G[j] - 1) * w));
+      if (j <= plant) { L[j] = Math.max(k.stretchMin, Math.min(this.lamMax[j], R ? G[j] + R[j] : G[j])); continue; }
+      const own = M ? M[j] : 1 + (G[j] - 1) * w, want = Math.max(k.stretchMin, Math.min(this.lamMax[j], R ? own + R[j] : own));
       let d = (want - L[j]) * f;
       // A recoil's flinching segments shorten at its own pace, which a reflex needs and a program's shortening never would.
       const r = L[j] > 1 ? k.recoverRate : shorten;

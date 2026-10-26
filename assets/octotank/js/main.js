@@ -45,7 +45,7 @@ import { rodArms } from './amira/arms/arm-rod.js';
    ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
    authored arms, touching nothing)  ?couple=0 (each rod steps alone on a root dragged to her, nothing fed back; by default
    her rods and body share one solve)  ?loads=1 (her rods with their loads; a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in)
-   ?grabby=0 (seals under ?loads=1 as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones) */
+   ?grabby=0 (seals under ?loads=1 as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?peel=0 (seals let go in one tick, not over a peel)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -123,7 +123,7 @@ async function boot() {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
     // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', peel: params.get('peel') !== '0', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
@@ -155,10 +155,11 @@ async function boot() {
   // ?keeptask=0 and ?blocked=0 show her without either.
   arms.suckerKnobs.keepTask = params.get('keeptask') !== '0';
   arms.blocked.knobs.on = params.get('blocked') !== '0';
-  // Grabby seals and seals sized to what each arm means (both under ?loads=1), the latch a thing that has stung her enough
-  // trips, and stations that hold their feet; ?grabby=0, ?grace=0, ?latch=0, and ?firm=0 show her without each.
+  // Grabby, intent-sized, and peeling seals (all under ?loads=1), the latch a thing that has stung her enough trips, and stations that hold their feet;
+  // ?grabby=0, ?grace=0, ?peel=0, ?latch=0, and ?firm=0 show her without each.
   if (params.get('grabby') === '0') arms.rodKnobs.grabby = false;
   if (params.get('grace') === '0') arms.rodKnobs.grace = false;
+  if (params.get('peel') === '0') arms.rodKnobs.peel = false;
   if (params.get('latch') === '0') arms.reflexes.latchKnobs.latch = false;
   if (params.get('firm') === '0' && loco) loco.knobs.stationFirm = false;
 
