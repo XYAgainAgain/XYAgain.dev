@@ -267,9 +267,9 @@ export class Pull {
     for (let a = 0; a < L.n && this.walls < want; a++) {
       const g = L.arms.arms[a].goal;
       // A station freed to pull gets its reach and its cool-down before it may hold again.
-      if (L.role[a] !== IDLE || (g && g.loco !== L) || L.time < this.freedT[a] + k.seekMax + k.seekCool) continue;
+      if (L.role[a] !== IDLE || (g && g.loco !== L) || L.time < this.freedT[a] + k.seekMax + k.seekCool || !L.freeFor(a, 'hold')) continue;
       const o = this._wallAnchor(a);
-      if (o && L.plantStation(a, o)) { this.walls++; this.holding[a] = 1; this.made[a] = 1; this.madeT[a] = L.roleT[a]; this.stats.toppedUp++; if (this._pinned) this._settle(a); }
+      if (o && L.plantStation(a, o)) { this.walls++; this.holding[a] = 1; this.made[a] = 1; this.madeT[a] = L.roleT[a]; this.stats.toppedUp++; L.grant(a, 'hold', 'top up'); if (this._pinned) this._settle(a); }
       else if (short && !g && this._reachWall(a)) short = false;
     }
   }
@@ -288,6 +288,7 @@ export class Pull {
     if (A.claim && !A.claim(a, 'stroke')) return false;
     if (!A.reach(a, p, { face: [p[0] - nrm[0] * 0.05, p[1] - nrm[1] * 0.05, p[2] - nrm[2] * 0.05], hold: k.seekMax })) { A.unclaim?.(a, 'stroke'); return false; }
     A.arms[a].goal.loco = L;
+    L.grant(a, 'hold', 'wall reach');
     this.wallReachAt[a] = L.time + k.seekMax + k.seekCool;
     this.stats.wallReaches++;
     return true;

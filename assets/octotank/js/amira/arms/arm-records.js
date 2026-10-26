@@ -18,6 +18,8 @@ export class ArmRecords {
     this._kind = new Array(n).fill(null);
     this._goal = new Array(n).fill(null);
     this._ep = new Array(n).fill(null);
+    // Her locomotion's assignment for each arm (null in the pool), its newest reason, and since when.
+    this.assigned = Array.from({ length: n }, () => ({ task: null, why: null, since: 0 }));
     this.msBuf = new Float32Array(WINDOW);
     this.msCount = 0;
   }
@@ -30,6 +32,15 @@ export class ArmRecords {
     const s = typeof text === 'string' ? text : this._name(text);
     this._note[a] = s ? `${kind}: ${s}` : kind;
     this._log(a, kind, s);
+  }
+
+  /* An assignment given, ended (task null), suspended, or resumed, with its reason; logged as an 'assign' event. */
+  assign(a, task, why = null) {
+    if (!(a >= 0 && a < this.state.length)) return;
+    const s = this.assigned[a];
+    if (s.task !== task) s.since = this.arms.time;
+    s.task = task; s.why = why;
+    this._log(a, 'assign', `${task ?? 'pool'}${why ? `, ${why}` : ''}`);
   }
 
   tick(dt) {

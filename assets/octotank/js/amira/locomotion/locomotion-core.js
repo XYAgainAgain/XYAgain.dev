@@ -63,6 +63,24 @@ export const LOCO_KNOBS = {
   glassShare: 0.3,        // share of her own picks that may go to the glass (never two running)
   glassLo: 0.1,           // m up the glass a wandering look lands, at random in this range
   glassHi: 0.6,
+  // Delegation (Gracefulness Plan, item 3): a task recruits its arms; ?recruit=0 gives each idle arm its own hazard again.
+  recruit: true,
+  recruitEvery: 0.25,     // s between the recruiter's looks at who serves the stroke
+  keepBonus: 0.2,         // usefulness an incumbent's score gains against a newcomer's
+  tenureMin: 1,           // s an assignment holds before re-scoring may take it
+  resumeWindow: 2,        // s an interrupted assignment waits to resume before it returns to the pool
+  strokeStagger: 0.15,    // s between any two strokes starting
+  recruitJitter: 0.05,    // s mean of the wait an assigned arm draws before its next stroke: the old hazard, as timing only
+  restInitiative: 0.4,    // share of its usual wander rate an unassigned arm keeps while she travels; its reach stays
+  feelers: 1,             // unassigned arms on her leading side that feel ahead at touch while she moves
+  curiosityWeight: { food: 1, toy: 0.9, slick: 0.9, rock: 0.8, spoiled: 0.5, glass: 0.2, floor: 0.2, sand: 0.2, wall: 0.2, lid: 0.2, self: 0, noxious: 0 },
+  breakSalience: 0.6,     // novelty × curiosityWeight an assigned arm's touch must reach to earn a curiosity break
+  breakMax: 3,            // s a break lasts at most
+  breakRate: 2,           // breaks a minute at most
+  breakHold: 0.5,         // s a break's touch reach holds the thing; 0 lets the arm linger on its idle aim instead
+  strokeSpan: 0,          // under loads, a stroke lets its foot go at this root-to-foot elongation, short of the pop; 0 lets it pop
+  sleepyLong: 20,         // s of rest after which she wakes slowly, her feelers quiet
+  sleepyWake: 60,         // s that waking lasts
 };
 
 export const ROLE = { idle: 0, seek: 1, planted: 2, recover: 3, station: 4, busy: 5, cool: 6 };
@@ -149,6 +167,53 @@ export function hazard(urgency, use, crowdF, k = LOCO_KNOBS, widen = false) {
 
 /* One seeded draw of whether a hazard h fires within dt; `rng.next` is uniform on [0, 1). */
 export function fires(rng, h, dt) { return h > 0 && rng.next() < 1 - Math.exp(-h * dt); }
+
+/* The stroke's crew: seat 2 (tenure, mid-stroke) stays whatever it scores; seat 1 stays while eligible, leaving only for a newcomer
+   keepBonus better (any, if it can't stroke per `able`), never for the seat count. Seats short of `want` go to the best; ties low. */
+export function pickCrew(score, eligible, seat, want, keepBonus, out = [], able = null) {
+  out.length = 0;
+  const fresh = [], ok = (a) => eligible[a] && Number.isFinite(score[a]);
+  for (let a = 0; a < score.length; a++) {
+    if (seat[a] === 2 || (seat[a] === 1 && ok(a))) out.push(a);
+    else if (seat[a] === 0 && ok(a)) fresh.push(a);
+  }
+  fresh.sort((x, y) => score[y] - score[x] || x - y);
+  let f = 0;
+  while (out.length < want && f < fresh.length) out.push(fresh[f++]);
+  // A newcomer clearly better than the weakest incumbent past its tenure takes its seat.
+  while (f < fresh.length) {
+    let w = -1;
+    for (const a of out) if (seat[a] === 1 && (w < 0 || score[a] < score[w] || (score[a] === score[w] && a > w))) w = a;
+    if (w < 0 || !(score[fresh[f]] > score[w] + (able && !able[w] ? 0 : keepBonus))) break;
+    out[out.indexOf(w)] = fresh[f++];
+  }
+  return out.sort((x, y) => x - y);
+}
+
+/* One assignment's interruption clock (suspendedAt NaN while it runs): 'suspend' as something stronger takes the arm,
+   'resume' once it lets go within the window, 'expire' past it (back to the pool), else 'keep' or 'wait'. */
+export function suspendStep(suspendedAt, held, now, window) {
+  if (!(suspendedAt === suspendedAt)) return held ? 'suspend' : 'keep';
+  if (now - suspendedAt > window) return 'expire';
+  return held ? 'wait' : 'resume';
+}
+
+/* What a touch is worth to an arm's curiosity: novelty (0–1) times its taste's weight, kept apart from taste salience. */
+export function curiosity(taste, novelty, weights = LOCO_KNOBS.curiosityWeight) {
+  return (weights?.[taste] ?? 0) * clamp(Number.isFinite(novelty) ? novelty : 0, 0, 1);
+}
+
+/* Whether the arbiter grants an assigned arm's touch a break: past breakSalience, none under way, under breakRate in the
+   last minute (`recent` holds start times), never the last hold on a wall or in the slot, never a turn's station. */
+export function breakAllowed({ score, active = false, recent = [], now = 0, lastHold = false, turnStation = false }, k = LOCO_KNOBS) {
+  if (!(score >= k.breakSalience) || active || lastHold || turnStation || !(k.breakMax > 0)) return false;
+  let n = 0;
+  for (const t of recent) if (now - t < 60) n++;
+  return n < k.breakRate;
+}
+
+/* The wait before an assigned arm's next stroke: exponential with mean `mean`, from a uniform u on [0, 1). */
+export function strokeWait(u, mean) { return mean > 0 ? mean * -Math.log1p(-Math.min(u, 1 - 1e-12)) : 0; }
 
 /* Why a planted push stroke ends, or null: its anchor lost, its rest length or the chord at full extension, its line
    no longer helping, or it ran too long. `along` is u · d, positive while the arm pushes her along the travel. */

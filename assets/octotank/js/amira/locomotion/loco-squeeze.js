@@ -303,7 +303,7 @@ export class Squeeze {
     for (let a = 0; a < L.n; a++) {
       const rf = L.mantle.rootFrame(a, this._rf);
       this.scores[a] = threadScore(rf.n, r.dir);
-      this.free[a] = L.role[a] === IDLE && !A.arms[a].goal ? 1 : 0;
+      this.free[a] = L.role[a] === IDLE && !A.arms[a].goal && L.freeFor(a, 'squeeze') ? 1 : 0;
     }
     let pick;
     if (kind === FAR) pick = pickThreaders(this.scores, this.free, count, k);
@@ -338,6 +338,7 @@ export class Squeeze {
       L.strokeMode[a] = this;
       this.kind[a] = kind;
       L._set(a, SEEK);
+      L.grant(a, 'squeeze', kind === NEAR ? 'near' : first ? 'thread' : 'far');
       this.stats.sends[kind === NEAR ? 'near' : first ? 'thread' : 'far']++;
       sent++;
     }

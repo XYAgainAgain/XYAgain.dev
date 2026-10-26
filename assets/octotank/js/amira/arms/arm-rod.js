@@ -29,7 +29,7 @@ export const ROD_ARM_KNOBS = {
   aimTau: 0.3,           // s the aim's correction takes to catch up with the rod's miss
   aimMax: 0.08,          // m the aim may move off where the program meant
   aimPress: 0.006,       // m closer to a toy than the program's clearance a middle grip aims: aimed true, the rod would hover over it
-  // Off in core; main.js turns the loads on for the bench, and ?loads=1 the loads and the root wrench for her rod arms.
+  // Off in core; main.js turns the loads on for the bench, and the loads and the root wrench for her rod arms unless ?loads=0.
   toyPush: 'capped',     // 'rod': a toy takes the rod's own contact momentum, split by the two inverse masses; 'capped': pushN per toy
   gripLoad: false,       // what a grip holds weighs on the rod's grip nodes, a tick late
   gripMass: true,        // and the held toy's mass rides those nodes, so its inertia is the rod's own, not a late pull that rings

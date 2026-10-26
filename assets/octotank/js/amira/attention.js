@@ -102,6 +102,8 @@ export class Attention {
     this._eye3 = [0, 0, 0];
     this._roots = new Float64Array(arms.arms.length * 3);
     this._r = [0, 0, 0];
+    // Her locomotion's say (a => bool): an arm a task holds isn't hers to send.
+    this.taken = null;
   }
 
   _read() {
@@ -177,6 +179,7 @@ export class Attention {
     }
     // The arm on the eye line if it can be had; past one a stronger claim holds, the next best on the line.
     const skip = new Set(), A = this.arms;
+    if (this.taken) for (let a = 0; a < R.length / 3; a++) if (this.taken(a)) skip.add(a);
     this.reached = -1;
     for (let tries = 0; tries < R.length / 3 && this.reached < 0; tries++) {
       const arm = armOnLine(R, eye, this.points[i], this.knobs, skip);

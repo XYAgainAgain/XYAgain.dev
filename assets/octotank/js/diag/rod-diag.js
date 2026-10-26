@@ -164,10 +164,10 @@ export class RodDiag {
     this._graceControls(add, range);
   }
 
-  /* Seals sized to what each arm means (rodKnobs.grace), read only while seals run (?loads=1, or the bench). */
+  /* Seals sized to what each arm means (rodKnobs.grace), read only while seals run (her loads, on unless ?loads=0, or the bench). */
   _graceControls(add, range) {
     const k = this.arms.rodKnobs, mm = (v) => `${(v * 1000).toFixed(1)} mm/N`, cm = (v) => `${(v * 100).toFixed(1)} cm`;
-    add({ name: 'Grip follows intent', label: () => `Grace: ${k.grace ? 'on' : 'off'}${k.seals ? '' : ' (?loads=1)'}`, run: () => { k.grace = !k.grace; } });
+    add({ name: 'Grip follows intent', label: () => `Grace: ${k.grace ? 'on' : 'off'}${k.seals ? '' : ' (loads off)'}`, run: () => { k.grace = !k.grace; } });
     range('Touch budget', [0.1, 0.2, 0.3, 0.5, 1, 2], () => k.touchArmN, (v) => { k.touchArmN = v; }, (v) => `${v} N an arm`);
     range('Adhesion share', [0.3, 0.4, 0.5, 0.6, 0.7, 0.8], () => k.adhesionShare, (v) => { k.adhesionShare = v; }, (v) => `${Math.round(v * 100)}%`);
     range('Touch give', [5e-4, 1e-3, 2e-3, 5e-3, 1e-2], () => k.touchCompliance, (v) => { k.touchCompliance = v; }, mm);

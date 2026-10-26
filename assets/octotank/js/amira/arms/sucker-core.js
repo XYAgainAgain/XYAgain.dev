@@ -40,7 +40,7 @@ export const SUCKER_KNOBS = {
   refractory: 1,         // s a patch stays unsealed after the arm moves on
   ignoreTime: 4,         // s an arm leaves a thing it moved on from alone
   // What a touch is worth to the brain, before the arm's state and the thing's novelty scale it.
-  tasteWeight: { noxious: 1, food: 1, spoiled: 0.9, toy: 0.5, slick: 0.5, rock: 0.25, floor: 0.15, glass: 0.15, lid: 0.15, wall: 0.15, self: 0.05 },
+  tasteWeight: { noxious: 1, food: 1, spoiled: 0.9, toy: 0.5, slick: 0.5, rock: 0.25, floor: 0.15, sand: 0.15, glass: 0.15, lid: 0.15, wall: 0.15, self: 0.05 },
   busySalience: 0.6,     // a touch by an arm busy with something else
   idleSalience: 0.35,    // and by an idle one, against an arm reaching for that very thing
   familiarTime: 40,      // s of touching that halve a thing's novelty

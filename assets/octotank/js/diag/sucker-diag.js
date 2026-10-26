@@ -18,7 +18,7 @@ export class SuckerDiag {
 
   _controls() {
     const A = this.arms, k = A.rodKnobs, L = A.reflexes.latchKnobs, seals = A._anyRod && !A.shadow, add = (a) => section('arms').add(a);
-    add({ key: '0', name: 'Grabby seals', label: () => `Grabby: ${k.grabby ? 'on' : 'off'}${k.seals ? '' : ' (?loads=1)'}`, run: () => { k.grabby = !k.grabby; }, disabled: !seals });
+    add({ key: '0', name: 'Grabby seals', label: () => `Grabby: ${k.grabby ? 'on' : 'off'}${k.seals ? '' : ' (loads off)'}`, run: () => { k.grabby = !k.grabby; }, disabled: !seals });
     add({ key: '=', name: 'Seal beat', label: () => `Beat: ${k.sealBeat} s`, run: () => { k.sealBeat = cycle([0.25, 0.5, 1], k.sealBeat); k.sealBeatSd = k.sealBeat / 2; }, disabled: !seals });
     add({ key: '.', name: 'Draw in a beat', label: () => `Beat holds: ×${k.beatLift} draw`, run: () => { k.beatLift = cycle([1, 2, 3], k.beatLift); }, disabled: !seals });
     add({ key: '/', name: 'Seal rest', label: () => `Rest: ${k.sealRest} s`, run: () => { k.sealRest = cycle([0.1, 0.25, 0.5], k.sealRest); }, disabled: !seals });

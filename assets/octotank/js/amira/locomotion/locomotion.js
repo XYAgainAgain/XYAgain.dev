@@ -1,6 +1,7 @@
 import {
   LOCO_KNOBS, ROLE, ROLE_NAMES, lerp, clamp, wrap, springTarget, strokeRate, ellMax, segAtArc, flatDir, footTarget, usefulness,
   wantPushers, crowd, hazard, fires, releaseReason, surfaceMode, capFor, arrivedPlace, arrivedEpisode, stallStep, yawTerm, toneAccel,
+  pickCrew, suspendStep, strokeWait, curiosity, breakAllowed,
 } from './locomotion-core.js';
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 
@@ -10,6 +11,10 @@ import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 
 const WINDOW = 1800;
 const { idle: IDLE, seek: SEEK, planted: PLANTED, recover: RECOVER, station: STATION, busy: BUSY, cool: COOL } = ROLE;
+// A pool arm's word for its suckers in Arms.assigned: INTENT none; an arm left without a word resolves to touch.
+export const QUIET = Object.freeze({ intent: 0 });
+// A feeler keeps its place on her leading side until another arm leads by this much more.
+const FEELER_KEEP = 0.25;
 
 /* The floor push: a foot near the body behind the travel, a rest length that grows, a release at full extension.
    Other modes (the climb's pull) register beside it with the same five calls, plus optional hooks: choose, release,
@@ -103,8 +108,30 @@ export class Locomotion {
     this.state = {
       mode: 'idle', desire: null, arrived: false, failed: null, speed: 0, along: 0, roles: Array.from({ length: n }, () => 'idle'),
       planted: 0, seeking: 0, stations: 0, pushT: 0, pullT: 0, floorT: 0, pairPushT: new Float64Array(4), stallT: 0, strokes: 0,
-      strokeDur: [], releases: { full: 0, blocked: 0, help: 0, lost: 0, long: 0, done: 0, taken: 0 }, note: '',
+      strokeDur: [], releases: { full: 0, blocked: 0, help: 0, lost: 0, long: 0, done: 0, taken: 0, span: 0 }, note: '',
     };
+    // Delegation, under knobs.recruit: each arm's task ('stroke', 'station', 'hold', 'squeeze', or null), since when and why,
+    // and while something stronger holds it, since when (NaN while it runs) and by what.
+    this.knobs.curiosityWeight = { ...this.knobs.curiosityWeight };
+    this.task = new Array(n).fill(null);
+    this.taskSince = new Float64Array(n);
+    this.taskWhy = new Array(n).fill(null);
+    this.suspT = new Float64Array(n).fill(NaN);
+    this.suspBy = new Array(n).fill(null);
+    this.strokeAt = new Float64Array(n);
+    this._lastStroke = -Infinity;
+    this._recruitAt = -Infinity;
+    this._score = new Float64Array(n); this._elig = new Uint8Array(n); this._seat = new Uint8Array(n); this._crew = [];
+    this.assignStats = { changes: new Float64Array(n), suspended: 0, resumed: 0, expired: 0, why: {} };
+    this.feeler = new Uint8Array(n);
+    this.sleepy = false;
+    this._restAt = NaN; this._wakeUntil = -Infinity; this._recruitWas = false;
+    this._avoidV = Array.from({ length: n }, () => [0, 0, 0]);
+    // The curiosity break under way (its arm, or -1), and every break granted: arm, taste, score, start, end, and its cost.
+    this.breakArm = -1; this._breakP = [0, 0, 0]; this._breakRecent = [];
+    this.breakLog = [];
+    this._dt = 0;
+    if (attention) attention.taken = (a) => !!this.knobs.recruit && (this.task[a] !== null || a === this.breakArm);
   }
 
   /* A mode beside the push (the climb's pull): an object with the same calls as PUSH. */
@@ -123,6 +150,7 @@ export class Locomotion {
     const u = clamp(Number.isFinite(urgency) ? urgency : 0.3, 0, 1);
     const d = { ...t, urgency: u, arriveR: Number.isFinite(arriveR) && arriveR > 0 ? arriveR : this.knobs.arriveR, source, t0: this.time, done, resolve, arrived: false, failed: null };
     this.desire = d;
+    this._recruitAt = -Infinity;
     this.stall.t = 0; this.stall.ema = 0;
     this.state.arrived = false; this.state.failed = null;
     this._recoverBase ??= this.arms.knobs.recoverRate;
@@ -133,9 +161,12 @@ export class Locomotion {
 
   stop(why = 'stopped') { if (this.desire) this._finish(false, why); }
 
-  /* A clean slate between scenarios: the desire stops, the arms forget their stings and seal history, and every listener
-     with a reset (a carry) drops what it holds. */
-  reset(why = 'reset') { this.stop(why); this.arms.resetHistory?.(); for (const f of this.listeners) f.reset?.(why); }
+  /* A clean slate between scenarios: the desire stops, the arms forget their stings and seal history, every listener
+     with a reset (a carry) drops what it holds, and the recruiter's assignments and break end. */
+  reset(why = 'reset') {
+    this.stop(why); this.arms.resetHistory?.(); for (const f of this.listeners) f.reset?.(why);
+    if (this.knobs?.recruit) this._poolOff(why);
+  }
 
   _resolve(target) {
     if (typeof target === 'number') target = this.toys[target];
@@ -169,6 +200,9 @@ export class Locomotion {
     this.state.arrived = arrived; this.state.failed = failed;
     if (this.pose.focus?.point === d.point) this.pose.attend(null);
     for (let a = 0; a < this.n; a++) if (this.role[a] === PLANTED || this.role[a] === SEEK) this._release(a, 'done');
+    if (this.knobs.recruit) for (let a = 0; a < this.n; a++) if (this.task[a] === 'stroke') this._unassign(a, 'done');
+    // A break ends with its desire, before a replacement desire can inherit it.
+    this._breakEnd('desire ended');
     if (this._recoverBase !== null) { this.arms.knobs.recoverRate = this._recoverBase; this._recoverBase = null; }
     d.resolve({ arrived, failed, t: +(this.time - d.t0).toFixed(3), source: d.source });
   }
@@ -184,7 +218,10 @@ export class Locomotion {
   _tick(dt) {
     if (!(dt > 0)) return;
     this.time += dt;
+    this._dt = dt;
     const k = this.knobs, m = this.mantle, st = this.state;
+    if (k.recruit) { this._recruitWas = true; this._sleepTick(); this._interrupts(); this._quietOff(); }
+    else if (this._recruitWas) this._recruitOff();
     if (this.hold) { st.mode = 'held'; this._started = false; return; }
     if (this.pose.rigid || m.drive !== 'force') {
       if (this._live) this._standDown(2);
@@ -296,6 +333,7 @@ export class Locomotion {
       for (let a = 0; a < this.n; a++) m.rootWorld(a, this._p3), this.stanceP.set(this._p3, a * 3);
       this.stanceOn = true;
     }
+    if (k.recruit) { this._modeTasks(); this._recruit(d, helpMin); }
     let planted = 0, seeking = 0, stations = 0;
     for (let a = 0; a < this.n; a++) {
       const arm = A.arms[a], g = arm.goal, mine = !!g && g.loco === this;
@@ -312,7 +350,10 @@ export class Locomotion {
         this._set(a, role === SEEK ? COOL : RECOVER);
       }
       role = this.role[a];
-      if (role === IDLE) this._idle(a, dt, d, helpMin, crowdF, widen);
+      if (role === IDLE) {
+        if (!k.recruit) this._idle(a, dt, d, helpMin, crowdF, widen);
+        else { this._ready(a, dt, d, helpMin, active); if (this.role[a] === SEEK) active++; }
+      }
       else if (role === SEEK) this._seek(a, d);
       else if (role === PLANTED) this._planted(a, dt, d, helpMin);
       else if (role === STATION) this._station(a, d, dt, turning);
@@ -352,12 +393,331 @@ export class Locomotion {
       st.roles[a] = springy || !this.stanceOn ? ROLE_NAMES[role] : 'stance';
     }
     st.planted = planted; st.seeking = seeking; st.stations = stations;
+    if (k.recruit) { this._breaks(d, turning); this._lives(d); }
   }
 
-  /* Any role outside a stroke gives the arm's claim back, however the stroke ended. */
+  /* Sleepy: resting, held in her den, or for sleepyWake after a rest of sleepyLong or more, as she wakes. */
+  _sleepTick() {
+    const k = this.knobs, rest = !!this.arms.resting || !!this.holdBy;
+    if (rest) { if (!(this._restAt === this._restAt)) this._restAt = this.time; }
+    else if (this._restAt === this._restAt) {
+      if (this.time - this._restAt >= k.sleepyLong) this._wakeUntil = this.time + k.sleepyWake;
+      this._restAt = NaN;
+    }
+    this.sleepy = rest || this.time < this._wakeUntil;
+  }
+
+  /* What each pool arm means with its suckers and how much life it keeps: while she travels, feelers on her leading side at touch,
+     the rest low on initiative, turned off her travel and the crew, quiet on the floor (on a climb their touch helps her hang). */
+  _lives(d) {
+    const k = this.knobs, A = this.arms, n = this.n, F = this.feeler, out = A.assigned, rank = this._rank ??= [], lead = this._leadS ??= new Float64Array(n);
+    const pool = (a) => this.task[a] === null && !A.arms[a].goal && (A.owner?.[a] ?? 'idle') === 'idle' && (this.role[a] === IDLE || this.role[a] === RECOVER || this.role[a] === COOL);
+    // The leading arms (outward bearing along the travel) feel ahead, a feeler keeping its place by FEELER_KEEP.
+    const want = d && !this.sleepy ? Math.max(0, Math.round(k.feelers)) : 0, hang = !!d && this._climbing(d);
+    rank.length = 0;
+    for (let a = 0; a < n; a++) if (want && pool(a)) { lead[a] = this._lead(a) + (F[a] ? FEELER_KEEP : 0); rank.push(a); }
+    rank.sort((x, y) => lead[y] - lead[x] || x - y);
+    F.fill(0);
+    for (let i = 0; i < Math.min(want, rank.length); i++) F[rank[i]] = 1;
+    for (let a = 0; a < n; a++) {
+      const arm = A.arms[a], quiet = !!d && !F[a] && pool(a);
+      // Only its own words: anything else written into assigned (a fixture's job) stands.
+      if (out && (out[a] === null || out[a] === QUIET)) out[a] = A.owner?.[a] === 'reflex' || (quiet && !hang) ? QUIET : null;
+      this._life(arm, quiet ? Math.max(0.05, k.restInitiative) : 1);
+      arm.avoid = quiet ? this._avoid(a) : null;
+    }
+  }
+
+  /* The curiosity break: an assigned arm's fresh touch, scored by its curiosity, earns one within breakAllowed's limits; the arm
+     suspends its task, reaches and tastes the thing at touch, and resumes after. */
+  _breaks(d, turning) {
+    const k = this.knobs, A = this.arms;
+    if (this.breakArm >= 0) {
+      const a = this.breakArm, arm = A.arms[a], b = this.breakLog[this.breakLog.length - 1], P = this._breakP, r = arm.frame.p;
+      b.ticks++; b.alongSum += this.state.along; b.plantedSum += this.state.planted;
+      // Out of reach once she has carried it past the arm's length, or past its start distance when it began farther than that.
+      const far = Math.hypot(P[0] - r[0], P[1] - r[1], P[2] - r[2]) > Math.max(arm.length, b.d0) + 0.1;
+      const grip = !!A.episodes?.[a]?.h, taken = this._breakTaken(a, b);
+      const why = !d ? 'desire ended' : this.time - b.t0 >= k.breakMax ? 'breakMax' : far ? 'out of reach' : grip ? 'gripped' : taken ? 'taken' : b.goal && !arm.goal ? 'tasted' : null;
+      if (!why) { if (!b.goal) { arm.wanderPick[0] = P[0]; arm.wanderPick[1] = P[1]; arm.wanderPick[2] = P[2]; arm.wanderAt = Math.max(arm.wanderAt, arm.time + 1); } return; }
+      this._breakEnd(why);
+      return;
+    }
+    if (!d || !(k.breakRate > 0) || !A.tastes) return;
+    while (this._breakRecent.length && this.time - this._breakRecent[0] >= 60) this._breakRecent.shift();
+    for (const o of A.tastes) {
+      const a = o.arm;
+      if (!o.fresh || this.task[a] === null || this.suspT[a] === this.suspT[a] || this.flipped) continue;
+      const score = curiosity(o.taste, this._novelty(o), k.curiosityWeight);
+      if (!breakAllowed({ score, recent: this._breakRecent, now: this.time, lastHold: this._lastHold(a), turnStation: this.role[a] === STATION && turning }, k)) continue;
+      if (this._breakStart(a, o, score, d)) return;
+    }
+  }
+
+  /* Whether something else has the break's arm: another goal, a grip, a reflex, a hold, or a whole-body mode. */
+  _breakTaken(a, b) {
+    const A = this.arms, goal = A.arms[a].goal, owner = A.owner?.[a];
+    return (!!goal && !(b?.goal && goal === b.goal)) || !!A.episodes?.[a]?.h || owner === 'reflex' || owner === 'held' || owner === 'mode';
+  }
+
+  /* Ends the break under way, however it ends: only its own reach is let go, and its task resumes if the break still holds it. */
+  _breakEnd(why) {
+    const a = this.breakArm;
+    if (a < 0) return;
+    const A = this.arms, arm = A.arms[a], b = this.breakLog[this.breakLog.length - 1], taken = this._breakTaken(a, b);
+    if (b?.goal && arm.goal === b.goal) arm.idle();
+    if (!taken) arm.moveOn();
+    if (b && b.t1 === null) { b.t1 = this.time; b.why = why; }
+    this.breakArm = -1;
+    if (this.task[a] !== null && this.suspBy[a] === 'break') {
+      this.suspT[a] = NaN; this.suspBy[a] = null; this.assignStats.resumed++;
+      this.strokeAt[a] = this.time + strokeWait(this.rng[a].next(), this.knobs.recruitJitter);
+      A.records?.assign?.(a, this.task[a], 'resumed');
+    }
+  }
+
+  /* The touch's novelty as it was tasted: the familiarity record already counts this tick's touch. */
+  _novelty(o) {
+    const A = this.arms, fam = A.familiar, g = o.arm * A.S + o.seg;
+    const key = A.touchKind?.[g] === 3 ? 'self' : A.touchEntry?.[g] ?? A.touchTaste?.[g], e = fam?.m?.get(key);
+    return e ? Math.pow(0.5, Math.max(0, e.s - this._dt) / Math.max(1e-3, A.suckerKnobs?.familiarTime ?? 40)) : 1;
+  }
+
+  /* Arm a is the hold she can't spare: anything the slot holds her by, or a wall hold with no spare beyond minWallHolds. */
+  _lastHold(a) {
+    if (this.task[a] === 'squeeze') return true;
+    const role = this.role[a];
+    if (!(role === PLANTED || role === STATION) || this.anchorN[a * 3 + 1] > this.knobs.floorCos) return false;
+    const pull = this.modes.get('pull');
+    return !pull || pull.walls - 1 < this.knobs.minWallHolds;
+  }
+
+  /* Its stroke lets go (a planted foot through the voluntary peel) and it reaches the touched point briefly, a reach keeping any toy
+     it meets a discovery rather than a grip. No claim: whatever would take the arm skips one on a break. */
+  _breakStart(a, o, score, d) {
+    const A = this.arms, arm = A.arms[a], role = this.role[a], owner = A.owner?.[a] ?? 'idle';
+    if (!(owner === 'idle' || owner === 'stroke') || A.episodes?.[a]?.h || (arm.goal && arm.goal.loco !== this)) return false;
+    const planted = role === PLANTED || role === STATION;
+    if (role === SEEK || planted) this._release(a, 'curious');
+    else if (arm.goal) arm.idle();
+    const P = this._breakP ??= [0, 0, 0];
+    for (let i = 0; i < 3; i++) P[i] = arm.wander[i] = arm.wanderPick[i] = o.point[i];
+    arm.wanderAt = arm.time + 1;
+    let goal = null;
+    if (this.knobs.breakHold > 0) {
+      const g = o.arm * A.S + o.seg, N = A.touchN, face = [P[0] - N[g * 3] * 0.05, P[1] - N[g * 3 + 1] * 0.05, P[2] - N[g * 3 + 2] * 0.05];
+      if (A.reach(a, P, { face, speed: arm.knobs.reachSpeed, hold: this.knobs.breakHold })) goal = arm.goal;
+    }
+    this.breakArm = a;
+    this.suspT[a] = this.time; this.suspBy[a] = 'break'; this.assignStats.suspended++;
+    this._breakRecent.push(this.time);
+    const r = arm.frame.p, d0 = Math.hypot(P[0] - r[0], P[1] - r[1], P[2] - r[2]);
+    this.breakLog.push({ arm: a, taste: o.taste, score, task: this.task[a], role: ROLE_NAMES[role], planted, t0: this.time, t1: null, why: null, d0, goal, urgency: d.urgency, ticks: 0, alongSum: 0, plantedSum: 0 });
+    if (this.breakLog.length > 500) this.breakLog.shift();
+    A.records?.assign?.(a, this.task[a], `break: ${o.taste}`);
+    return true;
+  }
+
+  /* A desire up a wall, or her hanging on one. */
+  _climbing(d) { return (d.kind === 'place' && d.point[1] > 0.05) || !!this.modes.get('pull')?.steep; }
+
+  /* How far arm a's outward bearing points along her travel (−1 to 1). */
+  _lead(a) {
+    const rf = this.mantle.rootFrame(a, this._rf), nl = Math.hypot(rf.n[0], rf.n[2]);
+    return nl > 1e-6 ? (rf.n[0] * this.dFlat[0] + rf.n[2] * this.dFlat[2]) / nl : 0;
+  }
+
+  /* What arm a's wander should turn from: her travel, and the crew's arms near it, as one direction at most 1 long. */
+  _avoid(a) {
+    const V = this._avoidV[a], A = this.arms, p = this.mantle.rootWorld(a, this._p3);
+    V[0] = this.dFlat[0] * 0.7; V[1] = 0; V[2] = this.dFlat[2] * 0.7;
+    for (let b = 0; b < this.n; b++) {
+      if (b === a || this.task[b] === null) continue;
+      const X = A.bodies[b].X, i = Math.round(0.6 * (A.bodies[b].n - 1)) * 3;
+      const dx = X[i] - p[0], dy = X[i + 1] - p[1], dz = X[i + 2] - p[2], l = Math.hypot(dx, dy, dz), w = 0.5 * clamp(1 - l / 0.3, 0, 1);
+      if (w > 0 && l > 1e-6) { V[0] += (dx / l) * w; V[1] += (dy / l) * w; V[2] += (dz / l) * w; }
+    }
+    const l = Math.hypot(V[0], V[1], V[2]);
+    if (l > 1) { V[0] /= l; V[1] /= l; V[2] /= l; }
+    return V;
+  }
+
+  /* Each tick starts with no word on any arm's suckers; _lives says it again if the controller runs this tick, so a mode
+     holding her body (a jet, her den) never inherits a quiet arm from before it. */
+  _quietOff() {
+    const out = this.arms.assigned;
+    if (out) for (let a = 0; a < this.n; a++) if (out[a] === QUIET) out[a] = null;
+  }
+
+  /* Sets an arm's wander rate; on a rise, a pick that low initiative put off past wanderMax comes due within it. */
+  _life(arm, ini) {
+    if (ini > arm.initiative && arm.wanderAt > arm.time + arm.knobs.wanderMax) arm.wanderAt = arm.time + arm.knobs.wanderMax;
+    arm.initiative = ini;
+  }
+
+  /* The recruiter switched off live. */
+  _recruitOff() {
+    this._recruitWas = false;
+    this._poolOff('recruit off');
+  }
+
+  /* Every assignment ends, a break with them, and every arm gets its own life back; only the recruiter's own quiet words are cleared. */
+  _poolOff(why) {
+    const out = this.arms.assigned;
+    for (let a = 0; a < this.n; a++) this._unassign(a, why);
+    this._breakEnd(why);
+    for (let a = 0; a < this.n; a++) {
+      const arm = this.arms.arms[a];
+      this.feeler[a] = 0;
+      this._life(arm, 1); arm.avoid = null;
+      if (out?.[a] === QUIET) out[a] = null;
+    }
+  }
+
+  /* Any role outside a stroke gives the arm's claim back, however the stroke ended; the assignment outlives it, and an
+     arm back from a stroke draws its wait before the next. */
   _set(a, role) {
     this.role[a] = role; this.roleT[a] = 0;
     if (role !== SEEK && role !== PLANTED && role !== STATION) this.arms.unclaim?.(a, 'stroke');
+    if (role === IDLE && this.knobs.recruit && this.task[a] === 'stroke') this.strokeAt[a] = this.time + strokeWait(this.rng[a].next(), this.knobs.recruitJitter);
+  }
+
+  /* Gives arm a a task, or (null) returns it to the pool; each counts as one change, recorded with its reason. */
+  _assign(a, task, why) {
+    const was = this.task[a];
+    if (was === task && !(this.suspT[a] === this.suspT[a])) return;
+    this.task[a] = task; this.taskSince[a] = this.time; this.taskWhy[a] = why;
+    this.suspT[a] = NaN; this.suspBy[a] = null;
+    if (was !== task) { this.assignStats.changes[a]++; this.assignStats.why[why] = (this.assignStats.why[why] ?? 0) + 1; }
+    if (task === 'stroke') this.strokeAt[a] = this.time + strokeWait(this.rng[a].next(), this.knobs.recruitJitter);
+    this.arms.records?.assign?.(a, task, why);
+  }
+
+  _unassign(a, why) { if (this.task[a] !== null) this._assign(a, null, why); }
+
+  /* Whether arm a may answer a mode's request (the squeeze's sends, the climb's holds): with the recruiter on, a pool or crew arm or
+     one already on that task, never one suspended or on a break. The mode keeps its own picker; this only says who is free. */
+  freeFor(a, task) {
+    if (!this.knobs.recruit) return true;
+    if (this.suspT[a] === this.suspT[a] || a === this.breakArm) return false;
+    const t = this.task[a];
+    return t === null || t === 'stroke' || t === task;
+  }
+
+  /* A mode's request granted. A quiet word _lives wrote earlier this tick goes with it: the mode's goal speaks now. */
+  grant(a, task, why) {
+    if (!this.knobs.recruit) return;
+    this._assign(a, task, why);
+    if (this.arms.assigned?.[a] === QUIET) this.arms.assigned[a] = null;
+  }
+
+  /* Each tick, before anything moves: an assigned stroke arm something stronger now holds (a reflex, a grip, a whole-body mode,
+     the righting, anything else's goal) is suspended, and resumes if let go within resumeWindow; past it, back to the pool. */
+  _interrupts() {
+    const k = this.knobs, A = this.arms, now = this.time, m = this.mantle;
+    const whole = this.hold ? 'hold' : this.flipped ? 'righting' : this.pose.rigid || m.drive !== 'force' || !k.enabled ? 'off' : null;
+    for (let a = 0; a < this.n; a++) {
+      if (this.task[a] !== 'stroke' || a === this.breakArm) continue;
+      const owner = A.owner?.[a], g = A.arms[a].goal;
+      const by = whole ?? (A.episodes?.[a]?.h ? 'grip' : owner === 'reflex' || owner === 'held' || owner === 'mode' ? owner : g && g.loco !== this ? 'taken' : null);
+      const act = suspendStep(this.suspT[a], !!by, now, k.resumeWindow);
+      if (act === 'suspend') { this.suspT[a] = now; this.suspBy[a] = by; this.assignStats.suspended++; A.records?.assign?.(a, 'stroke', `suspended: ${by}`); }
+      else if (act === 'resume') {
+        this.suspT[a] = NaN; this.suspBy[a] = null; this.assignStats.resumed++;
+        this.strokeAt[a] = now + strokeWait(this.rng[a].next(), k.recruitJitter);
+        A.records?.assign?.(a, 'stroke', 'resumed');
+      } else if (act === 'expire') { this.assignStats.expired++; this._unassign(a, 'expired'); }
+    }
+  }
+
+  /* The tasks a mode holds an arm for follow its role: a station is the climb's hold, the slot's, or a turn's; a stroke the
+     squeeze sends is the squeeze's. When the role ends, so does the task. */
+  _modeTasks() {
+    const sq = this.modes.get('squeeze'), pull = this.modes.get('pull'), threading = !!sq?.active && this.desire === sq.desire;
+    for (let a = 0; a < this.n; a++) {
+      if (a === this.breakArm) continue;
+      const role = this.role[a], t = this.task[a];
+      const g = this.arms.arms[a].goal;
+      const own = role === STATION ? (threading ? 'squeeze' : pull?.made?.[a] ? 'hold' : 'station')
+        : (role === SEEK || role === PLANTED) && sq && this.strokeMode[a] === sq ? 'squeeze'
+        : role === IDLE && t === 'hold' && g?.loco === this ? 'hold' : null;
+      if (own) { if (t !== own) this._assign(a, own, 'mode'); }
+      else if (t === 'station' || t === 'hold' || t === 'squeeze') this._unassign(a, 'released');
+    }
+  }
+
+  /* How much arm a would help the stroke its mode chooses for it now. */
+  _use(a) {
+    const rf = this.mantle.rootFrame(a, this._rf), n = this._nf, nl = Math.hypot(rf.n[0], rf.n[2]);
+    if (!(nl > 1e-6)) return -Infinity;
+    n[0] = rf.n[0] / nl; n[1] = 0; n[2] = rf.n[2] / nl;
+    let mode = this.modes.get('push');
+    for (const m of this._modeList) mode = m.choose?.(this, a, n, mode) ?? mode;
+    return mode.usefulness(this, a, n);
+  }
+
+  /* Every recruitEvery while a desire runs, the crew for wantPushers pushing at once, incumbents first. On the floor a member
+     recovering from a stroke keeps its seat beside the want; on a climb the idle arms are the climb's reserve for its holds. */
+  _recruit(d, helpMin) {
+    const k = this.knobs, A = this.arms, n = this.n;
+    if (!d) return;
+    if (this.time - this._recruitAt < k.recruitEvery) return;
+    this._recruitAt = this.time;
+    const S = this._score, E = this._elig, Q = this._seat;
+    let resting = 0;
+    for (let a = 0; a < n; a++) {
+      S[a] = -Infinity; E[a] = 0; Q[a] = 0;
+      const t = this.task[a], role = this.role[a], g = A.arms[a].goal;
+      if ((t !== null && t !== 'stroke') || a === this.breakArm) continue;
+      // Suspended, it keeps its assignment but no seat; the crew is backfilled meanwhile.
+      if (t === 'stroke' && this.suspT[a] === this.suspT[a]) continue;
+      const stroking = (role === SEEK || role === PLANTED) && !!g && g.loco === this;
+      if (t === 'stroke') {
+        Q[a] = stroking || this.time - this.taskSince[a] < k.tenureMin ? 2 : 1;
+        if (role === RECOVER || role === COOL) resting++;
+      }
+      if (!stroking && (g || A.episodes?.[a]?.h || !(role === IDLE || role === COOL || role === RECOVER))) continue;
+      S[a] = this._use(a);
+      // An incumbent keeps helping down to keepBonus under helpMin, so a bearing hovering at the edge doesn't flicker.
+      E[a] = S[a] >= helpMin - (Q[a] ? k.keepBonus : 0) ? 1 : 0;
+    }
+    const climbing = this._climbing(d);
+    // An incumbent kept by the margin but under helpMin can't stroke, so any newcomer that can takes its seat.
+    const able = this._able ??= new Uint8Array(n);
+    for (let a = 0; a < n; a++) able[a] = S[a] >= helpMin ? 1 : 0;
+    const crew = pickCrew(S, E, Q, wantPushers(d.urgency, k) + (climbing ? 0 : resting), k.keepBonus, this._crew, able);
+    const first = this._recruitD !== d;
+    this._recruitD = d;
+    for (let a = 0; a < n; a++) {
+      const on = crew.includes(a);
+      if (on && this.task[a] !== 'stroke') this._assign(a, 'stroke', first ? 'start' : 'recruit');
+      else if (!on && this.task[a] === 'stroke' && !(this.suspT[a] === this.suspT[a])) this._unassign(a, E[a] ? 'outscored' : 'unhelpful');
+    }
+  }
+
+  /* An idle arm under the recruiter: only an assigned one strokes, once its wait is up, strokeStagger has passed since any
+     stroke began, and fewer than the want are seeking or planted. With nowhere to go it may still hold her as a station. */
+  _ready(a, dt, d, helpMin, active) {
+    const k = this.knobs, A = this.arms;
+    if (!this.canPlant || this.flipped) return;
+    if (!d) return this._idle(a, dt, d, helpMin, 1, false);
+    if (this.task[a] !== 'stroke' || this.suspT[a] === this.suspT[a] || A.arms[a].goal) return;
+    if (this.time < this.strokeAt[a] || this.time < this._lastStroke + k.strokeStagger || active >= wantPushers(d.urgency, k)) return;
+    const rf = this.mantle.rootFrame(a, this._rf), n = this._nf, nl = Math.hypot(rf.n[0], rf.n[2]);
+    if (!(nl > 1e-6)) return;
+    n[0] = rf.n[0] / nl; n[1] = 0; n[2] = rf.n[2] / nl;
+    let mode = this.modes.get('push');
+    for (const m of this._modeList) mode = m.choose?.(this, a, n, mode) ?? mode;
+    if (!(mode.usefulness(this, a, n) >= helpMin)) return;
+    const foot = this._t3, opts = mode.seek(this, a, rf.p, n, foot);
+    if (!opts) { this._set(a, COOL); return; }
+    if (A.claim && !A.claim(a, 'stroke')) return;
+    const arm = A.arms[a], speed = lerp(arm.knobs.reachSpeed, arm.knobs.bendSpeedMax, d.urgency);
+    if (!A.reach(a, foot, { ...opts, speed, hold: k.seekMax + 1 })) { this._set(a, COOL); return; }
+    arm.goal.loco = this;
+    this.strokeMode[a] = mode;
+    this._set(a, SEEK);
+    this._lastStroke = this.time;
   }
 
   _idle(a, dt, d, helpMin, crowdF, widen) {
@@ -417,6 +777,8 @@ export class Locomotion {
     this.holdF[a] = o.force ?? 0;
     this.lostT[a] = 0; this.slipT[a] = 0;
     this.chord[a] = this._chordNow(a);
+    // A plant made after _lives (a listener's top-up or dab) must not keep a pool arm's quiet word through this step.
+    if (this.knobs.recruit && A.assigned?.[a] === QUIET) A.assigned[a] = null;
     return true;
   }
 
@@ -448,7 +810,9 @@ export class Locomotion {
     const W = this._why;
     W.ell = this.ell[a]; W.max = this.max[a]; W.chord = c; W.along = along; W.helpMin = helpMin; W.lostT = this.lostT[a];
     W.grace = k.anchorGrace; W.t = this.roleT[a]; W.tMax = k.strokeMax;
-    const why = mode.release ? mode.release(this, a, c) : releaseReason(W);
+    let why = mode.release ? mode.release(this, a, c) : releaseReason(W);
+    // Under loads a floor push lets its foot go short of the pop when strokeSpan asks; a climb's or squeeze's holds keep their own rules.
+    if (!why && k.recruit && k.strokeSpan > 0 && mode === PUSH && this.arms.rodKnobs?.seals && this.arms.sealAnat?.[a] >= k.strokeSpan) why = 'span';
     if (why) return this._release(a, why);
     const st = this.state;
     if (this.anchorN[a * 3 + 1] > k.floorCos) {
@@ -563,6 +927,19 @@ export class Locomotion {
   }
 
   resetStats() { this.msCount = 0; }
+
+  /* The panel's Assign line: per arm its task (or pool, feeler, break) and why, what holds it if suspended, its role, and
+     under loads its suckers' intent (– none, t touch, F firm); then the breaks this minute. */
+  describeAssign() {
+    if (!this.knobs.recruit) return 'off: each idle arm strokes on its own hazard';
+    const A = this.arms, I = ['–', 't', 'F'], seals = !!A.rodKnobs?.seals, now = this.time;
+    const each = Array.from({ length: this.n }, (_, a) => {
+      const brk = a === this.breakArm, t = brk ? 'break' : this.task[a] ?? (this.feeler[a] ? 'feeler' : 'pool');
+      const why = this.task[a] && !brk && this.taskWhy[a] ? `/${this.taskWhy[a]}` : '', held = !brk && this.suspT[a] === this.suspT[a] ? `(${this.suspBy[a]})` : '';
+      return `${a} ${t}${why}${held} ${ROLE_NAMES[this.role[a]]}${seals ? ` ${I[A.sealIntent?.[a] ?? 1]}` : ''}`;
+    });
+    return `${each.join('  ')}   breaks ${this._breakRecent.filter((t) => now - t < 60).length} this minute`;
+  }
 
   /* One line for the panel. */
   describe() {

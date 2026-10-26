@@ -153,6 +153,16 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         ['Righting below', 'rightHigh', [0.2, 0.3, 0.4], ' m'], ['Righting lets a lean be after', 'rightStill', [0.75, 1.5, 3], ' s'],
       ].map(([name, key, values, unit]) => ({ type: 'range', name, values, get: () => loco.knobs[key], set: (v) => { loco.knobs[key] = v; }, label: () => `${name} ${loco.knobs[key]}${unit}` })),
       { name: 'Flip her', label: () => 'Flip her', run: () => mantle.tip(2.9) },
+      { name: 'Recruit', label: () => (loco.knobs.recruit ? 'Recruit: on' : 'Recruit: off'), run: () => { loco.knobs.recruit = !loco.knobs.recruit; } },
+      ...[
+        ['Recruit every', 'recruitEvery', [0.1, 0.25, 0.5, 1], ' s'], ['Incumbent bonus', 'keepBonus', [0, 0.1, 0.2, 0.4], ''],
+        ['Tenure', 'tenureMin', [0, 0.5, 1, 2], ' s'], ['Resume within', 'resumeWindow', [0.5, 1, 2, 4], ' s'],
+        ['Stroke stagger', 'strokeStagger', [0, 0.075, 0.15, 0.3], ' s'], ['Stroke jitter', 'recruitJitter', [0, 0.05, 0.1, 0.2], ' s'],
+        ['Pool initiative', 'restInitiative', [0.2, 0.4, 0.7, 1], ''], ['Feelers', 'feelers', [0, 1, 2, 3], ''],
+        ['Break past', 'breakSalience', [0.4, 0.6, 0.8, 1.01], ''], ['Break lasts', 'breakMax', [1, 2, 3, 5], ' s'],
+        ['Breaks a minute', 'breakRate', [0, 1, 2, 4], ''], ['Break reach holds', 'breakHold', [0, 0.25, 0.5, 1], ' s'],
+      ].map(([name, key, values, unit]) => ({ type: 'range', name, values, get: () => loco.knobs[key], set: (v) => { loco.knobs[key] = v; }, label: () => `${name} ${loco.knobs[key]}${unit}` })),
+      { type: 'range', name: 'Stroke lets go at', values: [0, 1.35, 1.4, 1.45], get: () => loco.knobs.strokeSpan, set: (v) => { loco.knobs.strokeSpan = v; }, label: () => (loco.knobs.strokeSpan > 0 ? `Stroke lets go at ${loco.knobs.strokeSpan}×` : 'Stroke lets go at: the pop') },
     ] : [],
   };
 
@@ -367,8 +377,10 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         `Heading  ${deg(pose.yaw)}${pose.turning ? ', turning' : ''}   breath ${breath}`,
         `Attend   ${ctx.attention?.describe() ?? '–'}`,
         `Gait     ${loco ? `${loco.describe()}   ${loco.stats().mean.toFixed(3)} ms` : '–'}`,
+        `Assign   ${loco ? loco.describeAssign() : '–'}`,
         `Arms     ${arms.records.state.map((r, i) => `${i} ${r.label}`).join('  ')}`,
-        `Events   ${arms.records.recent(-1, 3).map((e) => eventText(e)).join('  ·  ') || '–'}`,
+        // Assignments have their own line, and at several a second they would crowd every other event out of this one.
+        `Events   ${arms.records.recent(-1, 24).filter((e) => e.kind !== 'assign').slice(-3).map((e) => eventText(e)).join('  ·  ') || '–'}`,
         ...(arms.knobs.muscle ? [muscleLine(arms)] : []),
         ...(ctx.rods?.describe() ?? []),
         ...(ctx.suckers?.describe() ?? []),

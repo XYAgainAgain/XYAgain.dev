@@ -1060,6 +1060,10 @@ export class Arm {
     // World push off the other arms' bodies near this one (arm-crowd.js, |push| ≤ 1), the idle program's smoothed lean on it,
     // and whether a reach may steer too (not over a driving rod, whose grip point any bend can move).
     this.crowd = { push: [0, 0, 0], lean: [0, 0, 0], reach: true };
+    // Her locomotion's say over an arm it leaves free while she travels: the share of its wander rate it keeps, and a world
+    // direction (|v| ≤ 1) its new wander picks mirror away from. 1 and null leave the idle as it always was.
+    this.initiative = 1;
+    this.avoid = null;
     this.started = false;
     this._dt = 0;
     this._t = [0, 0, 0]; this._n = [0, 0, 0];
@@ -1321,11 +1325,20 @@ export class Arm {
     }
     // The exploration target: a fresh pick every few seconds, pulled onto a nearby surface, followed smoothly.
     if (this.time >= this.wanderAt || !this.started) {
-      this.wanderAt = this.time + k.wanderMin + this.rng() * (k.wanderMax - k.wanderMin);
+      const ini = this.initiative, low = ini !== 1;
+      if (!low) this.wanderAt = this.time + k.wanderMin + this.rng() * (k.wanderMax - k.wanderMin);
+      else this.wanderAt = this.time + (k.wanderMin + this.rng() * (k.wanderMax - k.wanderMin)) / Math.max(0.05, ini);
       const cone = Math.min(1.4, k.wanderCone);
       const spin = this.rng() * 2 * Math.PI, off = Math.tan(cone * Math.sqrt(this.rng()));
       let a = off * Math.cos(spin), b = off * Math.sin(spin);
       if (mirror > 0) { const q = mirror * Math.min(0, a * lu + b * lv); a -= q * lu; b -= q * lv; }
+      const V = this.avoid;
+      if (V) {
+        // A pick heading where the arm shouldn't go (her travel, the crew's arms) mirrors off it, as far as that weighs.
+        const vu = V[0] * F.u[0] + V[1] * F.u[1] + V[2] * F.u[2], vv = V[0] * F.v[0] + V[1] * F.v[1] + V[2] * F.v[2], vl = len2(vu, vv);
+        const into = vl > 1e-6 ? (a * vu + b * vv) / vl : 0;
+        if (into > 0) { const s = (2 * into * Math.min(1, vl)) / vl; a -= s * vu; b -= s * vv; }
+      }
       const dir = this._t;
       dir[0] = F.d[0] + a * F.u[0] + b * F.v[0];
       dir[1] = F.d[1] + a * F.u[1] + b * F.v[1];

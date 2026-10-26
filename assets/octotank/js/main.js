@@ -44,8 +44,9 @@ import { rodArms } from './amira/arms/arm-rod.js';
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
    ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
    authored arms, touching nothing)  ?couple=0 (each rod steps alone on a root dragged to her, nothing fed back; by default
-   her rods and body share one solve)  ?loads=1 (her rods with their loads; a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in)
-   ?grabby=0 (seals under ?loads=1 as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?peel=0 (seals let go in one tick, not over a peel)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones) */
+   her rods and body share one solve)  ?loads=0 (her rods without their loads: no toy pushes, grip loads, or seals; with them, a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in)
+   ?grabby=0 (seals as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?peel=0 (seals let go in one tick, not over a peel)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones)
+   ?recruit=0 (no recruiter: each idle arm starts its strokes on its own hazard, every arm explores as it would at rest) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -130,9 +131,9 @@ async function boot() {
     // Her body answers her arms: they share one solve, the arms her locomotion moves riding her (Shared-Solve-On-Notes.md).
     // The panel's Shared solve switch turns it off live.
     const rods = rodArms(params.get('rods')), couple = params.get('couple') !== '0';
-    // ?loads=1: her rod arms push toys, bear their grips, and seal. Off by default; a rod outside the shared solve passes
+    // Her rod arms push toys, bear their grips, and seal unless ?loads=0; a rod outside the shared solve passes
     // it on through the explicit root wrench, which fed back a tick late grows tick on tick at her mass.
-    const rodKnobs = params.get('loads') === '1' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
+    const rodKnobs = params.get('loads') !== '0' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
     arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive', couple });
     const locoOn = params.get('loco') !== '0';
     pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
@@ -155,13 +156,14 @@ async function boot() {
   // ?keeptask=0 and ?blocked=0 show her without either.
   arms.suckerKnobs.keepTask = params.get('keeptask') !== '0';
   arms.blocked.knobs.on = params.get('blocked') !== '0';
-  // Grabby, intent-sized, and peeling seals (all under ?loads=1), the latch a thing that has stung her enough trips, and stations that hold their feet;
+  // Grabby, intent-sized, and peeling seals (all with her loads on), the latch a thing that has stung her enough trips, and stations that hold their feet;
   // ?grabby=0, ?grace=0, ?peel=0, ?latch=0, and ?firm=0 show her without each.
   if (params.get('grabby') === '0') arms.rodKnobs.grabby = false;
   if (params.get('grace') === '0') arms.rodKnobs.grace = false;
   if (params.get('peel') === '0') arms.rodKnobs.peel = false;
   if (params.get('latch') === '0') arms.reflexes.latchKnobs.latch = false;
   if (params.get('firm') === '0' && loco) loco.knobs.stationFirm = false;
+  if (params.get('recruit') === '0' && loco) loco.knobs.recruit = false;
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();

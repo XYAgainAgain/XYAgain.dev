@@ -521,7 +521,7 @@ export class Arms {
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
       const H = this.holdDelta[a], R = arms[a].rest;
       for (let i = 0; i < H.length; i++) H[i] = R[i] - H[i];
-      // A rod in the shared solve already moved her; the explicit wrench is only for ?loads=1 without it.
+      // A rod in the shared solve already moved her; the explicit wrench is only for her loads with ?couple=0.
       if (this.rodKnobs.wrench && !shadow && dt > 0 && !this.joined[a]) this._rootWrench(a);
       rodMs += performance.now() - t1;
     }
