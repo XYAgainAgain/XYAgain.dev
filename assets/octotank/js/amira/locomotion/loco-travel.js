@@ -130,9 +130,9 @@ export class Travel {
     d.urgency = clamp(pick.urgency, 0, 1);
     let mode = price.best, label = pick.label;
     if (mode === 'hop') {
-      const aim = [0, 0, 0];
-      hopAim(c, p, L.mantle.knobs.damping, TANK, k, aim);
-      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), spot: hopSpot(p, TANK, k), crawl: price.modes.crawl };
+      const aim = [0, 0, 0], panel = { x: this.wander.panelX, t: this.wander.panelT };
+      hopAim(c, p, L.mantle.knobs.damping, TANK, k, aim, panel);
+      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), spot: hopSpot(p, TANK, k, [0, 0, 0], panel), crawl: price.modes.crawl };
     } else if (price.modes.hop.why) this.refusals[price.modes.hop.why] = (this.refusals[price.modes.hop.why] ?? 0) + 1;
     this.counts.trips++;
     this.counts[mode === 'hop' ? 'hop' : label]++;
