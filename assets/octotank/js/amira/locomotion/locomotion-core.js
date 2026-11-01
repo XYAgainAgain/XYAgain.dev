@@ -16,6 +16,12 @@ export const LOCO_KNOBS = {
   toneK: 0,               // 1/s² pulling free patches toward their rest shape; momentum-neutral, off unless the ring folds
   yawGain: 4,             // heading error (rad) times a root's radius times this, as a tangential offset on its target
   yawMax: 0.05,           // m, the most that offset gets: about 1.8 N on a patch, the 0.2 N/cm measured at 0.5 kg scaled with her mass
+  // Unless a turn is commanded her heading is a couple on her whole body, not a tangential pull through her planted arms' springs.
+  feetCouple: true,
+  feetGain: 1,            // 1/s: heading error to turn rate, on top of the rate her pose is turning at
+  feetRate: 1,            // rad/s at most
+  feetEase: 0.2,          // s her turn rate takes to close on what's wanted
+  feetAccel: 4,           // rad/s² at most
   stallShare: 0.2,        // stalled while the crown makes under this share of the wanted speed along the travel
   stallT: 1.5,            // s stalled before recruitment widens
   stallPull: 4,           // s before the front arms would reach ahead for a hold (with a pull mode registered)
@@ -78,7 +84,9 @@ export const LOCO_KNOBS = {
   breakMax: 3,            // s a break lasts at most
   breakRate: 2,           // breaks a minute at most
   breakHold: 0.5,         // s a break's touch reach holds the thing; 0 lets the arm linger on its idle aim instead
-  strokeSpan: 0,          // under loads, a stroke lets its foot go at this root-to-foot elongation, short of the pop; 0 lets it pop
+  strokeSpan: 1.45,       // under loads, a stroke lets its foot go at this root-to-foot elongation, short of the pop; 0 lets it pop
+  strokeFade: 0.2,        // s a stroke's spring on her patch fades after it lets go; 0 drops it in one tick
+  restQuiet: true,        // told to rest, an arm with nothing to do seals nothing, so it slides and feels without snapping free
   sleepyLong: 20,         // s of rest after which she wakes slowly, her feelers quiet
   sleepyWake: 60,         // s that waking lasts
 };
@@ -274,6 +282,12 @@ export function yawTerm(rx, rz, eYaw, k, out) {
   const m = clamp(k.yawGain * eYaw * r, -k.yawMax, k.yawMax);
   out[0] = (-rz / r) * m; out[2] = (rx / r) * m;
   return out;
+}
+
+/* Rad/s² about her heading axis from her feet: a turn rate of the pose's own plus feetGain of the error, closed over feetEase. */
+export function feetTurn(eYaw, poseRate, rate, k) {
+  const want = clamp(poseRate + k.feetGain * eYaw, -k.feetRate, k.feetRate);
+  return clamp((want - rate) / Math.max(1e-3, k.feetEase), -k.feetAccel, k.feetAccel);
 }
 
 /* Tone on free patches: each vertex of an arm in mode 0 is pulled toward its rest offset in her live body frame (axes

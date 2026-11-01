@@ -363,8 +363,8 @@ export function installSqueeze(loco, opts) {
 
 const r3 = (v) => +(+v).toFixed(3);
 
-/* Through the slot to a floor point beyond the panel: every shell vertex past the far face within the limit, arms
-   first, turned first, exhaled from first in to last out, lengthened, then the end strain and volume after 2 s still. */
+/* Through the slot to a floor point beyond the panel: she passes with every shell vertex past the far face within the limit.
+   Form sits beside that, since a rough passage is still one: arms first, turned first, exhaled, lengthened, then strain and volume after 2 s still. */
 export async function squeeze(ctx, { to = [0.45, 0, 0], urgency = 0.6, limit = SQUEEZE_KNOBS.squeezeLimit, settle = 2, after = 3 } = {}) {
   const { loco, mantle: m } = ctx, sq = loco.modes.get('squeeze');
   if (!loco.canPlant) return { passed: false, failed: 'no plant support in the arms yet' };
@@ -377,17 +377,19 @@ export async function squeeze(ctx, { to = [0.45, 0, 0], urgency = 0.6, limit = S
   let tip = 0, best = -Infinity;
   for (let i = 0; i < n; i++) { const s = sh.positions[i * 3] * ax0[0] + sh.positions[i * 3 + 1] * ax0[1] + sh.positions[i * 3 + 2] * ax0[2]; if (s > best) { best = s; tip = i; } }
   const w = {
-    t: 0, firstIn: null, lastOut: null, farAtFirstIn: null, alignAtFirstIn: null, crownCross: null, tipCross: null,
+    t: 0, way: null, firstIn: null, lastOut: null, farAtFirstIn: null, alignAtFirstIn: null, crownCross: null, tipCross: null,
     notExhaled: 0, insideTicks: 0, preLead: -Infinity, lengthMax: 0, volMinInside: Infinity, volMaxInside: 0, track: [], acc: 0, faces: { behind: 0, past: 0, inside: 0, lead: 0 },
   };
   const ax = [0, 0, 0], tp = [0, 0, 0], len = { extent: 0, rms: 0 };
   const watch = (dt) => {
     w.t += dt;
-    const r = sq.way;
-    if (!r || sq.stage === 'off' || sq.stage === 'approach') return;
+    // The mode drops its route as it ends, and she can still be on her way out of the slot then.
+    if (sq.way) w.way = sq.way;
+    const r = w.way, live = sq.stage !== 'off';
+    if (!r || sq.stage === 'approach') return;
     const f = faceCounts(m.positions, m.origin, n, r, w.faces);
     // How far she bulged past the near face before the haul: a crown cupped into the gap, or a real entry.
-    if (sq.stage !== 'haul' && sq.stage !== 'out') w.preLead = Math.max(w.preLead, f.lead);
+    if (live && sq.stage !== 'haul' && sq.stage !== 'out') w.preLead = Math.max(w.preLead, f.lead);
     if (w.firstIn !== null && w.lastOut === null && f.behind === 0 && f.inside === 0) w.lastOut = r3(loco.time - sq.times.start);
     const crossing = f.behind < n && w.lastOut === null;
     if (crossing && w.firstIn === null) {
@@ -396,7 +398,7 @@ export async function squeeze(ctx, { to = [0.45, 0, 0], urgency = 0.6, limit = S
       m.mantleAxis(ax);
       w.alignAtFirstIn = r3(-(ax[0] * r.dir[0] + ax[1] * r.dir[1] + ax[2] * r.dir[2]));
     }
-    if (crossing) {
+    if (crossing && live) {
       w.insideTicks++;
       const hold = m.breathHold;
       if (!hold || hold.exhale !== 1) w.notExhaled++;
@@ -417,17 +419,16 @@ export async function squeeze(ctx, { to = [0.45, 0, 0], urgency = 0.6, limit = S
   loco.listeners.add(watch);
   let res;
   try {
-    let over = false;
-    const timer = until(loco, () => over || w.lastOut !== null, limit).then(() => ({ arrived: false, failed: w.lastOut !== null ? null : 'timeout' }));
-    res = await Promise.race([sq.go(to, { urgency }), timer]);
-    over = true;
-    // Through, she carries on toward the target a little while, then everything stops for the still check.
-    if (w.lastOut !== null && loco.desire) await until(loco, () => !loco.desire, after);
-  } finally {
-    loco.stop('scenario over');
-    loco.listeners.delete(watch);
-  }
-  await until(loco, () => false, settle);
+    try {
+      let over = false;
+      const timer = until(loco, () => over || w.lastOut !== null, limit).then(() => ({ arrived: false, failed: w.lastOut !== null ? null : 'timeout' }));
+      res = await Promise.race([sq.go(to, { urgency }), timer]);
+      over = true;
+      // Through, she carries on toward the target a little while, then everything stops for the still check.
+      if (w.lastOut !== null && loco.desire) await until(loco, () => !loco.desire, after);
+    } finally { loco.stop('scenario over'); }
+    await until(loco, () => false, settle);
+  } finally { loco.listeners.delete(watch); }
   const end = m.health(), r = sq.way ?? sq.lastWay;
   const out = {
     to, urgency, gapH: r ? r3(2 * r.ap.halfH) : null, fits: r ? r.fits : null, failed: res?.failed ?? null, arrived: !!res?.arrived,
@@ -440,8 +441,16 @@ export async function squeeze(ctx, { to = [0.45, 0, 0], urgency = 0.6, limit = S
   };
   out.turnedFirst = w.alignAtFirstIn !== null && w.alignAtFirstIn > Math.cos(0.4) && w.crownCross !== null && (w.tipCross === null || w.crownCross <= w.tipCross);
   out.armsFirst = w.farAtFirstIn !== null && w.farAtFirstIn >= k.farHoldsMin;
-  out.passed = w.lastOut !== null && w.lastOut <= limit && out.armsFirst && out.turnedFirst && w.notExhaled === 0
-    && w.lengthMax >= 1.15 && end.strainMax < 0.5 && end.volume > 0.85;
+  const form = [];
+  if (!out.armsFirst) form.push('not arms first');
+  if (!out.turnedFirst) form.push('not turned first');
+  if (w.notExhaled > 0) form.push('not exhaled');
+  if (!(w.lengthMax >= 1.15)) form.push(`lengthened ${r3(w.lengthMax)}×`);
+  if (!(end.strainMax < 0.5)) form.push(`strain ${r3(end.strainMax)}`);
+  if (!(end.volume > 0.85)) form.push(`volume ${r3(end.volume)}`);
+  out.passed = w.lastOut !== null && w.lastOut <= limit;
+  out.formPassed = form.length === 0;
+  out.note = !out.passed ? out.failed ?? (w.firstIn === null ? 'never in' : 'not through') : form.length ? `form: ${form.join(', ')}` : 'good form';
   return out;
 }
 

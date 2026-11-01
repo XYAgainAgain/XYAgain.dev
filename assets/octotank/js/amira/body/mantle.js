@@ -22,6 +22,9 @@ export const MANTLE_KNOBS = {
   gravityFactor: 0.04,    // slightly heavier than water: cuttlefish tissue without its float is 4% denser than seawater
   righting: 16,           // 1/s²: the dome's lift per meter of rest height, which rights her and nets to zero
   rollDamp: 4,            // 1/s: water's drag on her tumbling about a level axis, so righting settles, not swings
+  addedMass: 2,           // water she shoves along, over her body's mass: her springs and arms start her moving slowly, not at a snap
+  addedSpin: 10,          // the same on her turning; high because a one-way arm lends her none of its own turning inertia
+  wetRest: 1,             // share of that water her own springs answer to with nowhere to go; a stroke keeps her bare inertia, or she stalls
   vertexRadius: 0.004,
   friction: 0.4,
   pinSpeed: 1.2,          // m/s cap on a pinned root, so one step cannot cross a panel
@@ -100,6 +103,8 @@ export class Mantle {
     this._oweP = [0, 0, 0];
     this._oweL = [0, 0, 0];
     this._owed = false;
+    this.wetOff = false;                // her righting: she answers as her bare body while she rolls over
+    this.wetIdle = false;               // nowhere to go, so her springs answer with the water too (Locomotion sets it)
     this._scratch = new Float32Array(this.shell.count * 3);
     this._delta = new Float64Array(arms * 3);
     // Mass-weighted shares of the mantle and the head, for the axis between them.
@@ -259,6 +264,8 @@ export class Mantle {
     }
     // Implicit in the spring and the damper, so any gain is stable at the fixed step: v' = (v + dt·K·dx) / (1 + dt·D + dt²·K).
     const K = k.forceK, D = k.forceDamp, den = 1 + dt * D + dt * dt * K, lat = k.lateralDamp > 0 ? 1 + dt * k.lateralDamp + dt * dt * K : 0;
+    const wetDrive = !pin && !this.wetOff && this.wetIdle && k.wetRest > 0 && (k.addedMass > 0 || k.addedSpin > 0);
+    let jx = 0, jy = 0, jz = 0, lx = 0, ly = 0, lz = 0;
     for (let d = 0; d < this.driven.length; d++) {
       const i = this.driven[d], po = this.posAt + i * s, vo = this.velAt + i * s, arm = this.drivenArm[d], am = pin ? 2 : mode[arm];
       if (am === 0) continue;
@@ -296,9 +303,39 @@ export class Mantle {
         H[vo] += ux; H[vo + 1] += uy; H[vo + 2] += uz;
         const m = this.vertexMass[i] / dt;
         F[arm * 3] += ux * m; F[arm * 3 + 1] += uy * m; F[arm * 3 + 2] += uz * m;
+        if (wetDrive) {
+          const w = this.vertexMass[i], x = H[po], y = H[po + 1], z = H[po + 2];
+          jx += w * ux; jy += w * uy; jz += w * uz;
+          lx += w * (y * uz - z * uy); ly += w * (z * ux - x * uz); lz += w * (x * uy - y * ux);
+        }
       }
     }
     for (let r = 0; r < this.armForce.length; r++) this.armForce[r] = Math.hypot(F[r * 3], F[r * 3 + 1], F[r * 3 + 2]);
+    if (wetDrive && (jx || jy || jz || lx || ly || lz)) this._wetDrive(jx, jy, jz, lx, ly, lz);
+  }
+
+  /* The springs' rigid push this tick (impulse J and L about the local origin) answered as her body plus the water she drags:
+     only the rigid part is taken back, so a patch still dents and shifts her skin as far as it did. */
+  _wetDrive(jx, jy, jz, lx, ly, lz) {
+    const k = this.knobs, r = this.rigidState(), o = this.origin, cx = r.c[0] - o[0], cy = r.c[1] - o[1], cz = r.c[2] - o[2];
+    const sv = k.wetRest * Math.max(0, k.addedMass) / (1 + Math.max(0, k.addedMass)), sw = k.wetRest * Math.max(0, k.addedSpin) / (1 + Math.max(0, k.addedSpin));
+    const ax = lx - (cy * jz - cz * jy), ay = ly - (cz * jx - cx * jz), az = lz - (cx * jy - cy * jx), I = r.Ii;
+    const dv = this._wdv ??= [0, 0, 0], dw = this._wdw ??= [0, 0, 0];
+    dv[0] = -sv * jx / r.M; dv[1] = -sv * jy / r.M; dv[2] = -sv * jz / r.M;
+    for (let i = 0; i < 3; i++) dw[i] = -sw * (I[3 * i] * ax + I[3 * i + 1] * ay + I[3 * i + 2] * az);
+    this.addRigidVelocity(dv, dw, r.c);
+  }
+
+  /* Her rigid state as the shared solve should push against it, with the water she drags; the state itself when she drags none. */
+  wetRigid(r) {
+    if (this.wetOff) return r;
+    const m = 1 + Math.max(0, this.knobs.addedMass), s = 1 + Math.max(0, this.knobs.addedSpin);
+    if (m === 1 && s === 1) return r;
+    const w = this._wet ??= newRigid();
+    w.M = r.M * m; w.c = r.c; w.v = r.v; w.w = r.w;
+    for (let i = 0; i < 3; i++) w.L[i] = r.L[i] * s;
+    for (let i = 0; i < 9; i++) { w.I[i] = r.I[i] * s; w.Ii[i] = r.Ii[i] / s; }
+    return w;
   }
 
   _weighBreath() {

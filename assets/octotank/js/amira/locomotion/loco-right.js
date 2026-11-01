@@ -34,6 +34,7 @@ export class Right {
   _clear() {
     this.on = false; this.t = 0; this.still = 0; this.phase = '';
     this.loco.flipped = false;
+    this.loco.mantle.wetOff = false;
   }
 
   _tick(dt) {
@@ -67,6 +68,8 @@ export class Right {
     if (this.t < k.rightAfter) { this.phase = 'wait'; return; }
     this.phase = 'right';
     L.flipped = true;
+    // Rolling over is a hard shove, tuned against her bare inertia; the water's slowness would leave her on her back.
+    m.wetOff = true;
     for (let a = 0; a < L.n; a++) if (L.role[a] === STATION || L.role[a] === PLANTED) { L._release(a, 'right'); this.stats.released++; }
     L.stanceOn = false;
     const cap = rightPull(this.t, k);

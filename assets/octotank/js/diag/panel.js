@@ -130,6 +130,8 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         },
       },
       { key: 't', name: 'Tip her', label: () => 'Tip her', run: () => mantle.tip(1.2) },
+      { type: 'range', name: 'Water she drags', values: [0, 0.5, 1, 2, 4], get: () => mantle.knobs.addedMass, set: (v) => { mantle.knobs.addedMass = v; }, label: () => `Water she drags ${mantle.knobs.addedMass}× her mass` },
+      { type: 'range', name: 'Water on her turning', values: [0, 2, 5, 10, 20], get: () => mantle.knobs.addedSpin, set: (v) => { mantle.knobs.addedSpin = v; }, label: () => `Water on her turning ${mantle.knobs.addedSpin}×` },
     ],
     arms: [
       { key: 'a', name: 'Reach toys', label: () => 'Reach toys', run: () => arms.reachNearestToys(toys) },
@@ -163,6 +165,11 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         ['Breaks a minute', 'breakRate', [0, 1, 2, 4], ''], ['Break reach holds', 'breakHold', [0, 0.25, 0.5, 1], ' s'],
       ].map(([name, key, values, unit]) => ({ type: 'range', name, values, get: () => loco.knobs[key], set: (v) => { loco.knobs[key] = v; }, label: () => `${name} ${loco.knobs[key]}${unit}` })),
       { type: 'range', name: 'Stroke lets go at', values: [0, 1.35, 1.4, 1.45], get: () => loco.knobs.strokeSpan, set: (v) => { loco.knobs.strokeSpan = v; }, label: () => (loco.knobs.strokeSpan > 0 ? `Stroke lets go at ${loco.knobs.strokeSpan}×` : 'Stroke lets go at: the pop') },
+      { type: 'range', name: 'Stroke fade', values: [0, 0.1, 0.2, 0.3, 0.5], get: () => loco.knobs.strokeFade, set: (v) => { loco.knobs.strokeFade = v; }, label: () => (loco.knobs.strokeFade > 0 ? `Stroke fade ${loco.knobs.strokeFade} s` : 'Stroke fade: off') },
+      { name: 'Rest quiet', label: () => (loco.knobs.restQuiet ? 'Rest quiet: on' : 'Rest quiet: off'), run: () => { loco.knobs.restQuiet = !loco.knobs.restQuiet; } },
+      { name: 'Turns on her feet', label: () => (loco.knobs.feetCouple ? 'Turns on her feet: on' : 'Turns on her feet: off'), run: () => { loco.knobs.feetCouple = !loco.knobs.feetCouple; } },
+      { type: 'range', name: 'Feet turn rate', values: [0.25, 0.5, 1, 2], get: () => loco.knobs.feetRate, set: (v) => { loco.knobs.feetRate = v; }, label: () => `Feet turn rate ${loco.knobs.feetRate} rad/s` },
+      { type: 'range', name: 'Feet turn gain', values: [0.5, 1, 2, 4], get: () => loco.knobs.feetGain, set: (v) => { loco.knobs.feetGain = v; }, label: () => `Feet turn gain ${loco.knobs.feetGain} per second` },
     ] : [],
   };
 
@@ -284,7 +291,7 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
         run: async () => {
           if (!sc.run || isRunning()) return;
           say(`${sc.label}: running`);
-          try { const r = await tank.scenario(sc.name); console.log(sc.name, r); say(`${sc.label}: ${r.passed ? 'PASS' : r.passed === false ? 'FAIL' : 'done'}`); }
+          try { const r = await tank.scenario(sc.name); console.log(sc.name, r); say(`${sc.label}: ${r.passed ? 'PASS' : r.passed === false ? 'FAIL' : 'done'}${r.note ? ` (${r.note})` : ''}`); }
           catch (err) { say(`${sc.label}: ${err.message}`); }
         },
       };

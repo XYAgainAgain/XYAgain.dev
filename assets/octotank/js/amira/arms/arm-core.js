@@ -192,8 +192,8 @@ function bendFrame(d, u, v, ku, kv) {
 }
 
 /* The bends that reproduce chain P from root frame F (P[0] at its root) under twists tw, into out for the first `count`
-   joints: poseFromBends run backward. d, u, and v are 3-array scratch. */
-export function chainBends(F, tw, P, out, count, d, u, v) {
+   joints: poseFromBends run backward. d, u, and v are 3-array scratch; L, when given, caps each joint's bend. */
+export function chainBends(F, tw, P, out, count, d, u, v, L = null) {
   d[0] = F.d[0]; d[1] = F.d[1]; d[2] = F.d[2];
   u[0] = F.u[0]; u[1] = F.u[1]; u[2] = F.u[2];
   v[0] = F.v[0]; v[1] = F.v[1]; v[2] = F.v[2];
@@ -210,6 +210,8 @@ export function chainBends(F, tw, P, out, count, d, u, v) {
       if (el < 1e-12) { if (c <= 0) { ex = u[0]; ey = u[1]; ez = u[2]; phi = Math.PI; } }
       else { ex /= el; ey /= el; ez /= el; phi = Math.atan2(el, c); }
       if (phi > 0) {
+        // With limits L each joint turns only as far as it may, so what a fold asks for spills onto the joints after it.
+        if (L && phi > L[j]) phi = L[j];
         const ku = phi * (ex * u[0] + ey * u[1] + ez * u[2]), kv = phi * (ex * v[0] + ey * v[1] + ez * v[2]);
         out[j * 2] = ku; out[j * 2 + 1] = kv;
         bendFrame(d, u, v, ku, kv);

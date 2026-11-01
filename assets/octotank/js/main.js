@@ -36,7 +36,7 @@ import { WallOptics } from './tank/wall-optics.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 import { RodDiag } from './diag/rod-diag.js';
 import { SuckerDiag } from './diag/sucker-diag.js';
-import { rodArms } from './amira/arms/arm-rod.js';
+import { rodArms, ROD_ARM_KNOBS } from './amira/arms/arm-rod.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
    Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
@@ -46,7 +46,10 @@ import { rodArms } from './amira/arms/arm-rod.js';
    authored arms, touching nothing)  ?couple=0 (each rod steps alone on a root dragged to her, nothing fed back; by default
    her rods and body share one solve)  ?loads=0 (her rods without their loads: no toy pushes, grip loads, or seals; with them, a rod outside the shared solve passes them on through the explicit root wrench, unstable)  ?den=0 (no settling in)
    ?grabby=0 (seals as they were: no beat, no stretch and pop; the bench keeps them as they were unless ?grabby=1)  ?peel=0 (seals let go in one tick, not over a peel)  ?latch=0 (no wide berth after two stings)  ?firm=0 (stations' feet flicker like exploring ones)
-   ?recruit=0 (no recruiter: each idle arm starts its strokes on its own hazard, every arm explores as it would at rest) */
+   ?recruit=0 (no recruiter: each idle arm starts its strokes on its own hazard, every arm explores as it would at rest)
+   ?glide=0 (her body answers force without the water she drags; ?addedMass= and ?addedSpin= set each share)
+   ?bends=0 (no bend limit on the rods; the bench has none unless ?bends=1)  ?twitch=0 (a stroke runs to the pop and drops its spring at once, a resting arm keeps its touch)  ?shiver=0 (the rod's rest shape takes the chain's bends tick by tick; the bench too unless ?shiver=1)
+   ?slide=0 (her heading through her planted arms' springs even as she travels, no grip on the floor; the bench has no grip unless ?slide=1) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -124,7 +127,8 @@ async function boot() {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
     // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', peel: params.get('peel') !== '0', intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', peel: params.get('peel') !== '0', bendLimit: params.get('bends') === '1', grip: params.get('slide') === '1' ? ROD_ARM_KNOBS.grip : 0, ...(params.get('shiver') === '1' ? {} : { restFollow: 0 }), intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms.travelling = params.get('slide') === '1';
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
     mantle = new Mantle(phys, { n: level, origin: start, drive, knobs: mantleKnobs });
@@ -134,6 +138,9 @@ async function boot() {
     // Her rod arms push toys, bear their grips, and seal unless ?loads=0; a rod outside the shared solve passes
     // it on through the explicit root wrench, which fed back a tick late grows tick on tick at her mass.
     const rodKnobs = params.get('loads') !== '0' ? { toyPush: 'rod', gripLoad: true, seals: true, wrench: true } : {};
+    // Before the build, whose first tick lays the rods' rest shapes.
+    if (params.get('bends') === '0') rodKnobs.bendLimit = false;
+    if (params.get('slide') === '0') rodKnobs.grip = 0;
     arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive', couple });
     const locoOn = params.get('loco') !== '0';
     pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });
@@ -158,12 +165,16 @@ async function boot() {
   arms.blocked.knobs.on = params.get('blocked') !== '0';
   // Grabby, intent-sized, and peeling seals (all with her loads on), the latch a thing that has stung her enough trips, and stations that hold their feet;
   // ?grabby=0, ?grace=0, ?peel=0, ?latch=0, and ?firm=0 show her without each.
+  if (params.get('glide') === '0') { mantle.knobs.addedMass = 0; mantle.knobs.addedSpin = 0; }
   if (params.get('grabby') === '0') arms.rodKnobs.grabby = false;
   if (params.get('grace') === '0') arms.rodKnobs.grace = false;
   if (params.get('peel') === '0') arms.rodKnobs.peel = false;
   if (params.get('latch') === '0') arms.reflexes.latchKnobs.latch = false;
   if (params.get('firm') === '0' && loco) loco.knobs.stationFirm = false;
   if (params.get('recruit') === '0' && loco) loco.knobs.recruit = false;
+  if (params.get('shiver') === '0') arms.rodKnobs.restFollow = 0;
+  if (params.get('twitch') === '0' && loco) { loco.knobs.strokeSpan = 0; loco.knobs.strokeFade = 0; loco.knobs.restQuiet = false; }
+  if (params.get('slide') === '0' && loco) loco.knobs.feetCouple = false;
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();

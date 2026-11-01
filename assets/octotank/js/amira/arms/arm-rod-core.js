@@ -112,6 +112,8 @@ export class Rod {
     this.rad0 = Float64Array.from(rad);
     this.lam = new Float64Array(n).fill(1);
     this.bendScale = new Float64Array(n).fill(1);    // per joint: a braced stretch of arm is stiffer, a relaxed one softer
+    this.limitScale = new Float64Array(n).fill(1);   // per joint: a bend limit's spring, stiffening the bend alone
+    this.twistScale = new Float64Array(n).fill(1);   // and the share of it the joint's twist takes, on purpose (limitTwist)
     this.stretchScale = new Float64Array(n).fill(1);
     this.rest = new Float64Array(4 * n);
     for (let j = 0; j < n; j++) this.rest[4 * j + 3] = 1;
@@ -149,6 +151,8 @@ export class Rod {
     this.sCompT = new Float64Array(N); this.sCompN = new Float64Array(N); this.sComp0T = new Float64Array(N); this.sComp0N = new Float64Array(N);
     this.sTgtT = new Float64Array(N); this.sTgtN = new Float64Array(N); this.sClip = new Uint8Array(N); this.sU = new Float64Array(3 * N);
     this.addM = new Float64Array(N); this._aIn = new Float64Array(N); this._aLive = false;   // kg carried at a node: a held toy's inertia
+    // A node lying on the floor, set from outside each tick: its grip's rate (1/s), the most it bears (N), and the floor's normal.
+    this.gripRate = new Float64Array(N); this.gripMax = new Float64Array(N); this.gripN = new Float64Array(3 * N); this._gLive = false;
     this.configure();
     this.poseFromRest();
   }
@@ -695,6 +699,15 @@ export class Rod {
       }
       const al = Math.abs(wa), sa = al > 0 ? Math.sign(wa) * slow(al, ds * qa / ma, ds * qb / ma) : 0;
       vx = u[0] + px * sp + sa * t0; vy = u[1] + py * sp + sa * t1; vz = u[2] + pz * sp + sa * t2;
+      // Grip on the floor, against the floor and not the water: speed along it only ever falls, implicit like the drag above.
+      if (this._gLive && this.gripRate[i] > 0 && !this.sealed[i]) {
+        const G = this.gripN, nx = G[3 * i], ny = G[3 * i + 1], nz = G[3 * i + 2], vn = vx * nx + vy * ny + vz * nz;
+        const tx = vx - vn * nx, ty = vy - vn * ny, tz = vz - vn * nz, tl = Math.hypot(tx, ty, tz), h = ds * this.gripRate[i];
+        if (tl > 0) {
+          const f = Math.min(tl * h / (1 + h), ds * this.gripMax[i] / mp) / tl;
+          vx -= tx * f; vy -= ty * f; vz -= tz * f;
+        }
+      }
       v[3 * i] = vx; v[3 * i + 1] = vy; v[3 * i + 2] = vz;
     }
   }
@@ -741,7 +754,7 @@ export class Rod {
       // The rest rotation is ± a quaternion; the nearer sign by the full four-vector (the imaginary part alone flips cells).
       const dp = (rx - r0x) ** 2 + (ry - r0y) ** 2 + (rz - r0z) ** 2 + (rw - r0w) ** 2;
       const dm = (rx + r0x) ** 2 + (ry + r0y) ** 2 + (rz + r0z) ** 2 + (rw + r0w) ** 2, sg = dp <= dm ? 1 : -1;
-      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / this.EIv[j], ct = ib / this.GJv[j];
+      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / (this.EIv[j] * this.limitScale[j]), ct = ib / (this.GJv[j] * this.twistScale[j]);
       b[6 * j + 3] = -(rx - sg * r0x + cb * lB[3 * j]);
       b[6 * j + 4] = -(ry - sg * r0y + cb * lB[3 * j + 1]);
       b[6 * j + 5] = -(rz - sg * r0z + ct * lB[3 * j + 2]);
@@ -770,8 +783,8 @@ export class Rod {
         mm(A, 9 * j, T3, 0, T2, 0);
         mmt(T2, 0, A, 9 * j, T3, 0);
         put(D, o, 3, 3, T3, 0, 1);
-        const ib = this.lv[j] / (4 * this.bendScale[j] * ds2);
-        D[o + 21] += ib / this.EIv[j]; D[o + 28] += ib / this.EIv[j]; D[o + 35] += ib / this.GJv[j];
+        const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / (this.EIv[j] * this.limitScale[j]);
+        D[o + 21] += cb; D[o + 28] += cb; D[o + 35] += ib / (this.GJv[j] * this.twistScale[j]);
       } else { D[o + 21] = 1; D[o + 28] = 1; D[o + 35] = 1; }
       if (j === n - 1) continue;
       const e = o, w2 = 1 / (l * ll[j + 1]);

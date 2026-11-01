@@ -188,6 +188,16 @@ export class RodDiag {
     range('Drag to', [1.3, 1.4, 1.5, 1.6], () => k.dragMax, (v) => { k.dragMax = v; }, (v) => `×${v}`);
     range('Drag recover', [0.1, 0.2, 0.3, 0.5, 1], () => k.dragRecover, (v) => { k.dragRecover = v; }, (v) => `${v} a second`);
     range('Drag slip', [0.02, 0.04, 0.06, 0.08, 0.1], () => k.dragSlipMax, (v) => { k.dragSlipMax = v; }, cm);
+    range('Rest follow', [0, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2], () => k.restFollow, (v) => { k.restFollow = v; }, (v) => (v > 0 ? `${v} s` : 'tick by tick'));
+    add({ name: 'Bend limit', label: () => `Bend limit: ${k.bendLimit ? 'on' : 'off'}`, run: () => { k.bendLimit = !k.bendLimit; } });
+    range('Limit at the tip', [0.6, 0.7, 0.8, 0.9, 1.1], () => k.limitTip, (v) => { k.limitTip = v; }, (v) => `${Math.round(v * 180 / Math.PI)}°`);
+    range('Limit spring from', [0.7, 0.8, 0.85, 0.9, 0.95], () => k.limitSoft, (v) => { k.limitSoft = v; }, (v) => `${Math.round(v * 100)}%`);
+    range('Limit fade', [0, 0.1, 0.2, 0.3, 0.5], () => k.limitTau, (v) => { k.limitTau = v; }, (v) => `${v} s`);
+    range('Limit on twist', [0, 0.15, 0.33, 0.5, 1], () => k.limitTwist, (v) => { k.limitTwist = v; }, (v) => `${Math.round(v * 100)}%`);
+    range('Limit spring', [0, 3, 5, 10, 20, 40], () => k.limitGain, (v) => { k.limitGain = v; }, (v) => `${v}×`);
+    range('Floor grip', [0, 10, 30, 60, 120], () => k.grip, (v) => { k.grip = v; }, (v) => (v > 0 ? `${v} a second` : 'off'));
+    range('Grip bears', [0.005, 0.01, 0.02, 0.05, 0.1], () => k.gripMax, (v) => { k.gripMax = v; }, (v) => `${Math.round(v * 1000)} mN a node`);
+    range('Joints on the floor', [0.03, 0.1, 0.3, 1], () => k.gripSoft, (v) => { k.gripSoft = v; }, (v) => `${Math.round(v * 100)}% stiff`);
   }
 
   /* The shared solve's own dials, read only while it runs. */

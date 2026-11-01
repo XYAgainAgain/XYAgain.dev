@@ -1,8 +1,9 @@
 import {
   LOCO_KNOBS, ROLE, ROLE_NAMES, lerp, clamp, wrap, springTarget, strokeRate, ellMax, segAtArc, flatDir, footTarget, usefulness,
   wantPushers, crowd, hazard, fires, releaseReason, surfaceMode, capFor, arrivedPlace, arrivedEpisode, stallStep, yawTerm, toneAccel,
-  pickCrew, suspendStep, strokeWait, curiosity, breakAllowed,
+  pickCrew, suspendStep, strokeWait, curiosity, breakAllowed, feetTurn,
 } from './locomotion-core.js';
+import { steerAccel } from './loco-jet-core.js';
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 
 /* Her locomotion: a desire (a target and an urgency) solved by her arms alone. Each arm runs its own stroke machine on
@@ -60,6 +61,7 @@ export class Locomotion {
     this.rng = Array.from({ length: n }, (_, a) => createRng(deriveSeed(seed, 5501 + a)));
     this.role = new Uint8Array(n);
     this.roleT = new Float64Array(n);
+    this._fadeCap = new Float64Array(n);   // a stroke's cap as it lets go, while its spring fades
     this.strokeMode = new Array(n).fill(PUSH);
     this.ell = new Float64Array(n);
     this.chord = new Float64Array(n);
@@ -166,6 +168,7 @@ export class Locomotion {
   reset(why = 'reset') {
     this.stop(why); this.arms.resetHistory?.(); for (const f of this.listeners) f.reset?.(why);
     if (this.knobs?.recruit) this._poolOff(why);
+    this._fadeCap.fill(0);
   }
 
   _resolve(target) {
@@ -220,9 +223,12 @@ export class Locomotion {
     this.time += dt;
     this._dt = dt;
     const k = this.knobs, m = this.mantle, st = this.state;
+    m.wetIdle = false;
+    // Only a body going somewhere grips the floor: a resting arm keeps its shape and its wiggle, and a jet or a held rest has no use for it.
+    this.arms.travelling = !!this.desire && !this.hold;
     if (k.recruit) { this._recruitWas = true; this._sleepTick(); this._interrupts(); this._quietOff(); }
     else if (this._recruitWas) this._recruitOff();
-    if (this.hold) { st.mode = 'held'; this._started = false; return; }
+    if (this.hold) { m.wetIdle = !!this.holdBy && !this.desire; st.mode = 'held'; this._started = false; this._fadeCap.fill(0); return; }
     if (this.pose.rigid || m.drive !== 'force') {
       if (this._live) this._standDown(2);
       this._live = false;
@@ -249,6 +255,7 @@ export class Locomotion {
   _standDown(mode) {
     for (let a = 0; a < this.n; a++) if (this.role[a] !== IDLE && this.role[a] !== BUSY) this._release(a, 'done');
     this.role.fill(IDLE);
+    this._fadeCap.fill(0);
     this.mantle.armMode.fill(mode);
     this._started = false;
     this.stanceOn = false;
@@ -316,6 +323,7 @@ export class Locomotion {
 
   _arms(dt) {
     const k = this.knobs, m = this.mantle, A = this.arms, d = this.desire, st = this.state, pose = this.pose;
+    m.wetIdle = !d && !Number.isFinite(pose.command);
     const widen = this.phase >= 1, helpMin = widen ? k.helpMin / 2 : k.helpMin, urgency = d ? d.urgency : 0;
     let active = 0;
     for (let a = 0; a < this.n; a++) if (this.role[a] === SEEK || this.role[a] === PLANTED) active++;
@@ -335,6 +343,8 @@ export class Locomotion {
     }
     if (k.recruit) { this._modeTasks(); this._recruit(d, helpMin); }
     let planted = 0, seeking = 0, stations = 0;
+    // Only a commanded turn, on the stations it planted for the job, still turns her through their springs.
+    const onFeet = k.feetCouple && (!!d || !Number.isFinite(pose.command));
     for (let a = 0; a < this.n; a++) {
       const arm = A.arms[a], g = arm.goal, mine = !!g && g.loco === this;
       let role = this.role[a];
@@ -361,16 +371,20 @@ export class Locomotion {
         const arm2 = A.arms[a], top = Math.max(0, this.anchorSeg[a]);
         let rested = true;
         for (let j = 0; j <= top; j++) if (arm2.lam[j] > 1 + k.recoverTol) { rested = false; break; }
-        if (rested || this.roleT[a] >= k.recoverMax) this._set(a, IDLE);
+        if ((rested && !this._fading(a)) || this.roleT[a] >= k.recoverMax) this._set(a, IDLE);
       } else if (role === COOL && this.roleT[a] >= k.seekCool) this._set(a, IDLE);
       role = this.role[a];
-      const springy = role === PLANTED || role === STATION;
+      const springy = role === PLANTED || role === STATION, fading = this._fading(a);
       m.armMode[a] = springy ? 1 : 0;
       if (springy) {
         let cap = role === STATION ? (turning ? Math.max(k.stationN, k.turnCap) : k.stationN) : capFor(urgency, this.holdF[a], k);
         for (const mo of this._modeList) cap = mo.cap?.(this, a, cap) ?? cap;
-        this._spring(a, eYaw, cap);
+        this._spring(a, onFeet ? 0 : eYaw, cap);
+        this._fadeCap[a] = role === PLANTED ? cap : 0;
         if (role === PLANTED) planted++; else stations++;
+      } else if (fading) {
+        m.armMode[a] = 1;
+        this._spring(a, 0, this._fadeCap[a] * (1 - this.roleT[a] / k.strokeFade));
       } else if (this.stanceOn) {
         m.armMode[a] = 1;
         m.armTarget[a * 3] = this.stanceP[a * 3]; m.armTarget[a * 3 + 1] = this.stanceP[a * 3 + 1]; m.armTarget[a * 3 + 2] = this.stanceP[a * 3 + 2];
@@ -390,10 +404,28 @@ export class Locomotion {
       // An arm swinging to its next hold, and in a turn or a squeeze every arm nothing else holds, rides her (Arms.carried):
       // their swing, drag, and contact would otherwise fight the very motion her springs make.
       if (A.carried && role !== BUSY && !A.episodes?.[a]?.h && (role === SEEK || turning || d?.source === 'squeeze')) A.carried[a] = 1;
-      st.roles[a] = springy || !this.stanceOn ? ROLE_NAMES[role] : 'stance';
+      st.roles[a] = fading ? 'fade' : springy || !this.stanceOn ? ROLE_NAMES[role] : 'stance';
     }
     st.planted = planted; st.seeking = seeking; st.stations = stations;
+    if (onFeet && planted + stations > 0 && eYaw) this._turnOnFeet(eYaw);
     if (k.recruit) { this._breaks(d, turning); this._lives(d); }
+  }
+
+  /* Her heading as a couple on her whole body with a foot down: through one foot's spring the same push is a sideways shove
+     as well as a turn, and with almost no grip on the floor that shove is what slides her. */
+  _turnOnFeet(eYaw) {
+    const m = this.mantle, n = m.shell.count, a = this._alpha ??= [0, 0, 0], R = this._feetAcc ??= new Float32Array(n * 3);
+    a[1] = -feetTurn(eYaw, this.pose.yawRate, -m.rigidState().w[1], this.knobs);
+    steerAccel(m.positions, m.vertexMass, n, a, R);
+    m.addAccel(R, { neutral: 'force' });
+  }
+
+  /* Whether a stroke that just let go still eases its spring off her: dropped at once, each let-go steps her body by the arm's whole cap.
+     Righting wants her free of every hold, and an arm another program or a grip has taken is no longer hers to pull with. */
+  _fading(a) {
+    const k = this.knobs, g = this.arms.arms[a].goal;
+    return this.role[a] === RECOVER && k.strokeFade > 0 && this.roleT[a] < k.strokeFade && this._fadeCap[a] > 0 && !this.flipped
+      && (!g || g.loco === this) && !this.arms.episodes?.[a]?.h;
   }
 
   /* Sleepy: resting, held in her den, or for sleepyWake after a rest of sleepyLong or more, as she wakes. */
@@ -420,9 +452,9 @@ export class Locomotion {
     F.fill(0);
     for (let i = 0; i < Math.min(want, rank.length); i++) F[rank[i]] = 1;
     for (let a = 0; a < n; a++) {
-      const arm = A.arms[a], quiet = !!d && !F[a] && pool(a);
+      const arm = A.arms[a], quiet = !!d && !F[a] && pool(a), still = k.restQuiet && !!A.resting && pool(a);
       // Only its own words: anything else written into assigned (a fixture's job) stands.
-      if (out && (out[a] === null || out[a] === QUIET)) out[a] = A.owner?.[a] === 'reflex' || (quiet && !hang) ? QUIET : null;
+      if (out && (out[a] === null || out[a] === QUIET)) out[a] = A.owner?.[a] === 'reflex' || ((quiet || still) && !hang) ? QUIET : null;
       this._life(arm, quiet ? Math.max(0.05, k.restInitiative) : 1);
       arm.avoid = quiet ? this._avoid(a) : null;
     }
@@ -578,6 +610,7 @@ export class Locomotion {
      arm back from a stroke draws its wait before the next. */
   _set(a, role) {
     this.role[a] = role; this.roleT[a] = 0;
+    if (role !== RECOVER) this._fadeCap[a] = 0;
     if (role !== SEEK && role !== PLANTED && role !== STATION) this.arms.unclaim?.(a, 'stroke');
     if (role === IDLE && this.knobs.recruit && this.task[a] === 'stroke') this.strokeAt[a] = this.time + strokeWait(this.rng[a].next(), this.knobs.recruitJitter);
   }

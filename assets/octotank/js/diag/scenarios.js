@@ -71,7 +71,7 @@ function crawlWatch(ctx) {
   w.fn = (dt) => {
     w.ticks++;
     if (pose.rigid) w.rigid++;
-    for (let a = 0; a < mantle.armMode.length; a++) if (mantle.armMode[a] === 1 && loco.state.roles[a] !== 'planted' && loco.state.roles[a] !== 'station' && loco.state.roles[a] !== 'stance') w.unanchored++;
+    for (let a = 0; a < mantle.armMode.length; a++) if (mantle.armMode[a] === 1 && loco.state.roles[a] !== 'planted' && loco.state.roles[a] !== 'station' && loco.state.roles[a] !== 'stance' && loco.state.roles[a] !== 'fade') w.unanchored++;
     w.stallMax = Math.max(w.stallMax, loco.state.stallT);
     acc += dt;
     if (acc < 0.1) return;

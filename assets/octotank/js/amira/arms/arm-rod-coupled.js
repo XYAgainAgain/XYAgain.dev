@@ -199,7 +199,7 @@ export class CoupledRod extends Rod {
       const r0x = R[4 * j], r0y = R[4 * j + 1], r0z = R[4 * j + 2], r0w = R[4 * j + 3];
       const dp = (rx - r0x) ** 2 + (ry - r0y) ** 2 + (rz - r0z) ** 2 + (rw - r0w) ** 2;
       const dm = (rx + r0x) ** 2 + (ry + r0y) ** 2 + (rz + r0z) ** 2 + (rw + r0w) ** 2, sg = dp <= dm ? 1 : -1;
-      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / this.EIv[j], ct = ib / this.GJv[j];
+      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / (this.EIv[j] * this.limitScale[j]), ct = ib / (this.GJv[j] * this.twistScale[j]);
       b[6 * j + 3] = -(rx - sg * r0x + cb * lB[3 * j]);
       b[6 * j + 4] = -(ry - sg * r0y + cb * lB[3 * j + 1]);
       b[6 * j + 5] = -(rz - sg * r0z + ct * lB[3 * j + 2]);
@@ -226,8 +226,8 @@ export class CoupledRod extends Rod {
       mm(A, 9 * j, T3, 0, T2, 0);
       mmt(T2, 0, A, 9 * j, T3, 0);
       put(D, o, 3, 3, T3, 0, 1);
-      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2);
-      D[o + 21] += ib / this.EIv[j]; D[o + 28] += ib / this.EIv[j]; D[o + 35] += ib / this.GJv[j];
+      const ib = this.lv[j] / (4 * this.bendScale[j] * ds2), cb = ib / (this.EIv[j] * this.limitScale[j]);
+      D[o + 21] += cb; D[o + 28] += cb; D[o + 35] += ib / (this.GJv[j] * this.twistScale[j]);
       if (j === n - 1) continue;
       const e = o, w2 = 1 / (l * ll[j + 1]);
       for (let i = 0; i < 3; i++) for (let c = 0; c < 3; c++) E[e + 6 * i + c] = -Wp[pb + 3 * i + c] * w2;

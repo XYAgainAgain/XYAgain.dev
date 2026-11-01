@@ -1,4 +1,4 @@
-import { ROD_KNOBS, frameQuat } from './arm-rod-core.js';
+import { ROD_KNOBS, frameQuat, jointQuat } from './arm-rod-core.js';
 import { CoupledRod } from './arm-rod-coupled.js';
 import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, bodyRadius } from './arm-core.js';
 
@@ -11,6 +11,14 @@ export const ROD_ARM_KNOBS = {
   // and muscle keep COOMM's ratio. Bracing firms it (braceGain); 1e6 with a 2× tip was the authored look's fit.
   E0: 2.6e5,
   tipStiff: 1,
+  // The rod's own bend limit: the rest shape walked under it, and a one-sided spring from limitSoft of it outward.
+  bendLimit: true,
+  limitTip: 0.8,         // rad at the last joint, tighter than the intent's bendTip; the root and the ramp are the intent's
+  limitSoft: 0.85,       // share of the limit where the spring starts; below it the wiggle sees nothing
+  limitTau: 0.5,         // s that spring's stiffness takes to fade as a joint eases; it rises at once, so a joint at the soft limit can't flip it tick by tick
+  limitGain: 10,         // that spring's reach: at the limit it bears this many times (limit − soft limit) of the joint's own stiffness, its slope 3× that
+  limitTwist: 0.33,      // share of that spring the joint's twist takes: stiff in bend alone, a joint's twist rate ran 4–30× a free joint's and her time on her back rose
+  restFollow: 0.05,      // s the rest shape takes to follow the chain's bends: its contact moves them a little every tick, and a soft rod takes each as a shove
   rest: 'chain',         // the rest shape: the intent's chain as its contact laid it, its posed bends ('bends', which can
                          // run through her body), or 'targets' (its programs' own, with the rod as their spring)
   hold: 'rod',           // whose contact bends later rest shapes: 'rod', 'ghost' (the intent chain's own), or 'off'
@@ -74,6 +82,14 @@ export const ROD_ARM_KNOBS = {
   dragMax: 1.5,          // anatomical elongation of the span
   dragRecover: 0.3,      // per second back, once nothing drags
   dragSlipMax: 0.06,     // m
+  // Grip on the floor while she travels: an unsealed node lying on an upward face loses speed along it, by velocity alone so it
+  // can't fling anything. It saturates, so a stroke can still drag an arm. Weight is no use: an arm weighs about 0.04 N in water.
+  grip: 30,              // 1/s; 0 turns it off
+  gripMax: 0.02,         // N per node
+  gripGap: 0.002,        // m over the surface a node still counts as lying on it
+  gripCos: 0.7,          // a surface whose normal is this near up is a floor
+  gripSoft: 0.1,         // share of its stiffness a joint on the floor keeps: its rest shape rides her, and held to it the arm skates whatever the grip does
+  gripSoftTau: 0.15,     // s a joint takes to soften and firm: read tick by tick, contact's flicker would shake it
   wrench: false,         // the root's force and torque reach her body, a tick late; explicit, so at her mass it grows
   wrenchSpread: 'body',  // over all of her as a rigid body would take it, or 'patch', the arm's own
   // The shared solve (?couple=1) alone reads these.
@@ -201,6 +217,9 @@ export class RodArm {
     this._q = [0, 0, 0, 1];
     this._f9 = new Float64Array(9);
     this._B = new Float64Array((n - 1) * 2);
+    this._Bc = new Float64Array((n - 1) * 2);
+    this._L = new Float64Array(n - 1);
+    this._Ls = new Float64Array(n - 1);   // each joint's spring stiffness, fading
     this._s3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     this._sync();
   }
@@ -233,6 +252,7 @@ export class RodArm {
      targets mode its programs' targets with each joint's authored stiffness scaling the rod's bending there. */
   _rest(dt = 0) {
     const arm = this.intent, rod = this.rod, k = this.k;
+    rod.limitScale.fill(1); rod.twistScale.fill(1);
     const kind = arm.goal?.kind, stroke = this.coupled && k.looseStroke && !!arm.goal?.loco;
     const want = this.gripping || ((kind === 'hold' || kind === 'plant') && !stroke) || kind === 'fetch' ? 1 : 0;
     this.grab = !this.started ? want : this.grab + (want - this.grab) * (dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.grabTau)) : 0);
@@ -246,7 +266,14 @@ export class RodArm {
         rod.stretchScale[j] = arm.knobs.muscle && arm.mus ? arm.mus.axialStiff[j] : 1;
       }
     } else {
-      const s = this._s3, B = k.rest === 'chain' && arm.X.every(Number.isFinite) ? chainBends(arm.frame, arm.twist, arm.X, this._B, this.n - 1, s[0], s[1], s[2]) : arm.out;
+      const s = this._s3, lim = k.bendLimit ? this._limits() : null;
+      const fromChain = k.rest === 'chain' && arm.X.every(Number.isFinite);
+      let B = fromChain ? chainBends(arm.frame, arm.twist, arm.X, this._B, this.n - 1, s[0], s[1], s[2], lim) : arm.out;
+      if (lim && !fromChain) B = this._clampRest(B, lim);
+      if (k.restFollow > 0 && fromChain) {
+        const E = this._Be ??= Float64Array.from(B), f = !this.started ? 1 : dt > 0 ? 1 - Math.exp(-dt / k.restFollow) : 0;
+        for (let a = 0; a < E.length; a++) B[a] = E[a] += (B[a] - E[a]) * f;
+      } else this._Be = null;
       rod.setRestFromBends(B, arm.twist, arm.lam);
       // Soft tissue, firmed where the program braces: a braced stretch of arm is braceFactor times stiffer, a relaxed one is
       // the passive tissue (with the muscle map's own small change in muscle mode).
@@ -255,6 +282,48 @@ export class RodArm {
         const f = braceFactor(braceShare(arm, j), g, k);
         rod.bendScale[j] = this.stiff * (M ? M.bendStiff[j] : 1) * f; rod.stretchScale[j] = (M ? M.axialStiff[j] : 1) * f;
       }
+      if (k.grip > 0 && k.gripSoft < 1) this._floorJoints(dt);
+      if (lim && k.limitGain > 0 && this.started) this._limitSpring(B, lim, dt);
+      else this._Ls.fill(0);
+    }
+  }
+
+  /* Each joint's limit this tick: the turn off her body as the intent has it, the rest on the intent's ramp up to limitTip, a fetch's raise kept. */
+  _limits() {
+    const arm = this.intent, k = this.k, ak = arm.knobs, S = this.n - 1, L = this._L, tip = k.limitTip;
+    L[0] = arm.lim[0];
+    for (let j = 1; j < S; j++) L[j] = Math.max(arm.limRaise[j] * arm.w, ak.bendBase + (tip - ak.bendBase) * Math.pow(j / Math.max(1, S - 1), ak.bendPow));
+    return L;
+  }
+
+  /* Posed bends walk nothing, so they are cut to the limit joint by joint. */
+  _clampRest(B, L) {
+    const out = this._Bc, S = this.n - 1;
+    for (let j = 0; j < S; j++) {
+      const u = B[j * 2], v = B[j * 2 + 1], m = Math.sqrt(u * u + v * v), f = m > L[j] ? L[j] / m : 1;
+      out[j * 2] = u * f; out[j * 2 + 1] = v * f;
+    }
+    return out;
+  }
+
+  /* A second spring per joint, one-sided, cubic from the soft limit and straight past the limit, folded into the rest-shape spring so both
+     solves stay implicit: linearized at the live bend with its true slope, or a stiffness read a tick late chatters every joint in the band. */
+  _limitSpring(B, L, dt = 0) {
+    const rod = this.rod, k = this.k, q = rod.q, R = rod.rest, tw = this.intent.twist, soft = k.limitSoft, G = k.limitGain, S = this.n - 1, Ls = this._Ls, fade = k.limitTau > 0 ? (dt > 0 ? Math.exp(-dt / k.limitTau) : 1) : 0;
+    for (let j = 1; j < S; j++) {
+      const a = 4 * (j - 1), b = 4 * j, ax = q[a], ay = q[a + 1], az = q[a + 2], aw = q[a + 3], bx = q[b], by = q[b + 1], bz = q[b + 2], bw = q[b + 3];
+      const rx = aw * bx - ax * bw - ay * bz + az * by, ry = aw * by + ax * bz - ay * bw - az * bx, rz = aw * bz - ax * by + ay * bx - az * bw, rw = aw * bw + ax * bx + ay * by + az * bz;
+      const dz = 1 - 2 * (rx * rx + ry * ry), p0 = L[j] * soft;
+      if (dz >= Math.cos(p0) && !(Ls[j] > 1e-3)) { Ls[j] = 0; continue; }
+      const dx = 2 * (rx * rz + rw * ry), dy = 2 * (ry * rz - rw * rx), h = Math.sqrt(dx * dx + dy * dy);
+      if (!(h > 1e-9)) { Ls[j] *= fade; continue; }
+      const phi = Math.atan2(h, dz), w = Math.max(1e-6, L[j] - p0), u = Math.max(0, phi - p0) / w;
+      // The spring's moment over the joint's stiffness, f, and the slope it's linearized with, t: never under the true slope, or the step overshoots.
+      const f = u < 1 ? G * w * u * u * u : G * w * (1 + 3 * (u - 1)), t = Ls[j] = Math.max(3 * G * Math.min(1, u * u), Ls[j] * fade), target = t * phi - f;
+      // jointQuat is roll, then bend: the live bend's direction read in the joint's rolled frame.
+      const roll = tw[j - 1], c = Math.cos(roll), s = Math.sin(roll), eu = (dx * c + dy * s) / h, ev = (dy * c - dx * s) / h;
+      jointQuat((B[j * 2] + target * eu) / (1 + t), (B[j * 2 + 1] + target * ev) / (1 + t), roll, R, 4 * j);
+      rod.limitScale[j] = 1 + t; rod.twistScale[j] = 1 + k.limitTwist * t;
     }
   }
 
@@ -392,6 +461,30 @@ export class RodArm {
     this._frames();
   }
 
+  _floorJoints(dt) {
+    const rod = this.rod, k = this.k, G = this._gs ??= new Float64Array(rod.n).fill(1), f = dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.gripSoftTau)) : 0;
+    if (!this.started) { G.fill(1); return; }
+    for (let j = 1; j < rod.n; j++) {
+      G[j] += ((rod.gripRate[j] > 0 ? k.gripSoft : 1) - G[j]) * f;
+      rod.bendScale[j] *= G[j];
+    }
+  }
+
+  /* After settle: which nodes lie on the floor for the next tick's solve; sdf is the furniture alone, so a toy or another arm never grips. */
+  floorGrip(sdf, on = true) {
+    const k = this.k, rod = this.rod, X = this.X, g = on && k.grip > 0 ? k.grip : 0, nrm = this._n, gap = k.gripGap;
+    let live = false;
+    if (g > 0) for (let i = 1; i < this.n; i++) {
+      const o = i * 3, lies = sdf.collide(X[o], X[o + 1], X[o + 2], this.rad[i] + gap, nrm) > 0 && nrm[1] >= k.gripCos;
+      rod.gripRate[i] = lies ? g : 0;
+      if (!lies) continue;
+      live = true;
+      rod.gripMax[i] = k.gripMax; rod.gripN[o] = nrm[0]; rod.gripN[o + 1] = nrm[1]; rod.gripN[o + 2] = nrm[2];
+    }
+    else rod.gripRate.fill(0);
+    rod._gLive = live;
+  }
+
   _radii() {
     this.rod.radii(this.drawRad);
     // A segment squeezed shorter than girthFloor keeps that girth: contact did the squeezing, and up to 3× its girth (the
@@ -419,7 +512,7 @@ export class RodArm {
   get contactHold() { return { X: this.X, touched: this._touched, hit: this._hit }; }
 
   /* Seat the rod on the intent chain again, at rest. */
-  reset() { this.started = false; }
+  reset() { this.started = false; this.rod.gripRate.fill(0); this.rod._gLive = false; }
 
   /* The same report as Arm.health, measured on the rod: lengths against its rest stretch, bends against the intent's limits. */
   health() {

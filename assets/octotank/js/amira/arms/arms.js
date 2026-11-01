@@ -89,6 +89,7 @@ export class Arms {
     this.joined = new Uint8Array(count);              // per slot, stepped in the shared solve this tick
     this.oneWay = new Uint8Array(count);              // and of those, carried by her spring without pushing back
     this.carried = new Uint8Array(count);             // set by her locomotion each tick: an arm whose stroke carries it, as a driven patch would
+    this.travelling = false;                          // set by her locomotion each tick: she has somewhere to go, so her arms grip the floor
     this._joinList = [];
     this._joinEntry = this.arms.map(() => ({ rod: null, p: null, q: null, oneWay: false }));
     // The water's velocity at a point, for the rods' drag: set once the tank's currents exist.
@@ -473,15 +474,20 @@ export class Arms {
       // Her patch springs are inside the solve, so the arms' push and the springs' hold settle together.
       const C = this.coupler, rk = this.rodKnobs;
       C.carryTurn = rk.coupleTurn > 0 ? rk.coupleTurn : Infinity; C.extra = Math.max(0, Math.round(rk.coupleExtra) || 0);
-      const t1 = performance.now(), out = C.step(dt, rigid, list, ambient, m.springAnchors?.() ?? null);
-      // The momentum owed next tick was worked out against this velocity; if it did not land, neither does that.
-      if (m.addRigidVelocity(out.dv, out.dw, rigid.c)) m.owe(out.dP, out.dL);
+      const wet = m.wetRigid(rigid), t1 = performance.now(), out = C.step(dt, wet, list, ambient, m.springAnchors?.() ?? null);
+      // The momentum owed next tick was worked out against this velocity; if it did not land, neither does that. It was
+      // figured with the water she drags, and lands on her alone, so it shrinks by the same ratio to give the same speed.
+      if (m.addRigidVelocity(out.dv, out.dw, rigid.c)) {
+        const sm = rigid.M / wet.M, ss = wet === rigid ? 1 : 1 / (1 + Math.max(0, m.knobs.addedSpin)), dP = this._dP ??= [0, 0, 0], dL = this._dL ??= [0, 0, 0];
+        for (let i = 0; i < 3; i++) { dP[i] = out.dP[i] * sm; dL[i] = out.dL[i] * ss; }
+        m.owe(dP, dL);
+      }
       for (let a = 0; a < arms.length; a++) if (this.joined[a]) this.rods[a].commit();
       this.coupled = out; this.coupledDt = dt;
       // Her as the joined rods' contact finds her: moving as the solve left her, taking back what her skin pushes them by.
       const her = this._her ??= { body: this.body, c: [0, 0, 0], v: [0, 0, 0], w: [0, 0, 0], M: 0, Ii: null, P: [0, 0, 0], L: [0, 0, 0] };
       for (let i = 0; i < 3; i++) { her.c[i] = rigid.c[i]; her.v[i] = rigid.v[i] + out.dv[i]; her.w[i] = rigid.w[i] + out.dw[i]; her.P[i] = 0; her.L[i] = 0; }
-      her.M = rigid.M; her.Ii = rigid.Ii;
+      her.M = wet.M; her.Ii = wet.Ii;
       rodMs += performance.now() - t1;
     } else this.coupled = null;
     // Rounds of arm-on-arm contact between the bodies, then each one's world contact, which has the last word; a driving
@@ -509,6 +515,7 @@ export class Arms {
       }
     }
     this._rec = -1;
+    let gripping = false;
     for (let a = 0; a < arms.length; a++) {
       const rod = this.rods[a];
       if (!rod) continue;
@@ -516,6 +523,10 @@ export class Arms {
       if (!shadow && dt > 0 && this.rodKnobs.toyPush === 'rod') this._rodPush(a, dt);
       // A one-way rod's momentum never reaches her, so neither does its push off her skin.
       rod.settle(dt, this.joined[a] && !this.oneWay[a] ? this._her : null);
+      if (!shadow && (this.rodKnobs.grip > 0 || rod.rod._gLive)) {
+        if (!gripping) { gripping = true; this.sdf.unfocus(); }
+        rod.floorGrip(this.sdf, this.travelling);
+      }
       // The contact hold comes from the rod: what it lies on bends the program's later rest shapes, never its sag.
       if (hold === 'rod' && !shadow) arms[a]._feedback(rod.contactHold);
       // What the hold, from whichever chain gave it, added to the rest shape this tick.
