@@ -1,4 +1,4 @@
-import { TRAVEL_KNOBS, Energy, reachable, paceOf, priceTrip, hopAim, clamp } from './loco-travel-core.js';
+import { TRAVEL_KNOBS, Energy, reachable, paceOf, priceTrip, hopAim, hopSpot, clamp } from './loco-travel-core.js';
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 import { TANK } from '../../config.js';
 import { section } from '../../diag/panel.js';
@@ -19,7 +19,7 @@ export class Travel {
     this.rng = createRng(deriveSeed(seed, 6629));
     this.time = null;
     this.last = null;         // the last trip's price and choice
-    this.pending = null;      // a hop chosen this tick, launched once the controller has run: { d, aim, meters, crawl }
+    this.pending = null;      // a hop chosen this tick, launched once the controller has run: { d, aim, meters, spot, crawl }
     this.plan = null;         // a crossing she means to make: { target, what, side, tries, d }
     this.side = 0;
     this.sideT = 0;           // s she has spent on this side of the divider
@@ -52,6 +52,9 @@ export class Travel {
   }
 
   pace() { return paceOf(this.energy.value, this.knobs); }
+
+  /* Restless with guided hops: she roams, so a destination nearer than a hop isn't worth the trip. */
+  roams() { const h = this.loco.hopMode; return this.active && !this.calm && !!h?.on && !!h.knobs.roam; }
 
   tick() {
     const now = this.loco.time;
@@ -129,7 +132,7 @@ export class Travel {
     if (mode === 'hop') {
       const aim = [0, 0, 0];
       hopAim(c, p, L.mantle.knobs.damping, TANK, k, aim);
-      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), crawl: price.modes.crawl };
+      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), spot: hopSpot(p, TANK, k), crawl: price.modes.crawl };
     } else if (price.modes.hop.why) this.refusals[price.modes.hop.why] = (this.refusals[price.modes.hop.why] ?? 0) + 1;
     this.counts.trips++;
     this.counts[mode === 'hop' ? 'hop' : label]++;
@@ -144,7 +147,10 @@ export class Travel {
     if (!h) return;
     this.pending = null;
     if (this.loco.desire !== h.d || !this.active) return;
-    const r = this.loco.jetMode.start({ to: h.aim, speed: this.knobs.hopSpeed, urgency: 1, reason: 'travel', meters: h.meters });
+    // A guided hop lands on the spot itself; with ?hop=0 it is the plain jet aimed short by her coast.
+    const hop = this.loco.hopMode;
+    const r = hop?.on ? hop.start(h.spot, { speed: this.knobs.hopSpeed, reason: 'travel' })
+      : this.loco.jetMode.start({ to: h.aim, speed: this.knobs.hopSpeed, urgency: 1, reason: 'travel', meters: h.meters });
     if (r === true) return;
     this.counts.refused++; this.refusals[r] = (this.refusals[r] ?? 0) + 1;
     this.counts.hop--; this.counts[h.crawl.label]++;

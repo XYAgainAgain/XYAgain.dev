@@ -728,8 +728,8 @@ export class Arms {
      stiffBehind (arm-plant-core.js). */
   trail(i, v, spread, stiff, tip) { return this._goal(this.slotOf(i), makeTrail(v, spread, stiff, tip)); }
 
-  /* Arm i spreads out and down, `down` radians below level, as she sinks after a jet. */
-  spread(i, down) { return this._goal(this.slotOf(i), makeSpread(down)); }
+  /* Arm i spreads out and down, `down` radians below level, as she sinks after a jet; or along unit `aim`, a hop's parachute. */
+  spread(i, down, aim) { return this._goal(this.slotOf(i), makeSpread(down, aim)); }
 
   /* Arm i curls in under her and stays there. */
   tuck(i, curl) { return this._goal(this.slotOf(i), makeTuck(curl)); }
@@ -1960,17 +1960,22 @@ export class Arms {
   }
 
   releaseAll() {
-    const rk = this.rodKnobs, peel = !!rk.grace && !!rk.peel && rk.seals && !this.shadow;
     for (let a = 0; a < this.arms.length; a++) {
       this._end(a, true, 'release');
-      const st = this.seals[a], rod = this.rods[a]?.rod;
-      if (!peel || !st || !rod) { this._dropSeals(a, true); continue; }
-      // The plant stays on record, so its foot can't seal again until the goal changes.
-      st.plantSeg = -1; this._peelN = 0;
-      for (let j = 0; j < this.S; j++) if (st.kind[j] && rod.sealed[j + 1]) this._ask(a, j, 'release', 0);
-      this._ripple(a);
+      this.releaseSeals(a);
     }
     return 'released';
+  }
+
+  /* Arm a lets go of every seal: a fast tip-first peel under peel, at once otherwise. Any grip episode is left alone. */
+  releaseSeals(a) {
+    const rk = this.rodKnobs, peel = !!rk.grace && !!rk.peel && rk.seals && !this.shadow;
+    const st = this.seals[a], rod = this.rods[a]?.rod;
+    if (!peel || !st || !rod) { this._dropSeals(a, true); return; }
+    // The plant stays on record, so its foot can't seal again until the goal changes.
+    st.plantSeg = -1; this._peelN = 0;
+    for (let j = 0; j < this.S; j++) if (st.kind[j] && rod.sealed[j + 1]) this._ask(a, j, 'release', 0);
+    this._ripple(a);
   }
 
   /* Whether a pull on arm i's grip reels the thing in ('object') or hauls her to it ('body'), why, and the inputs: her

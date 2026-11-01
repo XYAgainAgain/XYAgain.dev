@@ -1219,8 +1219,8 @@ export class Arm {
     F.cu = cu; F.cv = cv;
   }
 
-  idle() {
-    if (this.goal && this.goal.kind !== 'lead') this._letGo(true);
+  idle(stay = true) {
+    if (this.goal && this.goal.kind !== 'lead') this._letGo(stay);
   }
 
   /* A program letting go. With `stay`, exploring carries on around where the arm ended up for a wander interval,

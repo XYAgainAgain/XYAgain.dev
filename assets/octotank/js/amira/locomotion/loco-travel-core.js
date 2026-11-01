@@ -132,15 +132,23 @@ export function priceTrip({ flat = 0, rise = 0, cross = false, energy = 0, debt 
   return { modes, best };
 }
 
-/* Where a hop aims from center c to target p: short of it by her coast, over the floor (off the glass for a spot up a wall),
-   lifted by a share of its length. drag is her body's linear drag (1/s). Written into out; returns the flat distance. */
-export function hopAim(c, p, drag, tank, k = TRAVEL_KNOBS, out = [0, 0, 0]) {
+/* The floor spot a hop to target p lands on: p itself, or for a spot up or by the glass the floor in front of it, pulled in
+   off whichever walls it is by. Written into out (y 0). */
+export function hopSpot(p, tank, k = TRAVEL_KNOBS, out = [0, 0, 0]) {
   let x = p[0], z = p[2];
   const hw = tank.w / 2, hd = tank.d / 2;
   if (p[1] > k.reachY || hw - Math.abs(x) <= k.wallNear || hd - Math.abs(z) <= k.wallNear) {
-    // Up or by the glass: the floor in front of it, pulled in off whichever walls it is by.
     x = clamp(x, -(hw - k.wallOff), hw - k.wallOff); z = clamp(z, -(hd - k.wallOff), hd - k.wallOff);
   }
+  out[0] = x; out[1] = 0; out[2] = z;
+  return out;
+}
+
+/* Where a plain aimed hop (?hop=0) aims from center c to target p: short of its spot by her coast, lifted by a share of
+   its length. drag is her body's linear drag (1/s). Written into out; returns the flat distance. */
+export function hopAim(c, p, drag, tank, k = TRAVEL_KNOBS, out = [0, 0, 0]) {
+  hopSpot(p, tank, k, out);
+  const x = out[0], z = out[2];
   const dx = x - c[0], dz = z - c[2], flat = Math.hypot(dx, dz);
   const back = flat > 1e-6 ? Math.min((k.hopSpeed / Math.max(1e-3, drag)) * k.coastShare, flat / 2) / flat : 0;
   out[0] = x - dx * back; out[2] = z - dz * back;

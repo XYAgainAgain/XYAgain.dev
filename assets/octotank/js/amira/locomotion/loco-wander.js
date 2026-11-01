@@ -107,6 +107,11 @@ export class Wander {
     const glass = !this.lastGlass && rng.chance(k.glassShare);
     for (let i = g; i < g + 3; i++) if (!glass || !ok(P[i], 0)) nan(P[i]);
     if (!ok(P[g + 3], 0)) nan(P[g + 3]);
+    // Restless with hops guided, she roams: what's nearer than a hop drops out while anything farther remains.
+    if (tr?.roams()) {
+      const near = (p) => Number.isFinite(p[0]) && Math.hypot(p[0] - c[0], p[2] - c[2]) < tr.knobs.hopMin;
+      if (P.some((p) => Number.isFinite(p[0]) && !near(p))) for (const p of P) if (near(p)) nan(p);
+    }
     const i = pickInterest(P, this.seen, rng, this.attention?.knobs ?? ATTEND_KNOBS, true);
     this.next = this.time + this._paced(k.wanderMin, 'wait');
     if (i < 0) return;

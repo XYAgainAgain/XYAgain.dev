@@ -1,12 +1,13 @@
 import { JET_KNOBS, OxygenDebt, jetSpeed, swimSpeed, jetThrust, steerAlpha, steerAccel, domeCancel, adrift, stopDistance, rayHit, smoothstep, clamp } from './loco-jet-core.js';
 import { register, until } from '../../diag/scenarios.js';
+import { installHop } from './loco-hop.js';
 import { section } from '../../diag/panel.js';
 
 /* Her jets: mantle-first at 45 cm/s to 1 m/s with her arms trailing, and the slower head-first swim. Thrust is one uniform acceleration on every
    skin vertex (no torque, no tearing), steered by a force-free turn of her mantle onto the course; she holds the locomotion controller off while it
    runs, then sinks on spread arms and owes an oxygen debt. Ticks as a listener after the gait and before the mantle steps. */
 
-const FLOOR_COS = 0.7;
+const FLOOR_COS = 0.7, UP = [0, 1, 0];
 
 export class Jet {
   constructor(loco, { parts = null } = {}) {
@@ -25,6 +26,7 @@ export class Jet {
     this.vWant = 0;
     this.stopAtWalls = true;
     this.meters = Infinity;    // the thrust's length, when one is asked for
+    this.guide = null;         // a hop's flight plan (loco-hop.js), or null for a plain jet
     this.heartStopped = false;
     this.siphonDir = null;     // world direction the funnel blows while thrusting, null otherwise
     this.t = 0;
@@ -58,8 +60,9 @@ export class Jet {
 
   /* A jet (or with kind 'swim', the head-first swim) along dir, or toward point `to`. speed overrides urgency's. Thrust
      ends short of a surface ahead so she coasts up to it (stopAtWalls true), on reaching it ('touch'), or never (false);
-     with `meters`, also once she has thrust that far. Returns true, or a string saying why not. */
-  start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true, meters = Infinity } = {}) {
+     with `meters`, also once she has thrust that far. A hop's `guide` (loco-hop.js) steers the course, her pose, and the trailing
+     arms, ends the thrust, aims the parachute, and says when she has landed. Returns true, or why not. */
+  start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true, meters = Infinity, guide = null } = {}) {
     const L = this.loco, k = this.k, m = this.mantle;
     // Her own glide's hold and a den's settle both give way to a fresh jet, once her heart allows; any other hold is a probe's.
     if (this.phase === 'thrust') return 'already moving';
@@ -69,13 +72,15 @@ export class Jet {
     if (kind === 'jet' && !this.debt.ready) return this.debt.debt > k.jetReady ? 'oxygen debt' : 'resting';
     this._body(0);
     const c = this.c, d = this._d;
-    if (to && [0, 1, 2].every((i) => Number.isFinite(+to[i]))) { d[0] = to[0] - c[0]; d[1] = to[1] - c[1]; d[2] = to[2] - c[2]; }
+    if (guide) guide.course(c, d);
+    else if (to && [0, 1, 2].every((i) => Number.isFinite(+to[i]))) { d[0] = to[0] - c[0]; d[1] = to[1] - c[1]; d[2] = to[2] - c[2]; }
     else if (dir && [0, 1, 2].every((i) => Number.isFinite(+dir[i]))) { d[0] = +dir[0]; d[1] = +dir[1]; d[2] = +dir[2]; }
     else return 'no course';
     const l = Math.hypot(d[0], d[1], d[2]);
     if (!(l > 1e-6)) return 'no course';
     for (let i = 0; i < 3; i++) this.dir[i] = d[i] / l;
-    this.to = to ? [+to[0], +to[1], +to[2]] : null;
+    this.to = to && !guide ? [+to[0], +to[1], +to[2]] : null;
+    this.guide = guide;
     this.kind = kind === 'swim' ? 'swim' : 'jet';
     const u = clamp(Number.isFinite(urgency) ? urgency : 1, 0, 1);
     this.vWant = Number.isFinite(speed) && speed > 0 ? Math.min(speed, k.vJetMax) : this.kind === 'jet' ? jetSpeed(u, k) : swimSpeed(u, k);
@@ -131,9 +136,16 @@ export class Jet {
   _arm(a, kind) {
     const A = this.arms, arm = A.arms[a], g = arm.goal;
     if (kind === 'trail') {
-      const v = this.speed > 0.1 ? this._unitV() : this.axisThrust();
-      if (g?.kind === 'trail') { g.v[0] = v[0]; g.v[1] = v[1]; g.v[2] = v[2]; return; }
-      if (typeof A.trail === 'function') A.trail(a, v, this.k.jetSpread, this.k.trailStiff, this.k.trailTip);
+      // A hop's arms stream behind along its own bearing, lifted off the sand, not down the slope of a climbing launch.
+      const hop = !!this.guide?.trail, v = hop ? this.guide.trail(this._tv ??= [0, 0, 0]) : this.speed > 0.1 ? this._unitV() : this.axisThrust();
+      const spread = hop ? this.guide.spread : this.k.jetSpread;
+      if (g?.kind === 'trail') { g.v[0] = v[0]; g.v[1] = v[1]; g.v[2] = v[2]; if (hop) g.spread = spread; return; }
+      if (typeof A.trail === 'function') A.trail(a, v, spread, this.k.trailStiff, this.k.trailTip);
+    } else if (kind === 'spread' && this.guide) {
+      // A hop's parachute: each arm's own aim, refreshed every tick as she nears the target.
+      const aim = this.guide.aim(a, A.arms[a], this._p);
+      if (g?.kind === 'spread' && g.aim) { g.aim[0] = aim[0]; g.aim[1] = aim[1]; g.aim[2] = aim[2]; return; }
+      if (typeof A.spread === 'function') A.spread(a, this.guide.down, aim);
     } else if (kind === 'spread') {
       if (g?.kind !== 'spread' && typeof A.spread === 'function') A.spread(a, this.k.spreadDown);
     } else if (kind === 'tuck') {
@@ -206,21 +218,28 @@ export class Jet {
   _thrustTick(dt) {
     const k = this.k, m = this.mantle, L = this.last, M = m.knobs.mass, drag = m.knobs.damping, n = m.shell.count;
     const d = this._d;
-    if (this.to) {
+    if (this.guide) {
+      const l = this.guide.course(this.c, d, this.v), why = this.guide.cut(this.c, this.v);
+      if (why) return this._endThrust(why);
+      if (!(Math.hypot(d[0], d[1], d[2]) > 0.5) || !Number.isFinite(l)) return this._endThrust('no course');
+    } else if (this.to) {
       d[0] = this.to[0] - this.c[0]; d[1] = this.to[1] - this.c[1]; d[2] = this.to[2] - this.c[2];
       const l = Math.hypot(d[0], d[1], d[2]);
       if (l <= this.loco.knobs.arriveR) return this._endThrust('arrived');
       for (let i = 0; i < 3; i++) d[i] /= l;
     } else for (let i = 0; i < 3; i++) d[i] = this.dir[i];
-    const t = this.axisThrust(), along = this.v[0] * t[0] + this.v[1] * t[1] + this.v[2] * t[2];
+    const t = this.axisThrust();
+    // A hop holds her body pitched under its climb (s) so she leads mantle-first, the funnel aimed down the course (u).
+    const s = this.guide?.pose ? this.guide.pose(d, this._s ??= [0, 0, 0]) : d, u = s === d ? t : d;
+    const along = this.v[0] * u[0] + this.v[1] * u[1] + this.v[2] * u[2];
     // Thrust waits until the funnel's push points near enough the course, so she turns before she goes.
-    const gate = smoothstep(k.jetAlign0, k.jetAlign1, t[0] * d[0] + t[1] * d[1] + t[2] * d[2]);
+    const gate = smoothstep(this.guide?.align0 ?? k.jetAlign0, this.guide?.align1 ?? k.jetAlign1, t[0] * s[0] + t[1] * s[1] + t[2] * s[2]) * (this.guide?.ramp > 0 ? smoothstep(0, this.guide.ramp, this.t) : 1);
     const F = jetThrust(M, drag, this.vWant, along, k) * gate, a = F / M;
     const T = this._thrust;
-    for (let i = 0; i < n; i++) { T[i * 3] = t[0] * a; T[i * 3 + 1] = t[1] * a; T[i * 3 + 2] = t[2] * a; }
+    for (let i = 0; i < n; i++) { T[i * 3] = u[0] * a; T[i * 3 + 1] = u[1] * a; T[i * 3 + 2] = u[2] * a; }
     m.addAccel(T, { neutral: false });
     const R = this._turn;
-    steerAccel(m.positions, m.vertexMass, n, steerAlpha(t, d, this.w, k, this._alpha), R);
+    steerAccel(m.positions, m.vertexMass, n, steerAlpha(t, s, this.w, k, this._alpha), R);
     domeCancel(m.dome, m.knobs.righting, k.jetDome, R);
     m.addAccel(R, { neutral: 'force' });
     // The visible stroke: the breathing muscles pulsed at jetHz, water leaving through the funnel the whole time.
@@ -231,7 +250,7 @@ export class Jet {
     }
     this.heartStopped = this.kind === 'jet';
     this.siphonDir = this.siphonDir ?? [0, 0, 0];
-    this.siphonDir[0] = -t[0]; this.siphonDir[1] = -t[1]; this.siphonDir[2] = -t[2];
+    this.siphonDir[0] = -u[0]; this.siphonDir[1] = -u[1]; this.siphonDir[2] = -u[2];
     this.parts?.aimSiphon?.(this.siphonDir);
     const step = this.speed * dt;
     L.meters += step; L.thrustT += dt; L.peak = Math.max(L.peak, this.speed);
@@ -275,9 +294,16 @@ export class Jet {
     const k = this.k, A = this.arms, L = this.loco;
     this.last.glideT += dt;
     // Still coasting fast, the arms keep trailing; once she slows they open into the parachute.
-    if (this.coasting && this.speed < k.spreadSpeed) this.coasting = false;
+    if (this.coasting && this.speed < (this.guide ? this.guide.paraSpeed : k.spreadSpeed)) this.coasting = false;
     for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) { this._arm(a, this.kind === 'swim' ? 'tuck' : this.coasting ? 'trail' : 'spread'); this._carry(a); }
     if (this.coasting) this._emit('coast', dt);
+    // A hop's parachute turns her belly-down with the thrust's own steering, so a launch pitched mantle-first lands upright.
+    if (this.guide?.right > 0) {
+      const m = this.mantle, n = m.shell.count, R = this._turn, al = steerAlpha(m.up(this._up ??= [0, 0, 0]), UP, this.w, k, this._alpha);
+      for (let i = 0; i < 3; i++) al[i] *= this.guide.right;
+      steerAccel(m.positions, m.vertexMass, n, al, R);
+      m.addAccel(R, { neutral: 'force' });
+    }
     let floorHold = false;
     for (let a = 0; a < L.n && !floorHold; a++) {
       const list = A.anchorList?.[a], cnt = A.anchorCount?.[a] ?? 0;
@@ -289,7 +315,9 @@ export class Jet {
       const c = L.mantle.ring().c, nrm = this._n, dist = A.sdf.distance(c[0], c[1], c[2], nrm);
       near = dist <= k.landGap && nrm[1] > FLOOR_COS;
     }
-    if (((floorHold || near) && this.speed < k.landSpeed) || this.t >= k.landMax) this._land(floorHold || near);
+    // A hop sinks all the way onto its spread arms: one tip sealed while she still hangs high leaves her standing on them.
+    const down = this.guide?.landNear ? near : floorHold || near;
+    if ((down && this.speed < k.landSpeed) || this.t >= (this.guide?.landMax ?? k.landMax)) this._land(floorHold || near);
   }
 
   _land(onFloor) {
@@ -297,17 +325,19 @@ export class Jet {
     for (let a = 0; a < this.owned.length; a++) {
       if (!this.owned[a]) continue;
       const g = A.arms[a].goal;
-      if (g && (g.kind === 'trail' || g.kind === 'spread' || g.kind === 'tuck')) A.arms[a].idle();
+      // A hop's arms forget the parachute's reach: idling around where it left them props her up on them like stilts.
+      if (g && (g.kind === 'trail' || g.kind === 'spread' || g.kind === 'tuck')) A.arms[a].idle(!this.guide);
       A.unclaim?.(a, 'mode');
       if (A.carried) A.carried[a] = 0;
     }
     this.owned.fill(0);
     this.phase = 'off';
     L.hold = false;
-    // Arms sealed on the floor as she settles become stations, so she lands planted.
-    const stations = L.canPlant ? L.anchorDown() : 0;
+    // Arms sealed on the floor as she settles become stations, so she lands planted; a hop's guide may decline.
+    const stations = L.canPlant && (!this.guide || this.guide.plant) ? L.anchorDown() : 0;
     Object.assign(this.last, { landed: !!onFloor, glideT: +this.last.glideT.toFixed(3), stations });
     this._emit('land');
+    this.guide = null;
   }
 
   _emit(what, dt = 0) { for (const f of this.listeners) f(what, this, dt); }
@@ -411,7 +441,7 @@ export function jetPress(jet) {
 
 const jetLabel = (jet) => (jet.phase === 'thrust' ? 'Jet: thrusting' : jet.debt.ready ? 'Jet' : jet.debt.debt > jet.k.jetReady ? 'Jet: winded' : 'Jet: resting');
 
-/* Install on a Locomotion: loco.jet(opts), loco.startle(point, strength), loco.heartStopped, and the scenarios. */
+/* Install on a Locomotion: loco.jet(opts), loco.startle(point, strength), loco.heartStopped, the hops, and the scenarios. */
 export function installJet(loco, opts = {}) {
   const jet = new Jet(loco, opts);
   loco.jetMode = jet;
@@ -422,5 +452,6 @@ export function installJet(loco, opts = {}) {
   Object.defineProperty(loco, 'heartStopped', { get: () => jet.heartStopped, configurable: true });
   section('loco').add({ key: 'j', name: 'Jet', label: () => jetLabel(jet), run: () => jetPress(jet) });
   register('jetCheck', { label: 'Jet check', run: jetScenario });
+  installHop(loco, jet);
   return jet;
 }

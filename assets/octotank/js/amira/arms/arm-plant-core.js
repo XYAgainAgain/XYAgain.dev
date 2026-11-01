@@ -126,8 +126,9 @@ export function makeTrail(v, spread = 0.35, stiff = 0.3, tip = null) {
   return { kind: 'trail', t: 0, v: [v[0], v[1], v[2]], spread, stiff, tip };
 }
 
-export function makeSpread(down = 0.5) {
-  return { kind: 'spread', t: 0, down };
+/* aim, a unit world direction, overrides the bearing-and-down aim; its owner may rewrite it in place each tick. */
+export function makeSpread(down = 0.5, aim = null) {
+  return { kind: 'spread', t: 0, down, aim: aim ? [aim[0], aim[1], aim[2]] : null };
 }
 
 export function makeTuck(curl = 2) {
@@ -158,7 +159,7 @@ export function trailTargets(arm, T, K) {
 /* After a jet, arms out wide and down while she sinks onto them. */
 export function spreadTargets(arm, T, K) {
   const g = arm.goal, k = arm.knobs;
-  spreadDir(arm.frame.d, g.down, _dir);
+  if (g.aim) { _dir[0] = g.aim[0]; _dir[1] = g.aim[1]; _dir[2] = g.aim[2]; } else spreadDir(arm.frame.d, g.down, _dir);
   arm._aim(_dir[0], _dir[1], _dir[2], 1, T);
   trailingStiffness(arm, K, k.stiffBehind * 0.2, 0.6);
   return 0;
