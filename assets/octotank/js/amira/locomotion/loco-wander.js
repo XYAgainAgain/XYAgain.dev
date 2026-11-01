@@ -2,10 +2,11 @@ import { pickInterest, ATTEND_KNOBS } from '../attention.js';
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 import { TANK } from '../../config.js';
 import { sizeOf } from './locomotion.js';
+import { Travel } from './loco-travel.js';
 
 /* Her own destinations while nobody asks for one, a stand-in for the brain: she picks something that catches her eye (a
-   toy, the novel and moved likelier, a rock, a spot on the glass), crawls there, tastes or looks a while, and moves on.
-   She keeps to her side of the rock wall and visits the glass from the floor, until she can squeeze and climb. */
+   toy, the novel and moved likelier, a rock, a spot on the glass), goes there, tastes or looks a while, and moves on.
+   With the travel chooser off she keeps to her side of the rock wall and crawls; with it on, her mood picks how. */
 
 export class Wander {
   constructor(loco, { toys = [], rocks = [], attention = null, panelX = 0.1, panelT = 0.06, seed = 1 } = {}) {
@@ -27,50 +28,65 @@ export class Wander {
     this.dwellUntil = 0;
     this.looking = null;
     this.what = '';
+    this.how = '';
+    this.travel = new Travel(this, { seed });
   }
+
+  /* A wait or dwell of s seconds, shortened or stretched by her mood while the chooser runs. */
+  _paced(s, which) { return this.travel.active ? s * this.travel.pace()[which] : s; }
 
   tick(dt) {
     const loco = this.loco, k = loco.knobs;
     this.time += dt;
     if (!k.wander) {
       if (this.desire && loco.desire === this.desire) loco.stop('wander off');
-      this.desire = null; this.state = 'off';
+      this.desire = null; this.state = 'off'; this.travel.drop();
       return;
     }
+    if (this.travel.active) this.travel.tick();
     // Resting, she stays home: her own trip ends and no new one starts. A click or a scenario still sends her.
     if (loco.arms.resting) {
       if (this.desire && loco.desire === this.desire) loco.stop('resting');
       if (this.looking && loco.pose.focus?.point === this.looking) loco.pose.attend(null);
       this.looking = null;
       this.desire = null; this.state = 'rest'; this.next = Math.max(this.next, this.time + k.wanderMin);
+      if (this.travel.active) this.travel.drop();
       if (!loco.desire) return;
     }
     // A click or a scenario takes over until its own desire ends.
-    if (loco.desire && loco.desire !== this.desire) { this.desire = null; this.state = 'yield'; this.next = Math.max(this.next, this.time + k.wanderMin); return; }
+    if (loco.desire && loco.desire !== this.desire) {
+      this.desire = null; this.state = 'yield'; this.next = Math.max(this.next, this.time + k.wanderMin);
+      if (this.travel.active) this.travel.drop();
+      return;
+    }
     if (this.desire) {
       if (loco.desire === this.desire) return;
       const d = this.desire;
       this.desire = null;
+      // A crossing that ended short tries again soon, from wherever it got her.
+      const retry = this.travel.active && this.travel.ended(d);
       if (d.arrived) return this._arrive(d);
-      this.state = 'wait'; this.next = this.time + k.wanderMin;
+      this.state = 'wait'; this.next = this.time + (retry ? this.travel.knobs.crossRetry : this._paced(k.wanderMin, 'wait'));
       return;
     }
     if (this.state === 'dwell') {
       if (this.time < this.dwellUntil) return;
       if (this.looking && loco.pose.focus?.point === this.looking) loco.pose.attend(null);
       this.looking = null;
-      this.state = 'wait'; this.next = this.time + this.rng.range(k.wanderMin, Math.max(k.wanderMin, k.wanderMax));
+      this.state = 'wait'; this.next = this.time + this._paced(this.rng.range(k.wanderMin, Math.max(k.wanderMin, k.wanderMax)), 'wait');
     }
     if (this.state === 'off' || this.state === 'yield' || this.state === 'rest') this.state = 'wait';
     // Without arms that can plant she can't get anywhere, so she doesn't set out.
     if (this.time >= this.next && loco.canPlant) this._pick();
   }
 
-  /* One pick among everything on her side of the wall and farther than arriving distance. */
+  /* One pick among everything on one side of the wall and farther than arriving distance: hers, or with the chooser on
+     sometimes the far one, and then only what she can get to. */
   _pick() {
-    const loco = this.loco, k = loco.knobs, c = loco.c, P = this.points, T = this.toys, R = this.rocks, rng = this.rng;
-    const side = Math.sign(c[0] - this.panelX) || -1, clear = this.panelT / 2 + 0.08;
-    const ok = (p, size) => Number.isFinite(p[0] + p[1] + p[2]) && (p[0] - this.panelX) * side > clear && Math.hypot(p[0] - c[0], p[2] - c[2]) > k.arriveR + size;
+    const loco = this.loco, k = loco.knobs, c = loco.c, P = this.points, T = this.toys, R = this.rocks, rng = this.rng, tr = this.travel.active ? this.travel : null;
+    if (tr?.plan) return this._cross(tr.plan);
+    const own = Math.sign(c[0] - this.panelX) || -1, clear = this.panelT / 2 + 0.08, far = !!tr && tr.farPick(), side = far ? -own : own;
+    const ok = (p, size) => Number.isFinite(p[0] + p[1] + p[2]) && (p[0] - this.panelX) * side > clear && Math.hypot(p[0] - c[0], p[2] - c[2]) > k.arriveR + size && (!tr || tr.reachable(p));
     const nan = (p) => { p[0] = NaN; p[1] = NaN; p[2] = NaN; };
     for (let i = 0; i < T.length; i++) {
       loco._entryPoint(T[i], P[i]);
@@ -92,15 +108,29 @@ export class Wander {
     for (let i = g; i < g + 3; i++) if (!glass || !ok(P[i], 0)) nan(P[i]);
     if (!ok(P[g + 3], 0)) nan(P[g + 3]);
     const i = pickInterest(P, this.seen, rng, this.attention?.knobs ?? ATTEND_KNOBS, true);
-    this.next = this.time + k.wanderMin;
+    this.next = this.time + this._paced(k.wanderMin, 'wait');
     if (i < 0) return;
     const target = i < T.length ? T[i] : i < g ? R[i - T.length] : P[i];
     this.lastGlass = i >= g && i < g + 3;
     this.seen[i] = [...P[i]];
     if (i < T.length && this.attention) this.attention.seen[i] = [...P[i]];
     this.what = i < T.length ? `toy ${i}` : i < g ? 'a rock' : this.lastGlass ? 'the glass' : 'an open spot';
+    if (far) return this._cross(tr.plan = { target: Array.isArray(target) ? [...target] : target, what: this.what, side, tries: 0, d: null });
     this.desire = loco.want(target, { urgency: k.wanderUrgency, source: 'wander' });
+    this.how = this.desire && tr ? tr.go(this.desire, false).label : '';
     this.state = this.desire ? 'going' : 'wait';
+  }
+
+  /* A trip across the divider, the first try or the next: one desire, which the squeeze routes through the slot. */
+  _cross(plan) {
+    this.what = plan.what;
+    // Already over by some other way, it is an ordinary trip.
+    const across = this.travel._side() !== plan.side;
+    if (!across) this.travel.drop();
+    this.desire = plan.d = this.loco.want(plan.target, { urgency: this.loco.knobs.wanderUrgency, source: 'wander' });
+    this.how = this.desire ? this.travel.go(this.desire, across).label : '';
+    this.state = this.desire ? 'going' : 'wait';
+    if (!this.desire) this.travel.drop();
   }
 
   _held(toy) { return (this.loco.arms.episodes ?? []).some((e) => e?.h && e.toy === toy); }
@@ -111,11 +141,13 @@ export class Wander {
     if (i >= 0 && this.attention) this.attention.lookAndReach(i);
     else { this.looking = [...d.point]; this.loco.pose.attend(this.looking); }
     this.state = 'dwell';
-    this.dwellUntil = this.time + this.rng.range(k.dwellMin, Math.max(k.dwellMin, k.dwellMax));
+    this.dwellUntil = this.time + this._paced(this.rng.range(k.dwellMin, Math.max(k.dwellMin, k.dwellMax)), 'dwell');
   }
 
   describe() {
     if (!this.loco.knobs.wander) return 'wander off';
-    return this.state === 'going' ? `wandering to ${this.what}` : this.state === 'dwell' ? `with ${this.what}` : 'idle, wandering';
+    const mood = this.travel.describe(), how = this.how && this.travel.active ? ` by ${this.how}` : '';
+    const what = this.state === 'going' ? `wandering to ${this.what}${how}` : this.state === 'dwell' ? `with ${this.what}` : 'idle, wandering';
+    return mood ? `${what}  (${mood})` : what;
   }
 }

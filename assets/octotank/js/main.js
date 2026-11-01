@@ -50,7 +50,8 @@ import { rodArms, ROD_ARM_KNOBS } from './amira/arms/arm-rod.js';
    ?glide=0 (her body answers force without the water she drags; ?addedMass= and ?addedSpin= set each share)
    ?bends=0 (no bend limit on the rods; the bench has none unless ?bends=1)  ?twitch=0 (a stroke runs to the pop and drops its spring at once, a resting arm keeps its touch)  ?shiver=0 (the rod's rest shape takes the chain's bends tick by tick; the bench too unless ?shiver=1)
    ?slide=0 (her heading through her planted arms' springs even as she travels, no grip on the floor; the bench has no grip unless ?slide=1)
-   ?clear=0 (no whole-segment check against the divider and the rocks and no stretch cap: a segment's middle fixes as before) */
+   ?clear=0 (no whole-segment check against the divider and the rocks and no stretch cap: a segment's middle fixes as before)
+   ?travel=0 (no travel chooser: no moody spells, no hops or far-side trips of her own; she crawls her own side) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -177,6 +178,8 @@ async function boot() {
   if (params.get('shiver') === '0') arms.rodKnobs.restFollow = 0;
   if (params.get('twitch') === '0' && loco) { loco.knobs.strokeSpan = 0; loco.knobs.strokeFade = 0; loco.knobs.restQuiet = false; }
   if (params.get('slide') === '0' && loco) loco.knobs.feetCouple = false;
+  // Her mood picks how she travels and whether she crosses the divider; ?travel=0 has her crawl her own side as before.
+  if (params.get('travel') === '0' && loco?.wander) loco.wander.travel.knobs.on = false;
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();
@@ -241,6 +244,7 @@ async function boot() {
   tank.attention = attention; if (attention) tank.knobs.attention = attention.knobs;
   tank.carry = carry;
   if (den) { tank.den = den; tank.knobs.den = den.knobs; }
+  if (loco?.wander) { tank.travel = loco.wander.travel; tank.knobs.travel = loco.wander.travel.knobs; }
   tank.water = water; tank.knobs.water = water.knobs;
   tank.suckerView = new SuckerView(arms, scene);
   const armView = tank.armView = new ArmView(arms, mantle, scene, Number(params.get('girth')) > 0 ? { girth: +params.get('girth') } : {});

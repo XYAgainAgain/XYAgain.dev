@@ -24,6 +24,7 @@ export class Jet {
     this.to = null;
     this.vWant = 0;
     this.stopAtWalls = true;
+    this.meters = Infinity;    // the thrust's length, when one is asked for
     this.heartStopped = false;
     this.siphonDir = null;     // world direction the funnel blows while thrusting, null otherwise
     this.t = 0;
@@ -56,9 +57,9 @@ export class Jet {
   get busy() { return this.phase !== 'off'; }
 
   /* A jet (or with kind 'swim', the head-first swim) along dir, or toward point `to`. speed overrides urgency's. Thrust
-     ends short of a surface ahead so she coasts up to it (stopAtWalls true), on reaching it ('touch'), or never (false).
-     Returns true, or a string saying why not. */
-  start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true } = {}) {
+     ends short of a surface ahead so she coasts up to it (stopAtWalls true), on reaching it ('touch'), or never (false);
+     with `meters`, also once she has thrust that far. Returns true, or a string saying why not. */
+  start({ dir = null, to = null, speed = null, urgency = 1, reason = 'command', kind = 'jet', stopAtWalls = true, meters = Infinity } = {}) {
     const L = this.loco, k = this.k, m = this.mantle;
     // Her own glide's hold and a den's settle both give way to a fresh jet, once her heart allows; any other hold is a probe's.
     if (this.phase === 'thrust') return 'already moving';
@@ -81,6 +82,7 @@ export class Jet {
     if (this.kind === 'jet') this.debt.start();
     this.reason = reason;
     this.stopAtWalls = stopAtWalls === 'touch' ? 'touch' : stopAtWalls !== false;
+    this.meters = Number.isFinite(meters) && meters > 0 ? meters : Infinity;
     // The crawl stands down: strokes and stations let go, the stance lets go, every patch is left free.
     L.holdBy?.release('jet');
     L.standDown(0);
@@ -196,7 +198,8 @@ export class Jet {
     if (!adrift(this.adriftClock, dist, anchors, dt, k)) return;
     this.adriftClock.t = 0;
     const far = Math.hypot(d.point[0] - c[0], d.point[1] - c[1], d.point[2] - c[2]);
-    const kind = far <= k.swimDist && d.urgency < k.jetUrgency ? 'swim' : 'jet';
+    // In a calm spell she swims however far it is: calm, she never leaps to get somewhere.
+    const kind = (far <= k.swimDist && d.urgency < k.jetUrgency) || L.wander?.travel?.calm ? 'swim' : 'jet';
     this.start({ to: d.point, urgency: d.urgency, reason: 'adrift', kind });
   }
 
@@ -237,6 +240,8 @@ export class Jet {
     for (let a = 0; a < this.owned.length; a++) if (this.owned[a]) { this._arm(a, this.kind === 'swim' ? 'tuck' : 'trail'); this._carry(a); }
     this._emit('thrust', dt);
     if (spent) return this._endThrust('spent');
+    // A hop missing its aim by more than arriveR would otherwise thrust on across the tank.
+    if (L.meters >= this.meters) return this._endThrust('planned');
     if (this.t >= k.jetMaxT) return this._endThrust('time');
     if (this.stopAtWalls && this.arms.sdf) {
       this.arms.sdf.unfocus?.();
