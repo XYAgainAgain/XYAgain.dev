@@ -299,6 +299,8 @@ export class Arms {
       distance: sdf.distance,
       focus: (lo, hi) => { if (knobs.collider !== 'jolt') (knobs.looseContact ? all : sdf).focus(lo, hi); },
       unfocus: () => { all.unfocus(); sdf.unfocus(); },
+      // The furniture whose bounded solids a whole segment is checked against (arm-clear-core.js).
+      solids: sdf,
     };
   }
 

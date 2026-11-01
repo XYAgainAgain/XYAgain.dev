@@ -309,6 +309,8 @@ function placeAlong(pts, i, j, len, ref, cL, sL) {
   pts[i * 3] = pts[j * 3] + _dir[0] * len; pts[i * 3 + 1] = pts[j * 3 + 1] + _dir[1] * len; pts[i * 3 + 2] = pts[j * 3 + 2] + _dir[2] * len;
 }
 
+const GOLDEN = (Math.sqrt(5) - 1) / 2, SEG_ITERS = 16;
+
 /* Signed-distance world over boxes, spheres, capsules (local +Y axis, as Jolt's), and planes. A primitive's
    `q` is its world rotation; collide() returns the deepest penetration of a sphere and its outward normal. */
 export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
@@ -329,6 +331,8 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
   };
   const P = prims.map((p, i) => {
     const o = { ...p, q: [0, 0, 0, 1], c: [0, 0, 0], flat: true, lo: [-Infinity, -Infinity, -Infinity], hi: [Infinity, Infinity, Infinity], sealed: null, loose: i >= fixed, up: [0, 1, 0] };
+    // A bounded solid: a segment can cut it between two points clear of it, where a half-space or the sand can't be cut.
+    o.solid = i < fixed && (p.type === 'box' || p.type === 'capsule' || p.type === 'sphere');
     place(o, p.c ?? [0, 0, 0], p.q ?? [0, 0, 0, 1]);
     return o;
   });
@@ -422,11 +426,38 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
   // The primitives a probe looks at: all of them, or those near one arm after focus().
   const act = Int32Array.from(P, (_, i) => i);
   let nAct = P.length;
+  // A tapered capsule's depth into solid p at t along it, concave in t on a convex shape: a plain box or sphere, and a capsule
+  // whose end cap butting into another solid runs on as a cylinder, as collide() has it (a lip running into the glass).
+  const seg = { ax: 0, ay: 0, az: 0, dx: 0, dy: 0, dz: 0, ra: 0, dr: 0, x0: 0, x1: 0, y0: 0, y1: 0, z0: 0, z1: 0 };
+  const solidDist = (p, x, y, z) => sdf(p, x, y, z, p.type !== 'capsule');
+  const segDepth = (p, t) => seg.ra + seg.dr * t - solidDist(p, seg.ax + seg.dx * t, seg.ay + seg.dy * t, seg.az + seg.dz * t);
+  const setSeg = (ax, ay, az, bx, by, bz, ra, rb) => {
+    const R = Math.max(ra, rb);
+    seg.ax = ax; seg.ay = ay; seg.az = az; seg.dx = bx - ax; seg.dy = by - ay; seg.dz = bz - az; seg.ra = ra; seg.dr = rb - ra;
+    seg.x0 = Math.min(ax, bx) - R; seg.x1 = Math.max(ax, bx) + R; seg.y0 = Math.min(ay, by) - R; seg.y1 = Math.max(ay, by) + R;
+    seg.z0 = Math.min(az, bz) - R; seg.z1 = Math.max(az, bz) + R;
+  };
+  const near = (p) => !(seg.x1 < p.lo[0] || seg.x0 > p.hi[0] || seg.y1 < p.lo[1] || seg.y0 > p.hi[1] || seg.z1 < p.lo[2] || seg.z0 > p.hi[2]);
+  // The deepest t by golden section, then the two ends, which a concave depth may peak at.
+  const seek = { t: 0, v: 0, f0: 0, f1: 0 };
+  const deepest = (p) => {
+    let lo = 0, hi = 1, c = hi - GOLDEN, d = GOLDEN, fc = segDepth(p, c), fd = segDepth(p, d);
+    for (let it = 0; it < SEG_ITERS; it++) {
+      if (fc >= fd) { hi = d; d = c; fd = fc; c = hi - GOLDEN * (hi - lo); fc = segDepth(p, c); }
+      else { lo = c; c = d; fc = fd; d = lo + GOLDEN * (hi - lo); fd = segDepth(p, d); }
+    }
+    let t = fc >= fd ? c : d, v = Math.max(fc, fd);
+    const f0 = segDepth(p, 0), f1 = segDepth(p, 1);
+    if (f0 > v) { v = f0; t = 0; }
+    if (f1 > v) { v = f1; t = 1; }
+    seek.t = t; seek.v = v; seek.f0 = f0; seek.f1 = f1;
+  };
   const api = {
     prims: P,
     hit: -1,
     skip: -1,              // one primitive collide() ignores, such as the toy the probing arm holds.
     skipLo: 0, skipHi: Infinity, // for probes of these arm points only (a probe naming no point always skips it)
+    segHit: -1, segT: 0,   // cut()'s solid and where along the segment it cuts deepest
     /* Move primitive i, one past the fixed ones, to its pose this tick. */
     move(i, c, q) { place(P[i], c, q); },
     /* Narrow every collide() to the primitives whose bounds meet the box lo..hi, until the next focus or unfocus. */
@@ -451,6 +482,44 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
         if (pen > best) { best = pen; bi = act[k]; out[0] = g[0]; out[1] = g[1]; out[2] = g[2]; }
       }
       api.hit = bi;
+      return best;
+    },
+    /* How far a tapered capsule a (radius ra) to b (rb) cuts a bounded solid past what its end spheres sink in; -Infinity when none is near.
+       The deepest cut's outward normal goes into out, its solid into segHit, and its place along the segment into segT. */
+    cut(ax, ay, az, bx, by, bz, ra, rb, out) {
+      setSeg(ax, ay, az, bx, by, bz, ra, rb);
+      let best = -Infinity, bi = -1, bt = 0;
+      for (let i = 0; i < P.length; i++) {
+        const p = P[i];
+        if (!p.solid || !near(p)) continue;
+        deepest(p);
+        const e = seek.v - Math.max(0, seek.f0, seek.f1);
+        if (e > best) { best = e; bi = i; bt = seek.t; segDepth(p, bt); out[0] = g[0]; out[1] = g[1]; out[2] = g[2]; }
+      }
+      api.segHit = bi; api.segT = bt;
+      return best;
+    },
+    /* Bounded solid i's signed depth along such a capsule wherever it lies (negative: a gap), and its outward normal at
+       the deepest or nearest point into out. */
+    depthTo(i, ax, ay, az, bx, by, bz, ra, rb, out) {
+      const p = P[i];
+      if (!p?.solid) return -Infinity;
+      setSeg(ax, ay, az, bx, by, bz, ra, rb);
+      deepest(p);
+      segDepth(p, seek.t);
+      out[0] = g[0]; out[1] = g[1]; out[2] = g[2];
+      return seek.v;
+    },
+    /* How far the point lies from the nearest bounded solid, R when none is within R. */
+    gap(x, y, z, R) {
+      let best = R;
+      setSeg(x, y, z, x, y, z, R, R);
+      for (let i = 0; i < P.length; i++) {
+        const p = P[i];
+        if (!p.solid || !near(p)) continue;
+        const d = solidDist(p, x, y, z);
+        if (d < best) best = d;
+      }
       return best;
     },
     distance(x, y, z, out) {

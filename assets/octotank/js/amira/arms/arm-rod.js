@@ -1,6 +1,7 @@
 import { ROD_KNOBS, frameQuat, jointQuat } from './arm-rod-core.js';
 import { CoupledRod } from './arm-rod-coupled.js';
 import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, bodyRadius } from './arm-core.js';
+import { solidsOf, capLength, sidePush, foldTarget } from './arm-clear-core.js';
 
 /* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
    rod, with mass, water, and contact of its own, is where the arm is; it reaches the intent only through _feedback. */
@@ -28,6 +29,15 @@ export const ROD_ARM_KNOBS = {
   intentRounds: 1,       // finishing passes a driving rod's intent chain runs, the last of the arm-on-arm rounds (0: all)
   cutFixes: 3,           // pushes the last contact round may give one segment still cutting into something
   cutSkin: true,         // and those pushes count a segment's middle sunk in her skin too
+  // Segment clearance: the last round checks each whole segment against the divider and the rocks, and caps its stretch.
+  clear: true,
+  stretchCap: 1.9,       // of a segment's rest length, the longest contact leaves it (0: no cap)
+  clearFixes: 3,         // sideways pushes one segment cutting a solid may take before it is undone
+  clearTol: 0.005,       // m a segment may cut a solid past its ends and be left to the middle fixes: a graze, or a chord across a round surface
+  clearMargin: 2e-4,     // m past clear each push aims
+  clearSide: 0.2,        // share of the way-off direction that must lie across the segment for a push to help
+  clearTMin: 0.25,       // a cut this near the root end is pushed as if this far along, so the far end never leaps
+  foldMin: 0.1,          // of rest length, the shortest a segment folds to when nothing else clears it
   girthFloor: 0.8,       // stretch under which a squeezed segment stops thickening, the authored arm's stretchMin (0: no floor)
   current: true,         // the tank's currents push the rod
   braceGain: 12,         // times the passive bending and axial stiffness a fully braced stretch of arm adds on top
@@ -221,6 +231,7 @@ export class RodArm {
     this._L = new Float64Array(n - 1);
     this._Ls = new Float64Array(n - 1);   // each joint's spring stiffness, fading
     this._s3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    this.clearStats = { capped: 0, pushed: 0, reverted: 0, folded: 0 };
     this._sync();
   }
 
@@ -394,6 +405,8 @@ export class RodArm {
       if (!this._fresh && m > this.rad[i] * k.sweepStep) travelPoint(this, i, world, body, Q[o], Q[o + 1], Q[o + 2]);
       else projectPoint(this, i, world, body);
     }
+    const S = last && world && this.k.clear ? solidsOf(world) : null;
+    if (last) this._late = null;
     if (last && world) {
       const nrm = this._n, nb = this._mb ??= [0, 0, 0], fixes = Math.max(1, Math.round(this.k.cutFixes) || 1);
       for (let i = 1; i < n; i++) {
@@ -416,9 +429,91 @@ export class RodArm {
         }
       }
     }
+    if (S) this._clear(world, body, S);
     Q.set(X);
     this._fresh = false;
     this._first = false;
+  }
+
+  /* The last round's word on the bounded solids, root to tip: a segment cutting one is pushed off across itself toward where it
+     lay last tick, else put back there, else folded in beside its neighbor; then the stretch cap, along a segment now clear. */
+  _clear(world, body, S) {
+    this._late = S;
+    for (let i = 1; i < this.n; i++) this._clearSeg(i, world, body, S);
+  }
+
+  /* Segment i (nodes i − 1 to i) cleared of the bounded solids S, then capped along its now-clear line. */
+  _clearSeg(i, world, body, S) {
+    const X = this.X, P = this.started ? this.P : null, k = this.k, l0 = this.intent.len0, st = this.clearStats;
+    const nrm = this._cn ??= [0, 0, 0], tmp = this._ct ??= [0, 0, 0], tgt = this._cg ??= [0, 0, 0];
+    const fixes = Math.max(0, Math.round(k.clearFixes) || 0), tol = k.clearTol > 0 ? k.clearTol : 0;
+    const a = 3 * (i - 1), o = 3 * i, ra = this.rad[i - 1], rb = this.rad[i];
+    const max = k.stretchCap > 0 ? k.stretchCap * l0[i - 1] : Infinity, reach = Number.isFinite(max) ? max : 2 * l0[i - 1];
+    let cut = this._cut(S, a, o, ra, rb, nrm);
+    if (cut > tol) {
+      this._touched[i] = 1;
+      if (i < this._hit) this._hit = i;
+      for (let f = 0; f < fixes && cut > tol; f++) {
+        if (!sidePush(S, X, a, o, ra, rb, P, cut, nrm, k, reach, tmp, tgt)) break;
+        this._moveTo(i, world, body, tgt[0], tgt[1], tgt[2]);
+        cut = this._cut(S, a, o, ra, rb, nrm);
+        st.pushed++;
+      }
+      if (cut > tol && P) {
+        X[o] = P[o]; X[o + 1] = P[o + 1]; X[o + 2] = P[o + 2];
+        projectPoint(this, i, world, body);
+        cut = this._cut(S, a, o, ra, rb, nrm);
+        if (cut > tol) {
+          this._moveTo(i, world, body, P[o] + X[a] - P[a], P[o + 1] + X[a + 1] - P[a + 1], P[o + 2] + X[a + 2] - P[a + 2]);
+          cut = this._cut(S, a, o, ra, rb, nrm);
+        }
+        if (!(cut > tol)) st.reverted++;
+      }
+      // Last, the free ball beside its neighbor: always clear, though a node threaded past a wall comes back through it.
+      if (cut > tol) {
+        foldTarget(S, X, a, o, Math.max(ra, rb), Math.max(0, k.foldMin) * l0[i - 1], reach, tgt);
+        X[o] = tgt[0]; X[o + 1] = tgt[1]; X[o + 2] = tgt[2];
+        projectPoint(this, i, world, body);
+        st.folded++;
+      }
+    }
+    if (capLength(X, a, o, max)) st.capped++;
+  }
+
+  /* Settle's word after a toy's push moved nodes since the last round: each moved node out of the solids, then every segment
+     it touches cleared and capped the same way, the furniture alone, so the push's share into the toy stands. */
+  _clearLate() {
+    const X = this.X, Q = this.Q, S = this._late, l0 = this.intent.len0, cap = this.k.stretchCap > 0 ? this.k.stretchCap : Infinity;
+    this._late = null;
+    if (!S) {
+      for (let i = 1; i < this.n; i++) if (capLength(X, 3 * (i - 1), 3 * i, cap * l0[i - 1])) this.clearStats.capped++;
+      return;
+    }
+    // Another arm's contact may have left a focus on the solids; these nodes need all of them.
+    let unfocused = false;
+    for (let i = 1; i < this.n; i++) {
+      const a = 3 * (i - 1), o = 3 * i;
+      const movedA = X[a] !== Q[a] || X[a + 1] !== Q[a + 1] || X[a + 2] !== Q[a + 2];
+      const movedO = X[o] !== Q[o] || X[o + 1] !== Q[o + 1] || X[o + 2] !== Q[o + 2];
+      if (!movedA && !movedO) { if (capLength(X, a, o, cap * l0[i - 1])) this.clearStats.capped++; continue; }
+      if (!unfocused) { S.unfocus?.(); unfocused = true; }
+      // Only out of a bounded solid it sank in: the floor and the glass are point contact's, and a push off them here buzzed.
+      if (movedO && S.gap(X[o], X[o + 1], X[o + 2], this.rad[i]) < this.rad[i] - this.k.clearTol) projectPoint(this, i, S, null);
+      this._clearSeg(i, S, null, S);
+    }
+  }
+
+  /* How far segment a–o cuts the bounded solids past its own ends. */
+  _cut(S, a, o, ra, rb, out) {
+    const X = this.X;
+    return S.cut(X[a], X[a + 1], X[a + 2], X[o], X[o + 1], X[o + 2], ra, rb, out);
+  }
+
+  /* Point i carried to (x, y, z) around whatever it meets on the way. */
+  _moveTo(i, world, body, x, y, z) {
+    const X = this.X, o = 3 * i, fx = X[o], fy = X[o + 1], fz = X[o + 2];
+    X[o] = x; X[o + 1] = y; X[o + 2] = z;
+    travelPoint(this, i, world, body, fx, fy, fz);
   }
 
   /* After the last round: what contact moved, the rod keeps as velocity (a point pushed out of a rock must not keep
@@ -427,6 +522,8 @@ export class RodArm {
   settle(dt, her = null) {
     if (this.intent.valid === false) return;
     const rod = this.rod, X = this.X, x = rod.x, n = this.n, h = this._placed ? 0 : dt, joined = this._joined, nb = this._nb ??= [0, 0, 0];
+    // A toy's push since the last round can stretch a segment or swing it into a solid; clearance and the cap have the last word.
+    if (this.k.clear) this._clearLate();
     for (let i = 1; i < n; i++) {
       const o = i * 3, dx = X[o] - x[o], dy = X[o + 1] - x[o + 1], dz = X[o + 2] - x[o + 2];
       if (dx === 0 && dy === 0 && dz === 0) continue;

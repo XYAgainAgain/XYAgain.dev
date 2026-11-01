@@ -49,7 +49,8 @@ import { rodArms, ROD_ARM_KNOBS } from './amira/arms/arm-rod.js';
    ?recruit=0 (no recruiter: each idle arm starts its strokes on its own hazard, every arm explores as it would at rest)
    ?glide=0 (her body answers force without the water she drags; ?addedMass= and ?addedSpin= set each share)
    ?bends=0 (no bend limit on the rods; the bench has none unless ?bends=1)  ?twitch=0 (a stroke runs to the pop and drops its spring at once, a resting arm keeps its touch)  ?shiver=0 (the rod's rest shape takes the chain's bends tick by tick; the bench too unless ?shiver=1)
-   ?slide=0 (her heading through her planted arms' springs even as she travels, no grip on the floor; the bench has no grip unless ?slide=1) */
+   ?slide=0 (her heading through her planted arms' springs even as she travels, no grip on the floor; the bench has no grip unless ?slide=1)
+   ?clear=0 (no whole-segment check against the divider and the rocks and no stretch cap: a segment's middle fixes as before) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -127,7 +128,7 @@ async function boot() {
     mantle = new Mount({ ...BENCH_KNOBS });
     const index = mantle.k.index, rods = params.get('rod') === '0' ? [] : [index];
     // Its intent chain keeps every finishing pass, as the twin check's twin does; the twin check closes both rod-to-intent channels.
-    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', peel: params.get('peel') !== '0', bendLimit: params.get('bends') === '1', grip: params.get('slide') === '1' ? ROD_ARM_KNOBS.grip : 0, ...(params.get('shiver') === '1' ? {} : { restFollow: 0 }), intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
+    arms = new Arms(phys, mantle, armKnobs, { seed, indices: [index], rods, rodKnobs: { ...(twin ? { hold: 'off', aim: false } : {}), toyPush: 'rod', gripLoad: true, seals: true, grabby: params.get('grabby') === '1', grace: params.get('grace') === '1', peel: params.get('peel') !== '0', bendLimit: params.get('bends') === '1', grip: params.get('slide') === '1' ? ROD_ARM_KNOBS.grip : 0, ...(params.get('shiver') === '1' ? {} : { restFollow: 0 }), ...(params.get('clear') === '0' ? { clear: false } : {}), intentRounds: 0 }, bodyMass: benchBodyMass(1040) });
     arms.travelling = params.get('slide') === '1';
     bench = new Bench({ arms, mount: mantle, phys, seed, toys, rocks, twin });
   } else {
@@ -141,6 +142,7 @@ async function boot() {
     // Before the build, whose first tick lays the rods' rest shapes.
     if (params.get('bends') === '0') rodKnobs.bendLimit = false;
     if (params.get('slide') === '0') rodKnobs.grip = 0;
+    if (params.get('clear') === '0') rodKnobs.clear = false;
     arms = new Arms(phys, mantle, armKnobs, { seed, rods, rodKnobs, rodMode: params.get('rodmode') === 'shadow' ? 'shadow' : 'drive', couple });
     const locoOn = params.get('loco') !== '0';
     pose = new Pose(mantle, start, {}, { seed, rigid: !locoOn });

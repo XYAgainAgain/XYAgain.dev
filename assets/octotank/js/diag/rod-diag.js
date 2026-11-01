@@ -34,6 +34,23 @@ export function coupledLine(A) {
   return `Into her ${n} rods, ${one} one-way   push ${mN(c.impulseP).toFixed(0)} mN   twist ${mN(c.impulseL).toFixed(1)} mN·m   S ${c.S}, ${c.iters} iters   gap ${(c.gap * 1000).toFixed(2)} mm, ${(c.gapTurn * 180 / Math.PI).toFixed(2)}°${c.failed ? `   FAILED ${c.failed}` : ''}${c.refused ? '   REFUSED' : ''}`;
 }
 
+/* Segment clearance since the page began, every rod summed: caps, pushes off a solid, cuts undone, and folds, then the
+   worst segment's stretch now. */
+export function clearLine(A) {
+  const k = A.rodKnobs, t = { capped: 0, pushed: 0, reverted: 0, folded: 0 };
+  let worst = 0;
+  for (const r of A.rods) {
+    if (!r) continue;
+    for (const key in t) t[key] += r.clearStats[key];
+    for (let j = 0; j < r.n - 1; j++) {
+      const X = r.X, l = Math.hypot(X[3 * j + 3] - X[3 * j], X[3 * j + 4] - X[3 * j + 1], X[3 * j + 5] - X[3 * j + 2]) / r.len0[j];
+      if (l > worst) worst = l;
+    }
+  }
+  if (!k.clear) return `Clear    off   worst stretch ${worst.toFixed(2)}×`;
+  return `Clear    caps ${t.capped}   pushes ${t.pushed}   undone ${t.reverted}   folds ${t.folded}   worst stretch ${worst.toFixed(2)}×${k.stretchCap > 0 ? ` of ${k.stretchCap}×` : ''}`;
+}
+
 /* Which of several stats is worst by f: its index, or -1 for none. */
 export function worstOf(stats, f) {
   let best = -1;
@@ -131,6 +148,7 @@ export class RodDiag {
       const L = this.wrench[i].last, idN = Math.hypot(L[6], L[7], L[8]), gap = Math.hypot(L[0] - L[6], L[1] - L[7], L[2] - L[8]);
       if (this.wrench[i].n) lines.push(`ID       ${tag}pull ${(idN * 1000).toFixed(0)} mN   twist ${(Math.hypot(L[9], L[10], L[11]) * 1000).toFixed(1)} mN·m   gap ${idN > 1e-6 ? Math.round(gap / idN * 100) : 0}%`);
     }
+    lines.push(clearLine(A));
     lines.push(`Cost     rod${many ? 's' : ''} ${rs.p50.toFixed(3)} ms p50, ${rs.p95.toFixed(3)} p95${tail}`);
     return lines;
   }
@@ -189,6 +207,10 @@ export class RodDiag {
     range('Drag recover', [0.1, 0.2, 0.3, 0.5, 1], () => k.dragRecover, (v) => { k.dragRecover = v; }, (v) => `${v} a second`);
     range('Drag slip', [0.02, 0.04, 0.06, 0.08, 0.1], () => k.dragSlipMax, (v) => { k.dragSlipMax = v; }, cm);
     range('Rest follow', [0, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2], () => k.restFollow, (v) => { k.restFollow = v; }, (v) => (v > 0 ? `${v} s` : 'tick by tick'));
+    // Whole segments against the divider and the rocks, and the stretch cap (?clear=0 boots without both).
+    add({ name: 'Segment clearance', label: () => `Segment clearance: ${k.clear ? 'on' : 'off'}`, run: () => { k.clear = !k.clear; } });
+    range('Stretch cap', [0, 1.5, 1.7, 1.9, 2.2, 2.5], () => k.stretchCap, (v) => { k.stretchCap = v; }, (v) => (v > 0 ? `×${v}` : 'off'));
+    range('Cut left alone', [0.002, 0.003, 0.005, 0.008, 0.012], () => k.clearTol, (v) => { k.clearTol = v; }, (v) => `${(v * 1000).toFixed(0)} mm`);
     add({ name: 'Bend limit', label: () => `Bend limit: ${k.bendLimit ? 'on' : 'off'}`, run: () => { k.bendLimit = !k.bendLimit; } });
     range('Limit at the tip', [0.6, 0.7, 0.8, 0.9, 1.1], () => k.limitTip, (v) => { k.limitTip = v; }, (v) => `${Math.round(v * 180 / Math.PI)}°`);
     range('Limit spring from', [0.7, 0.8, 0.85, 0.9, 0.95], () => k.limitSoft, (v) => { k.limitSoft = v; }, (v) => `${Math.round(v * 100)}%`);
