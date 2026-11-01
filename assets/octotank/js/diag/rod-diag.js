@@ -51,6 +51,15 @@ export function clearLine(A) {
   return `Clear    caps ${t.capped}   pushes ${t.pushed}   undone ${t.reverted}   folds ${t.folded}   worst stretch ${worst.toFixed(2)}×${k.stretchCap > 0 ? ` of ${k.stretchCap}×` : ''}`;
 }
 
+/* The gathered rest's line: how far each rod's rest shape has let go of the chain for the relaxed one, and how fast it creeps. */
+export function gatherLine(A) {
+  const k = A.rodKnobs;
+  if (!k.gather) return 'Gather   off';
+  const w = [];
+  A.rods.forEach((r) => { if (r) w.push(Math.round((r.gatherW ?? 0) * 100)); });
+  return `Gather   ${w.join(' ')} %   relaxes in ${k.relaxTau} s`;
+}
+
 /* Which of several stats is worst by f: its index, or -1 for none. */
 export function worstOf(stats, f) {
   let best = -1;
@@ -149,6 +158,7 @@ export class RodDiag {
       if (this.wrench[i].n) lines.push(`ID       ${tag}pull ${(idN * 1000).toFixed(0)} mN   twist ${(Math.hypot(L[9], L[10], L[11]) * 1000).toFixed(1)} mN·m   gap ${idN > 1e-6 ? Math.round(gap / idN * 100) : 0}%`);
     }
     lines.push(clearLine(A));
+    lines.push(gatherLine(A));
     lines.push(`Cost     rod${many ? 's' : ''} ${rs.p50.toFixed(3)} ms p50, ${rs.p95.toFixed(3)} p95${tail}`);
     return lines;
   }
@@ -211,6 +221,11 @@ export class RodDiag {
     add({ name: 'Segment clearance', label: () => `Segment clearance: ${k.clear ? 'on' : 'off'}`, run: () => { k.clear = !k.clear; } });
     range('Stretch cap', [0, 1.5, 1.7, 1.9, 2.2, 2.5], () => k.stretchCap, (v) => { k.stretchCap = v; }, (v) => (v > 0 ? `×${v}` : 'off'));
     range('Cut left alone', [0.002, 0.003, 0.005, 0.008, 0.012], () => k.clearTol, (v) => { k.clearTol = v; }, (v) => `${(v * 1000).toFixed(0)} mm`);
+    // The gathered rest (?gather=0 boots without it).
+    add({ name: 'Gathered rest', label: () => `Gathered rest: ${k.gather ? 'on' : 'off'}`, run: () => { k.gather = !k.gather; } });
+    range('Relaxes in', [0.3, 0.6, 1, 2, 4], () => k.relaxTau, (v) => { k.relaxTau = v; }, (v) => `${v} s`);
+    range('Lets go from', [0, 0.15, 0.3, 0.5], () => k.gatherFrom, (v) => { k.gatherFrom = v; }, (v) => `${Math.round(v * 100)}% rested`);
+    range('Let go by', [0.6, 0.75, 0.9, 1], () => k.gatherTo, (v) => { k.gatherTo = v; }, (v) => `${Math.round(v * 100)}% rested`);
     add({ name: 'Bend limit', label: () => `Bend limit: ${k.bendLimit ? 'on' : 'off'}`, run: () => { k.bendLimit = !k.bendLimit; } });
     range('Limit at the tip', [0.6, 0.7, 0.8, 0.9, 1.1], () => k.limitTip, (v) => { k.limitTip = v; }, (v) => `${Math.round(v * 180 / Math.PI)}°`);
     range('Limit spring from', [0.7, 0.8, 0.85, 0.9, 0.95], () => k.limitSoft, (v) => { k.limitSoft = v; }, (v) => `${Math.round(v * 100)}%`);

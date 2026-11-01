@@ -2,6 +2,7 @@ import { ROD_KNOBS, frameQuat, jointQuat } from './arm-rod-core.js';
 import { CoupledRod } from './arm-rod-coupled.js';
 import { restArm, armVolume, projectPoint, travelPoint, focusChain, chainBends, bodyRadius } from './arm-core.js';
 import { solidsOf, capLength, sidePush, foldTarget } from './arm-clear-core.js';
+import { gatherWeight, liveBends, relaxBends, blendBends } from './arm-gather-core.js';
 
 /* A rod arm's body chain: the intent Arm keeps its programs and its chain, its chain's bends set the rod's rest shape, and the
    rod, with mass, water, and contact of its own, is where the arm is; it reaches the intent only through _feedback. */
@@ -22,6 +23,12 @@ export const ROD_ARM_KNOBS = {
   restFollow: 0.05,      // s the rest shape takes to follow the chain's bends: its contact moves them a little every tick, and a soft rod takes each as a shove
   rest: 'chain',         // the rest shape: the intent's chain as its contact laid it, its posed bends ('bends', which can
                          // run through her body), or 'targets' (its programs' own, with the rod as their spring)
+  // The gathered rest (arm-gather-core.js): resting with nothing to do, the rest shape creeps onto the rod's own bends, so the
+  // arm drapes on what it lies on instead of holding the chain's shape against it.
+  gather: true,
+  gatherFrom: 0.3,       // restW where the rest shape starts letting go of the chain
+  gatherTo: 0.9,         // and where it has let go
+  relaxTau: 1,           // s the relaxed rest shape takes to creep onto the rod's own bends
   hold: 'rod',           // whose contact bends later rest shapes: 'rod', 'ghost' (the intent chain's own), or 'off'
   stiffRef: 90,          // 1/s² of authored joint stiffness that leaves the rod's bending as is, in targets mode
   rootShare: 0.033,      // the drawn arm's root radius over the full arm's length, the front pair's too
@@ -232,6 +239,7 @@ export class RodArm {
     this._Ls = new Float64Array(n - 1);   // each joint's spring stiffness, fading
     this._s3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     this.clearStats = { capped: 0, pushed: 0, reverted: 0, folded: 0 };
+    this.gatherW = 0;                     // how far the rest shape has let go of the chain for the relaxed one (arm-gather-core.js)
     this._sync();
   }
 
@@ -268,6 +276,7 @@ export class RodArm {
     const want = this.gripping || ((kind === 'hold' || kind === 'plant') && !stroke) || kind === 'fetch' ? 1 : 0;
     this.grab = !this.started ? want : this.grab + (want - this.grab) * (dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.grabTau)) : 0);
     if (k.rest === 'targets') {
+      this.gatherW = 0;
       rod.setRestFromBends(arm.tgt, arm.twist, arm.lam);
       const ak = arm.knobs, ref = k.stiffRef > 0 ? k.stiffRef : ROD_ARM_KNOBS.stiffRef;
       for (let j = 0; j < rod.n; j++) {
@@ -285,6 +294,14 @@ export class RodArm {
         const E = this._Be ??= Float64Array.from(B), f = !this.started ? 1 : dt > 0 ? 1 - Math.exp(-dt / k.restFollow) : 0;
         for (let a = 0; a < E.length; a++) B[a] = E[a] += (B[a] - E[a]) * f;
       } else this._Be = null;
+      // Resting with nothing to do, the shape lets go of the chain for one creeping onto the rod's own bends (a program, a tuck or
+      // a reach, takes it back); awake, the relaxed shape tracks the chain, so letting go starts with no jump.
+      const gw = k.gather && fromChain && this.started ? gatherWeight(arm.restW, k.gatherFrom, k.gatherTo) * (1 - arm.w) : 0, R = this._Br ??= new Float64Array(B.length);
+      if (gw > 0) {
+        relaxBends(R, liveBends(rod.q, rod.qg, arm.twist, rod.n, this._Bl ??= new Float64Array(B.length)), lim, dt > 0 ? 1 - Math.exp(-dt / Math.max(1e-3, k.relaxTau)) : 0, rod.n);
+        blendBends(B, R, gw, B);
+      } else R.set(B);
+      this.gatherW = gw;
       rod.setRestFromBends(B, arm.twist, arm.lam);
       // Soft tissue, firmed where the program braces: a braced stretch of arm is braceFactor times stiffer, a relaxed one is
       // the passive tissue (with the muscle map's own small change in muscle mode).
