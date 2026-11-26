@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
-import { Fn, uniform, texture, positionLocal, positionWorld, cameraPosition, normalWorld, materialColor, materialEmissive, vec2, vec3, vec4, float, mix, refract } from 'three/tsl';
+import { Fn, uniform, texture, positionLocal, positionWorld, cameraPosition, normalWorld, materialColor, materialEmissive, materialAO, vec2, vec3, vec4, float, mix, refract } from 'three/tsl';
 import { clipProjection } from './optics-core.js';
 import { Refraction } from './refraction.js';
 
 export class Surface {
-  constructor(renderer, scene, camera, waves, level, knobs) {
-    Object.assign(this, { renderer, scene, camera, waves, knobs });
+  constructor(renderer, scene, camera, waves, level, knobs, { occupancy = null } = {}) {
+    Object.assign(this, { renderer, scene, camera, waves, knobs, occupancy });
     this.level = uniform(level);
     this.gain = uniform(knobs.caustics);
     this.reflectionOn = uniform(0);
@@ -17,7 +17,10 @@ export class Surface {
     this.field.generateMipmaps = false;
     this.focus = new Float32Array(nx * nz);
     this.slope = [0, 0];
-    this.originals = new Map(); this.reverse = new Map();
+    // Patched copies by original, receivers of the contact shadow apart from the casters (who would only shadow themselves).
+    this.originals = new Map(); this.casters = new Map(); this.reverse = new Map();
+    this.dirty = true; this.hooked = new Set(); this.onChild = () => { this.dirty = true; };
+    this.onGone = ({ child }) => child.traverse((object) => this.unhook(object));
     this.group = new THREE.Group();
     this.group.name = 'Water visuals';
     scene.add(this.group);
@@ -110,44 +113,66 @@ export class Surface {
     edgePositions.needsUpdate = true;
   }
 
-  material(original) {
+  /* The original's color, emissive, and occlusion nodes (or the material's defaults) with the caustic and the depth tint
+     on top; on receivers, the contact shadow in the occlusion and, by contactDirect, the rest. */
+  material(original, receive = true) {
     if (!original?.isMeshStandardMaterial || this.reverse.has(original)) return original;
-    if (this.originals.has(original)) return this.originals.get(original);
+    const contact = receive ? this.occupancy : null, cache = contact ? this.originals : this.casters;
+    if (cache.has(original)) return cache.get(original);
     const result = new THREE.MeshStandardNodeMaterial();
     result.copy(original);
     const { width, depth } = this.waves;
+    const base = original.colorNode ?? materialColor, emissive = original.emissiveNode ?? materialEmissive;
+    const touch = contact ? contact.contactAt(positionWorld).toVar() : null, direct = touch ? contact.directOf(touch) : float(1);
     result.colorNode = Fn(() => {
       const wet = this.level.sub(positionWorld.y).smoothstep(0, 0.02);
       const coord = positionWorld.xz.add(vec2(positionWorld.y.mul(0.12), positionWorld.y.mul(-0.08))).div(vec2(width, depth)).add(0.5);
       const caustic = texture(this.field, coord.clamp(0.001, 0.999)).a.sub(1).mul(3).clamp(-0.4, 2);
       const lit = normalWorld.y.max(0).mul(0.8).add(0.2);
       const waterDepth = positionWorld.z.negate().add(depth / 2).div(depth).clamp(0, 1);
-      return materialColor.mul(float(1).add(caustic.mul(this.gain).mul(wet).mul(lit)))
+      const color = base.mul(float(1).add(caustic.mul(this.gain).mul(wet).mul(lit)))
         .mul(mix(vec3(1), vec3(0.86, 0.96, 0.99), waterDepth.mul(wet)));
+      return touch ? color.mul(direct) : color;
     })();
     result.emissiveNode = Fn(() => {
       const wet = this.level.sub(positionWorld.y).smoothstep(0, 0.02);
       const coord = positionWorld.xz.add(vec2(positionWorld.y.mul(0.12), positionWorld.y.mul(-0.08))).div(vec2(width, depth)).add(0.5);
       const light = texture(this.field, coord.clamp(0.001, 0.999)).a.sub(1).max(0).min(2);
-      return materialEmissive.add(vec3(0.045, 0.065, 0.06).mul(light).mul(this.gain).mul(wet).mul(normalWorld.y.max(0)));
+      return emissive.add(vec3(0.045, 0.065, 0.06).mul(light).mul(this.gain).mul(wet).mul(normalWorld.y.max(0)).mul(direct));
     })();
-    this.originals.set(original, result); this.reverse.set(result, original);
+    // An aoNode makes Three skip the aoMap, so a mapped original's occlusion is folded back in by hand.
+    if (touch) { const ao = original.aoNode ?? (original.aoMap ? materialAO : null); result.aoNode = ao ? ao.mul(touch) : touch; }
+    cache.set(original, result); this.reverse.set(result, original);
     return result;
   }
 
+  /* Walks the scene once: patches (or restores) every standard material and listens for children added anywhere, so a
+     mesh added later marks the scene dirty and is patched on the next update. A material swapped in place calls markDirty. */
   patchMaterials(enabled) {
     let changed = false;
     this.scene.traverse((object) => {
+      if (!this.hooked.has(object)) {
+        this.hooked.add(object); object.addEventListener('childadded', this.onChild); object.addEventListener('childremoved', this.onGone);
+      }
       if (!object.isMesh || object === this.mesh) return;
+      const receive = !object.userData.noContact;
       const patch = (m) => {
-        const next = enabled ? this.material(m) : (this.reverse.get(m) ?? m);
+        const source = this.reverse.get(m) ?? m, next = enabled ? this.material(source, receive) : source;
         if (next !== m) changed = true;
         return next;
       };
       if (Array.isArray(object.material)) object.material = object.material.map(patch);
       else object.material = patch(object.material);
     });
+    this.dirty = false;
     if (changed) { this.lastReflection = -Infinity; this.refraction.last = -Infinity; }
+  }
+
+  markDirty() { this.dirty = true; }
+
+  unhook(object) {
+    if (!this.hooked.delete(object)) return;
+    object.removeEventListener('childadded', this.onChild); object.removeEventListener('childremoved', this.onGone);
   }
 
   update(level) {
@@ -157,7 +182,7 @@ export class Surface {
     this.backdrop.position.y = level / 2; this.backdrop.scale.y = level;
     this.gain.value = Math.max(0, this.knobs.caustics);
     this.reflectionStrength.value = Math.max(0, this.knobs.reflectionStrength);
-    this.patchMaterials(true);
+    if (this.dirty) this.patchMaterials(true);
   }
 
   reflect(time, force = false) {
@@ -221,8 +246,9 @@ export class Surface {
 
   dispose() {
     this.patchMaterials(false);
-    for (const m of this.originals.values()) m.dispose();
-    this.originals.clear(); this.reverse.clear();
+    for (const object of [...this.hooked]) this.unhook(object);
+    for (const m of [...this.originals.values(), ...this.casters.values()]) m.dispose();
+    this.originals.clear(); this.casters.clear(); this.reverse.clear();
     this.group.removeFromParent();
     for (const object of [this.mesh, this.line, this.backdrop]) { object.geometry.dispose(); object.material.dispose(); }
     this.field.dispose(); this.target.dispose();

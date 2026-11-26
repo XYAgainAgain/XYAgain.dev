@@ -34,6 +34,9 @@ export function attachDebug(ctx) {
     setProbe: (fn) => { ctx.probe = typeof fn === 'function' ? fn : null; },
   };
   if (ctx.loco) tank.knobs.loco = ctx.loco.knobs;
+  // The passages fitted from the layout's squeeze zones, and a line per zone on what it held.
+  tank.passages = ctx.rockwork?.passages ?? [];
+  tank.passageNotes = ctx.rockwork?.notes ?? [];
   return tank;
 }
 

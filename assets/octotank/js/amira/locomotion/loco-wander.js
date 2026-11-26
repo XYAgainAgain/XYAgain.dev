@@ -44,7 +44,7 @@ export class Wander {
       return;
     }
     if (this.travel.active) this.travel.tick();
-    // Resting, she stays home: her own trip ends and no new one starts. A click or a scenario still sends her.
+    // Resting, she stays home: her trip ends and no new one starts. A click or a scenario can send her anyway.
     if (loco.arms.resting) {
       if (this.desire && loco.desire === this.desire) loco.stop('resting');
       if (this.looking && loco.pose.focus?.point === this.looking) loco.pose.attend(null);
@@ -84,10 +84,21 @@ export class Wander {
      sometimes the far one, and then only what she can get to. */
   _pick() {
     const loco = this.loco, k = loco.knobs, c = loco.c, P = this.points, T = this.toys, R = this.rocks, rng = this.rng, tr = this.travel.active ? this.travel : null;
-    if (tr?.plan) return this._cross(tr.plan);
+    // A passage retry is dropped while an arm grips a toy, or when the passage fails her fit.
+    const gripping = (loco.arms.episodes ?? []).some((e) => e?.h);
+    if (tr?.plan) {
+      if (!tr.plan.passage || (!gripping && tr.usable(tr.plan.passage))) return this._cross(tr.plan);
+      tr.drop();
+    }
     // No panel is one undivided tank: no sides, and the rock, if any, rules out what her body can't stand at.
     const walled = this.panelX != null, phys = loco.arms.phys, reach = this._reach ??= bodyReach(loco.mantle);
-    const own = walled ? Math.sign(c[0] - this.panelX) || -1 : Math.sign(c[0]) || -1, clear = walled ? this.panelT / 2 + 0.08 : 0, far = walled && !!tr && tr.farPick(), side = far ? -own : own;
+    const tunnel = !walled && tr && !gripping ? tr.passage() : null;
+    const own = walled ? Math.sign(c[0] - this.panelX) || -1 : Math.sign(c[0]) || -1, clear = walled ? this.panelT / 2 + 0.08 : 0, far = (walled || !!tunnel) && !!tr && tr.farPick(), side = far ? -own : own;
+    // Through the rock a far trip is a spot past the passage's other mouth, from wherever she is.
+    if (far && tunnel) {
+      const there = -tr._side(), spot = tr.farSpot(tunnel, there);
+      if (spot) { this.next = this.time + this._paced(k.wanderMin, 'wait'); return this._cross(tr.plan = { target: spot, what: 'the far side', side: there, tries: 0, d: null, passage: tunnel }); }
+    }
     const ok = (p, size, place = true) => Number.isFinite(p[0] + p[1] + p[2]) && (!walled || (p[0] - this.panelX) * side > clear) && Math.hypot(p[0] - c[0], p[2] - c[2]) > k.arriveR + size && (!tr || tr.reachable(p))
       && (place ? clearOfRock(phys, p, reach) : rockDistance(phys, p[0], p[1], p[2]) > 0);
     const nan = (p) => { p[0] = NaN; p[1] = NaN; p[2] = NaN; };
@@ -123,20 +134,21 @@ export class Wander {
     this.seen[i] = [...P[i]];
     if (i < T.length && this.attention) this.attention.seen[i] = [...P[i]];
     this.what = i < T.length ? `toy ${i}` : i < g ? 'a rock' : this.lastGlass ? 'the glass' : 'an open spot';
-    if (far) return this._cross(tr.plan = { target: Array.isArray(target) ? [...target] : target, what: this.what, side, tries: 0, d: null });
+    if (far && !tunnel) return this._cross(tr.plan = { target: Array.isArray(target) ? [...target] : target, what: this.what, side, tries: 0, d: null });
     this.desire = loco.want(target, { urgency: k.wanderUrgency, source: 'wander' });
     this.how = this.desire && tr ? tr.go(this.desire, false).label : '';
     this.state = this.desire ? 'going' : 'wait';
   }
 
-  /* A trip across the divider, the first try or the next: one desire, which the squeeze routes through the slot. */
+  /* A trip across the divider, the first try or the next: one desire, which the squeeze routes through the slot or a passage. */
   _cross(plan) {
     this.what = plan.what;
     // Already over by some other way, it is an ordinary trip.
     const across = this.travel._side() !== plan.side;
     if (!across) this.travel.drop();
     this.desire = plan.d = this.loco.want(plan.target, { urgency: this.loco.knobs.wanderUrgency, source: 'wander' });
-    this.how = this.desire ? this.travel.go(this.desire, across).label : '';
+    if (this.desire && across && plan.passage) this.desire.via = plan.passage;
+    this.how = this.desire ? this.travel.go(this.desire, across && plan.passage ? 'tunnel' : across).label : '';
     this.state = this.desire ? 'going' : 'wait';
     if (!this.desire) this.travel.drop();
   }

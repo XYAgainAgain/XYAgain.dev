@@ -1,16 +1,68 @@
 import * as THREE from 'three/webgpu';
+// Node's headless boot stubs three with no named exports and never mounts the sand, so the TSL names resolve late.
+import * as TSL from 'three/tsl';
 import { TANK } from '../config.js';
 import { section } from '../diag/panel.js';
 import { readPose, verticalSpan } from './toy-ripples.js';
 import { SandField } from './sand-core.js';
 import { SandCollider } from './sand-collider.js';
 import { SandContacts } from './sand-contacts.js';
+import { SAND_LOOK, FLAT_CUT, FLAT_RAMP, AO_INTENSITY, TRIPLANAR_MODES, roughnessRange } from './sand-look-core.js';
+
+/* The sand's maps along three axis projections in the bed's unrotated space. The top one is the planar mapping
+   on the mesh's uv with Three's normal map, so flat sand and ?triplanar=0 match the planar look. */
+export function sandNodes(maps, u) {
+  const { Fn, texture, uv, positionLocal, normalWorldGeometry, normalMap, transformDirection, cameraViewMatrix, vec3, vec4, float, If, mix, select, smoothstep, dFdx, dFdy } = TSL;
+  const weights = () => {
+    const n = normalWorldGeometry, a = n.abs().pow(vec3(u.sharpness)), w = a.div(a.x.add(a.y).add(a.z).max(1e-8));
+    const side = float(1).sub(smoothstep(float(FLAT_CUT - FLAT_RAMP), float(FLAT_CUT), n.y)).mul(u.sides.min(1));
+    const wx = w.x.mul(side), wz = w.z.mul(side), walls = u.sides.lessThan(1.5), keepX = wx.greaterThanEqual(wz);
+    const x = select(walls.and(keepX.not()), float(0), wx), z = select(walls.and(keepX), float(0), wz);
+    return vec3(x, float(1).sub(x).sub(z), z);
+  };
+  /* Side lookups sit in fragment-dependent branches, where derivatives are undefined and Naga rejects them. A toVar is
+     declared where first read, so the gradients are assigned here, inside the Fn but before any If. */
+  const projections = () => {
+    const p = positionLocal.mul(u.invTile), uvX = p.zy.toVar(), uvZ = p.xy.toVar(), gx = vec4(0).toVar(), gz = vec4(0).toVar();
+    gx.assign(vec4(dFdx(uvX), dFdy(uvX))); gz.assign(vec4(dFdx(uvZ), dFdy(uvZ)));
+    return { w: weights().toVar(), top: uv().mul(u.invTile), uvX, uvZ, gx, gz };
+  };
+  const blend = (map, pick) => Fn(() => {
+    const { w, top, uvX, uvZ, gx, gz } = projections();
+    const result = pick(texture(map, top)).mul(w.y).toVar();
+    If(w.x.greaterThan(0), () => { result.addAssign(pick(texture(map, uvX).grad(gx.xy, gx.zw)).mul(w.x)); });
+    If(w.z.greaterThan(0), () => { result.addAssign(pick(texture(map, uvZ).grad(gz.xy, gz.zw)).mul(w.z)); });
+    return result;
+  })();
+  const normal = Fn(() => {
+    const { w, top, uvX, uvZ, gx, gz } = projections(), N = normalWorldGeometry, s = u.relief;
+    const result = normalMap(texture(maps.normal, top), u.relief2).mul(w.y).toVar();
+    // Whiteout blends in world space: X projects (z, y) and Z projects (x, y), each tangent sample riding the true normal.
+    If(w.x.greaterThan(0), () => {
+      const t = texture(maps.normal, uvX).grad(gx.xy, gx.zw).xyz.mul(2).sub(1);
+      result.addAssign(transformDirection(vec3(N.x.mul(t.z.abs()), N.y.add(t.y.mul(s)), N.z.add(t.x.mul(s))), cameraViewMatrix).mul(w.x));
+    });
+    If(w.z.greaterThan(0), () => {
+      const t = texture(maps.normal, uvZ).grad(gz.xy, gz.zw).xyz.mul(2).sub(1);
+      result.addAssign(transformDirection(vec3(N.x.add(t.x.mul(s)), N.y.add(t.y.mul(s)), N.z.mul(t.z.abs())), cameraViewMatrix).mul(w.z));
+    });
+    return result.normalize();
+  })();
+  return {
+    color: blend(maps.albedo, (s) => s.rgb),
+    roughness: mix(u.roughLo, u.roughHi, blend(maps.roughness, (s) => s.g)),
+    // The AO map's intensity, applied here because an aoNode replaces the material's aoMap path.
+    ao: blend(maps.ao, (s) => s.r).sub(1).mul(AO_INTENSITY).add(1),
+    normal,
+  };
+}
 
 export class TankSand {
   constructor(phys, knobs = {}) {
     this.phys = phys;
     this.field = new SandField(TANK.w, TANK.d, 256, 128, knobs);
     this.knobs = this.field.knobs;
+    for (const key of Object.keys(SAND_LOOK)) this.knobs[key] ??= SAND_LOOK[key];
     this.contacts = new SandContacts(phys, this.field);
     this.collider = new SandCollider(phys, this.field);
     phys.terrain = this.collider;
@@ -55,10 +107,15 @@ export class TankSand {
     const height = this.textures.height.image, canvas = document.createElement('canvas'); canvas.width = canvas.height = 128;
     const context = canvas.getContext('2d', { willReadFrequently: true });
     context.drawImage(height, 0, 0, 128, 128); this.detail = context.getImageData(0, 0, 128, 128).data;
-    const material = this.material = new THREE.MeshStandardMaterial({
-      map: this.textures.albedo, normalMap: this.textures.normal, roughnessMap: this.textures.roughness,
-      aoMap: this.textures.ao, aoMapIntensity: 0.35, roughness: 0.95, normalScale: new THREE.Vector2(this.knobs.relief, this.knobs.relief),
-    });
+    const { uniform } = TSL;
+    this.u = {
+      invTile: uniform(1 / this.knobs.tileSize), relief: uniform(this.knobs.relief), relief2: uniform(new THREE.Vector2(this.knobs.relief, this.knobs.relief)),
+      sides: uniform(TRIPLANAR_MODES.on), roughLo: uniform(0), roughHi: uniform(1), sharpness: uniform(SAND_LOOK.sharpness),
+    };
+    const material = this.material = new THREE.MeshStandardNodeMaterial({ roughness: 1, metalness: 0 });
+    const nodes = sandNodes(this.textures, this.u);
+    material.colorNode = nodes.color; material.roughnessNode = nodes.roughness; material.aoNode = nodes.ao; material.normalNode = nodes.normal;
+    this.look();
     const f = this.field, geometry = new THREE.PlaneGeometry(f.width, f.depth, f.nx - 1, f.nz - 1);
     this.micro = new Float32Array(f.h.length);
     geometry.rotateX(-Math.PI / 2);
@@ -98,13 +155,22 @@ export class TankSand {
     return ((at(i, j) * (1 - a) + at(i + 1, j) * a) * (1 - b) + (at(i, j + 1) * (1 - a) + at(i + 1, j + 1) * a) * b) * 0.003 * this.knobs.relief;
   }
 
+  /* The material's uniforms from the knobs: tile size and relief (the panel's controls), triplanar mode, roughness floor. */
+  look() {
+    const k = this.knobs, u = this.u;
+    if (!u) return;
+    const tile = Number.isFinite(k.tileSize) && k.tileSize > 0 ? k.tileSize : 0.35, relief = Number.isFinite(k.relief) ? k.relief : 0;
+    u.invTile.value = 1 / tile; u.relief.value = relief; u.relief2.value.set(relief, relief);
+    u.sides.value = TRIPLANAR_MODES[k.triplanar] ?? TRIPLANAR_MODES.on;
+    u.sharpness.value = Number.isFinite(k.sharpness) ? Math.max(1, k.sharpness) : SAND_LOOK.sharpness;
+    [u.roughLo.value, u.roughHi.value] = roughnessRange(k.roughFloor);
+  }
+
   sync(force = false) {
     if (!this.mesh) return;
     const started = performance.now(), f = this.field, style = `${this.knobs.tileSize}/${this.knobs.relief}`;
+    this.look();
     if (style !== this.style) {
-      for (const texture of Object.values(this.textures)) texture.repeat.setScalar(1 / this.knobs.tileSize);
-      for (const mesh of [this.mesh, this.skirt]) mesh.material.normalScale.setScalar(this.knobs.relief);
-      this.material.normalScale.setScalar(this.knobs.relief);
       const positions = this.mesh.geometry.attributes.position.array;
       for (let p = 0; p < this.micro.length; p++) this.micro[p] = this.detailAt(positions[p * 3], positions[p * 3 + 2]);
       this.style = style; force = true;
@@ -169,8 +235,12 @@ export class TankSand {
         ['Den healing half-life', 'intentHalfLife', [0, 3600, 21600, 86400, 604800], (v) => v ? `${+(v / 3600).toFixed(1)} hr` : 'off'],
         ['Gravel settling', 'slump', [0, 0.5, 1, 2, 4, 8], (v) => `${v}×`],
         ['Excavation limit', 'limit', [0.01, 0.02, 0.03, 0.04], (v) => `${Math.round(v * 100)} cm`],
+        ['Roughness floor', 'roughFloor', [0, 0.3, 0.45, 0.6, 0.75], (v) => (v ? `${v}` : 'off (raw map)')],
+        ['Triplanar sharpness', 'sharpness', [2, 4, 8, 16], (v) => `${v}`],
       ].map(([name, key, values, format]) => ({ type: 'range', name, values, get: () => this.knobs[key], label: () => `${name}: ${format(this.knobs[key])}`,
         set: (value) => { this.knobs[key] = value; if (key === 'unevenness' || key === 'limit') this.reset(); else this.sync(); } })),
+      { name: 'Triplanar sand', label: () => `Triplanar: ${this.knobs.triplanar}`,
+        run: () => { const modes = ['on', 'walls', 'off']; this.knobs.triplanar = modes[(modes.indexOf(this.knobs.triplanar) + 1) % modes.length]; this.look(); } },
     ];
     for (const action of this.actions) controls.add(action);
   }

@@ -1,8 +1,10 @@
-import { TRAVEL_KNOBS, Energy, reachable, paceOf, priceTrip, hopAim, hopSpot, clamp } from './loco-travel-core.js';
+import { TRAVEL_KNOBS, Energy, reachable, paceOf, priceTrip, hopAim, hopSpot, clamp, farCoin } from './loco-travel-core.js';
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 import { TANK } from '../../config.js';
 import { section } from '../../diag/panel.js';
 import { clearOfRock, bodyReach } from '../../tank/rock-clear.js';
+import { passageFit } from './loco-squeeze-core.js';
+import { passageOut } from './loco-passage-core.js';
 
 /* How she gets where Wander sends her, and how much she wants to go: her energy drifts through calm and restless spells,
    each trip is priced by mode (crawl, climb, the squeeze, a hop, a swing once she has one), and she takes the cheapest.
@@ -10,13 +12,19 @@ import { clearOfRock, bodyReach } from '../../tank/rock-clear.js';
 
 const UPRIGHT = 0.9;
 
+/* Which of passage P's mouths point p is nearer, 0 or 1. */
+function mouthNear(P, p) {
+  const [a, b] = P.mouths;
+  return Math.hypot(p[0] - a.p[0], p[1] - a.p[1], p[2] - a.p[2]) <= Math.hypot(p[0] - b.p[0], p[1] - b.p[1], p[2] - b.p[2]) ? 0 : 1;
+}
+
 export class Travel {
   constructor(wander, { seed = 1 } = {}) {
     this.wander = wander;
     this.loco = wander.loco;
     this.knobs = { ...TRAVEL_KNOBS };
     this.energy = new Energy(createRng(deriveSeed(seed, 6623)), this.knobs);
-    // Its own stream for the far-side coin, so the spells never shift with how many picks she makes.
+    // A separate stream for the far-side coin, so the spells never shift with how many picks she makes.
     this.rng = createRng(deriveSeed(seed, 6629));
     this.time = null;
     this.last = null;         // the last trip's price and choice
@@ -26,8 +34,8 @@ export class Travel {
     this.sideT = 0;           // s she has spent on this side of the divider
     this.counts = { trips: 0, crawl: 0, climb: 0, squeeze: 0, hop: 0, refused: 0, far: 0, jetsCalm: 0, jetsRestless: 0, spells: 0, crossed: 0, crossGaveUp: 0 };
     this.refusals = {};
-    // After the controller, as the jet's own adrift launch is: a jet started mid-tick would leave the rest of that tick's gait
-    // planting arms the jet has just claimed. Added before the jet installs, so it runs first and the thrust starts this tick.
+    // After the controller, as the jet's adrift launch is: a jet started mid-tick leaves the rest of that tick's gait
+    // planting arms the jet has claimed. Added before the jet installs, so it runs first and the thrust starts this tick.
     this._listen = () => this._launch();
     this._listen.reset = () => this.reset();
     this.loco.listeners.add(this._listen);
@@ -39,7 +47,7 @@ export class Travel {
     loc.add({ type: 'range', name: 'Energy', values: [-1, 0, 0.25, 0.5, 0.75, 1], get: () => k.energyPin, set: (v) => { k.energyPin = v; }, label: () => (k.energyPin < 0 ? 'Energy: drifting' : `Energy pinned at ${k.energyPin}`) });
     loc.add({ type: 'range', name: 'Leaps above energy', values: [0.4, 0.55, 0.7, 0.85, 1.01], get: () => k.leapMin, set: (v) => { k.leapMin = v; }, label: () => (k.leapMin > 1 ? 'Travel leaps: never' : `Travel leaps above energy ${k.leapMin}`) });
     loc.add({ type: 'range', name: 'Breath worth when restless', values: [2, 8, 20, 60], get: () => k.breathRestless, set: (v) => { k.breathRestless = v; }, label: () => `A full breath debt worth ${k.breathRestless} s, restless` });
-    loc.add({ type: 'range', name: 'Far side share', values: [0, 0.1, 0.3, 0.5, 1], get: () => k.farShare, set: (v) => { k.farShare = v; }, label: () => `Far side share ${k.farShare} × energy` });
+    loc.add({ type: 'range', name: 'Far side share', values: [0, 0.1, 0.3, 0.5, 1], get: () => k.farShare, set: (v) => { k.farShare = v; }, label: () => `Far side share ${k.farShare} × energy (the slot, or a passage)` });
   }
 
   /* Choosing for her: on, and Wander running. */
@@ -74,22 +82,53 @@ export class Travel {
     }
   }
 
-  // Without a panel the tank is one side.
-  _side() { return this.wander.panelX == null ? -1 : Math.sign(this.loco.c[0] - this.wander.panelX) || -1; }
-
-  /* The far side this pick, likelier as she grows restless or bored of this side, and only from the floor: the slot is
-     reached from below. */
-  farPick() {
-    const L = this.loco, k = this.knobs;
-    const want = k.farShare * Math.min(1, this.energy.value + this.sideT / Math.max(1, k.sideBore));
-    return this.rng.next() < want && L.c[1] < k.crossFromY && !L.modes.get('pull')?.steep && !L.flipped;
+  // Without a panel the tank is one side, or with a passage that fits her, the side of whichever mouth she is nearer.
+  _side() {
+    if (this.wander.panelX != null) return Math.sign(this.loco.c[0] - this.wander.panelX) || -1;
+    const P = this.passage();
+    return P ? (mouthNear(P, this.loco.c) === 0 ? -1 : 1) : -1;
   }
 
-  /* A crossing's desire ended: true if she should try again soon. Through, or out of tries, the plan ends. */
+  /* With no divider, the widest passage the squeeze may route her through, or null. */
+  passage() {
+    const sq = this.loco.modes.get('squeeze');
+    if (this.wander.panelX != null || !sq?.passages?.length || !this.loco.knobs.tunnels) return null;
+    for (const P of sq.passages) if (passageFit(P, sq.section, sq.k).fits) return P;
+    return null;
+  }
+
+  /* Passages on and P fitting her under the squeeze's current knobs. */
+  usable(P) {
+    const sq = this.loco.modes.get('squeeze');
+    return !!sq && !!this.loco.knobs.tunnels && passageFit(P, sq.section, sq.k).fits;
+  }
+
+  /* A floor spot on side `side` of passage P, out of the mouth there along its line, where her body clears the rock and
+     the glass; null with none. */
+  farSpot(P, side) {
+    const phys = this.loco.arms.phys, reach = this._reach ??= bodyReach(this.loco.mantle);
+    const hw = TANK.w / 2 - reach, hd = TANK.d / 2 - reach;
+    for (let i = 0; i < 6; i++) {
+      const p = passageOut(P, side < 0 ? 0 : 1, this.knobs.farPast + this.knobs.farSpread * this.rng.next());
+      p[0] = clamp(p[0], -hw, hw); p[1] = 0; p[2] = clamp(p[2], -hd, hd);
+      if (clearOfRock(phys, p, reach) && this.reachable(p)) return p;
+    }
+    return null;
+  }
+
+  /* The far side this pick, likelier as she grows restless or bored of this side, and only from the floor: the slot and
+     the passages are reached from below. */
+  farPick() {
+    const L = this.loco, k = this.knobs;
+    return farCoin(this.rng, k.farShare, this.energy.value, this.sideT / Math.max(1, k.sideBore)) && L.c[1] < k.crossFromY && !L.modes.get('pull')?.steep && !L.flipped;
+  }
+
+  /* A crossing's desire ended: true if she should try again soon. Through, out of tries, or with its passage unusable, the
+     plan ends. */
   ended(d) {
     const p = this.plan;
     if (!p || p.d !== d) return false;
-    if (d.arrived || this._side() === p.side) { this.plan = null; return false; }
+    if (d.arrived || this._side() === p.side || (p.passage && !this.usable(p.passage))) { this.plan = null; return false; }
     if (++p.tries >= this.knobs.crossTries) { this.plan = null; this.counts.crossGaveUp++; return false; }
     return true;
   }
@@ -146,6 +185,7 @@ export class Travel {
     this.counts.trips++;
     this.counts[mode === 'hop' ? 'hop' : label]++;
     if (cross) this.counts.far++;
+    if (cross === 'tunnel') this.counts.tunnel = (this.counts.tunnel ?? 0) + 1;
     this.last = { mode, label, flat: +flat.toFixed(2), energy: +e.toFixed(2), crawl: +price.modes.crawl.cost.toFixed(1), hop: Number.isFinite(price.modes.hop.cost) ? +price.modes.hop.cost.toFixed(1) : price.modes.hop.why };
     return this.last;
   }

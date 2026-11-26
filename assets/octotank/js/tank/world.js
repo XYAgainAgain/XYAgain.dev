@@ -5,6 +5,7 @@ import { buildToys, buildToysOn } from '../enrichment/toys.js';
 import { Water } from '../water/buoyancy.js';
 import { WATER_KNOBS } from '../water/buoyancy-core.js';
 import { buildShell, SHAPE_KNOBS } from '../amira/body/mantle-core.js';
+import { fitZone } from '../amira/locomotion/loco-passage-core.js';
 
 /* Her tank's world for the page and the headless harness alike: the glass, the furniture, the sand, her spawn, the toys,
    and the water. 'divider' is the slotted test wall and two boulders; 'rockwork' is the baked layout. */
@@ -17,9 +18,9 @@ export function worldName(params, fallback = 'rockwork') {
 }
 
 export const ROCK_COLLIDERS = ['single', 'chunks'];
-export const ROCK_CHUNKS = { size: 0.25, height: 0.25, pad: 3, bevel: 0.003 };
+export const ROCK_CHUNKS = { size: 0, height: 0, pad: 3, bevel: 0.003 };
 
-/* ?rock=: the rock as one mesh body, or as closed pieces near her. */
+/* ?rock=single: the rock as a plain mesh body. The default hands it over as culled pieces; one piece covers the grid. */
 export function rockCollider(params, fallback = 'chunks') {
   const r = params.get('rock');
   return ROCK_COLLIDERS.includes(r) ? r : fallback;
@@ -69,6 +70,18 @@ function denSpawn(field, den, sand, ext) {
   return best.p;
 }
 
+/* The passages her squeeze may route through: one per enclosed bore in each zone with the role 'squeeze', with a note
+   per zone on what it held. */
+function fitPassages(world, field, layout) {
+  const t = layout.tank ?? {}, size = t.size ?? [2, 1, 1], tank = { w: size[0], h: size[1], d: size[2] };
+  for (const z of layout.zones ?? []) {
+    if (!z.roles?.includes('squeeze')) continue;
+    const { passages, notes } = fitZone((x, y, zz, out) => field.distance(x, y, zz, out), z, { tank, floor: t.substrate ?? 0.05 });
+    world.passages.push(...passages);
+    world.passageNotes.push(`${z.name}: ${passages.length} passage${passages.length === 1 ? '' : 's'}${notes.length ? `; ${notes.join('; ')}` : ''}`);
+  }
+}
+
 /* Everything up to her body, in the page's build order. `level` and `mantleKnobs` are her shell's, for
    the spawn; `assets` as loadLayout's. */
 export async function buildWorld(phys, { name = 'rockwork', params = new URLSearchParams(), seed = 1, level = 10, mantleKnobs = {}, assets = null } = {}) {
@@ -76,7 +89,7 @@ export async function buildWorld(phys, { name = 'rockwork', params = new URLSear
   const floaters = +(params.get('floaters') ?? WATER_KNOBS.floaters) || 0;
   const count = Math.max(0, Math.min(80, +(params.get('toys') ?? 12) || 0));
   const newSand = () => (params.get('sand') === '0' ? null : new TankSand(phys, { seed: Number.isFinite(Number(params.get('sandseed'))) && params.has('sandseed') ? Number(params.get('sandseed')) : 420 }));
-  const world = { name, walls, panel: [], rocks: [], layoutKnobs: null, apertures: [], wander: { rocks: [], panelX: null, panelT: null }, layout: null, rockwork: null };
+  const world = { name, walls, panel: [], rocks: [], layoutKnobs: null, apertures: [], passages: [], passageNotes: [], wander: { rocks: [], panelX: null, panelT: null }, layout: null, rockwork: null };
   let waterKnobs = { floaters };
   if (name === 'divider') {
     const layoutKnobs = world.layoutKnobs = { ...LAYOUT_KNOBS };
@@ -94,8 +107,11 @@ export async function buildWorld(phys, { name = 'rockwork', params = new URLSear
     const { field, layout } = await loadLayout(assets);
     const entry = rockCollider(params) === 'chunks' ? phys.addMeshes(field.chunks(ROCK_CHUNKS), { friction: 0.7, field }) : phys.addMesh(field.mesh(), { friction: 0.7 });
     entry.tag = 'rock'; entry.taste = 'rock';
-    world.rockwork = phys.rockwork = { entry, field };
     world.layout = layout;
+    // ?tunnel=0 leaves every passage unused, so none is fitted.
+    if (params.get('tunnel') !== '0') fitPassages(world, field, layout);
+    world.rockwork = phys.rockwork = { entry, field, passages: world.passages, notes: world.passageNotes };
+    for (const note of world.passageNotes) console.info(`Tank: squeeze zone ${note}`);
     world.sand = newSand();
     const den = layout.pieces.find((p) => p.name === 'Den hollow');
     if (!den) throw new Error('tank-layout.json: no "Den hollow" piece');

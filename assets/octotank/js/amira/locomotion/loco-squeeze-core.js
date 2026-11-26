@@ -1,7 +1,8 @@
 import { neutralizeAccel } from '../body/mantle-core.js';
+import { passageAt, passageTangent, passageValue, passageProject, passageOut } from './loco-passage-core.js';
 
-/* The squeeze without THREE or Jolt: whether her hard parts fit a slot, the route through an aperture, which arms
-   thread it, where a far hold lands, and the lengthening muscle field. loco-squeeze.js runs it on her body. */
+/* The squeeze without THREE or Jolt: whether she fits a slot or a passage, the route through either, which arms thread
+   it, where its holds land, and the lengthening muscle field. loco-squeeze.js runs it on her body. */
 
 export const SQUEEZE_KNOBS = {
   eyeD: 0.017,            // m, measured 15–20 mm (Hanke and Kelber 2020); eyes lie along a horizontal slot's width
@@ -33,10 +34,70 @@ export const SQUEEZE_KNOBS = {
   capHaul: 14,            // N a far hold hauls with (design: the visible stretch that recovers, Body Rework Report)
   threadSpread: 0.1,      // m across the slot's width each threading arm's target leads its root by, along its bearing (design)
   squeezeLimit: 90,       // s the scenario allows for the whole passage (design)
+  tunnels: true,          // passages fitted from the layout's squeeze zones route a desire that asks for one
+  fitKeep: 0.8,           // share of her settled volume a passage's narrowest section must let her keep (KEEP_TABLE)
+  easyKeep: 0.95,         // a section that keeps this much asks no exhale and no lengthening of her
+  tunnelBack: 0.12,       // m outside the entry mouth along the centerline she lines up at, about half her length
+  tunnelR: 0.05,          // m from that point that counts as there
+  tunnelTurn: 0.2,        // m from it she starts turning onto the line on her feet
+  tunnelSide: 0.15,       // m her crown may lie off the line at a mouth to thread from there (low tunnel: 0.097 measured)
+  reachIn: 0.08,          // m into the bore a first reach lands, ahead of her crown
+  reachAhead: 0.1,        // m ahead of her crown a re-reach lands while she hauls
+  exitPast: 0.1,          // m past the exit mouth her haul aims, along the centerline
+  holdFace: 0.012,        // m off the rock a tunnel hold aims, about an arm's radius
+  alignMax: 6,            // s she turns onto the line on her first holds before hauling anyway
+  tunnelTurnK: 40,        // 1/s² per radian turning her onto a passage's line
+  farAhead: 0.01,         // m ahead of her crown along the centerline a tunnel hold must lie to haul
+  pushMax: 2,             // trailing arms pushing her along a bore from behind while she hauls
+  pushBack: 0.05,         // m behind her crown along the centerline a push lands
+  capEasy: 3,             // N a hold hauls with through a passage that asks nothing of her; capHaul at its tightest
 };
+
+/* Her kept share of settled volume hauled through a hole 14 cm long, by the hole's area over her rest section across her
+   head-to-mantle line (Node, 488 vertices, round holes 5–11 cm and 12 × 9 cm boxes, 2–14 N). */
+export const KEEP_TABLE = [[0.25, 0.36], [0.37, 0.49], [0.5, 0.59], [0.65, 0.77], [0.83, 0.9], [1.02, 0.96], [1.24, 0.965]];
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const clamp = (x, lo, hi) => (x < lo ? lo : x > hi ? hi : x);
+
+export function keepShare(ratio, table = KEEP_TABLE) {
+  if (!(ratio > 0)) return 0;
+  if (ratio <= table[0][0]) return table[0][1] * ratio / table[0][0];
+  for (let i = 1; i < table.length; i++) {
+    const [x1, y1] = table[i];
+    if (ratio <= x1) { const [x0, y0] = table[i - 1]; return y0 + (y1 - y0) * (ratio - x0) / (x1 - x0); }
+  }
+  return table[table.length - 1][1];
+}
+
+/* The area of her silhouette across `axis`: the convex hull of the points projected on the plane normal to it, m². */
+export function restSection(P, n, axis) {
+  let b = [0, 1, 0];
+  const d = dot(b, axis);
+  b = [b[0] - d * axis[0], b[1] - d * axis[1], b[2] - d * axis[2]];
+  const bl = Math.hypot(b[0], b[1], b[2]);
+  if (!(bl > 1e-6)) b = [1, 0, 0]; else b = [b[0] / bl, b[1] / bl, b[2] / bl];
+  const c = [axis[1] * b[2] - axis[2] * b[1], axis[2] * b[0] - axis[0] * b[2], axis[0] * b[1] - axis[1] * b[0]];
+  const pts = [];
+  for (let i = 0; i < n; i++) { const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2]; pts.push([x * b[0] + y * b[1] + z * b[2], x * c[0] + y * c[1] + z * c[2]]); }
+  pts.sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+  const cr = (o, a, q) => (a[0] - o[0]) * (q[1] - o[1]) - (a[1] - o[1]) * (q[0] - o[0]), lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  const h = lo.slice(0, -1).concat(up.slice(0, -1));
+  let A = 0;
+  for (let i = 0; i < h.length; i++) { const a = h[i], q = h[(i + 1) % h.length]; A += a[0] * q[1] - a[1] * q[0]; }
+  return Math.abs(A) / 2;
+}
+
+/* Whether she can pass a passage honestly: its narrowest section by area keeps fitKeep of her volume and its narrowest
+   ball clears her hard parts. `tight` (0–1) is how much exhale and lengthening it asks of her. */
+export function passageFit(P, section, k = SQUEEZE_KNOBS) {
+  const ratio = P.narrow.area / Math.max(1e-9, section), keep = keepShare(ratio);
+  const hard = hardFit(2 * P.narrow.r, k), fits = hard && keep >= k.fitKeep;
+  const tight = clamp((k.easyKeep - keep) / Math.max(1e-6, k.easyKeep - k.fitKeep), 0, 1);
+  return { fits, keep, ratio, tight, why: fits ? null : !hard ? 'too small for her hard parts' : `keeps ${keep.toFixed(2)} of her volume` };
+}
 
 /* The widest hard part plus skin on both sides, against the slot's height. A 1e-9 m slack keeps 26 mm exactly passing. */
 export function hardMin(k = SQUEEZE_KNOBS) { return Math.max(k.eyeD, k.capsuleD, k.beakD) + 2 * k.skinMin; }
@@ -220,3 +281,62 @@ export function turnField(P, m, n, axis, want, K, damp, spin, out, w = null) {
 /* The breath held at a full exhale: depth is a breath's peak-to-peak swing, and a full exhale holds half of it below
    the middle, so emptying cavityShare from rest takes twice that depth (derived from the breath's calibration). */
 export function cavityHold(k = SQUEEZE_KNOBS) { return { exhale: 1, depth: 2 * k.cavityShare, outflow: 0 }; }
+
+/* The route through passage P from crown c to target t; null when both share a side or, from outside, t lies in the bore.
+   Inside, out the way `head` points along the line at c (else toward t). sigma(s) is how far past the entry mouth. */
+export function tunnelRoute(c, t, P, k = SQUEEZE_KNOBS, head = null) {
+  const m0 = P.mouths[0], m1 = P.mouths[1], pc = passageProject(P, c), pt = passageProject(P, t);
+  const within = (q) => q.s > m0.s && q.s < m1.s && q.d < passageValue(P, 'reach', q.s) + 0.02;
+  const near = (p) => (Math.hypot(p[0] - m0.p[0], p[1] - m0.p[1], p[2] - m0.p[2]) <= Math.hypot(p[0] - m1.p[0], p[1] - m1.p[1], p[2] - m1.p[2]) ? 0 : 1);
+  const inside = within(pc), tIn = within(pt);
+  let to;
+  if (inside) to = head ? (dot(head, passageTangent(P, pc.s, [0, 0, 0])) >= 0 ? 1 : 0) : tIn ? (pt.s >= pc.s ? 1 : 0) : near(t);
+  else if (tIn || near(c) === (to = near(t))) return null;
+  const e = 1 - to, sign = e === 0 ? 1 : -1, s0 = P.mouths[e].s, L = Math.abs(P.mouths[to].s - s0);
+  const dir = passageTangent(P, s0, [0, 0, 0]).map((v) => v * sign + 0);
+  return { kind: 'tunnel', P, sign, e, to, s0, L, inside, tIn, dir, near: passageOut(P, e, k.tunnelBack), exit: passageOut(P, to, k.exitPast) };
+}
+
+export function sigmaOf(way, s) { return way.sign * (s - way.s0); }
+export function sOfSigma(way, sig) { return way.s0 + way.sign * sig; }
+
+/* A tunnel hold: from the centerline at s, out across the section along dir's part across it, to holdFace off the first
+   surface dist(x, y, z, n) finds within range. Writes the point and the surface's outward normal; false with none. */
+export function boreHold(P, s, dir, dist, k, out, nrm, range = 0.15) {
+  const c = passageAt(P, s, [0, 0, 0]), t = passageTangent(P, s, [0, 0, 0]);
+  let d = dir ? [dir[0], dir[1], dir[2]] : [0, -1, 0], a = dot(d, t);
+  d = [d[0] - a * t[0], d[1] - a * t[1], d[2] - a * t[2]];
+  let l = Math.hypot(d[0], d[1], d[2]);
+  if (!(l > 1e-6)) { a = -t[1]; d = [t[0] * a, -1 - t[1] * a, t[2] * a]; l = Math.hypot(d[0], d[1], d[2]); }
+  if (!(l > 1e-6)) return false;
+  d = [d[0] / l, d[1] / l, d[2] / l];
+  const f = (m) => dist(c[0] + d[0] * m, c[1] + d[1] * m, c[2] + d[2] * m, nrm) - k.holdFace;
+  if (!(f(0) > 0)) return false;
+  let lo = 0, hi = -1;
+  for (let m = 0.002; m <= range; m += 0.002) { if (f(m) <= 0) { hi = m; break; } lo = m; }
+  if (hi < 0) return false;
+  for (let i = 0; i < 12; i++) { const mid = (lo + hi) / 2; if (f(mid) > 0) lo = mid; else hi = mid; }
+  out[0] = c[0] + d[0] * lo; out[1] = c[1] + d[1] * lo; out[2] = c[2] + d[2] * lo;
+  dist(out[0], out[1], out[2], nrm);
+  return Number.isFinite(out[0] + out[1] + out[2]);
+}
+
+/* Shell vertices behind the entry mouth, inside the bore, and past the exit mouth along the travel, and `lead`, the
+   farthest any lies past the entry; each vertex projected near the last one's place. */
+export function boreCounts(X, P, origin, n, way, out = { behind: 0, past: 0, inside: 0, lead: 0 }) {
+  const q = [0, 0, 0], pr = { s: 0, d: 0, i: 0 };
+  out.behind = 0; out.past = 0; out.inside = 0;
+  let lead = -Infinity, hint = -1;
+  for (let i = 0; i < n; i++) {
+    q[0] = X[i * 3] + origin[0]; q[1] = X[i * 3 + 1] + origin[1]; q[2] = X[i * 3 + 2] + origin[2];
+    passageProject(P, q, pr, hint);
+    // A vertex far along the shell from the last may sit far along the line too: a miss at the window's edge rescans.
+    if (hint >= 0 && (pr.i === Math.max(0, hint - 6) || pr.i === Math.min(P.points.length - 2, hint + 5))) passageProject(P, q, pr);
+    hint = pr.i;
+    const sg = sigmaOf(way, pr.s);
+    if (sg < 0) out.behind++; else if (sg > way.L) out.past++; else out.inside++;
+    if (sg > lead) lead = sg;
+  }
+  out.lead = n > 0 ? lead : 0;
+  return out;
+}

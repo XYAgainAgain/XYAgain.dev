@@ -210,7 +210,7 @@ export class Rockwork {
     return this.cachedMesh;
   }
 
-  /* Closed pieces on a `size` m grid (`height` 0 for full columns). Each runs `pad` samples into its neighbors: true for
+  /* Closed pieces on a `size` m grid (`size` or `height` 0 for no cut along it). Each runs `pad` samples into its neighbors: true for
      one, sunk `bevel` m per sample after, then a box face, all inside the neighbor's true rock so the union stays exact. */
   chunks({ size = 0.25, height = 0.25, pad = 3, bevel = 0.003 } = {}) {
     // Under three samples the caps have no room to close inside the neighbor.
@@ -222,6 +222,8 @@ export class Rockwork {
       return out;
     };
     const axes = [cuts(nx, size), cuts(ny, height), cuts(nz, size)], ramp = Math.round(bevel / this.q), list = [];
+    // A lone piece has no neighbor to cap against, so it is the cached mesh itself.
+    if (axes.every((c) => c.length === 2)) { const m = this.mesh(); return m.indices.length ? [{ positions: m.positions, indices: m.indices }] : []; }
     const s0 = [0, 0, 0], s1 = [0, 0, 0], a0 = [0, 0, 0], a1 = [0, 0, 0], g = [0, 0, 0];
     for (let cz = 0; cz < axes[2].length - 1; cz++) for (let cy = 0; cy < axes[1].length - 1; cy++) for (let cx = 0; cx < axes[0].length - 1; cx++) {
       const c = [cx, cy, cz];

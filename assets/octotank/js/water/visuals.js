@@ -9,7 +9,7 @@ import { Circulation } from './currents.js';
 import { Displacements } from '../tank/toy-ripples.js';
 
 export class WaterVisuals {
-  constructor({ renderer, scene, camera, ctx, jet, seed, enabled = true }) {
+  constructor({ renderer, scene, camera, ctx, jet, seed, enabled = true, occupancy = null }) {
     Object.assign(this, { renderer, scene, camera, ctx, jet });
     this.knobs = { ...VISUAL_KNOBS, sourceX: -TANK.w / 2 + 0.08, sourceZ: -TANK.d / 2 + 0.06 };
     for (const key of ['reflectionHz', 'refractionHz']) Object.defineProperty(this.knobs, key, {
@@ -27,7 +27,7 @@ export class WaterVisuals {
     // The overflow is already running when the page opens.
     if (enabled && !this.reduced.matches) for (let i = 0; i < 960; i++) this.waves.advance(1 / 120, this.knobs);
     this.flow = new Flow(TANK.w, TANK.h, TANK.d);
-    this.surface = new Surface(renderer, scene, camera, this.waves, ctx.water.knobs.surfaceY, this.knobs);
+    this.surface = new Surface(renderer, scene, camera, this.waves, ctx.water.knobs.surfaceY, this.knobs, { occupancy });
     this.particles = new Particles(this.surface.group, TANK.w, TANK.d, ctx.water.knobs.surfaceY, seed, this.knobs);
     this.previous = new Float32Array(512 * 3);
     this.samples = new Float32Array(512 * 4);

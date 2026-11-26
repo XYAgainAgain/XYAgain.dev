@@ -5,6 +5,7 @@ import { loadJolt, Physics } from './tank/physics.js';
 import { Mantle, MANTLE_KNOBS } from './amira/body/mantle.js';
 import { SHELL_LEVELS } from './amira/body/mantle-core.js';
 import { buildWorld, worldName } from './tank/world.js';
+import { rockRaycast } from './tank/rock-ray.js';
 import { Arms } from './amira/arms/arms.js';
 import { SuckerView } from './amira/arms/sucker-view.js';
 import { ArmView } from './amira/arms/arm-view.js';
@@ -29,6 +30,8 @@ import { TankGlass } from './tank/glass.js';
 import { wallGeometry } from './tank/geometry.js';
 import { registerWeight } from './tank/sand-weight.js';
 import { WallOptics } from './tank/wall-optics.js';
+import { TankLights } from './tank/lights.js';
+import { Occupancy } from './tank/occupancy.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
 import { RodDiag } from './diag/rod-diag.js';
 import { SuckerDiag } from './diag/sucker-diag.js';
@@ -49,7 +52,10 @@ import { rodArms, ROD_ARM_KNOBS } from './amira/arms/arm-rod.js';
    ?travel=0 (no travel chooser: no moody spells, no hops or far-side trips of her own; she crawls her own side)
    ?hop=0 (hops fly as plain aimed jets: no guided cutoff onto the spot, no parachute reaching for it)
    ?clear=0 (no whole-segment check against the divider and the rocks and no stretch cap: a segment's middle fixes as before)
-   ?gather=0 (resting arms keep the chain's walked bends as their rest shape instead of relaxing onto their own; the bench too unless ?gather=1) */
+   ?gather=0 (resting arms keep the chain's walked bends as their rest shape instead of relaxing onto their own; the bench too unless ?gather=1)
+   ?tunnel=0 (the layout's squeeze zones fit no route: no passage trips, and a desire asking for one crawls straight)
+   ?pane=legacy (the old rim light and glossy sand)  ?triplanar=0|walls (the sand's planar mapping, or one side projection)
+   ?contact=0 (no contact shadows) */
 
 const params = new URLSearchParams(location.search);
 const root = document.documentElement;
@@ -104,6 +110,11 @@ async function boot() {
   const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
   const W = await buildWorld(phys, { name: benchOn ? 'divider' : worldName(params), params, seed, level, mantleKnobs });
   const { walls, panel, rocks, sand, start, toys, water, layoutKnobs } = W;
+  const legacyPane = params.get('pane') === 'legacy';
+  if (sand) {
+    sand.knobs.triplanar = params.get('triplanar') === '0' ? 'off' : params.get('triplanar') === 'walls' ? 'walls' : 'on';
+    if (legacyPane) sand.knobs.roughFloor = 0;
+  }
   const armKnobs = params.has('collider') ? { collider: params.get('collider') } : {};
   // Her arms run on their muscles; ?muscle=0 runs them on the authored targets alone, as before the muscle map.
   armKnobs.muscle = params.get('muscle') === '0' ? 0 : 1;
@@ -169,6 +180,7 @@ async function boot() {
   // Her mood picks how she travels and whether she crosses the divider; ?travel=0 has her crawl her own side as before.
   if (params.get('travel') === '0' && loco?.wander) loco.wander.travel.knobs.on = false;
   if (params.get('hop') === '0' && loco?.hopMode) loco.hopMode.knobs.on = false;
+  if (params.get('tunnel') === '0' && loco) loco.knobs.tunnels = false;
 
   // A long lens keeps the exhibit readable from the front while preserving its depth.
   const scene = new THREE.Scene();
@@ -176,13 +188,8 @@ async function boot() {
   const camera = new THREE.PerspectiveCamera(22, innerWidth / innerHeight, 0.05, 20);
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
-  scene.add(new THREE.HemisphereLight(0x9fc4ff, 0x1a2230, 1.2));
-  const key = new THREE.DirectionalLight(0xfff2d8, 2.2);
-  key.position.set(0.4, 1.6, 0.9);
-  scene.add(key);
-  const rim = new THREE.DirectionalLight(0x6fa0ff, 0.8);
-  rim.position.set(-0.8, 0.5, -0.6);
-  scene.add(rim);
+  const lights = new TankLights(scene, renderer, { legacy: legacyPane });
+  const occupancy = params.get('contact') === '0' ? null : new Occupancy(renderer, scene, {}, { rock: W.rockwork?.field });
   if (sand) await sand.mount(scene, [256, 512, 1024].includes(+params.get('sandtex')) ? +params.get('sandtex') : 1024);
 
   const mats = {
@@ -211,6 +218,8 @@ async function boot() {
     else if (e.kind === 'capsule') geo = new THREE.CapsuleGeometry(e.size[1], e.size[0] * 2, 4, 10);
     else geo = new THREE.CylinderGeometry(e.size[1], e.size[1], e.size[0] * 2, 16);
     const mesh = new THREE.Mesh(geo, e.taste === 'floor' ? mats.floor : mats[e.tag] ?? mats.toy);
+    // Rays on the rock come from the field: a mesh raycast would test every triangle.
+    if (W.rockwork && e === W.rockwork.entry) mesh.raycast = rockRaycast(W.rockwork.field, geo.attributes.position.array);
     scene.add(mesh);
     const tint = e.water ? new THREE.MeshStandardMaterial({ color: e.water.tint, roughness: 0.4, metalness: 0.1 }) : null;
     rigidMeshes.push({ e, mesh, tint });
@@ -230,7 +239,8 @@ async function boot() {
   scene.add(rootMarkers);
   const m4 = new THREE.Matrix4(), tmp3 = [0, 0, 0];
 
-  water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
+  let materialsSwapped = null;
+  water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; materialsSwapped?.(); };
   water.setTint(water.knobs.tint);
   const ctx = { phys, mantle, arms, pose, attention, loco, carry, den, bench, rods: null, panel, walls, rocks, toys, layoutKnobs, water, world: W.name, rockwork: W.rockwork, watch: null, probe: null };
   const tank = attachDebug(ctx);
@@ -253,6 +263,12 @@ async function boot() {
   if (bench) bench.view = armView;
   else if (arms._anyRod) tank.rods = ctx.rods = new RodDiag(arms, { view: () => armView });
   if (!bench) tank.suckers = ctx.suckers = new SuckerDiag(arms, { loco });
+  // She and the toys cast the contact shadows and none of them receive them, both set before the water's first patch.
+  const herMeshes = [mantleMesh, armView.tubeMesh, armView.webMesh, ...(bodyParts ? [...bodyParts.parts.map((p) => p.mesh), ...bodyParts.eyes.map((e) => e.pupil)] : [])];
+  for (const mesh of [...herMeshes, armView.cups, armView.ghostMesh, ...armView.capsuleMeshes]) if (mesh) mesh.userData.noContact = true;
+  if (occupancy) for (const mesh of [...herMeshes, ...rigidMeshes.filter(({ e }) => e.tag === 'toy').map((r) => r.mesh)]) occupancy.registerCaster(mesh);
+  tank.lights = lights; tank.knobs.lights = lights.knobs;
+  tank.occupancy = occupancy; if (occupancy) tank.knobs.occupancy = occupancy.knobs;
   const cameraRig = new TankCamera(camera, renderer.domElement, {
     animals: [mantleMesh, armView.tubeMesh, armView.webMesh, ...(bodyParts?.parts.map((p) => p.mesh) ?? [])].filter(Boolean),
     scenery: [...rigidMeshes.filter(({ e }) => e.tag !== 'arm').map((r) => r.mesh), ...(sand ? [sand.mesh] : [])], say,
@@ -268,8 +284,9 @@ async function boot() {
     cameraRig.fit();
   });
   window.tank = tank;
-  const waterVisuals = new WaterVisuals({ renderer, scene, camera, ctx, jet, seed, enabled: params.get('waterview') !== '0' });
+  const waterVisuals = new WaterVisuals({ renderer, scene, camera, ctx, jet, seed, enabled: params.get('waterview') !== '0', occupancy });
   tank.waterVisuals = waterVisuals;
+  materialsSwapped = () => waterVisuals.surface.markDirty();
   // The rods feel the tank's currents, which are the visuals' for now.
   const flow = [0, 0, 0];
   arms.ambient = (x, y, z, out) => { waterVisuals.currents.sample(x, y, z, phys.time, water.knobs.surfaceY, flow); out[0] = flow[0]; out[1] = flow[1]; out[2] = flow[2]; };
@@ -293,7 +310,7 @@ async function boot() {
 
   // Headless runs skip drawing so the sim keeps real time; a screenshot asks for one frame.
   const headless = params.get('render') === '0';
-  let wantFrame = !headless, afterFrame = null, drawnTick = -1;
+  let wantFrame = !headless, afterFrame = null, drawnTick = -1, drawnActs = 0;
   tank.renderOnce = () => new Promise((resolve) => { wantFrame = true; afterFrame = resolve; });
   let last = performance.now();
   const preTick = (dt) => {
@@ -320,7 +337,9 @@ async function boot() {
     if (headless) { wantFrame = false; }
     // Her shapes only change on a physics tick, so a frame between two ticks would rebuild them identically; a drawing
     // knob changed meanwhile shows on the next tick, at most 1/60 s later.
-    if (phys.stepTotal !== drawnTick || diag.state.paused || afterFrame) {
+    const ticked = phys.stepTotal !== drawnTick;
+    const reshaped = ticked || diag.state.paused || !!afterFrame;
+    if (reshaped) {
       drawnTick = phys.stepTotal;
       mantle.sync();
       mantleGeo.attributes.position.needsUpdate = true;
@@ -340,6 +359,9 @@ async function boot() {
     cameraRig.update(dt);
     waterVisuals.update(phys.time);
     glass.update();
+    // The water's material patch is the only reader of the map, so it isn't drawn while the water is hidden. Only a tick
+    // or a panel action (Tip, a rod reset, a knob) can move her or a toy, so other frames, paused ones too, keep the map.
+    if (waterVisuals.enabled && occupancy) { occupancy.capture(phys.time, ticked || !!afterFrame || diag.state.acts !== drawnActs); drawnActs = diag.state.acts; }
     wallOptics.withoutPanes(() => glass.withoutShine(() => waterVisuals.beforeRender(phys.time)));
     wallOptics.render(phys.time);
     if (afterFrame) { const f = afterFrame; afterFrame = null; f(); }

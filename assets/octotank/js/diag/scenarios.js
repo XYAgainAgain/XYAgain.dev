@@ -324,6 +324,7 @@ register('ball', { label: 'Ball', key: '1' });
 register('crawl', { label: 'Crawl', key: '2', run: crawl });
 register('climb', { label: 'Climb', key: '3' });
 register('squeeze', { label: 'Squeeze slot', key: '4', world: 'divider' });
+register('tunnel', { label: 'Through the tunnel', world: 'rockwork' });
 register('pull', { label: 'One-arm pull', run: pull });
 register('turn', { label: 'Turn 1 rad', run: turn });
 register('pile', { label: 'Arm pile', run: pile });

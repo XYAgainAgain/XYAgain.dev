@@ -7,7 +7,7 @@ const FRAMES = 120;
 const STORE = 'octotank.panel';
 const SECTIONS = [['sim', 'Sim'], ['view', 'View'], ['body', 'Body'], ['bench', 'Bench'], ['arms', 'Arms'], ['rod', 'Rod'], ['loco', 'Locomotion']];
 // Section ids per tab, in display order; a section no tab names lands in the last one. A tab with no sections hides.
-const TABS = [['amira', 'Amira', ['body', 'loco']], ['arms', 'Arms', ['arms', 'rod', 'bench']], ['tank', 'Tank', ['sim', 'sand']], ['view', 'View', ['view', 'camera']], ['more', 'More', []]];
+const TABS = [['amira', 'Amira', ['body', 'loco']], ['arms', 'Arms', ['arms', 'rod', 'bench']], ['tank', 'Tank', ['sim', 'sand', 'lights', 'contact']], ['view', 'View', ['view', 'camera']], ['more', 'More', []]];
 
 const queued = [];
 let attach = null;
@@ -45,7 +45,8 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
   const loco = ctx.loco, bench = ctx.bench ?? null;
   const gaps = new Float32Array(FRAMES);
   let gapCount = 0, lastFrame = 0, textAt = 0, breathDepth = mantle.knobs.breathDepth || 0.035, lastExhale = 0, inhaling = false;
-  const state = { paused: false };
+  // acts counts panel actions, so a paused frame knows whether one that may have moved her has run.
+  const state = { paused: false, acts: 0 };
   const DRIVES = ['force', 'pin', 'free'];
   const stored = load();
   stored.open = plain(stored.open);
@@ -191,12 +192,12 @@ export function createPanel({ el, readout, controls, ctx, tank, toys, seed, say 
       a.button.firstChild.textContent = text;
     }
   };
-  const fire = (a) => { a.run(); relabel(); };
+  const fire = (a) => { a.run(); state.acts++; relabel(); };
   const button = (a) => {
     if (a.type === 'range') {
       const input = tag('input', { type: 'range', min: 0, max: a.values.length - 1, step: 1, disabled: !!a.disabled });
       input.setAttribute('aria-label', a.name);
-      input.addEventListener('input', () => { a.set(a.values[Number(input.value)]); relabel(); });
+      input.addEventListener('input', () => { a.set(a.values[Number(input.value)]); state.acts++; relabel(); });
       a.button = input;
       a.caption = tag('span');
       return tag('label', { className: 'btn' }, a.caption, input);

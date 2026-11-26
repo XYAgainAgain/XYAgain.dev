@@ -345,6 +345,7 @@ export class Locomotion {
     let planted = 0, seeking = 0, stations = 0;
     // Only a commanded turn, on the stations it planted for the job, still turns her through their springs.
     const onFeet = k.feetCouple && (!!d || !Number.isFinite(pose.command));
+    const ride = d?.source === 'squeeze' || !!this.modes.get('squeeze')?.carries?.(this, d);
     for (let a = 0; a < this.n; a++) {
       const arm = A.arms[a], g = arm.goal, mine = !!g && g.loco === this;
       let role = this.role[a];
@@ -402,8 +403,8 @@ export class Locomotion {
       } else m.armCap[a] = Infinity;
       if (role === SEEK) seeking++;
       // An arm swinging to its next hold, and in a turn or a squeeze every arm nothing else holds, rides her (Arms.carried):
-      // their swing, drag, and contact would otherwise fight the very motion her springs make.
-      if (A.carried && role !== BUSY && !A.episodes?.[a]?.h && (role === SEEK || turning || d?.source === 'squeeze')) A.carried[a] = 1;
+      // their swing, drag, and contact fight the motion her springs make.
+      if (A.carried && role !== BUSY && !A.episodes?.[a]?.h && (role === SEEK || turning || ride)) A.carried[a] = 1;
       st.roles[a] = fading ? 'fade' : springy || !this.stanceOn ? ROLE_NAMES[role] : 'stance';
     }
     st.planted = planted; st.seeking = seeking; st.stations = stations;
