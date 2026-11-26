@@ -8,7 +8,7 @@ import { RodCoupler } from './rod-coupler-core.js';
 import { LOCO_KNOBS } from '../locomotion/locomotion-core.js';
 import { CLIMB_KNOBS } from '../locomotion/loco-climb-core.js';
 import { makeTrail, makeSpread, makeTuck } from './arm-plant-core.js';
-import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD, toFrame, spanStretch, worstStretch } from './sucker-core.js';
+import { SUCKER_KNOBS, layoutSuckers, SuckerBank, tasteRule, tasteGrip, tasteRecoils, sampleHold, tasteSalience, isDiscovery, TASK_GOALS, Familiarity, SEAL_NONE, SEAL_WORK, SEAL_HARD, toFrame, spanStretch, worstStretch } from './sucker-core.js';
 import { ArmRecords } from './arm-records.js';
 import { ArmCrowd } from './arm-crowd.js';
 import { ArmReflexes } from './arm-reflex.js';
@@ -954,11 +954,11 @@ export class Arms {
         const entry = this.touchEntry[g], mine = kind === 2 && ep?.toy === entry;
         if (kind === 2 && !mine && this._ignored(a, entry)) continue;
         if (j !== held && !(kind === 1 && Math.abs(j - ps) <= 1) && !(grab && st.kind[j]) && this._sliding(this.bodies[a], j, g, kind === 2 ? entry : null, dt)) continue;
-        const rule = mine ? ep.rule : tasteRule(this.touchTaste[g], sk, this);
-        if (!(rule.grip > 0)) continue;
+        const grip = mine ? ep.rule.grip : tasteGrip(this.touchTaste[g], sk, this.gripSelf);
+        if (!(grip > 0)) continue;
         // A firm plant (a station) holds its foot on purpose, and so does a segment whose rod has taken hold there.
         mode[j] = (mine && ep.hard) || (pg?.firm && kind === 1 && Math.abs(j - ps) <= 1) || (grab && st.kind[j]) ? SEAL_HARD : SEAL_WORK;
-        scale[j] = rule.grip;
+        scale[j] = grip;
       }
       bank.step(dt, mode, scale);
       for (let j = 0; j < S; j++) if (this.touchKind[a * S + j] === 3) c.selfSealed += bank.segSealed[j];
@@ -1002,7 +1002,7 @@ export class Arms {
       if (!toy || this._ignored(a, toy)) continue;
       const taste = toy.taste ?? toy.tag;
       // Never an episode on a noxious thing: even gripless, its end would moveOn the reach the reflex means to resume.
-      if (tasteRule(taste, sk, this).recoil) continue;
+      if (tasteRecoils(taste)) continue;
       if (isDiscovery(goal?.kind, this.track[a] === toy || (goal?.kind === 'plant' && goal.entry === toy), taste, sk)) continue;
       return this._start(a, toy);
     }

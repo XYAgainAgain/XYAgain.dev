@@ -9,6 +9,7 @@ export const SAND_KNOBS = {
 export const TOUCH_GAP = 0.012;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const smooth = (v) => v * v * (3 - 2 * v);
+const DENSE_COVERAGE = 0.85;
 
 function noise(table, x, z) {
   const ix = Math.floor(x), iz = Math.floor(z), u = smooth(x - ix), v = smooth(z - iz);
@@ -39,6 +40,10 @@ export class SandField {
     this.island = new Int32Array(n);
     this.region = new Int32Array(n); this.queue = new Int32Array(n);
     this.version = 0; this.dirty = null; this.active = null;
+    this.patchSize = 8; this.patchNX = Math.ceil(nx / this.patchSize); this.patchNZ = Math.ceil(nz / this.patchSize);
+    const patches = this.patchNX * this.patchNZ;
+    this.patchLive = new Uint8Array(patches); this.patchRough = new Uint8Array(patches); this.patchVisit = new Uint8Array(patches);
+    this.patchVersion = new Float64Array(patches); this.patchClock = 0;
     this.reset(); this.setMask(this.blocked);
   }
 
@@ -56,13 +61,29 @@ export class SandField {
       this.base[p] = this.h[p] = Math.max(this.knobs.minimum, this.knobs.depth + value / sum * this.knobs.unevenness);
     }
     this.cut.fill(0); this.ridge.fill(0); this.occupied.fill(0); this.marked.fill(0); this.intent.fill(0); this.pendingCount = 0;
+    this.patchLive.fill(0); this.patchRough.fill(0); this.patchVisit.fill(0);
+    for (let j = 0; j < this.nz; j++) for (let i = 0; i < this.nx; i++) {
+      const p = j * this.nx + i;
+      if ((i + 1 < this.nx && Math.abs(this.base[p] - this.base[p + 1]) > 0.65 * this.dx) || (j + 1 < this.nz && Math.abs(this.base[p] - this.base[p + this.nx]) > 0.65 * this.dz)) this.markPatches(this.patchRough, i, i, j, j);
+    }
     this.intentClock = 0; this.active = null; this.touch(0, this.nx - 1, 0, this.nz - 1);
   }
 
-  touch(x0, x1, z0, z1) {
+  markPatches(target, x0, x1, z0, z1, value = 1, filter = null) {
+    const size = this.patchSize;
+    const a = Math.max(0, Math.floor(x0 / size)), b = Math.min(this.patchNX - 1, Math.floor(x1 / size));
+    const c = Math.max(0, Math.floor(z0 / size)), d = Math.min(this.patchNZ - 1, Math.floor(z1 / size));
+    for (let j = c; j <= d; j++) for (let i = a; i <= b; i++) {
+      const p = j * this.patchNX + i;
+      if (!filter || filter[p]) target[p] = value;
+    }
+  }
+
+  touch(x0, x1, z0, z1, patches = null) {
     const b = this.dirty;
     this.dirty = b ? { x0: Math.min(b.x0, x0), x1: Math.max(b.x1, x1), z0: Math.min(b.z0, z0), z1: Math.max(b.z1, z1) } : { x0, x1, z0, z1 };
     this.version++;
+    this.markPatches(this.patchVersion, x0, x1, z0, z1, ++this.patchClock, patches);
   }
 
   setMask(mask) {
@@ -194,10 +215,15 @@ export class SandField {
     }
     out.moved *= area;
     if (out.moved > 0) { this.wake(x0, x1, z0, z1); this.touch(x0, x1, z0, z1); }
+    else if (dug.length) {
+      this.markPatches(this.patchLive, x0, x1, z0, z1);
+      this.markPatches(this.patchVersion, x0, x1, z0, z1, ++this.patchClock);
+    }
     return out;
   }
 
   wake(x0, x1, z0, z1) {
+    this.markPatches(this.patchLive, x0, x1, z0, z1);
     const b = this.active;
     this.active = b ? { x0: Math.min(b.x0, x0), x1: Math.max(b.x1, x1), z0: Math.min(b.z0, z0), z1: Math.max(b.z1, z1) } : { x0, x1, z0, z1 };
   }
@@ -206,7 +232,35 @@ export class SandField {
     if (!this.active || !Number.isFinite(dt) || dt <= 0) return false;
     const b = this.active, k = this.knobs, h = this.h, occupied = this.occupied;
     const x0 = Math.max(0, b.x0 - 1), x1 = Math.min(this.nx - 1, b.x1 + 1), z0 = Math.max(0, b.z0 - 1), z1 = Math.min(this.nz - 1, b.z1 + 1);
-    const each = (fn) => { for (let j = z0; j <= z1; j++) for (let i = x0; i <= x1; i++) fn(j * this.nx + i, i, j); };
+    const size = this.patchSize, columns = this.patchNX, visit = this.patchVisit;
+    visit.fill(0);
+    let covered = 0;
+    for (let p = 0; p < visit.length; p++) if (this.patchLive[p] || this.patchRough[p]) {
+      const x = (p % columns) * size, z = Math.floor(p / columns) * size;
+      visit[p] = 1;
+      covered += Math.max(0, Math.min(x1 + 1, x + size) - Math.max(x0, x)) * Math.max(0, Math.min(z1 + 1, z + size) - Math.max(z0, z));
+    }
+    const cutoff = (x1 - x0 + 1) * (z1 - z0 + 1) * DENSE_COVERAGE;
+    let dense = covered >= cutoff;
+    if (!dense) {
+      for (let p = 0; p < visit.length; p++) if (this.patchLive[p] || this.patchRough[p]) {
+        const x = (p % columns) * size, z = Math.floor(p / columns) * size;
+        this.markPatches(visit, x - 1, x + size, z - 1, z + size);
+      }
+      covered = 0;
+      for (let tz = Math.floor(z0 / size); tz <= Math.floor(z1 / size); tz++) for (let tx = Math.floor(x0 / size); tx <= Math.floor(x1 / size); tx++) {
+        if (visit[tz * columns + tx]) covered += (Math.min(x1 + 1, (tx + 1) * size) - Math.max(x0, tx * size)) * (Math.min(z1 + 1, (tz + 1) * size) - Math.max(z0, tz * size));
+      }
+      dense = covered >= cutoff;
+    }
+    if (dense) this.markPatches(visit, x0, x1, z0, z1);
+    // Rows stay global: a tile-major pass would change which Float32 writes each neighbor sees.
+    const each = dense ? (fn) => { for (let j = z0; j <= z1; j++) for (let i = x0; i <= x1; i++) fn(j * this.nx + i, i, j); } : (fn) => {
+      for (let j = z0; j <= z1; j++) for (let tx = Math.floor(x0 / size); tx <= Math.floor(x1 / size); tx++) {
+        if (!visit[Math.floor(j / size) * columns + tx]) continue;
+        for (let i = Math.max(x0, tx * size); i <= Math.min(x1, (tx + 1) * size - 1); i++) fn(j * this.nx + i, i, j);
+      }
+    };
     const pending = (fn) => { for (let i = 0; i < this.pendingCount; i++) fn(this.pending[i]); };
     this.contactIslands();
     this.budget.fill(0); this.excavated.fill(0);
@@ -255,7 +309,10 @@ export class SandField {
         if (!excess) continue;
         const high = difference > 0 ? p : q, low = difference > 0 ? q : p;
         const move = Math.min(excess * Math.min(0.24, k.slump * dt), h[high] - Math.max(k.minimum, this.base[high] - k.limit), this.base[low] + k.limit - h[low]);
-        if (move > 0) { h[high] -= move; h[low] += move; changed = true; }
+        if (move > 0) {
+          h[high] -= move; h[low] += move; changed = true;
+          if (!dense) this.markPatches(visit, i - 1, i + (axis ? 1 : 2), j - 1, j + (axis ? 2 : 1));
+        }
       }
       if (Math.abs(h[p] - old) > 1e-9) changed = true;
     });
@@ -266,7 +323,18 @@ export class SandField {
       else { live.x0 = Math.min(live.x0, i); live.x1 = Math.max(live.x1, i); live.z0 = Math.min(live.z0, j); live.z1 = Math.max(live.z1, j); }
     });
     this.active = live;
-    if (changed) this.touch(x0, x1, z0, z1);
+    // Subthreshold remnants and intent still matter if a later wake spans them again.
+    for (let p = 0; p < visit.length; p++) if (visit[p]) {
+      const x = (p % columns) * size, z = Math.floor(p / columns) * size;
+      let remains = 0;
+      for (let j = z; j < Math.min(this.nz, z + size) && !remains; j++) for (let i = x; i < Math.min(this.nx, x + size); i++) {
+        const q = j * this.nx + i;
+        if (h[q] !== this.base[q] || this.intent[q]) { remains = 1; break; }
+      }
+      this.patchLive[p] = remains;
+    }
+    if (changed) this.touch(x0, x1, z0, z1, visit);
+    else this.markPatches(this.patchVersion, x0, x1, z0, z1, ++this.patchClock, visit);
     return changed;
   }
 }

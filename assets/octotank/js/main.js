@@ -312,7 +312,6 @@ async function boot() {
       loco.tick(dt);
       den?.tick(dt);
       mantle.tick(dt);
-      mantle.sync();
     }
     arms.tick(dt, phys.time);
     bench?.after(dt);

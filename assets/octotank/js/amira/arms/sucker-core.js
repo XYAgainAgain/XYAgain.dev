@@ -119,6 +119,16 @@ export function tasteRule(tag, k = SUCKER_KNOBS, { gripSelf = false } = {}) {
   return boring;
 }
 
+/* Allocation-free .grip and .recoil of tasteRule for the per-segment loops; keep in step with it. */
+export function tasteGrip(tag, k = SUCKER_KNOBS, gripSelf = false) {
+  if (tag === 'spoiled') return k.spoiledGrip;
+  if (tag === 'slick' || tag === 'noxious') return 0;
+  if (tag === 'self') return gripSelf ? 1 : 0;
+  return 1;
+}
+
+export const tasteRecoils = (tag) => tag === 'noxious';
+
 /* A noxious thing's severity: its own when it carries one in (0, 1], else the knob's. */
 export function severityOf(thing, k = SUCKER_KNOBS) {
   const v = thing?.severity;
