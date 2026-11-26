@@ -309,10 +309,11 @@ function placeAlong(pts, i, j, len, ref, cL, sL) {
   pts[i * 3] = pts[j * 3] + _dir[0] * len; pts[i * 3 + 1] = pts[j * 3 + 1] + _dir[1] * len; pts[i * 3 + 2] = pts[j * 3 + 2] + _dir[2] * len;
 }
 
-const GOLDEN = (Math.sqrt(5) - 1) / 2, SEG_ITERS = 16;
+// A bounded field is sampled along a segment no coarser than SCAN_STEP (m), its grid pitch; SCAN_MAX caps a runaway segment.
+const GOLDEN = (Math.sqrt(5) - 1) / 2, SEG_ITERS = 16, SCAN_STEP = 0.01, SCAN_MAX = 64, SCAN_ITERS = 10;
 
-/* Signed-distance world over boxes, spheres, capsules (local +Y axis, as Jolt's), and planes. A primitive's
-   `q` is its world rotation; collide() returns the deepest penetration of a sphere and its outward normal. */
+/* Signed-distance world over boxes, spheres, capsules (local +Y axis, as Jolt's), planes, and world-space fields; a field
+   `bounded` by finite lo/hi is a solid of any shape. collide() returns a sphere's deepest penetration and outward normal. */
 export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
   const ax = [0, 0, 0], ay = [0, 0, 0], az = [0, 0, 0];
   // Pose a primitive and its world-space bounds, so a probe far from it costs six compares.
@@ -331,8 +332,11 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
   };
   const P = prims.map((p, i) => {
     const o = { ...p, q: [0, 0, 0, 1], c: [0, 0, 0], flat: true, lo: [-Infinity, -Infinity, -Infinity], hi: [Infinity, Infinity, Infinity], sealed: null, loose: i >= fixed, up: [0, 1, 0] };
+    const field = p.type === 'field' && p.bounded === true && finite3(p.lo) && finite3(p.hi);
     // A bounded solid: a segment can cut it between two points clear of it, where a half-space or the sand can't be cut.
-    o.solid = i < fixed && (p.type === 'box' || p.type === 'capsule' || p.type === 'sphere');
+    o.solid = i < fixed && (p.type === 'box' || p.type === 'capsule' || p.type === 'sphere' || field);
+    // Its field is at least the distance to this box outside it, which distance()'s cull relies on.
+    if (field) { o.lo = [p.lo[0], p.lo[1], p.lo[2]]; o.hi = [p.hi[0], p.hi[1], p.hi[2]]; }
     place(o, p.c ?? [0, 0, 0], p.q ?? [0, 0, 0, 1]);
     return o;
   });
@@ -438,15 +442,43 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
     seg.z0 = Math.min(az, bz) - R; seg.z1 = Math.max(az, bz) + R;
   };
   const near = (p) => !(seg.x1 < p.lo[0] || seg.x0 > p.hi[0] || seg.y1 < p.lo[1] || seg.y0 > p.hi[1] || seg.z1 < p.lo[2] || seg.z0 > p.hi[2]);
-  // The deepest t by golden section, then the two ends, which a concave depth may peak at.
-  const seek = { t: 0, v: 0, f0: 0, f1: 0 };
-  const deepest = (p) => {
-    let lo = 0, hi = 1, c = hi - GOLDEN, d = GOLDEN, fc = segDepth(p, c), fd = segDepth(p, d);
-    for (let it = 0; it < SEG_ITERS; it++) {
+  const seek = { t: 0, v: 0, f0: 0, f1: 0 }, top = { t: 0, v: 0 };
+  // The deepest t in lo..hi by golden section, into top.
+  const golden = (p, lo, hi, iters) => {
+    const w = hi - lo;
+    let c = hi - GOLDEN * w, d = lo + GOLDEN * w, fc = segDepth(p, c), fd = segDepth(p, d);
+    for (let it = 0; it < iters; it++) {
       if (fc >= fd) { hi = d; d = c; fd = fc; c = hi - GOLDEN * (hi - lo); fc = segDepth(p, c); }
       else { lo = c; c = d; fc = fd; d = lo + GOLDEN * (hi - lo); fd = segDepth(p, d); }
     }
-    let t = fc >= fd ? c : d, v = Math.max(fc, fd);
+    top.t = fc >= fd ? c : d; top.v = Math.max(fc, fd);
+  };
+  const FS = new Float64Array(SCAN_MAX + 1);
+  // A field's depth may peak anywhere: samples, then golden section in each gap whose Lipschitz bound (depth moves at most
+  // L + |dr| per unit t) could beat the best so far.
+  const scan = (p, tol) => {
+    const L = len3(seg.dx, seg.dy, seg.dz), n = L > SCAN_STEP ? Math.min(SCAN_MAX, Math.ceil(L / SCAN_STEP)) : 1;
+    let t = 0, v = (FS[0] = segDepth(p, 0));
+    for (let k = 1; k <= n; k++) if ((FS[k] = segDepth(p, k / n)) > v) { v = FS[k]; t = k / n; }
+    // cut() needs only a peak more than tol above both ends and zero.
+    const floor = tol === null ? -Infinity : Math.max(0, FS[0], FS[n]) + tol;
+    const slack = (L + Math.abs(seg.dr)) / (2 * n), kb = Math.round(t * n);
+    // The two gaps beside the deepest sample first, so the bound prunes the rest.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let k = 1; k <= n; k++) {
+        if ((pass === 0) !== (k === kb || k === kb + 1)) continue;
+        if (!((FS[k - 1] + FS[k]) / 2 + slack > Math.max(v, floor))) continue;
+        golden(p, (k - 1) / n, k / n, SCAN_ITERS);
+        if (top.v > v) { v = top.v; t = top.t; }
+      }
+    }
+    seek.t = t; seek.v = v; seek.f0 = FS[0]; seek.f1 = FS[n];
+  };
+  // A convex depth peaks once inside or at an end.
+  const deepest = (p, tol = null) => {
+    if (p.type === 'field') { scan(p, tol); return; }
+    golden(p, 0, 1, SEG_ITERS);
+    let t = top.t, v = top.v;
     const f0 = segDepth(p, 0), f1 = segDepth(p, 1);
     if (f0 > v) { v = f0; t = 0; }
     if (f1 > v) { v = f1; t = 1; }
@@ -485,14 +517,17 @@ export function makeSdfWorld(prims, { fixed = prims.length } = {}) {
       return best;
     },
     /* How far a tapered capsule a (radius ra) to b (rb) cuts a bounded solid past what its end spheres sink in; -Infinity when none is near.
-       The deepest cut's outward normal goes into out, its solid into segHit, and its place along the segment into segT. */
-    cut(ax, ay, az, bx, by, bz, ra, rb, out) {
+       The deepest cut's outward normal goes into out, its solid into segHit, and its place along the segment into segT. A
+       field's cut no deeper than tol may read short. */
+    cut(ax, ay, az, bx, by, bz, ra, rb, out, tol = 0) {
       setSeg(ax, ay, az, bx, by, bz, ra, rb);
       let best = -Infinity, bi = -1, bt = 0;
       for (let i = 0; i < P.length; i++) {
         const p = P[i];
         if (!p.solid || !near(p)) continue;
-        deepest(p);
+        // A field's box can span the tank; the middle's distance less half the length culls it instead.
+        if (p.type === 'field' && solidDist(p, ax + seg.dx / 2, ay + seg.dy / 2, az + seg.dz / 2) - len3(seg.dx, seg.dy, seg.dz) / 2 > Math.max(ra, rb)) continue;
+        deepest(p, tol > 0 ? tol : 0);
         const e = seek.v - Math.max(0, seek.f0, seek.f1);
         if (e > best) { best = e; bi = i; bt = seek.t; segDepth(p, bt); out[0] = g[0]; out[1] = g[1]; out[2] = g[2]; }
       }

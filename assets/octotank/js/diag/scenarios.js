@@ -8,9 +8,10 @@ import { TANK } from '../config.js';
 const registry = new Map(), watchers = new Set();
 let running = null;
 
-/* `bench` marks a scenario for the bench (?bench=arm), which runs without her body or locomotion. */
-export function register(name, { label = name, key = null, run = null, bench = false } = {}) {
-  registry.set(name, { name, label, key, run, bench });
+/* `bench` marks a scenario for the bench (?bench=arm), which runs without her body or locomotion; `world` one that needs
+   that world (main.js's ?world=). */
+export function register(name, { label = name, key = null, run = null, bench = false, world = null } = {}) {
+  registry.set(name, { name, label, key, run, bench, world });
   for (const fn of watchers) fn();
 }
 
@@ -26,6 +27,7 @@ export async function runScenario(name, ctx, opts = {}) {
   if (!s?.run) throw new Error(`scenario ${name}: not built yet`);
   if (running) throw new Error(`scenario ${running} is already running`);
   if (s.bench !== !!ctx.bench) throw new Error(`scenario ${name}: ${s.bench ? 'needs the bench (?bench=arm)' : 'not on the bench'}`);
+  if (s.world && ctx.world && s.world !== ctx.world) { const why = `needs the ${s.world} world (?world=${s.world})`; return { passed: null, failed: why, note: why }; }
   if (s.bench) {
     running = name;
     try { return await s.run(ctx, opts); } finally { running = null; }
@@ -112,7 +114,10 @@ async function leg(ctx, to, urgency, limit) {
 /* Across her side of the wall and back: a hurried run to the panel side, the scored calm crossing, a hurried return. */
 async function crawl(ctx, { variant = null } = {}) {
   if (!ctx.loco.canPlant) return { passed: false, failed: 'no plant support in the arms yet' };
-  if (variant === 'boulder') return { variant, leg: await leg(ctx, [-0.7, 0, -0.28], 0.3, 40), passed: null };
+  if (variant === 'boulder') {
+    if (!ctx.rocks?.length) return { variant, passed: null, failed: 'needs the divider world (?world=divider)', note: 'needs the divider world (?world=divider)' };
+    return { variant, leg: await leg(ctx, [-0.7, 0, -0.28], 0.3, 40), passed: null };
+  }
   const setup = await leg(ctx, [-0.05, 0, -0.2], 0.9, 20);
   const calm = await leg(ctx, [-0.88, 0, 0.2], 0.3, 40);
   const hurried = await leg(ctx, [-0.3, 0, 0.0], 0.9, 12);
@@ -318,7 +323,7 @@ async function denRest(ctx, { limit = 40, after = 5 } = {}) {
 register('ball', { label: 'Ball', key: '1' });
 register('crawl', { label: 'Crawl', key: '2', run: crawl });
 register('climb', { label: 'Climb', key: '3' });
-register('squeeze', { label: 'Squeeze slot', key: '4' });
+register('squeeze', { label: 'Squeeze slot', key: '4', world: 'divider' });
 register('pull', { label: 'One-arm pull', run: pull });
 register('turn', { label: 'Turn 1 rad', run: turn });
 register('pile', { label: 'Arm pile', run: pile });

@@ -144,15 +144,16 @@ export function scoreLanding(c, p, upY, flippedEver, k = PARA_KNOBS) {
 }
 
 /* A seeded floor target for the hop scenario: dist m (lo–hi) at a seeded bearing from c, at least margin m off the glass,
-   off the divider's face, clear of keep-out discs [x, z, r], and ok(x, z) if given. rand() gives 0–1. null after `tries` misses. */
+   off the divider's face (none when panelX is null), clear of keep-out discs [x, z, r], and ok(x, z) if given. rand() gives 0–1.
+   null after `tries` misses. */
 export function pickTarget(c, rand, { lo = 0.4, hi = 0.8, tank, panelX, panelT, margin = 0.15, keep = [], ok = null, tries = 200 } = {}) {
-  const side = Math.sign(c[0] - panelX) || -1;
+  const side = panelX == null ? 0 : Math.sign(c[0] - panelX) || -1;
   // The length is drawn first and shrinks toward lo only when no bearing fits, so long hops aren't crowded out by the glass.
   let d = lo + rand() * (hi - lo);
   for (let i = 0; i < tries; i++) {
     if (i && i % 20 === 0) d = Math.max(lo, d * 0.93);
     const th = rand() * 2 * Math.PI, x = c[0] + Math.cos(th) * d, z = c[2] + Math.sin(th) * d;
-    if ((x - panelX) * side < panelT / 2 + margin) continue;
+    if (side && (x - panelX) * side < panelT / 2 + margin) continue;
     if (tank.w / 2 - Math.abs(x) < margin || tank.d / 2 - Math.abs(z) < margin) continue;
     if (keep.some(([kx, kz, r]) => Math.hypot(x - kx, z - kz) < r) || (ok && !ok(x, z))) continue;
     return [x, 0, z];

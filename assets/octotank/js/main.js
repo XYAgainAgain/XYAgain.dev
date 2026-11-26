@@ -4,8 +4,7 @@ import { seedFromUrl } from '../../pond/js/rng.js';
 import { loadJolt, Physics } from './tank/physics.js';
 import { Mantle, MANTLE_KNOBS } from './amira/body/mantle.js';
 import { SHELL_LEVELS } from './amira/body/mantle-core.js';
-import { buildTank, buildPanel, buildRocks, apertures, LAYOUT_KNOBS } from './tank/layout.js';
-import { buildToys } from './enrichment/toys.js';
+import { buildWorld, worldName } from './tank/world.js';
 import { Arms } from './amira/arms/arms.js';
 import { SuckerView } from './amira/arms/sucker-view.js';
 import { ArmView } from './amira/arms/arm-view.js';
@@ -23,14 +22,11 @@ import { Den } from './amira/locomotion/loco-den.js';
 import { isRunning } from './diag/scenarios.js';
 import { BodyParts } from './amira/body/body-parts.js';
 import { attachDebug } from './diag/debug.js';
-import { Water } from './water/buoyancy.js';
-import { WATER_KNOBS } from './water/buoyancy-core.js';
 import { WaterVisuals } from './water/visuals.js';
 import { createPanel } from './diag/panel.js';
 import { TankCamera } from './tank/camera.js';
 import { TankGlass } from './tank/glass.js';
 import { wallGeometry } from './tank/geometry.js';
-import { TankSand } from './tank/sand.js';
 import { registerWeight } from './tank/sand-weight.js';
 import { WallOptics } from './tank/wall-optics.js';
 import { Mount, Bench, BENCH_KNOBS, benchBodyMass } from './diag/bench.js';
@@ -39,7 +35,7 @@ import { SuckerDiag } from './diag/sucker-diag.js';
 import { rodArms, ROD_ARM_KNOBS } from './amira/arms/arm-rod.js';
 
 /* Amira's tank: Jolt from the import map, her soft body and arms (amira/), the rockwork, the toys, and the panel.
-   Flags: ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
+   Flags: ?world=divider (the slotted test wall and two boulders; the bench always has it)  ?rock=single (the rockwork as one mesh body)  ?verts=150|300|500  ?drive=force|pin|free  ?seed=  ?gl=1  ?joltdebug=1  ?gap=  ?toys=  ?iters=  ?pa=
    ?collider=jolt  ?curious=0  ?armtoys=1 (Jolt's own arm-on-toy contact)  ?water=0  ?floaters=  ?girth=  ?capsules=1  ?loco=0 (the rigid posture)  ?wander=0  ?sand=0  ?sandseed=  ?sandtex=256|512|1024  plus any MANTLE_KNOBS name; ?render=0 (headless: step only, draw on tank.renderOnce)
    ?bench=arm (her set aside, one arm on a mount: diag/bench.js)  ?rod=0 (the bench arm authored, no rod)  ?twin=1 (the bench's twin check; with ?toys=0)
    ?rods=none (her authored arms; all eight are rods by default)  ?rods=3,4 (only those arms rods)  ?rodmode=shadow (the rods run beside her
@@ -78,9 +74,6 @@ async function boot() {
   const seed = seedFromUrl();
   const level = SHELL_LEVELS[params.get('verts') ?? '500'] ?? SHELL_LEVELS[500];
   const drive = ['pin', 'free'].includes(params.get('drive')) ? params.get('drive') : 'force';
-  const layoutKnobs = { ...LAYOUT_KNOBS };
-  if (params.has('gap')) layoutKnobs.gapH = +params.get('gap') || layoutKnobs.gapH;
-  if (params.get('bullnose') === '0') layoutKnobs.bullnose = false;
 
   say('loading Jolt');
   const joltP = loadJolt({ debug: params.get('joltdebug') === '1' });
@@ -98,16 +91,6 @@ async function boot() {
   say('building');
 
   const phys = new Physics(Jolt, { armsHitToys: params.get('armtoys') === '1' });
-  const walls = buildTank(phys);
-  const panel = buildPanel(phys, layoutKnobs);
-  const rocks = buildRocks(phys);
-  const sand = params.get('sand') === '0' ? null : new TankSand(phys, { seed: Number.isFinite(Number(params.get('sandseed'))) && params.has('sandseed') ? Number(params.get('sandseed')) : 420 });
-  const start = [layoutKnobs.panelX - 0.42, layoutKnobs.gapY + 0.08, 0];
-  const keepOut = [[-0.55, 0.05, -0.12, 0.09], [0.5, 0.05, 0.1, 0.1], [start[0], start[1], start[2], 0.1]];
-  const floaters = +(params.get('floaters') ?? WATER_KNOBS.floaters) || 0;
-  const toys = buildToys(phys, seed, Math.max(0, Math.min(80, +(params.get('toys') ?? 12) || 0)), { keepOut, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, floaters });
-  // ?water=0 keeps the toys' real masses but leaves them in air: no buoyancy, no drag.
-  const water = phys.water = new Water(phys, toys, { enabled: params.get('water') !== '0', knobs: { floaters } });
   // Any mantle knob can ride the query string by its own name (?forceK=2000&bend=none); iters and pa are short forms.
   const mantleKnobs = {};
   const alias = { iters: 'iterations', pa: 'pressurePa' };
@@ -118,6 +101,9 @@ async function boot() {
     if (typeof MANTLE_KNOBS[name] === 'string') mantleKnobs[name] = raw;
     else if (Number.isFinite(+raw)) mantleKnobs[name] = +raw;
   }
+  const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
+  const W = await buildWorld(phys, { name: benchOn ? 'divider' : worldName(params), params, seed, level, mantleKnobs });
+  const { walls, panel, rocks, sand, start, toys, water, layoutKnobs } = W;
   const armKnobs = params.has('collider') ? { collider: params.get('collider') } : {};
   // Her arms run on their muscles; ?muscle=0 runs them on the authored targets alone, as before the muscle map.
   armKnobs.muscle = params.get('muscle') === '0' ? 0 : 1;
@@ -125,7 +111,6 @@ async function boot() {
   armKnobs.crowd = params.get('crowd') === '0' ? 0 : 1;
   // The bench sets her aside: a mount holds one arm (a rod unless ?rod=0), and nothing of her body, posture, attention,
   // or locomotion is built.
-  const benchOn = params.get('bench') === 'arm', twin = benchOn && params.get('twin') === '1';
   let mantle, arms, pose = null, attention = null, loco = null, carry = null, jet = null, bench = null, den = null;
   if (benchOn) {
     mantle = new Mount({ ...BENCH_KNOBS });
@@ -153,10 +138,10 @@ async function boot() {
     pose.tick(0);
     attention = new Attention(pose, arms, toys, { seed, knobs: params.get('curious') === '0' ? { curious: false } : {} });
     loco = new Locomotion({ mantle, arms, pose, attention, toys }, { seed, knobs: { enabled: locoOn, wander: params.get('wander') !== '0' } });
-    loco.wander = new Wander(loco, { toys, rocks, attention, panelX: layoutKnobs.panelX, panelT: layoutKnobs.panelT, seed });
+    loco.wander = new Wander(loco, { toys, attention, seed, ...W.wander });
     carry = new Carry({ mantle, arms, loco });
     installClimb(loco);
-    installSqueeze(loco, { apertures: apertures(layoutKnobs) });
+    installSqueeze(loco, { apertures: W.apertures });
     jet = installJet(loco);
     installFew(loco, { carry });
     installRight(loco);
@@ -214,6 +199,13 @@ async function boot() {
     if (e.tag === 'wall') { if (e.pos[2] > 0) continue; }   // the front glass stays clear
     let geo;
     if (e.tag === 'wall') geo = wallGeometry(e);
+    else if (e.kind === 'mesh') {
+      const m = W.rockwork.field.mesh();
+      geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
+      geo.setIndex(new THREE.BufferAttribute(m.indices, 1));
+    }
     else if (e.kind === 'box') geo = new THREE.BoxGeometry(e.size[0] * 2, e.size[1] * 2, e.size[2] * 2);
     else if (e.kind === 'sphere') geo = new THREE.SphereGeometry(e.size[0], 20, 14);
     else if (e.kind === 'capsule') geo = new THREE.CapsuleGeometry(e.size[1], e.size[0] * 2, 4, 10);
@@ -240,7 +232,7 @@ async function boot() {
 
   water.onTint = (on) => { for (const r of rigidMeshes) if (r.tint) r.mesh.material = on ? r.tint : mats.toy; };
   water.setTint(water.knobs.tint);
-  const ctx = { phys, mantle, arms, pose, attention, loco, carry, den, bench, rods: null, panel, walls, rocks, toys, layoutKnobs, water, watch: null, probe: null };
+  const ctx = { phys, mantle, arms, pose, attention, loco, carry, den, bench, rods: null, panel, walls, rocks, toys, layoutKnobs, water, world: W.name, rockwork: W.rockwork, watch: null, probe: null };
   const tank = attachDebug(ctx);
   tank.scene = scene; tank.camera = camera; tank.renderer = renderer; tank.bodyParts = bodyParts;
   if (bodyParts) tank.knobs.parts = bodyParts.knobs;

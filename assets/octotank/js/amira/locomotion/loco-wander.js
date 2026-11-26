@@ -3,10 +3,10 @@ import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 import { TANK } from '../../config.js';
 import { sizeOf } from './locomotion.js';
 import { Travel } from './loco-travel.js';
+import { clearOfRock, rockDistance, bodyReach } from '../../tank/rock-clear.js';
 
-/* Her own destinations while nobody asks for one, a stand-in for the brain: she picks something that catches her eye (a
-   toy, the novel and moved likelier, a rock, a spot on the glass), goes there, tastes or looks a while, and moves on.
-   With the travel chooser off she keeps to her side of the rock wall and crawls; with it on, her mood picks how. */
+/* Her destinations while nobody asks for one, a stand-in for the brain: something that catches her eye (a toy, the novel and moved likelier, a rock, a spot on the glass), a visit, then on.
+   With the travel chooser off she keeps to her side of the divider and crawls; with it on, her mood picks how. */
 
 export class Wander {
   constructor(loco, { toys = [], rocks = [], attention = null, panelX = 0.1, panelT = 0.06, seed = 1 } = {}) {
@@ -85,18 +85,21 @@ export class Wander {
   _pick() {
     const loco = this.loco, k = loco.knobs, c = loco.c, P = this.points, T = this.toys, R = this.rocks, rng = this.rng, tr = this.travel.active ? this.travel : null;
     if (tr?.plan) return this._cross(tr.plan);
-    const own = Math.sign(c[0] - this.panelX) || -1, clear = this.panelT / 2 + 0.08, far = !!tr && tr.farPick(), side = far ? -own : own;
-    const ok = (p, size) => Number.isFinite(p[0] + p[1] + p[2]) && (p[0] - this.panelX) * side > clear && Math.hypot(p[0] - c[0], p[2] - c[2]) > k.arriveR + size && (!tr || tr.reachable(p));
+    // No panel is one undivided tank: no sides, and the rock, if any, rules out what her body can't stand at.
+    const walled = this.panelX != null, phys = loco.arms.phys, reach = this._reach ??= bodyReach(loco.mantle);
+    const own = walled ? Math.sign(c[0] - this.panelX) || -1 : Math.sign(c[0]) || -1, clear = walled ? this.panelT / 2 + 0.08 : 0, far = walled && !!tr && tr.farPick(), side = far ? -own : own;
+    const ok = (p, size, place = true) => Number.isFinite(p[0] + p[1] + p[2]) && (!walled || (p[0] - this.panelX) * side > clear) && Math.hypot(p[0] - c[0], p[2] - c[2]) > k.arriveR + size && (!tr || tr.reachable(p))
+      && (place ? clearOfRock(phys, p, reach) : rockDistance(phys, p[0], p[1], p[2]) > 0);
     const nan = (p) => { p[0] = NaN; p[1] = NaN; p[2] = NaN; };
     for (let i = 0; i < T.length; i++) {
       loco._entryPoint(T[i], P[i]);
       // A toy that has stung her enough to latch is no destination: her arms keep a berth off it (arm-reflex.js).
-      if (!ok(P[i], sizeOf(T[i])) || this._held(T[i]) || loco.arms.reflexes?.latched(T[i])) nan(P[i]);
+      if (!ok(P[i], sizeOf(T[i]), false) || this._held(T[i]) || loco.arms.reflexes?.latched(T[i])) nan(P[i]);
       this.seen[i] = this.attention?.seen[i] ?? this.seen[i];
     }
     for (let i = 0; i < R.length; i++) { const p = P[T.length + i]; loco._entryPoint(R[i], p); if (!ok(p, sizeOf(R[i]))) nan(p); }
     // One spot per glass wall at a random height and place on her side; the side wall across the tank is skipped.
-    const hw = TANK.w / 2, hd = TANK.d / 2, lo = side < 0 ? -hw + 0.1 : this.panelX + clear, hi = side < 0 ? this.panelX - clear : hw - 0.1;
+    const hw = TANK.w / 2, hd = TANK.d / 2, lo = side < 0 || !walled ? -hw + 0.1 : this.panelX + clear, hi = side < 0 && walled ? this.panelX - clear : hw - 0.1;
     const g = T.length + R.length, y = () => rng.range(k.glassLo, Math.max(k.glassLo, k.glassHi));
     P[g][0] = rng.range(lo, hi); P[g][1] = y(); P[g][2] = -hd;
     P[g + 1][0] = rng.range(lo, hi); P[g + 1][1] = y(); P[g + 1][2] = hd;

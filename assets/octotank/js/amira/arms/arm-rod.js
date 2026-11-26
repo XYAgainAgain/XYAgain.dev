@@ -523,7 +523,7 @@ export class RodArm {
   /* How far segment a–o cuts the bounded solids past its own ends. */
   _cut(S, a, o, ra, rb, out) {
     const X = this.X;
-    return S.cut(X[a], X[a + 1], X[a + 2], X[o], X[o + 1], X[o + 2], ra, rb, out);
+    return S.cut(X[a], X[a + 1], X[a + 2], X[o], X[o + 1], X[o + 2], ra, rb, out, this.k.clearTol);
   }
 
   /* Point i carried to (x, y, z) around whatever it meets on the way. */

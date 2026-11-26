@@ -939,9 +939,9 @@ const _rn = [0, 0, 0];
 
 /* Lays seal i's anchor back `radius` out from the surface it formed on and stores the normal there. `surface(x, y, z, out)`
    is that one primitive's signed distance and outward normal, never the world's nearest. maxCurve (1/m) is the sharpest
-   bend a slide may follow: an edge rounds off at the node's radius, so it turns at 1/radius at any speed. Only
-   REPROJECT.on moves the anchor, and a peeling one, meant to leave its surface, is left alone. */
-export function reprojectSeal(rod, i, surface, radius, { maxTurn = 0.35, maxCurve = 0.5 / radius, maxShift = radius } = {}) {
+   bend a slide may follow: an edge rounds off at the node's radius, so it turns at 1/radius at any speed; a turn under
+   minTurn passes unslid. Only REPROJECT.on moves the anchor, and a peeling one, meant to leave its surface, is left alone. */
+export function reprojectSeal(rod, i, surface, radius, { maxTurn = 0.35, maxCurve = 0.5 / radius, maxShift = radius, minTurn = 1e-6 } = {}) {
   if (!rod.sealed[i]) return REPROJECT.lost;
   if (rod.sealPeeling(i)) return REPROJECT.on;
   const o = 3 * i, A = rod.sA, ax = A[o], ay = A[o + 1], az = A[o + 2];
@@ -952,7 +952,7 @@ export function reprojectSeal(rod, i, surface, radius, { maxTurn = 0.35, maxCurv
   const N = rod.sN;
   if (N[o] || N[o + 1] || N[o + 2]) {
     const turn = Math.acos(Math.max(-1, Math.min(1, N[o] * nx + N[o + 1] * ny + N[o + 2] * nz))), arc = rod.sSlip[i] - rod.sSlipAt[i];
-    if (turn > maxTurn || (turn > 1e-6 && turn > maxCurve * arc)) return REPROJECT.edge;
+    if (turn > maxTurn || (turn > minTurn && turn > maxCurve * arc)) return REPROJECT.edge;
   }
   _rn[0] = nx; _rn[1] = ny; _rn[2] = nz;
   rod.placeAnchor(i, ax - nx * sh, ay - ny * sh, az - nz * sh, _rn);

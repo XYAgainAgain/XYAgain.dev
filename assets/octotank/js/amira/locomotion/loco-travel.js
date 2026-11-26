@@ -2,6 +2,7 @@ import { TRAVEL_KNOBS, Energy, reachable, paceOf, priceTrip, hopAim, hopSpot, cl
 import { createRng, deriveSeed } from '../../../../pond/js/rng.js';
 import { TANK } from '../../config.js';
 import { section } from '../../diag/panel.js';
+import { clearOfRock, bodyReach } from '../../tank/rock-clear.js';
 
 /* How she gets where Wander sends her, and how much she wants to go: her energy drifts through calm and restless spells,
    each trip is priced by mode (crawl, climb, the squeeze, a hop, a swing once she has one), and she takes the cheapest.
@@ -73,7 +74,8 @@ export class Travel {
     }
   }
 
-  _side() { return Math.sign(this.loco.c[0] - this.wander.panelX) || -1; }
+  // Without a panel the tank is one side.
+  _side() { return this.wander.panelX == null ? -1 : Math.sign(this.loco.c[0] - this.wander.panelX) || -1; }
 
   /* The far side this pick, likelier as she grows restless or bored of this side, and only from the floor: the slot is
      reached from below. */
@@ -129,10 +131,17 @@ export class Travel {
     const pick = price.modes[price.best];
     d.urgency = clamp(pick.urgency, 0, 1);
     let mode = price.best, label = pick.label;
+    const panel = this.wander.panelX == null ? null : { x: this.wander.panelX, t: this.wander.panelT };
+    // A landing her body can't fit beside the rock is crawled instead.
+    const spot = mode === 'hop' ? hopSpot(p, TANK, k, [0, 0, 0], panel) : null;
+    if (spot && !clearOfRock(L.arms.phys, spot, this._reach ??= bodyReach(L.mantle))) {
+      this.refusals.rock = (this.refusals.rock ?? 0) + 1;
+      mode = 'crawl'; label = price.modes.crawl.label; d.urgency = clamp(price.modes.crawl.urgency, 0, 1);
+    }
     if (mode === 'hop') {
-      const aim = [0, 0, 0], panel = { x: this.wander.panelX, t: this.wander.panelT };
+      const aim = [0, 0, 0];
       hopAim(c, p, L.mantle.knobs.damping, TANK, k, aim, panel);
-      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), spot: hopSpot(p, TANK, k, [0, 0, 0], panel), crawl: price.modes.crawl };
+      this.pending = { d, aim, meters: Math.hypot(aim[0] - c[0], aim[1] - c[1], aim[2] - c[2]), spot, crawl: price.modes.crawl };
     } else if (price.modes.hop.why) this.refusals[price.modes.hop.why] = (this.refusals[price.modes.hop.why] ?? 0) + 1;
     this.counts.trips++;
     this.counts[mode === 'hop' ? 'hop' : label]++;

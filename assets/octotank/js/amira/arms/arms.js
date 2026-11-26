@@ -56,6 +56,8 @@ const NORMAL_AGREE = 0.94;
 const DRAG_SLIDE = 0.01, DRAG_LOAD = 0.8;
 const REPROJECT_WHY = ['on', 'edge', 'off', 'lost'];
 const SAND_EDGE = { maxCurve: Infinity };
+// rad: a baked field's normal turns up to ~4 mrad between a node and its anchor, so less than this reads as unturned.
+const FIELD_EDGE = { minTurn: 0.01 };
 
 export class Arms {
   /* indices: each slot's arm number (her own 0–7 when omitted; the bench holds one arm in slot 0); rods: the arm
@@ -230,10 +232,10 @@ export class Arms {
   _buildWorld() {
     const prims = [], mid = [0, 0, 0];
     this.primEntry = [];
-    const walls = this.phys.rigid.filter((e) => e.tag === 'wall');
+    const walls = this.phys.rigid.filter((e) => e.tag === 'wall'), rock = this.phys.rockwork;
     for (const e of walls) for (let a = 0; a < 3; a++) mid[a] += e.pos[a] / walls.length;
     for (const e of this.phys.rigid) {
-      if (e.tag !== 'wall' && e.tag !== 'panel' && e.tag !== 'rock') continue;
+      if ((e.tag !== 'wall' && e.tag !== 'panel' && e.tag !== 'rock') || e === rock?.entry) continue;
       const q = this.phys.rotationOf(e);
       if (e.tag === 'wall' && e.kind === 'box') {
         const a = e.size.indexOf(Math.min(...e.size)), side = Math.sign(e.pos[a] - mid[a]) || 1;
@@ -249,6 +251,12 @@ export class Arms {
     if (this.phys.terrain) {
       prims.push({ type: 'field', distance: (x, y, z, out) => this.phys.terrain.distance(x, y, z, out) });
       this.primEntry.push(this.phys.terrain.entry);
+    }
+    // After the sand, so every index before it stands as in a world without the rockwork.
+    if (rock?.field && rock.entry) {
+      const f = rock.field;
+      prims.push({ type: 'field', bounded: true, lo: f.lo, hi: f.hi, distance: (x, y, z, out) => f.distance(x, y, z, out) });
+      this.primEntry.push(rock.entry);
     }
     // Loose things go in after the furniture, posed from Jolt each tick: an arm lies over a toy rather than through it.
     // `sdf` (the furniture alone) is what health() measures against.
@@ -1907,7 +1915,8 @@ export class Arms {
     if (p >= 0) {
       this._surfAt = p; this._surfPose = toy ? st.pose : null; this._surfO = w; this._surfD = NaN;
       // The sand is a bed of facets that her weight and her digging tilt under a still anchor: there only a sudden turn is an edge.
-      const r = body.rad[i], code = reprojectSeal(rod, i, this._surface, r, this.allSdf.prims[p].type === 'field' ? SAND_EDGE : undefined);
+      const r = body.rad[i], P = this.allSdf.prims[p];
+      const code = reprojectSeal(rod, i, this._surface, r, this.primEntry[p]?.tag === 'sand' ? SAND_EDGE : P.type === 'field' && P.solid ? FIELD_EDGE : undefined);
       st.pre[j] = Math.abs(this._surfD - r);
       if (code !== REPROJECT.on) return REPROJECT_WHY[code];
     }

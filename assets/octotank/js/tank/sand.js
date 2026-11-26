@@ -28,10 +28,11 @@ export class TankSand {
       if (['box', 'sphere', 'capsule', 'cylinder'].includes(e.kind)) prims.push({ kind: e.kind, size: e.size, pose });
     }
     if (this.maskPose?.length === poses.length && poses.every((v, i) => v === this.maskPose[i])) return false;
-    const f = this.field, mask = new Uint8Array(f.h.length), interval = new Float64Array(2);
+    const f = this.field, mask = new Uint8Array(f.h.length), interval = new Float64Array(2), rock = this.phys.rockwork?.field, normal = [0, 0, 0];
     for (let j = 0; j < f.nz; j++) for (let i = 0; i < f.nx; i++) {
       const p = j * f.nx + i;
       const x = i * f.dx - f.width / 2, z = j * f.dz - f.depth / 2;
+      if (rock && rock.distance(x, f.base[p], z, normal) < 0.005) { mask[p] = 1; continue; }
       for (const primitive of prims) {
         if (verticalSpan(primitive.kind, primitive.size, primitive.pose, x, z, interval) && f.base[p] >= interval[0] - 0.001 && f.base[p] <= interval[1] + 0.001) { mask[p] = 1; break; }
       }

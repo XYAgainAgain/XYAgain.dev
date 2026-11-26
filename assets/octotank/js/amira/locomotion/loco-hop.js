@@ -3,6 +3,7 @@ import { TRAVEL_KNOBS, hopAim } from './loco-travel-core.js';
 import { register, until } from '../../diag/scenarios.js';
 import { section } from '../../diag/panel.js';
 import { TANK } from '../../config.js';
+import { clearOfRock, bodyReach } from '../../tank/rock-clear.js';
 import { createRng, deriveSeed, seedFromUrl } from '../../../../pond/js/rng.js';
 
 /* Jet hops: she launches mantle-first, climbs to an apex and levels out, cuts thrust when her coast will carry the rest,
@@ -159,13 +160,14 @@ export async function hopScenario(ctx, { target = null, settle = 1, after = 2, l
   try { return await hopRun(ctx, jet, hop, { target, settle, after, lo, hi }); } finally { if (was) Object.assign(hop.knobs, was); }
 }
 
-async function hopRun({ loco: L, arms: A, mantle: m, seed }, jet, hop, { target, settle, after, lo, hi }) {
+async function hopRun({ loco: L, arms: A, mantle: m, seed, phys }, jet, hop, { target, settle, after, lo, hi }) {
   await until(L, () => false, settle);
   await until(L, () => jet.debt.ready && !L.flipped, 15);
   const c0 = [...m.ring().c], rng = createRng(deriveSeed(seed ?? seedFromUrl(), 6637));
-  const panelX = L.wander?.panelX ?? 0.1, panelT = L.wander?.panelT ?? 0.06, nrm = [0, 0, 0];
+  const panelX = L.wander ? L.wander.panelX : 0.1, panelT = L.wander?.panelT ?? 0.06, nrm = [0, 0, 0], reach = bodyReach(m);
   // Open floor: the floor is the closest thing to points 0.15 and 0.3 m over the spot, so no rock, glass, or divider is near.
   const open = (x, z) => {
+    if (phys && !clearOfRock(phys, [x, 0, z], reach)) return false;
     if (!A.sdf) return true;
     A.sdf.unfocus?.();
     return [0.15, 0.3].every((y) => { A.sdf.distance(x, y, z, nrm); return nrm[1] > 0.95; });

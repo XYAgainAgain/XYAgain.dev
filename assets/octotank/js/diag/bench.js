@@ -977,9 +977,9 @@ register('bench-budget', { label: 'Push budget', bench: true, run: budgetCheck }
 register('bench-heavy', { label: 'Heavy toy', bench: true, run: heavyCheck });
 register('bench-light', { label: 'Light toy', bench: true, run: lightCheck });
 register('bench-balance', { label: 'Momentum balance', bench: true, run: balanceCheck });
-register('bench-peel', { label: 'Seal peel', bench: true, run: peelCheck });
+register('bench-peel', { label: 'Seal peel', bench: true, run: peelCheck, world: 'divider' });
 register('bench-wrench', { label: 'Root wrench', bench: true, run: wrenchCheck });
 register('bench-twin', { label: 'Twin check', bench: true, run: twinCheck });
-register('bench-lip', { label: 'Lip check', bench: true, run: lipCheck });
+register('bench-lip', { label: 'Lip check', bench: true, run: lipCheck, world: 'divider' });
 register('bench-reach', { label: 'Reach check', bench: true, run: reachCheck });
 register('bench-toy', { label: 'Toy throw', bench: true, run: toyCheck });

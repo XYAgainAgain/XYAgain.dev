@@ -357,7 +357,7 @@ export class Squeeze {
 export function installSqueeze(loco, opts) {
   const sq = new Squeeze(loco, opts);
   loco.registerMode('squeeze', sq);
-  register('squeeze', { label: 'Squeeze slot', key: '4', run: squeeze });
+  register('squeeze', { label: 'Squeeze slot', key: '4', run: squeeze, world: 'divider' });
   return sq;
 }
 

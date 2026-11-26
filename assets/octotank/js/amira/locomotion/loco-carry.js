@@ -5,6 +5,7 @@ import {
 import { springTarget, lerp } from './locomotion-core.js';
 import { until, register } from '../../diag/scenarios.js';
 import { FRONT_ARMS } from '../attention.js';
+import { clearOfRock, rockDistance, bodyReach } from '../../tank/rock-clear.js';
 
 /* Loose things as holds: a small prize stowed in her web beside the crown ring, a bigger one reeled to her mouth, and
    a wedged one she hauls herself to on a spring whose anchor rides the toy, the toy taking the opposite pull. Ticks as
@@ -289,7 +290,7 @@ const r3 = (v) => +(+v).toFixed(3);
    it, up to `reaches` tries; the first reach is attention's look-and-reach. */
 async function reachAndGrip(ctx, { urgency = 0.5, reaches = 3 } = {}) {
   const { loco, arms: A, attention: att, mantle: m, carry, toys, phys } = ctx, k = carry?.knobs ?? CARRY_KNOBS;
-  const panelX = ctx.layoutKnobs?.panelX ?? 0.1, out = { reaches: [], passed: false };
+  const panelX = ctx.layoutKnobs ? ctx.layoutKnobs.panelX : null, out = { reaches: [], passed: false };
   const at = (t) => { const p = t.body.GetPosition(); return [p.GetX(), p.GetY(), p.GetZ()]; };
   const crownDist = (t) => { const c = m.ring().c, p = at(t); return Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2]); };
   const rad = (t) => extent(t.kind, t.size) / 2;
@@ -300,7 +301,7 @@ async function reachAndGrip(ctx, { urgency = 0.5, reaches = 3 } = {}) {
     sdf.unfocus();
     return Math.hypot(v[0], v[1], v[2]) < 0.02 && onFloor(at(t), t.kind, t.size, phys.rotationOf(t), sdf.distance, k);
   };
-  const mine = (t) => at(t)[0] < panelX - 0.1 && (t.water?.weightInWater ?? 0) < 0.7;
+  const mine = (t) => (panelX == null || at(t)[0] < panelX - 0.1) && (t.water?.weightInWater ?? 0) < 0.7;
   const spheres = toys.filter((t) => t.kind === 'sphere' && mine(t));
   // Near-neutral balls take 5–6 s to land; anything still sinking after 8 s is skipped.
   await until(loco, () => spheres.some(resting), 8);
@@ -368,7 +369,7 @@ export async function ballScenario(ctx, { urgency = 0.5, carryUrgency = 0.4, rea
   const { loco, arms: A, mantle: m, carry } = ctx;
   if (!carry || typeof A.stow !== 'function') return { passed: false, failed: 'no carry support in the arms yet' };
   if (knobs) Object.assign(carry.knobs, knobs);
-  const sel0 = A.counts.selfSealed, rel0 = A.counts.release, panelX = ctx.layoutKnobs?.panelX ?? 0.1, sdf = A.sdf, nrm = [0, 0, 0];
+  const sel0 = A.counts.selfSealed, rel0 = A.counts.release, panelX = ctx.layoutKnobs ? ctx.layoutKnobs.panelX : null, sdf = A.sdf, nrm = [0, 0, 0], reach = bodyReach(m);
   const g = await reachAndGrip(ctx, { urgency, reaches });
   const { out, toy, arm, at, crownDist, rad, resting } = g;
   out.passed = false;
@@ -383,9 +384,9 @@ export async function ballScenario(ctx, { urgency = 0.5, carryUrgency = 0.4, rea
   let best = null, bestD = -Infinity;
   for (let i = 0; i < 16; i++) {
     const th = (i / 16) * 2 * Math.PI, p = [c0[0] + 0.4 * Math.cos(th), 0, c0[2] + 0.4 * Math.sin(th)];
-    if (p[0] > panelX - 0.2 || Math.abs(p[0]) > TANK.w / 2 - 0.15 || Math.abs(p[2]) > TANK.d / 2 - 0.12) continue;
+    if ((panelX != null && p[0] > panelX - 0.2) || Math.abs(p[0]) > TANK.w / 2 - 0.15 || Math.abs(p[2]) > TANK.d / 2 - 0.12 || !clearOfRock(ctx.phys, p, reach)) continue;
     sdf.unfocus();
-    const dd = sdf.distance(p[0], 0.05, p[2], nrm);
+    const dd = Math.min(sdf.distance(p[0], 0.05, p[2], nrm), rockDistance(ctx.phys, p[0], 0.05, p[2], nrm));
     if (dd > bestD) { bestD = dd; best = p; }
   }
   const watch = { ticks: 0, near: 0, strokes: 0, fMax: 0, capMin: Infinity, track: [], detail: [] };

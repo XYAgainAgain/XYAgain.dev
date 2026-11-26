@@ -179,4 +179,4 @@ async function lip(ctx, opts = {}) {
   return result;
 }
 
-register('lip', { label: 'Over the lip', run: lip });
+register('lip', { label: 'Over the lip', run: lip, world: 'divider' });

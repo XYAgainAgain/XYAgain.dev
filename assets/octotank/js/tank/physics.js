@@ -14,6 +14,7 @@ export async function loadJolt({ debug = false } = {}) {
 }
 
 const STEP_WINDOW = 1800;   // 30 s of step samples at 60 Hz
+const SETTLE_STEPS = 30;    // steps; a new soft body is inflating
 
 // Grip proxies sit one layer past config's: kinematic stand-ins for an arm's grip point that collide with nothing.
 export const PROXY_LAYER = LAYERS.COUNT;
@@ -146,6 +147,119 @@ export class Physics {
     return entry;
   }
 
+  /* A static triangle mesh at the origin from { positions, indices }, counterclockwise from outside. One closed body on
+     purpose: Jolt pushes a soft-body vertex out through its nearest triangle in each shape, back face or not. */
+  addMesh(mesh, { layer = LAYERS.NON_MOVING, friction = 0.7 } = {}) {
+    const { id, body, lo, hi } = this._staticMesh(mesh, layer, friction);
+    const size = [0, 1, 2].map((a) => (hi[a] - lo[a]) / 2);
+    const entry = { id, body, kind: 'mesh', size, motion: 'static', layer, pos: [0, 0, 0], bounds: { lo, hi }, volume: 0, mass: Infinity };
+    this.rigid.push(entry);
+    return entry;
+  }
+
+  /* Closed pieces as one entry: the first is its body, the rest its `parts`, outside `rigid`. With `field`, a soft body skips each
+     piece over `margin` m plus two steps of its fastest vertex, and the last step's change in that speed, away. */
+  addMeshes(meshes, { layer = LAYERS.NON_MOVING, friction = 0.7, field = null, margin = 0.025 } = {}) {
+    if (!meshes.length) throw new Error('addMeshes: no pieces');
+    if (field && this.cull?.field && this.cull.field !== field) throw new Error('addMeshes: one culled field per world');
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity], pieces = meshes.map((m) => this._staticMesh(m, layer, friction));
+    for (const p of pieces) for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], p.lo[a]); hi[a] = Math.max(hi[a], p.hi[a]); }
+    const size = [0, 1, 2].map((a) => (hi[a] - lo[a]) / 2), parts = pieces.slice(1).map((p) => p.id);
+    const entry = { id: pieces[0].id, body: pieces[0].body, parts, kind: 'mesh', size, motion: 'static', layer, pos: [0, 0, 0], bounds: { lo, hi }, volume: 0, mass: Infinity };
+    if (field) {
+      const cull = this._softCull(), J = this.Jolt;
+      cull.field = field; cull.margin = margin; cull.version++;
+      entry.culled = pieces.map((p) => { const ptr = J.getPointer(p.body); cull.boxes.set(ptr, [...p.lo, ...p.hi]); return ptr; });
+    }
+    this.rigid.push(entry);
+    return entry;
+  }
+
+  /* Jolt walks every vertex to its nearest triangle in each overlapping body, however far; the listener drops the pieces
+     the field proves out of reach before the walk. */
+  _softCull() {
+    if (this.cull) return this.cull;
+    const J = this.Jolt, cull = this.cull = { field: null, margin: 0, reach: 0, boxes: new Map(), version: 0, open: false, age: 0, speed: 0, step: -1, ptr: 0, near: new Float64Array(0), count: 0, n: [0, 0, 0] };
+    const listener = cull.listener = new J.SoftBodyContactListenerJS();
+    const accept = J.SoftBodyValidateResult_AcceptContact, reject = J.SoftBodyValidateResult_RejectContact;
+    listener.OnSoftBodyContactValidate = (soft, other) => {
+      const b = cull.boxes.get(other);
+      if (!b) return accept;
+      // Keyed on stepTotal: a stepper that doesn't bump it reuses the last step's vertices.
+      if (cull.step !== this.stepTotal || cull.ptr !== soft) this._nearVertices(soft);
+      if (cull.open) return accept;
+      const m = cull.reach, P = cull.near;
+      for (let i = 0; i < cull.count * 3; i += 3) {
+        const x = P[i], y = P[i + 1], z = P[i + 2];
+        const dx = x < b[0] ? b[0] - x : x > b[3] ? x - b[3] : 0, dy = y < b[1] ? b[1] - y : y > b[4] ? y - b[4] : 0, dz = z < b[2] ? b[2] - z : z > b[5] ? z - b[5] : 0;
+        if (dx * dx + dy * dy + dz * dz <= m * m) return accept;
+      }
+      return reject;
+    };
+    listener.OnSoftBodyContactAdded = () => {};
+    this.system.SetSoftBodyContactListener(listener);
+    return cull;
+  }
+
+  // Once per step, and only when a piece asks.
+  _nearVertices(ptr) {
+    const J = this.Jolt, cull = this.cull, body = J.wrapPointer(ptr, J.Body);
+    const verts = J.castObject(body.GetMotionProperties(), J.SoftBodyMotionProperties).GetVertices(), n = verts.size();
+    const base = J.getPointer(verts.at(0)), stride = n > 1 ? (J.getPointer(verts.at(1)) - base) >> 2 : 0, at = (base >> 2) + (J.SoftBodyVertexTraits.prototype.mPositionOffset >> 2), vat = (base >> 2) + (J.SoftBodyVertexTraits.prototype.mVelocityOffset >> 2);
+    if (cull.near.length < n * 3) cull.near = new Float64Array(n * 3);
+    // Jolt keeps soft bodies unrotated, with each vertex stored relative to the center of mass.
+    const H = J.HEAPF32, o = body.GetCenterOfMassPosition(), ox = o.GetX(), oy = o.GetY(), oz = o.GetZ(), f = cull.field, P = cull.near;
+    let v2 = 0;
+    for (let i = 0; i < n; i++) { const k = vat + i * stride; v2 = Math.max(v2, H[k] * H[k] + H[k + 1] * H[k + 1] + H[k + 2] * H[k + 2]); }
+    // A speed that jumped last step means a push in progress; a new body is inflating, so it skips nothing.
+    const speed = Math.sqrt(v2), fresh = cull.ptr !== ptr;
+    cull.age = fresh ? 0 : cull.age + 1;
+    const lim = cull.reach = cull.margin + (2 * speed + Math.abs(speed - (fresh ? 0 : cull.speed))) * FIXED_DT;
+    cull.speed = speed;
+    cull.open = !(lim < Infinity) || cull.age < SETTLE_STEPS;
+    let c = 0;
+    for (let i = 0; i < n; i++) {
+      const k = at + i * stride, x = H[k] + ox, y = H[k + 1] + oy, z = H[k + 2] + oz;
+      if (x !== x || y !== y || z !== z) cull.open = true;
+      if (!(f.distance(x, y, z, cull.n) <= lim)) continue;
+      P[c * 3] = x; P[c * 3 + 1] = y; P[c * 3 + 2] = z; c++;
+    }
+    cull.count = c; cull.step = this.stepTotal; cull.ptr = ptr;
+  }
+
+  _staticMesh({ positions, indices }, layer, friction) {
+    const J = this.Jolt, verts = new J.VertexList(), tris = new J.IndexedTriangleList(), f3 = new J.Float3(0, 0, 0), tri = new J.IndexedTriangle(0, 0, 0, 0, 0);
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    verts.reserve(positions.length / 3);
+    for (let p = 0; p < positions.length; p += 3) {
+      f3.x = positions[p]; f3.y = positions[p + 1]; f3.z = positions[p + 2];
+      verts.push_back(f3);
+      for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], positions[p + a]); hi[a] = Math.max(hi[a], positions[p + a]); }
+    }
+    tris.reserve(indices.length / 3);
+    for (let n = 0; n < indices.length; n += 3) {
+      tri.set_mIdx(0, indices[n]); tri.set_mIdx(1, indices[n + 1]); tri.set_mIdx(2, indices[n + 2]);
+      tris.push_back(tri);
+    }
+    const materials = new J.PhysicsMaterialList(), settings = new J.MeshShapeSettings(verts, tris, materials);
+    J.destroy(f3); J.destroy(tri); J.destroy(verts); J.destroy(tris); J.destroy(materials);
+    const result = settings.Create();
+    if (result.HasError()) { const error = result.GetError().c_str(); J.destroy(result); J.destroy(settings); throw new Error(`addMesh: ${error}`); }
+    const shape = result.Get();
+    shape.AddRef();
+    J.destroy(result); J.destroy(settings);
+    this.tmp.r.Set(0, 0, 0); this.tmp.q.Set(0, 0, 0, 1);
+    const cs = new J.BodyCreationSettings(shape, this.tmp.r, this.tmp.q, J.EMotionType_Static, layer);
+    // Toys rolling across triangle seams catch on internal edges without it.
+    cs.mFriction = friction; cs.mEnhancedInternalEdgeRemoval = true;
+    const body = this.bodies.CreateBody(cs);
+    J.destroy(cs);
+    shape.Release();
+    const id = body.GetID();
+    this.bodies.AddBody(id, J.EActivation_DontActivate);
+    return { id, body, lo, hi };
+  }
+
   moveKinematic(entry, x, y, z, qx, qy, qz, qw, dt) {
     this.tmp.r.Set(x, y, z);
     this.tmp.q.Set(qx, qy, qz, qw);
@@ -166,7 +280,7 @@ export class Physics {
   }
 
   /* A sphere probe against the static world alone (NON_MOVING). Returns the deepest penetration and writes the
-     direction that lifts the probe out into `out`; every Jolt object it uses is made once, on first call. */
+     direction that lifts the probe out into `out`; Jolt objects are made once. Culled rock answers from its field. */
   collideStaticSphere(x, y, z, r, out) {
     const J = this.Jolt;
     let q = this.query;
@@ -184,17 +298,31 @@ export class Physics {
         shape, mat, scale: v, at: new J.RVec3(0, 0, 0), base: new J.RVec3(0, 0, 0),
         settings: new J.CollideShapeSettings(), collector: new J.CollideShapeClosestHitCollisionCollector(),
         bpl, bp: new J.SpecifiedBroadPhaseLayerFilter(bpl), obj: new J.SpecifiedObjectLayerFilter(LAYERS.NON_MOVING),
-        body: new J.BodyFilter(), shapeFilter: new J.ShapeFilter(), npq: this.system.GetNarrowPhaseQuery(),
+        body: new J.BodyFilter(), shapeFilter: new J.ShapeFilter(), npq: this.system.GetNarrowPhaseQuery(), n: [0, 0, 0],
       };
+    }
+    const field = this.cull?.field;
+    if (field && !q.skip) {
+      const skip = q.skip = new J.BodyFilterJS(), ids = q.pieceIds = new Set();
+      skip.ShouldCollide = (id) => !ids.has(J.wrapPointer(id, J.BodyID).GetIndexAndSequenceNumber());
+      skip.ShouldCollideLocked = (body) => !this.cull?.boxes.has(body);
+    }
+    // Keyed on membership: a freed body id can come back on another body.
+    if (field && q.pieceVersion !== this.cull.version) {
+      q.pieceIds.clear();
+      for (const ptr of this.cull.boxes.keys()) q.pieceIds.add(J.wrapPointer(ptr, J.Body).GetID().GetIndexAndSequenceNumber());
+      q.pieceVersion = this.cull.version;
     }
     q.scale.Set(r, r, r);
     q.at.Set(x, y, z);
     q.mat.SetTranslation(q.at);
     q.collector.Reset();
-    q.npq.CollideShape(q.shape, q.scale, q.mat, q.settings, q.base, q.collector, q.bp, q.obj, q.body, q.shapeFilter);
-    if (!q.collector.HadHit()) return 0;
-    const hit = q.collector.get_mHit(), depth = hit.get_mPenetrationDepth();
+    q.npq.CollideShape(q.shape, q.scale, q.mat, q.settings, q.base, q.collector, q.bp, q.obj, field ? q.skip : q.body, q.shapeFilter);
+    const rock = field ? r - field.distance(x, y, z, q.n) : 0;
+    const depth = q.collector.HadHit() ? q.collector.get_mHit().get_mPenetrationDepth() : 0;
+    if (rock > 0 && !(depth >= rock)) { out[0] = q.n[0]; out[1] = q.n[1]; out[2] = q.n[2]; return rock; }
     if (!(depth > 0)) return 0;
+    const hit = q.collector.get_mHit();
     // The axis is the way to push the other body (shape 2) out, so the probe leaves along its negative.
     const ax = hit.get_mPenetrationAxis();
     const l = Math.hypot(ax.GetX(), ax.GetY(), ax.GetZ());
@@ -280,6 +408,10 @@ export class Physics {
     this.rigid.splice(i, 1);
     this.bodies.RemoveBody(entry.id);
     this.bodies.DestroyBody(entry.id);
+    for (const id of entry.parts ?? []) { this.bodies.RemoveBody(id); this.bodies.DestroyBody(id); }
+    for (const ptr of entry.culled ?? []) this.cull.boxes.delete(ptr);
+    if (entry.culled) { this.cull.version++; if (!this.cull.boxes.size) this.cull.field = null; }
+    if (this.rockwork?.entry === entry) this.rockwork = null;
   }
 
   destroy() {
@@ -288,9 +420,10 @@ export class Physics {
     for (const e of this.proxies) { this.bodies.RemoveBody(e.id); this.bodies.DestroyBody(e.id); }
     this.proxies = [];
     for (const e of [...this.rigid]) this.removeRigid(e);
+    if (this.cull) { this.system.SetSoftBodyContactListener(null); this.Jolt.destroy(this.cull.listener); this.cull = null; }
     for (const t of Object.values(this.tmp)) this.Jolt.destroy(t);
     if (this.query) {
-      const { shape, npq, ...owned } = this.query;
+      const { shape, npq, n, pieceIds, pieceVersion, ...owned } = this.query;
       shape.Release();
       for (const o of Object.values(owned)) this.Jolt.destroy(o);
       this.query = null;

@@ -41,9 +41,12 @@ export class WaterObstacles {
       }
     }
     if (!changed) return false;
-    const start = performance.now(), w = this.waves, q = this.owned;
+    const start = performance.now(), w = this.waves, q = this.owned, rock = this.phys.rockwork?.field;
     for (let j = 0; j < w.nz; j++) for (let i = 0; i < w.nx; i++) {
-      q.point.Set(i * w.dx - w.width / 2, level, j * w.dz - w.depth / 2);
+      const x = i * w.dx - w.width / 2, z = j * w.dz - w.depth / 2;
+      // A probe wholly inside the rock mesh touches no triangle.
+      if (rock?.inside(x, level, z)) { this.mask[j * w.nx + i] = 1; continue; }
+      q.point.Set(x, level, z);
       q.mat.SetTranslation(q.point); q.collector.Reset();
       this.query.CollideShape(this.shape, q.scale, q.mat, q.settings, q.base, q.collector, q.bp, q.obj, q.body, q.filter);
       this.mask[j * w.nx + i] = q.collector.HadHit() ? 1 : 0;
